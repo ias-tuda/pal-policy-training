@@ -95,6 +95,50 @@ Evaluate.
 uv run play Mjlab-Tracking-Flat-Pal-Kangaroo --wandb-run-path your-org/mjlab/run-id
 ```
 
+## Manipulation
+
+Cube stacking on the Kangaroo's left gripper: pick up a block and place it on top of a
+second one. The manipulation env configs default to `num_envs=1`, so
+`--env.scene.num-envs` must always be passed when training.
+
+Train locally.
+
+```bash
+uv run train Mjlab-Stack-Pal-Kangaroo-Grippers --env.scene.num-envs 4096
+```
+
+Evaluate.
+
+```bash
+uv run play Mjlab-Stack-Pal-Kangaroo-Grippers --wandb-run-path your-org/pal-mjlab/run-id
+```
+
+### Training on SLURM
+
+`scripts/slurm_train.sh` submits one job per seed, each running `train` on a single GPU
+and logging to W&B. It refuses to launch from a dirty git tree or a stale `uv.lock`, so
+the git hash W&B records matches the code that ran.
+
+It uses the repo's `.venv` directly on the compute node, so run `make sync` on a login
+node first.
+
+```bash
+make sync                                        # once, on a login node
+DRY_RUN=1 bash scripts/slurm_train.sh            # inspect the generated job script
+bash scripts/slurm_train.sh                      # submit
+SEEDS="42 123 456" bash scripts/slurm_train.sh   # one job per seed, shared wandb group
+```
+
+Everything is configured through environment variables — `TASK`, `SEEDS`, `NUM_ENVS`,
+`MAX_ITERS`, `WANDB_PROJECT`, `TIME`, `GPU_CONSTRAINT`, … — and any extra positional
+arguments are forwarded verbatim to `train` as tyro overrides:
+
+```bash
+NUM_ENVS=2048 TIME=12:00:00 bash scripts/slurm_train.sh --agent.algorithm.entropy-coef 0.01
+```
+
+See the header of `scripts/slurm_train.sh` for the full list and defaults.
+
 ## Results
 
 <video src="https://github.com/user-attachments/assets/32c0e534-ead9-400e-afe5-42174a6b739b" controls muted loop playsinline style="width:100%;"></video>
