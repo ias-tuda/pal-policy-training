@@ -6,6 +6,11 @@
        block below, which makes them ring hard enough to blow up QACC and trigger MuJoCo's
        auto-reset within ~40 ms at dt=2 ms. 1e-4 is the smallest value that holds (1e-5 still
        diverges); damping alone does not fix it. Numerical, not a claim about the real linkage. -->
+  <!-- Pad-surface sites, one per fingertip. Measured as the centroid of the mesh vertices
+       facing the opposing pad: the two sites of one jaw sit 79.27 mm apart at rest, which
+       reproduces the measured open-jaw gap exactly. The manipulation tasks key their grasp
+       shaping terms off these; the ground-truth grasp signal is the pad contact sensors on
+       the gripper_*_fingertip_*_collision geoms. -->
   <default>
     <site group="5" rgba="1 0 0 1" size="0.01" />
     <default class="visual">
@@ -118,6 +123,7 @@
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="inner_finger" />
                           <geom name="gripper_left_inner_finger_left_collision" class="collision" type="mesh" mesh="inner_finger" density="0"/>
                           <body name="gripper_left_fingertip_left_link" pos="0 0.05 0" quat="0.913545 0 0 0.406738">
+                            <site name="gripper_left_fingertip_left_site" pos="-0.0115 0.04428 0.0073"/>
                             <inertial pos="-0.000864586 0.011929 -2.73244e-11" quat="0.704565 0.704565 0.0599056 0.0599056" mass="0.033503" diaginertia="3.69751e-06 2.84428e-06 1.65117e-06" />
                             <joint name="gripper_left_fingertip_left_joint" pos="0 0 0" axis="0 0 1" range="-0.802851 0" armature="1e-4" />
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="fingertip" />
@@ -136,6 +142,7 @@
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="inner_finger" />
                           <geom name="gripper_left_inner_finger_right_collision" class="collision" type="mesh" mesh="inner_finger" density="0"/>
                           <body name="gripper_left_fingertip_right_link" pos="0 0.05 0" quat="0.913545 0 0 0.406738">
+                            <site name="gripper_left_fingertip_right_site" pos="-0.0115 0.04428 -0.0073"/>
                             <inertial pos="-0.000864586 0.011929 -2.73244e-11" quat="0.704565 0.704565 0.0599056 0.0599056" mass="0.033503" diaginertia="3.69751e-06 2.84428e-06 1.65117e-06" />
                             <joint name="gripper_left_fingertip_right_joint" pos="0 0 0" axis="0 0 1" range="-0.802851 0" armature="1e-4" />
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="fingertip" />
@@ -197,6 +204,7 @@
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="inner_finger" />
                           <geom name="gripper_right_inner_finger_left_collision" class="collision" type="mesh" mesh="inner_finger" density="0"/>
                           <body name="gripper_right_fingertip_left_link" pos="0 0.05 0" quat="0.913545 0 0 0.406738">
+                            <site name="gripper_right_fingertip_left_site" pos="-0.0115 0.04428 0.0073"/>
                             <inertial pos="-0.000864586 0.011929 -2.73244e-11" quat="0.704565 0.704565 0.0599056 0.0599056" mass="0.033503" diaginertia="3.69751e-06 2.84428e-06 1.65117e-06" />
                             <joint name="gripper_right_fingertip_left_joint" pos="0 0 0" axis="0 0 1" range="-0.802851 0" armature="1e-4" />
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="fingertip" />
@@ -215,6 +223,7 @@
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="inner_finger" />
                           <geom name="gripper_right_inner_finger_right_collision" class="collision" type="mesh" mesh="inner_finger" density="0"/>
                           <body name="gripper_right_fingertip_right_link" pos="0 0.05 0" quat="0.913545 0 0 0.406738">
+                            <site name="gripper_right_fingertip_right_site" pos="-0.0115 0.04428 -0.0073"/>
                             <inertial pos="-0.000864586 0.011929 -2.73244e-11" quat="0.704565 0.704565 0.0599056 0.0599056" mass="0.033503" diaginertia="3.69751e-06 2.84428e-06 1.65117e-06" />
                             <joint name="gripper_right_fingertip_right_joint" pos="0 0 0" axis="0 0 1" range="-0.802851 0" armature="1e-4" />
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.752941 0.752941 0.752941 1" mesh="fingertip" />
