@@ -534,9 +534,10 @@ def plot_ik(ik: dict, spawn, target, args, out: pathlib.Path) -> None:
   ax.grid(alpha=0.25)
   ax.set_title(
     f"Left jaw, top-down grasp of a cube on the table (grasp point z = {ik['grasp_z']:.3f})\n"
-    f"{ok.sum()} / {ok.size} cells solvable, collision-free, inside soft limits  "
-    f"[torso collider {'ON' if args.torso else 'OFF'}]\n"
-    "clearance is measured to the edge of the region *or of the table*, whichever is nearer"
+    f"{ok.sum()} / {ok.size} cells solvable, collision-free, inside soft limits"
+    f"  [torso {'ON' if args.torso else 'OFF'}, elbow {'ON' if args.arm4 else 'OFF'}]\n"
+    "clearance runs to the edge of the region or of the table, whichever is nearer",
+    fontsize=10,
   )
   fig.tight_layout()
   fig.savefig(out, dpi=140)
