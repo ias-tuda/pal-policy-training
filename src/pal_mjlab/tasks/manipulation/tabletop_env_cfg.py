@@ -222,6 +222,15 @@ def make_tabletop_env_cfg(
         "asset_cfg": SceneEntityCfg(ROBOT, joint_names=(".*",)),
       },
     ),
+    # Holding the *pose* is not enough: ``clear_state`` also zeroes every actuator target
+    # on reset, and the action manager only writes the joints the policy owns. Without
+    # this the leg position actuators would drive to 0 and retract the telescopic legs to
+    # their mechanical minimum a second into the episode, fixed base or not.
+    "hold_joints_at_default": EventTermCfg(
+      func=mdp.hold_joints_at_default,
+      mode="reset",
+      params={"asset_cfg": SceneEntityCfg(ROBOT)},
+    ),
     # Only then jitter the commanded joints. The legs are deliberately excluded: perturbing
     # them independently would violate the four-bar mimic.
     "reset_robot_joints": EventTermCfg(

@@ -113,3 +113,30 @@ def reset_objects_on_surface(
     asset.write_root_link_velocity_to_sim(
       torch.zeros(n, 6, device=device), env_ids=env_ids
     )
+
+
+def hold_joints_at_default(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | Sequence[int] | None,
+  asset_cfg: SceneEntityCfg,
+) -> None:
+  """Point every position actuator at the default pose.
+
+  ``EntityData.clear_state`` zeroes ``joint_pos_target`` on every reset, and the action
+  manager only ever writes the joints the policy owns. On a robot whose action space is
+  deliberately narrower than ``.*`` -- a humanoid whose legs belong to a separate balance
+  controller -- that leaves the remaining actuators commanded to 0 rather than held at
+  their default. Kangaroo's telescopic legs duly retracted from 0.60 m to their 0.132 m
+  mechanical limit within a second, leaving the fixed base at 0.9 m with the feet dangling
+  0.47 m above the floor.
+
+  Targeting *all* joints is deliberate: the action term overwrites its own joints on the
+  first step of the episode, so this is simply "everything holds the default pose until
+  something asks otherwise".
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  if env_ids is None:
+    env_ids = slice(None)  # type: ignore[assignment]
+  asset.set_joint_position_target(
+    asset.data.default_joint_pos[env_ids], env_ids=env_ids
+  )
