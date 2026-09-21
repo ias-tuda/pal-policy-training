@@ -26,11 +26,16 @@ whitelist that today knows only ``joint_pos``, ``joint_vel``, ``actions``, ``com
 the IMU terms. The object-state terms below have no entry there yet, so a policy trained
 with them cannot be driven on hardware until the C++ node is extended. Keep these term
 *names and dimensions* stable so that extension stays mechanical.
+
+Every term in the actor group must be something hardware can actually produce. The grasp
+flag is the counter-example and is deliberately critic-only (see below): it comes from a
+MuJoCo contact sensor with no hardware equivalent.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -48,6 +53,7 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 from mjlab.terrains import TerrainEntityCfg
+from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
@@ -64,6 +70,29 @@ COMMAND = "goal_pose"
 
 #: Sensor name for object-on-table support.
 SUPPORT_SENSOR = "object_table_contact"
+
+# -- Object tracker error model -------------------------------------------------------
+# Sized for a marker-based tracker (OptiTrack class), with headroom. The dominant error of
+# such a system is *not* per-frame jitter -- that is sub-millimetre -- but the constant
+# offset between the tracked rigid-body frame and the cube's geometric centre, which comes
+# out of calibration and then holds for the whole episode. That distinction matters: a
+# zero-mean noise resampled every step is something the policy can average away over a few
+# frames, leaving it effectively reading ground truth, whereas a per-episode bias is not
+# observable from a single trajectory and has to be handled.
+OBJECT_POS_BIAS = 0.008
+"""Per-episode constant position offset, metres."""
+OBJECT_POS_NOISE = 0.002
+"""Per-step position jitter, metres."""
+OBJECT_YAW_BIAS = 0.03
+"""Per-episode constant yaw offset, radians."""
+OBJECT_YAW_NOISE = 0.01
+"""Per-step yaw jitter, radians."""
+
+# Tracker latency, in control steps. The loop runs at 1/(sim.timestep * decimation) =
+# 50 Hz, so one step is 20 ms; 0-2 steps spans a marker tracker's few-ms capture latency
+# plus network and ROS transport. Sampled per env so the policy cannot tune to one value.
+OBJECT_DELAY_MIN_LAG = 0
+OBJECT_DELAY_MAX_LAG = 2
 
 
 def make_grasp_sensor(gripper: GripperCfg, object_name: str) -> ContactSensorCfg:
@@ -166,23 +195,47 @@ def make_tabletop_env_cfg(
     "object_pos": ObservationTermCfg(
       func=mdp.object_position_b,
       params={"object_name": OBJECT},
-      noise=Unoise(n_min=-0.005, n_max=0.005),
+      noise=NoiseModelWithAdditiveBiasCfg(
+        noise_cfg=Unoise(n_min=-OBJECT_POS_NOISE, n_max=OBJECT_POS_NOISE),
+        bias_noise_cfg=Unoise(n_min=-OBJECT_POS_BIAS, n_max=OBJECT_POS_BIAS),
+      ),
+      delay_min_lag=OBJECT_DELAY_MIN_LAG,
+      delay_max_lag=OBJECT_DELAY_MAX_LAG,
     ),
     "object_yaw": ObservationTermCfg(
       func=mdp.object_yaw_b,
       params={"object_name": OBJECT},
-      noise=Unoise(n_min=-0.02, n_max=0.02),
+      noise=NoiseModelWithAdditiveBiasCfg(
+        noise_cfg=Unoise(n_min=-OBJECT_YAW_NOISE, n_max=OBJECT_YAW_NOISE),
+        bias_noise_cfg=Unoise(n_min=-OBJECT_YAW_BIAS, n_max=OBJECT_YAW_BIAS),
+      ),
+      delay_min_lag=OBJECT_DELAY_MIN_LAG,
+      delay_max_lag=OBJECT_DELAY_MAX_LAG,
     ),
     "target_pos": ObservationTermCfg(
       func=mdp.goal_position_b, params={"command_name": COMMAND}
     ),
-    "grasped": ObservationTermCfg(
-      func=mdp.is_grasped, params={"sensor_name": grasp_sensor}
-    ),
   }
+
+  # ``grasped`` is read off a pads-vs-object contact sensor, which exists in MuJoCo and
+  # nowhere on the real gripper. Feeding it to the actor trains a policy around a perfect
+  # binary grasp flag it cannot have at deployment, so it stays critic-only: privileged
+  # information is exactly what an asymmetric actor-critic is for. The critic is not
+  # exported and runs only in sim, so it may use it freely.
+  critic_terms = dict(actor_terms)
+  # ``enable_corruption=False`` below suppresses the critic's noise, but not its delay --
+  # those are separate stages of the observation pipeline. The critic runs only in sim and
+  # is never exported, so strip the lag too and let it value states from the true object
+  # pose; a critic fed stale observations just adds variance to the advantage estimate.
+  for _name in ("object_pos", "object_yaw"):
+    critic_terms[_name] = replace(critic_terms[_name], delay_min_lag=0, delay_max_lag=0)
+  critic_terms["grasped"] = ObservationTermCfg(
+    func=mdp.is_grasped, params={"sensor_name": grasp_sensor}
+  )
+
   observations = {
     "actor": ObservationGroupCfg(dict(actor_terms), enable_corruption=True),
-    "critic": ObservationGroupCfg(dict(actor_terms), enable_corruption=False),
+    "critic": ObservationGroupCfg(critic_terms, enable_corruption=False),
   }
 
   # -- Actions --------------------------------------------------------------------
@@ -263,6 +316,43 @@ def make_tabletop_env_cfg(
         "ranges": (0.6, 1.2),
       },
     ),
+    # Robot-to-table extrinsics. Without this every env shares one bit-identical workspace
+    # layout and the policy can memorise a single reach. ``startup`` rather than ``reset``
+    # because base placement is a property of a physical setup, not of an episode -- and
+    # across 4096 envs that is still 4096 distinct layouts. Doing it at startup also keeps
+    # it clear of ``reset_objects``, which reads the table pose out of physics data to
+    # place the cubes and so must run after the table has moved.
+    # This doubles as the tracker-to-robot calibration error when object pose arrives in
+    # the tracker's frame rather than the robot's.
+    "table_pose": EventTermCfg(
+      mode="startup",
+      func=dr.body_pos,
+      params={
+        "asset_cfg": SceneEntityCfg(TABLE, body_names=(TABLE,)),
+        "operation": "add",
+        "distribution": "uniform",
+        "ranges": {0: (-0.02, 0.02), 1: (-0.02, 0.02), 2: (-0.01, 0.01)},
+      },
+    ),
+    # Actuator variation.
+    # Every actuator group, not just the commanded ones: ``dr.pd_gains`` indexes
+    # ``entity.actuators`` (one entry per actuator *group*) with ids that
+    # ``SceneEntityCfg.actuator_names`` resolves against ``entity.actuator_names`` (one
+    # entry per MJCF actuator, i.e. per joint). Those two lists have different lengths, so
+    # naming a subset here raises IndexError inside mjlab. Scoping is not worth working
+    # around: the extra groups are the legs, which are welded by ``fixed_base`` and parked
+    # at their defaults by ``hold_joints_at_default``, so their tracking error is ~0 and a
+    # +/-15% gain draw changes the torque they apply by nothing measurable.
+    "pd_gains": EventTermCfg(
+      mode="startup",
+      func=dr.pd_gains,
+      params={
+        "asset_cfg": SceneEntityCfg(ROBOT),
+        "kp_range": (0.85, 1.15),
+        "kd_range": (0.85, 1.15),
+        "operation": "scale",
+      },
+    ),
     "pad_friction_spin": EventTermCfg(
       mode="startup",
       func=dr.geom_friction,
@@ -275,6 +365,32 @@ def make_tabletop_env_cfg(
       },
     ),
   }
+  if robot.joint_damping_range is not None:
+    events["joint_damping"] = EventTermCfg(
+      mode="startup",
+      func=dr.joint_damping,
+      params={
+        "asset_cfg": action_joints,
+        "operation": "abs",
+        "distribution": "uniform",
+        "ranges": dict(robot.joint_damping_range),
+        "shared_random": False,
+      },
+    )
+
+  if robot.joint_friction_range is not None:
+    events["joint_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.dof_frictionloss,
+      params={
+        "asset_cfg": action_joints,
+        "operation": "abs",
+        "distribution": "uniform",
+        "ranges": dict(robot.joint_friction_range),
+        "shared_random": False,
+      },
+    )
+
   if not robot.fixed_base:
     events["reset_base"] = EventTermCfg(
       func=mdp.reset_root_state_uniform,

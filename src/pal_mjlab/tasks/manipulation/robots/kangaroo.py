@@ -57,6 +57,21 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
     r"arm_.*_[67]_joint": 0.05,
     r"gripper_.*_finger_joint": 0.20,
   },
+  # The arms have no frictionloss in the model at all (see ManipulationRobotCfg), so this
+  # adds stiction they currently lack rather than perturbing an existing value. 1.0 N.m is
+  # 2% of the 50 N.m arm effort limit. The jaw gets three orders of magnitude less: its
+  # armature is 1e-4 and the four-bar is stiff, so anything larger stalls the latch.
+  # The arms have no joint-level viscous damping in the model (it all lives in the actuator
+  # kd), so this adds a modest real term rather than perturbing one: 0.05 is ~5% of the
+  # arms' kd of 1.0. The jaw does have a default near 0.03, so its range brackets that.
+  joint_damping_range={
+    r"arm_.*_[1-7]_joint": (0.0, 0.05),
+    r"gripper_.*_finger_joint": (0.02, 0.04),
+  },
+  joint_friction_range={
+    r"arm_.*_[1-7]_joint": (0.0, 1.0),
+    r"gripper_.*_finger_joint": (0.0, 0.02),
+  },
   viewer_body="pelvis_2_link",
   # Tabletop manipulation only: balance is PAL's controller's job, and a Kangaroo that
   # topples over drowns the manipulation reward signal in fall recovery.

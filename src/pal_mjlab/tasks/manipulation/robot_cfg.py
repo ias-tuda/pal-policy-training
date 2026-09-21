@@ -15,7 +15,7 @@ mentions a body part by name.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import mujoco
 from mjlab.entity import EntityCfg
@@ -86,6 +86,28 @@ class ManipulationRobotCfg:
 
   viewer_body: str
   """Body the viewer anchors on."""
+
+  joint_damping_range: Mapping[str, tuple[float, float]] | None = None
+  """Absolute ``dof_damping`` ranges keyed by joint-name regex, sampled per env at startup.
+  ``None`` disables the randomisation.
+
+  Absolute for the same reason as ``joint_friction_range``, and it is a distinct quantity
+  from the ``damping`` in ``_pal_impedance_params``: that one is the actuator's derivative
+  gain (randomised separately by ``dr.pd_gains``), whereas this is joint-level viscous
+  damping. The arms carry none of the latter at all, so a multiplicative range would be a
+  silent no-op on exactly the joints that matter.
+  """
+
+  joint_friction_range: Mapping[str, tuple[float, float]] | None = None
+  """Absolute ``dof_frictionloss`` ranges keyed by joint-name regex, sampled per env at
+  startup. ``None`` disables the randomisation.
+
+  Absolute rather than scaled because the arm actuators are built by
+  ``_calc_actuator_params``, which sets armature/stiffness/damping but *no* frictionloss:
+  their default is 0, so a multiplicative range would be a no-op and the arms would keep
+  the frictionless joints they have today. Ranges are per joint group because the stiction
+  that is realistic on a 50 N.m arm joint would seize the gripper four-bar.
+  """
 
   fixed_base: bool = False
   """Weld the robot's root body to the world, holding it at its initial pose. Set for
