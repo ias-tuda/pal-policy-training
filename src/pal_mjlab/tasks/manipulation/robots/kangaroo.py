@@ -7,10 +7,59 @@ Everything else -- tasks, rewards, observations -- goes through
 
 from __future__ import annotations
 
+import dataclasses
+
+from mjlab.entity import EntityCfg
+
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
   get_kangaroo_grippers_robot_cfg,
 )
 from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg, ManipulationRobotCfg
+
+#: Pelvis joints, which no manipulation policy commands.
+_PELVIS_JOINTS = ("pelvis_1_joint", "pelvis_2_joint")
+
+#: Stiffness/damping the pelvis actuators get here, in place of PAL's 50/20 N.m/rad and
+#: 2.0 N.m.s/rad. See ``_rigid_torso_robot_cfg``. Damping is roughly critical for the
+#: torso+arms inertia the pelvis carries (~2 kg.m^2): 2*sqrt(2000*2) ~ 126.
+_PELVIS_STIFFNESS = 2000.0
+_PELVIS_DAMPING = 120.0
+
+
+def _rigid_torso_robot_cfg() -> EntityCfg:
+  """The gripper Kangaroo with a torso that holds still.
+
+  PAL's own impedance gains (K 50 / 20) are what the arms will meet on hardware, so the
+  arm actuators keep them -- but the pelvis is a different case. It is not in the action
+  space (see ``_ACTION_JOINTS``): on hardware the torso is held by PAL's balance
+  controller, which this task does not model, and in sim it is left to a position actuator
+  commanded at the default pose. At K=50 that is soft enough to matter: with both arms
+  driven to saturation, ``pelvis_1_joint`` settles 0.35 rad (20 deg) off its default, so
+  the whole workspace leans with the arm load and the policy learns against a torso that
+  moves in a way the real one, held by the balance controller, will not.
+
+  At K=2000 the same rollout holds it to 0.001 rad (0.06 deg), with no overshoot. The
+  holding torque needed is ~17 N.m, well inside the 50 N.m clamp, so the joint is stiff
+  rather than saturated and the effort limit is untouched.
+
+  Local to manipulation: ``kangaroo_constants`` is shared with the velocity and reaching
+  tasks, where the pelvis *is* policy-driven and PAL's real gains are the point.
+  """
+  cfg = get_kangaroo_grippers_robot_cfg()
+  articulation = cfg.articulation
+  assert articulation is not None
+  actuators = tuple(
+    dataclasses.replace(a, stiffness=_PELVIS_STIFFNESS, damping=_PELVIS_DAMPING)
+    if set(a.target_names_expr) & set(_PELVIS_JOINTS)
+    else a
+    for a in articulation.actuators
+  )
+  if actuators == articulation.actuators:
+    raise ValueError(f"no actuator drives {_PELVIS_JOINTS}")
+  return dataclasses.replace(
+    cfg, articulation=dataclasses.replace(articulation, actuators=actuators)
+  )
+
 
 #: Jaw travel, measured on the shipped PAL meshes: the pads are 79.3 mm apart at q=0 and
 #: closed at the joint's upper limit.
@@ -44,7 +93,7 @@ _ACTION_JOINTS = (
 )
 
 KANGAROO_GRIPPERS = ManipulationRobotCfg(
-  entity_cfg_fn=get_kangaroo_grippers_robot_cfg,
+  entity_cfg_fn=_rigid_torso_robot_cfg,
   grippers=(_gripper("left"), _gripper("right")),
   action_joint_regex=_ACTION_JOINTS,
   # Arm and wrist follow kangaroo_constants._ACTION_SCALE_OVERRIDES. The jaw is
