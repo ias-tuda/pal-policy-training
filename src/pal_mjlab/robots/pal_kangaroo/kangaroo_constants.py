@@ -16,7 +16,13 @@ from pal_mjlab import PAL_MJLAB_SRC_PATH
 # - kangaroo_full: full model with 4 DoF per arm and a fake forearm
 
 REGEX_LEG_LENGTH_JOINTS_ONLY = r"leg_.*_length_joint"
-REGEX_ALL_ACTUATED_JOINTS = r"^(?!leg_.*_femur_joint$|leg_.*_knee_joint$).*$"
+# Excludes the femur/knee joints (driven by the leg four-bar equalities) and the gripper
+# finger joints (driven by the jaw four-bar). The grippers variant would otherwise pull
+# its 12 finger joints into the locomotion posture reward, whose per-joint std tables
+# only cover legs, pelvis and arms.
+REGEX_ALL_ACTUATED_JOINTS = (
+  r"^(?!leg_.*_femur_joint$|leg_.*_knee_joint$|gripper_.*_joint$).*$"
+)
 REGEX_FEMUR_AND_KNEE_LINKS = (
   r"^(leg_left_femur_link|leg_right_femur_link|leg_left_knee_link|leg_right_knee_link)$"
 )
@@ -140,10 +146,55 @@ def _calc_leg_params(
   }
 
 
-# Motor parameters: (gear_ratio, motor_inertia, effort_limit)
-S_PLUS = _calc_actuator_params(121, 1.728e-5, 50)
-S_MINUS = _calc_actuator_params(101, 1.3e-5, 25)
-XS = _calc_actuator_params(101, 1.3e-5, 25)
+def _pal_impedance_params(
+  stiffness: float, damping: float, effort: float, armature: float
+) -> dict:
+  """Actuator params taken straight from PAL's deployed impedance controller.
+
+  ``pal_local_joint_control`` runs tau = K*(q_des - q) + D*(dq_des - dq), and its per-joint
+  K/D ship in ``kangaroo_controller_configuration/config/local_joint_control/
+  impedance_control/*.yaml``. That is the path the RL deployer drives (policy ->
+  /subscriber_controller/desired_state -> subscriber_controller pass-through ->
+  pal_local_joint_control), so those gains -- not a design formula -- are what a trained
+  policy will actually meet on hardware.
+
+  ``_calc_leg_params`` already does exactly this for the legs: its values reproduce PAL's
+  *RL* leg gains to three decimals. The arms were instead left on ``_calc_actuator_params``,
+  which gives K 49.9/26.2 and D 3.18/1.67 against PAL's 40/20 and 1.0 -- damping out by up
+  to 3.2x. This brings the arms into line with the legs, from the same source.
+
+  Damping is passed explicitly rather than derived: PAL's arm damping does *not* follow the
+  2*zeta*K/omega_n rule the leg helper uses (that would give 2.55 at K=40).
+
+  Armature stays from ``_calc_actuator_params`` -- it models reflected rotor inertia, which
+  is a property of the drivetrain and independent of the controller gains.
+  """
+  return {
+    "armature": armature,
+    "stiffness": stiffness,
+    "damping": damping,
+    "effort_limit": effort,
+  }
+
+
+# Reflected rotor inertia, from (gear_ratio, motor_inertia).
+_ARMATURE_S_PLUS = FACTOR * 1.728e-5 * 121**2  # arm 1-2, pelvis
+_ARMATURE_S_MINUS = FACTOR * 1.3e-5 * 101**2  # arm 3-7
+
+# K/D from PAL's impedance config; effort from its uniform torque_clamp: 50.
+S_PLUS = _pal_impedance_params(40.0, 1.0, 50, _ARMATURE_S_PLUS)  # arm_*_1, arm_*_2
+S_MINUS = _pal_impedance_params(20.0, 1.0, 50, _ARMATURE_S_MINUS)  # arm_*_3,4,5
+XS = _pal_impedance_params(20.0, 1.0, 50, _ARMATURE_S_MINUS)  # arm_*_6,7
+PELVIS_1 = _pal_impedance_params(50.0, 2.0, 50, _ARMATURE_S_PLUS)
+PELVIS_2 = _pal_impedance_params(20.0, 2.0, 50, _ARMATURE_S_PLUS)
+
+# The gripper is driven by gripper_controller (a JointTrajectoryController), not by the
+# impedance path, so it has no impedance_control entry. PAL's nominal is pids.yaml
+# {p: 500, d: 0.5, i: 2, torque_clamp: 50} -- but p=500 on a ~5e-6 kg.m^2 finger inside an
+# equality-constrained four-bar is not numerically viable at dt=5ms (a servo sweep drives the
+# jaw cleanly at kp=8). The value below is chosen for a stable, firm pinch and is
+# UNCALIBRATED against the real grip force.
+GRIPPER = _pal_impedance_params(20.0, 0.5, 20, 1e-4)
 
 ##
 # MJCF & Assets
@@ -204,19 +255,20 @@ KANGAROO_LEG_ACTUATORS = (
 )
 
 # Arms & Torso
-KANGAROO_PELVIS_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
-  target_names_expr=(
-    "pelvis_1_joint",
-    "pelvis_2_joint",
-  ),
-  **S_PLUS,
+# Split out of S_PLUS: PAL gives the two pelvis joints different stiffness (50 / 20) and a
+# different damping (2.0) from the arms.
+KANGAROO_PELVIS_1_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
+  target_names_expr=("pelvis_1_joint",),
+  **PELVIS_1,
+)
+KANGAROO_PELVIS_2_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
+  target_names_expr=("pelvis_2_joint",),
+  **PELVIS_2,
 )
 KANGAROO_S_PLUS_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
   target_names_expr=(
     "arm_.*_1_joint",
     "arm_.*_2_joint",
-    "pelvis_1_joint",
-    "pelvis_2_joint",
   ),
   **S_PLUS,
 )
@@ -229,12 +281,25 @@ KANGAROO_XS_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
   **XS,
 )
 
+# Drives the jaw. Only the outer-left finger joint is actuated on the real gripper; the other
+# five finger joints mimic it 1:1 (fingertips at -1), which the MJCF approximates with its
+# <equality><connect>/<joint polycoef> block.
+KANGAROO_GRIPPER_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
+  target_names_expr=(r"gripper_.*_finger_joint",),
+  **GRIPPER,
+)
+
 COMMON_ACTUATORS = KANGAROO_LEG_ACTUATORS + (
   KANGAROO_S_PLUS_ACTUATOR_CFG,
+  KANGAROO_PELVIS_1_ACTUATOR_CFG,
+  KANGAROO_PELVIS_2_ACTUATOR_CFG,
   KANGAROO_S_MINUS_ACTUATOR_CFG,
 )
 
-KANGAROO_LOWER_BODY_ACTUATORS = KANGAROO_LEG_ACTUATORS + (KANGAROO_PELVIS_ACTUATOR_CFG,)
+KANGAROO_LOWER_BODY_ACTUATORS = KANGAROO_LEG_ACTUATORS + (
+  KANGAROO_PELVIS_1_ACTUATOR_CFG,
+  KANGAROO_PELVIS_2_ACTUATOR_CFG,
+)
 
 ##
 # Initial State
@@ -288,6 +353,38 @@ FULL_COLLISION = CollisionCfg(
   friction={_FOOT_REGEX: (0.6,)},
 )
 
+# Manipulation: feet plus the hand and forearm, so the gripper can actually hold something and
+# the arm cannot sweep through a table. The gripper/arm colliders are PAL's own collision
+# meshes -- its URDF gives <collision> to the 4 gripper link types and to arm 5/6/7, each
+# referencing the same STL as its <visual>; the MJCF conversion had dropped them.
+_PAD_REGEX = r"gripper_.*_(fingertip|inner_finger)_(left|right)_collision"
+_HAND_REGEX = r"(gripper_.*_collision|arm_.*_[567]_collision)"
+
+# arm_*_4_collision is deliberately NOT included: it is a hand-authored 0.3 m capsule of
+# radius 0.07 that encloses arm 5/6/7, so with those links now colliding it penetrates its own
+# children by ~65 mm. It remains in FULL_COLLISION for the 4-DoF `kangaroo` variant, where it
+# is the only arm collider and has no children to swallow.
+MANIPULATION_COLLISION = CollisionCfg(
+  geom_names_expr=(_FOOT_REGEX, _HAND_REGEX),
+  contype=1,
+  conaffinity=1,
+  # condim=4 on the pads is what decides whether a smooth cylinder rolls in the jaw: with
+  # condim=3 there is no torsional friction and the mug spins about the closing axis no
+  # matter how high the sliding coefficient is.
+  condim={_PAD_REGEX: 4, _FOOT_REGEX: 3, ".*": 3},
+  # Pads outrank the object so their friction wins the pairwise combination.
+  priority={_PAD_REGEX: 2, _FOOT_REGEX: 1, ".*": 0},
+  # 0.9 is PAL's own mu1/mu2 for every finger link (gripper.urdf.xacro <gazebo> block).
+  # Torsional/rolling terms are sim tuning, set by the grasp-hold test.
+  friction={_PAD_REGEX: (0.9, 0.02, 0.0001), _FOOT_REGEX: (0.6,)},
+  # A stiff pad contact (time constant 4 ms rather than the 10 ms default). Measured with
+  # check_grasp_hold: a 0.25 kg mug slides 2.8 mm through the jaw over 6 s at 0.01, against
+  # 0.84 mm at 0.004. The slide is gravity-driven and real -- it drops to 0.3 mm with gravity
+  # off -- so this is load-bearing for a task whose insertion clearance is 8 mm.
+  solref={_PAD_REGEX: (0.004, 1.0)},
+  solimp={_PAD_REGEX: (0.95, 0.99, 0.001, 0.5, 2.0)},
+)
+
 ##
 # Articulation Configs
 ##
@@ -303,7 +400,8 @@ KANGAROO_HANDS_ARTICULATION = EntityArticulationInfoCfg(
   actuators=COMMON_ACTUATORS, soft_joint_pos_limit_factor=0.9
 )
 KANGAROO_GRIPPERS_ARTICULATION = EntityArticulationInfoCfg(
-  actuators=COMMON_ACTUATORS + (KANGAROO_XS_ACTUATOR_CFG,),
+  actuators=COMMON_ACTUATORS
+  + (KANGAROO_XS_ACTUATOR_CFG, KANGAROO_GRIPPER_ACTUATOR_CFG),
   soft_joint_pos_limit_factor=0.9,
 )
 
@@ -323,7 +421,7 @@ _ROBOT_CONFIGS = {
   "grippers": (
     get_kangaroo_grippers_spec,
     KANGAROO_GRIPPERS_ARTICULATION,
-    FULL_COLLISION,
+    MANIPULATION_COLLISION,
   ),
 }
 
@@ -365,6 +463,18 @@ _EXCLUDED_JOINTS = {
 }
 
 
+# The derived 0.25 * effort / stiffness lands at 0.31 rad for the arms under PAL's gains,
+# which is far too coarse for manipulation. These are set from the reach a single control
+# step should cover, not from the actuator sizing.
+_ACTION_SCALE_OVERRIDES: dict[str, float] = {
+  "arm_.*_1_joint": 0.10,
+  "arm_.*_2_joint": 0.10,
+  r"arm_.*_(?![1267]_joint)\d+_joint": 0.10,  # S_MINUS: arm 3, 4, 5
+  r"arm_.*_(?![12345]_joint)\d+_joint": 0.05,  # XS: wrist 6, 7
+  r"gripper_.*_finger_joint": 0.50,  # jaw: coarse on purpose, it is used as a latch
+}
+
+
 def _build_action_scales(
   articulation: EntityArticulationInfoCfg, exclude: set = frozenset()
 ) -> tuple[dict, tuple]:
@@ -383,7 +493,7 @@ def _build_action_scales(
     )
     for n in a.target_names_expr:
       if n in e and n in s and s[n] and n not in exclude:
-        scales[n] = 0.25 * e[n] / s[n]
+        scales[n] = _ACTION_SCALE_OVERRIDES.get(n, 0.25 * e[n] / s[n])
         names.append(n)
   return scales, tuple(names)
 
