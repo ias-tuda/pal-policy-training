@@ -55,8 +55,8 @@ def _step(env: ManagerBasedRlEnv):
 def test_the_guard_is_on_by_default():
   cfg = make_pick_place_env_cfg(KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left")
   assert "non_finite_state" in cfg.terminations
-  # A time-out, not a failure: the policy did not cause it, so it must not be trained on it.
-  assert cfg.terminations["non_finite_state"].time_out
+  # A failure, not a truncation -- the plan's D9. See `make_tabletop_env_cfg`.
+  assert not cfg.terminations["non_finite_state"].time_out
 
 
 def test_a_diverged_world_is_terminated_and_recycled():
@@ -64,10 +64,10 @@ def test_a_diverged_world_is_terminated_and_recycled():
   env.reset()
   _step(env)
   _poison(env)
-  obs, _, _, truncated, _ = _step(env)
+  obs, _, terminated, _, _ = _step(env)
 
-  assert bool(truncated[POISONED]), "the diverged world should have been truncated"
-  assert not bool(truncated.sum() > 1), "only the poisoned world should have ended"
+  assert bool(terminated[POISONED]), "the diverged world should have been terminated"
+  assert not bool(terminated.sum() > 1), "only the poisoned world should have ended"
   assert torch.isfinite(obs["actor"]).all(), (
     "observations must be finite after the reset"
   )
