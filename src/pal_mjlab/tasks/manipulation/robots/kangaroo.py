@@ -8,7 +8,7 @@ Everything else -- tasks, rewards, observations -- goes through
 from __future__ import annotations
 
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
-  get_kangaroo_grippers_robot_cfg,
+  get_kangaroo_grippers_tabletop_robot_cfg,
 )
 from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg, ManipulationRobotCfg
 
@@ -43,8 +43,12 @@ _ACTION_JOINTS = (
   r"gripper_.*_finger_joint",
 )
 
+# `get_kangaroo_grippers_tabletop_robot_cfg`, not `get_kangaroo_grippers_robot_cfg`: the
+# tabletop variant is the one whose torso, upper arm and elbow have collision geometry and
+# whose start pose holds the left jaw over the table. The locomotion/reaching tasks keep the
+# other one -- see kangaroo_constants.py.
 KANGAROO_GRIPPERS = ManipulationRobotCfg(
-  entity_cfg_fn=get_kangaroo_grippers_robot_cfg,
+  entity_cfg_fn=get_kangaroo_grippers_tabletop_robot_cfg,
   grippers=(_gripper("left"), _gripper("right")),
   action_joint_regex=_ACTION_JOINTS,
   # Arm and wrist follow kangaroo_constants._ACTION_SCALE_OVERRIDES. The jaw is

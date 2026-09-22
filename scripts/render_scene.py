@@ -2,14 +2,18 @@
 
 S1.1 and S1.6 of the pick-and-place plan. Three poses are worth looking at:
 
-``--pose nominal``
-    ``qpos`` = ``INIT_STATE``, no dynamics. What the configuration *says* the robot starts as.
+``--pose start``
+    ``qpos`` = the robot cfg's own initial joint positions, no dynamics. What the
+    configuration *says* the robot starts as.
 ``--pose settled``
     the same, then stepped with the control the env actually applies: the action term writes
     its default target to the 16 arm/jaw actuators, and every other actuator is left at
     ``ctrl = 0``. What the robot *becomes*.
-``--pose manipulation``
-    a proposed tabletop-ready arm pose supplied with ``--arm-pose``, on top of ``INIT_STATE``.
+``--pose locomotion``
+    ``INIT_STATE`` instead, which is where the tabletop tasks started before S1.2.
+
+``--baseline`` renders the pre-S1.4 robot, and ``--colliders`` swaps the visual meshes for
+the collision geometry, which is the only way to see what a collision decision actually did.
 
 Views: the task's own viewer angle (``ViewerConfig`` in ``tabletop_env_cfg.py``: azimuth
 140, elevation -15), a top-down plan view, and a close-up of the working area. The target
@@ -32,7 +36,6 @@ from scene_model import (  # noqa: E402
   DEFAULT_TASK,
   compile_scene,
   geom_id,
-  joint_qadr,
   nominal_data,
 )
 
@@ -48,9 +51,7 @@ ACTION_ACTUATORS = (r"arm_.*_[1-7]_joint", r"gripper_.*_finger_joint")
 def parse_args() -> argparse.Namespace:
   p = argparse.ArgumentParser(description=__doc__)
   p.add_argument("--task", default=DEFAULT_TASK)
-  p.add_argument(
-    "--pose", choices=("nominal", "settled", "manipulation"), default="nominal"
-  )
+  p.add_argument("--pose", choices=("start", "settled", "locomotion"), default="start")
   p.add_argument(
     "--arm-pose",
     type=float,
@@ -72,7 +73,14 @@ def parse_args() -> argparse.Namespace:
     "--target", type=float, nargs=2, default=(0.40, 0.07), metavar=("X", "Y")
   )
   p.add_argument(
-    "--torso", action="store_true", help="enable the torso/elbow colliders"
+    "--baseline",
+    action="store_true",
+    help="render the pre-S1.4 robot: no torso, upper-arm or elbow collider, locomotion pose",
+  )
+  p.add_argument(
+    "--colliders",
+    action="store_true",
+    help="draw the collision geometry instead of the visual meshes",
   )
   p.add_argument("--width", type=int, default=1100)
   p.add_argument("--height", type=int, default=800)
@@ -127,16 +135,11 @@ def place_object(model: mujoco.MjModel, data: mujoco.MjData, xy) -> None:
 
 
 def build(args: argparse.Namespace) -> tuple[mujoco.MjModel, mujoco.MjData]:
-  extra = ("pelvis_2_collision", "arm_left_4_collision") if args.torso else ()
-  model = compile_scene(args.task, extra)
-  data = nominal_data(model)
+  from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import INIT_STATE
 
-  if args.pose == "manipulation":
-    if args.arm_pose is None:
-      raise SystemExit("--pose manipulation needs --arm-pose q1..q7")
-    data.qpos[joint_qadr(model, [f"arm_left_{i}_joint" for i in range(1, 8)])] = (
-      args.arm_pose
-    )
+  model = compile_scene(args.task, baseline=args.baseline)
+  init = INIT_STATE if (args.pose == "locomotion" or args.baseline) else None
+  data = nominal_data(model, init)
 
   mujoco.mj_forward(model, data)
   place_object(model, data, args.spawn)
@@ -244,6 +247,18 @@ def main() -> None:
 
   option = mujoco.MjvOption()
   option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+  if args.colliders:
+    # Group 2 is the visual meshes, group 3 the colliders (see the `visual` / `collision`
+    # default classes in kangaroo_grippers.xml). Group 3 also holds the colliders the
+    # variant switched *off* -- the legs, for one -- and drawing those would make the
+    # picture claim a collision model the robot does not have, so move them out of sight.
+    option.geomgroup[2] = 0
+    option.geomgroup[3] = 1
+    for gid in range(model.ngeom):
+      if model.geom_group[gid] == 3 and not (
+        model.geom_contype[gid] or model.geom_conaffinity[gid]
+      ):
+        model.geom_group[gid] = 4
   with mujoco.Renderer(model, height=args.height, width=args.width) as renderer:
     from PIL import Image
 

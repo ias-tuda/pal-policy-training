@@ -25,21 +25,17 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from reach_map import (  # noqa: E402
-  ARM4_GEOM,
   ARM_JOINTS,
   HAND_BODY,
   TABLE_TOP_Z,
   TCP_SITE,
-  TORSO_GEOM,
   _park_free_bodies,
-  _skip,
   left_arm_geoms,
   pad_offset,
 )
 from scene_model import (  # noqa: E402
   DEFAULT_TASK,
   compile_scene,
-  geom_id,
   joint_qadr,
   nominal_data,
   site_id,
@@ -61,16 +57,31 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--restarts", type=int, default=400)
   p.add_argument("--seed", type=int, default=0)
   p.add_argument(
-    "--no-torso",
+    "--free-height",
     action="store_true",
-    help="do not enable the torso capsule while checking the pose (not recommended: the "
-    "pose has to stay collision-free once S1.4 turns it on)",
+    help="constrain only the grasp point's x and y, and let the arm choose its height -- "
+    "the sensible request when --elbow pins the elbow, since that leaves the grasp point "
+    "on a surface rather than free in space",
   )
   p.add_argument(
-    "--arm4",
+    "--clearance",
+    type=float,
+    nargs=2,
+    default=(0.10, 0.35),
+    metavar=("MIN", "MAX"),
+    help="with --free-height, the band the pads must end up in above the table top (m)",
+  )
+  p.add_argument(
+    "--elbow",
+    type=float,
+    default=None,
+    help="pin arm_*_4_joint to this angle in rad and solve the other six around it "
+    "(1.5708 = elbow square)",
+  )
+  p.add_argument(
+    "--baseline",
     action="store_true",
-    help="also check against arm_left_4_collision, the oversized elbow capsule, ignoring "
-    "its contacts with its own children",
+    help="solve against the pre-S1.4 collision set instead of the tabletop one",
   )
   return p.parse_args()
 
@@ -78,11 +89,7 @@ def parse_args() -> argparse.Namespace:
 def solve(args: argparse.Namespace) -> dict:
   from reach_map import _ik_top_down
 
-  extra = () if args.no_torso else (TORSO_GEOM,)
-  if args.arm4:
-    extra += (ARM4_GEOM,)
-  model = compile_scene(args.task, extra)
-  elbow = {geom_id(model, f"robot/{ARM4_GEOM}")} if args.arm4 else set()
+  model = compile_scene(args.task, baseline=args.baseline)
   data = nominal_data(model)
   offset = pad_offset(model, data)
   _park_free_bodies(model, data)
@@ -90,42 +97,73 @@ def solve(args: argparse.Namespace) -> dict:
   qadr = joint_qadr(model, ARM_JOINTS)
   lo, hi = soft_limits(model, ARM_JOINTS)
   mid = 0.5 * (lo + hi)
-  span = 0.5 * (hi - lo)
+  span = np.maximum(0.5 * (hi - lo), 1e-9)
   tcp = site_id(model, TCP_SITE)
   hand = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, HAND_BODY)
   is_arm = left_arm_geoms(model)
   goal = np.asarray(args.tcp, dtype=float)
 
+  # Pinning the elbow: clamp its soft range to the requested angle. The solver clips to
+  # [lo, hi] every iteration and the locked column is dropped from the Jacobian, so the
+  # remaining six joints carry the whole task.
+  free = np.ones(len(ARM_JOINTS), dtype=bool)
+  if args.elbow is not None:
+    elbow_idx = ARM_JOINTS.index("arm_left_4_joint")
+    if not lo[elbow_idx] <= args.elbow <= hi[elbow_idx]:
+      raise SystemExit(
+        f"elbow {args.elbow:.4f} is outside arm_left_4_joint's soft range "
+        f"[{lo[elbow_idx]:.4f}, {hi[elbow_idx]:.4f}]"
+      )
+    lo[elbow_idx] = hi[elbow_idx] = args.elbow
+    free[elbow_idx] = False
+    mid = 0.5 * (lo + hi)
+
+  pos_mask = (True, True, not args.free_height)
+  pads = [
+    site_id(model, f"robot/gripper_left_fingertip_{s}_site") for s in ("left", "right")
+  ]
+
   rng = np.random.default_rng(args.seed)
   best, best_cost = None, np.inf
-  solved = free = 0
+  solved = n_free = in_band = 0
   for s in range(args.restarts):
     q0 = mid if s == 0 else rng.uniform(lo, hi)
-    q = _ik_top_down(model, data, qadr, lo, hi, tcp, hand, goal, q0)
+    q = _ik_top_down(
+      model, data, qadr, lo, hi, tcp, hand, goal, q0, free=free, pos_mask=pos_mask
+    )
     if q is None:
       continue
     solved += 1
     data.qpos[qadr] = q
     mujoco.mj_kinematics(model, data)
+    if args.free_height:
+      pad_z = min(data.site_xpos[s][2] for s in pads) - TABLE_TOP_Z
+      if not args.clearance[0] <= pad_z <= args.clearance[1]:
+        continue
+    in_band += 1
     mujoco.mj_collision(model, data)
     if any(
-      not _skip(elbow, is_arm, int(data.contact[c].geom1), int(data.contact[c].geom2))
-      and (is_arm[int(data.contact[c].geom1)] or is_arm[int(data.contact[c].geom2)])
+      is_arm[int(data.contact[c].geom1)] or is_arm[int(data.contact[c].geom2)]
       for c in range(data.ncon)
     ):
       continue
-    free += 1
+    n_free += 1
     # Comfort: how close the pose sits to the middle of each joint's soft range. A nominal
     # pose at a limit is one the `joint_pos_limits` penalty fights from step zero.
-    cost = float(np.max(np.abs((q - mid) / span)))
+    cost = float(np.max(np.abs((q - mid)[free] / span[free])))
     if cost < best_cost:
       best, best_cost = q.copy(), cost
   print(
-    f"{args.restarts} restarts: {solved} IK solutions, {free} of them collision-free "
-    f"(torso collider {'OFF' if args.no_torso else 'ON'})"
+    f"{args.restarts} restarts: {solved} IK solutions, {in_band} in the pad-height band, "
+    f"{n_free} of those collision-free "
+    f"({'pre-S1.4 baseline' if args.baseline else 'S1.4 collision set'}"
+    + (f", elbow pinned at {args.elbow:.4f} rad" if args.elbow is not None else "")
+    + ")"
   )
   if best is None:
-    raise SystemExit(f"no collision-free pose puts the grasp point at {goal}")
+    raise SystemExit(
+      f"no collision-free pose puts the grasp point at {goal[:2] if args.free_height else goal}"
+    )
   return dict(
     model=model,
     data=data,
@@ -148,6 +186,9 @@ def report(res: dict) -> None:
 
   print("\nnominal left-arm pose (rad), and where each joint sits in its soft range:")
   for name, value, low, high in zip(ARM_JOINTS, q, res["lo"], res["hi"], strict=True):
+    if high - low < 1e-9:  # a pinned joint has no range to sit in
+      print(f"  {name:22s} {value:+7.3f}   pinned")
+      continue
     frac = (value - 0.5 * (low + high)) / (0.5 * (high - low))
     print(
       f"  {name:22s} {value:+7.3f}   soft [{low:+6.3f},{high:+6.3f}]  at {frac:+.2f} of range"

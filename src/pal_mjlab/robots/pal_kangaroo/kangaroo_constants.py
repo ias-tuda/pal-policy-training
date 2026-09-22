@@ -1,5 +1,7 @@
 """Pal Robotics KANGAROO constants."""
 
+import dataclasses
+import math
 from pathlib import Path
 
 import mujoco
@@ -222,6 +224,107 @@ def get_kangaroo_grippers_spec() -> mujoco.MjSpec:
   return _load_spec(KANGAROO_GRIPPERS_XML)
 
 
+# Collision proxies for the links a tabletop task needs and the shipped MJCF does not give
+# usable ones for: the torso, and the upper arm / forearm / elbow of both arms. Each is the
+# link-frame bounding box of that link's visual meshes -- an oriented box, since MuJoCo
+# boxes rotate with their body. Fitted with `scripts/fit_link_colliders.py` against
+# kangaroo_grippers.xml, 2026-09-22; re-run it if PAL ships new meshes. Left and right come
+# out identical in their own link frames (the meshes are shared and the mirroring lives in
+# the body frames), so one entry covers both.
+#
+# Boxes rather than capsules, and the difference is not cosmetic. A capsule that *contains*
+# a link has to put a full hemisphere beyond each end of the mesh; on the upper arm that is
+# 74 mm deep and points straight into the chest, and the shoulder then reports contact with
+# the torso in 46% of sampled arm configurations. Measured over the same configurations, the
+# arm's real meshes come within 1 mm of the torso -- these are genuine pairs, so they cannot
+# simply be excluded -- but the capsule fires roughly 10 cm early. Boxes have no overhang and
+# are 2.4x smaller by volume.
+#
+# `arm_*_4_collision` is a *replacement*, not an addition. PAL's is a hand-authored capsule
+# running from x=-0.30 to x=0 of radius 0.07, but the arm-4 mesh only spans x in
+# [-0.155, 0.043]: the extra 0.145 m reaches down the forearm and swallows arm 5-7, which is
+# why MANIPULATION_COLLISION drops it rather than fixing it.
+_TABLETOP_BOXES = {
+  "pelvis_2_collision": (
+    "pelvis_2_link",
+    (0.0000, 0.0000, 0.2328),
+    (0.1344, 0.1609, 0.2406),
+  ),
+  "arm_{side}_2_collision": (
+    "arm_{side}_2_link",
+    (0.0655, -0.0100, -0.0432),
+    (0.1090, 0.0535, 0.0497),
+  ),
+  "arm_{side}_3_collision": (
+    "arm_{side}_3_link",
+    (-0.0061, -0.0100, -0.1144),
+    (0.0497, 0.0535, 0.0993),
+  ),
+  "arm_{side}_4_collision": (
+    "arm_{side}_4_link",
+    (-0.0558, 0.0100, -0.0447),
+    (0.0992, 0.0535, 0.0511),
+  ),
+}
+
+#: Link pairs whose proxies overlap without the links being anywhere near each other. Both
+#: are a link and its grandparent across one joint, where neighbouring boxes necessarily
+#: interpenetrate at the joint; MuJoCo already excludes parent/child pairs itself, and these
+#: are the next ones out.
+#:
+#: Measured, not assumed. Over 4000 random arm configurations inside the soft limits, the
+#: closest the real meshes ever come is 82.8 mm for arm 2 vs arm 4 and 71.7 mm for arm 4 vs
+#: arm 6 -- they cannot touch. The same test keeps other suspicious-looking pairs *in*: arm 5
+#: vs arm 7 closes to 9.2 mm and the torso to within 1 mm of every arm link, so those
+#: contacts are real and stay detected.
+_TABLETOP_CONTACT_EXCLUDES: tuple[tuple[str, str], ...] = tuple(
+  (f"arm_{side}_{a}_link", f"arm_{side}_{b}_link")
+  for side in ("left", "right")
+  for a, b in ((2, 4), (4, 6))
+)
+
+
+def get_kangaroo_grippers_tabletop_spec() -> mujoco.MjSpec:
+  """The grippers model with a collision set a tabletop task can trust.
+
+  The shipped MJCF gives the grippers variant collision geometry for the feet, the legs,
+  arm 5-7 and the gripper, and `MANIPULATION_COLLISION` narrows that to the feet, arm 5-7
+  and the gripper. Nothing above the elbow collides, so the upper arm and the torso sweep
+  through the table. This adds them, in code, leaving PAL's XML untouched (see CLAUDE.md,
+  *External Dependencies*): three boxes per arm and one for the torso, all sized from the
+  link meshes, plus the four contact excludes they make necessary.
+  """
+  spec = _load_spec(KANGAROO_GRIPPERS_XML)
+  collision_class = spec.find_default("collision")
+
+  for side in ("left", "right"):
+    for template, (body, pos, half) in _TABLETOP_BOXES.items():
+      geom_name = template.format(side=side)
+      existing = next((g for g in spec.geoms if g.name == geom_name), None)
+      if existing is not None:
+        geom = existing
+      else:
+        # The `collision` default class carries group 3, the orange debug material and
+        # contype/conaffinity 1, exactly as the geoms already in the XML get them.
+        geom = spec.body(body.format(side=side)).add_geom(
+          name=geom_name, default=collision_class
+        )
+      geom.type = mujoco.mjtGeom.mjGEOM_BOX
+      geom.pos = pos
+      geom.size = half
+      geom.quat = (1.0, 0.0, 0.0, 0.0)
+      # `arm_*_4_collision` ships as a fromto capsule, and MuJoCo rejects a geom that has
+      # both a fromto and a pos. NaN is how a spec marks fromto unset.
+      geom.fromto = (math.nan,) * 6
+      # The links carry explicit <inertial> elements, so geom density never reaches the
+      # body mass; set it to zero anyway so that stays true if an inertial is ever dropped.
+      geom.density = 0.0
+
+  for body_a, body_b in _TABLETOP_CONTACT_EXCLUDES:
+    spec.add_exclude(name=f"{body_a}__{body_b}", bodyname1=body_a, bodyname2=body_b)
+  return spec
+
+
 ##
 # Actuator Configs
 ##
@@ -305,6 +408,11 @@ KANGAROO_LOWER_BODY_ACTUATORS = KANGAROO_LEG_ACTUATORS + (
 # Initial State
 ##
 
+#: Left arm 1-7 for the tabletop pose. `arm_left_4_joint` is pinned at pi/2 -- elbow square
+#: -- and the remaining six solve for "open jaw directly above the working area, axis
+#: straight down"; see MANIPULATION_INIT_STATE.
+_MANIPULATION_LEFT_ARM = (-0.319, 1.468, 1.855, 1.571, 0.014, 1.894, -0.891)
+
 INIT_STATE = EntityCfg.InitialStateCfg(
   pos=(0.0, 0.0, 0.9),
   joint_pos={
@@ -326,6 +434,41 @@ INIT_STATE = EntityCfg.InitialStateCfg(
     "arm_.*_4_joint": 0.8,
     "pelvis_1_joint": 0.0,
     "pelvis_2_joint": 0.0,
+  },
+  joint_vel={".*": 0.0},
+)
+
+# Tabletop starting pose. INIT_STATE is the locomotion pose: it names arm 1-4 only, leaves
+# arm 5-7 and the jaw at zero, and puts the left grasp point at (0.178, 0.326, 0.558) --
+# 20 cm below the table top and behind its near edge, arm hanging by the side. A
+# manipulation episode that starts there spends its first second getting the hand over the
+# table.
+#
+# This holds the *left* arm with the elbow square and the open jaw directly above the
+# working area, pointing straight down, so the policy starts where the work is. Legs,
+# pelvis and the right arm keep their locomotion values; the arm entries are written per
+# side rather than as `arm_.*_N_joint` patterns so that nothing here overlaps a pattern in
+# INIT_STATE. Solved by `scripts/nominal_pose.py --elbow 1.5708`; see
+# ../docs/reports/pick-place-v0/.
+MANIPULATION_INIT_STATE = EntityCfg.InitialStateCfg(
+  pos=INIT_STATE.pos,
+  joint_pos={
+    **{
+      k: v
+      for k, v in INIT_STATE.joint_pos.items()
+      if k.startswith("leg_") or k.startswith("pelvis_")
+    },
+    "arm_right_1_joint": -0.24,
+    "arm_right_2_joint": 1.32,
+    "arm_right_3_joint": -1.57,
+    "arm_right_4_joint": 0.8,
+    "arm_left_1_joint": _MANIPULATION_LEFT_ARM[0],
+    "arm_left_2_joint": _MANIPULATION_LEFT_ARM[1],
+    "arm_left_3_joint": _MANIPULATION_LEFT_ARM[2],
+    "arm_left_4_joint": _MANIPULATION_LEFT_ARM[3],
+    "arm_left_5_joint": _MANIPULATION_LEFT_ARM[4],
+    "arm_left_6_joint": _MANIPULATION_LEFT_ARM[5],
+    "arm_left_7_joint": _MANIPULATION_LEFT_ARM[6],
   },
   joint_vel={".*": 0.0},
 )
@@ -385,6 +528,27 @@ MANIPULATION_COLLISION = CollisionCfg(
   solimp={_PAD_REGEX: (0.95, 0.99, 0.001, 0.5, 2.0)},
 )
 
+# The manipulation set plus the links `get_kangaroo_grippers_tabletop_spec` gives usable
+# colliders: the torso, and the upper arm, forearm and elbow of both arms. Everything else --
+# pad condim, priority, friction, the stiff pad contact -- is inherited unchanged, so the
+# only physics difference against MANIPULATION_COLLISION is which links exist to be hit.
+# Active robot colliders go from 36 to 50.
+#
+# It costs workspace, and the cost is measured, not estimated: of the 1200 2 cm cells of the
+# table top, the left jaw can take a cube from above on 445 under MANIPULATION_COLLISION and
+# on 353 under this one, a 21% loss (../docs/reports/pick-place-v0/s1-report.md). Most of it
+# is the torso, and it is not an artifact -- the arm's real meshes come within 1 mm of the
+# torso, so it was passing straight through the chest before.
+TABLETOP_COLLISION = dataclasses.replace(
+  MANIPULATION_COLLISION,
+  geom_names_expr=(
+    _FOOT_REGEX,
+    _HAND_REGEX,
+    r"arm_.*_[234]_collision",
+    "pelvis_2_collision",
+  ),
+)
+
 ##
 # Articulation Configs
 ##
@@ -423,13 +587,20 @@ _ROBOT_CONFIGS = {
     KANGAROO_GRIPPERS_ARTICULATION,
     MANIPULATION_COLLISION,
   ),
+  "grippers_tabletop": (
+    get_kangaroo_grippers_tabletop_spec,
+    KANGAROO_GRIPPERS_ARTICULATION,
+    TABLETOP_COLLISION,
+  ),
 }
 
 
-def _make_robot_cfg(variant: str) -> EntityCfg:
+def _make_robot_cfg(
+  variant: str, init_state: EntityCfg.InitialStateCfg = INIT_STATE
+) -> EntityCfg:
   spec_fn, articulation, collision = _ROBOT_CONFIGS[variant]
   return EntityCfg(
-    init_state=INIT_STATE,
+    init_state=init_state,
     collisions=(collision,),
     spec_fn=spec_fn,
     articulation=articulation,
@@ -453,6 +624,17 @@ def get_kangaroo_hands_robot_cfg() -> EntityCfg:
 
 def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
   return _make_robot_cfg("grippers")
+
+
+def get_kangaroo_grippers_tabletop_robot_cfg() -> EntityCfg:
+  """The grippers variant for tabletop manipulation: full arm/torso colliders, arm-up pose.
+
+  Separate from `get_kangaroo_grippers_robot_cfg` on purpose. That one is what
+  `Mjlab-Velocity-*-Pal-Kangaroo-Grippers` and `Mjlab-Reaching-Flat-Pal-Kangaroo-Grippers`
+  instantiate, and neither wants a different collision set or a different starting pose
+  under it.
+  """
+  return _make_robot_cfg("grippers_tabletop", MANIPULATION_INIT_STATE)
 
 
 _EXCLUDED_JOINTS = {

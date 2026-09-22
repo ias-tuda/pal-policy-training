@@ -25,27 +25,32 @@ DEFAULT_TASK = "Mjlab-Lift-Pal-Kangaroo-Grippers"
 
 
 def compile_scene(
-  task_id: str = DEFAULT_TASK, extra_collision_geoms: tuple[str, ...] = ()
+  task_id: str = DEFAULT_TASK, baseline: bool = False
 ) -> mujoco.MjModel:
   """The compiled single-env scene for ``task_id``.
 
-  ``extra_collision_geoms`` adds geom-name patterns to the robot's ``CollisionCfg`` before
-  the spec is compiled -- the only place they can be added. ``CollisionCfg.edit_spec``
-  zeroes ``contype``/``conaffinity`` on every geom it does not match, and MuJoCo's compiler
-  then leaves those geoms out of the bounding-volume hierarchy, so a geom re-enabled on the
-  *compiled* model still never reaches narrow phase: it reports ``contype=1`` and generates
-  no contacts. This is what the S1.4 variants have to go through.
+  ``baseline`` swaps the robot back to ``get_kangaroo_grippers_robot_cfg`` -- the collision
+  set and start pose the manipulation tasks had before S1.4 -- so any "what did the new
+  colliders cost" question is answered against the real previous model rather than against
+  a remembered number.
+
+  Note that collision geometry can only be changed *before* ``Scene.compile()``.
+  ``CollisionCfg.edit_spec`` zeroes ``contype``/``conaffinity`` on every geom it does not
+  match, and MuJoCo's compiler then leaves those geoms out of the bounding-volume
+  hierarchy: a geom re-enabled on the compiled model reports ``contype=1`` and still never
+  reaches narrow phase.
   """
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
-  if extra_collision_geoms:
-    robot = env_cfg.scene.entities["robot"]
-    robot.collisions = tuple(
-      dataclasses.replace(
-        cfg, geom_names_expr=tuple(cfg.geom_names_expr) + tuple(extra_collision_geoms)
-      )
-      for cfg in robot.collisions
+  if baseline:
+    from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
+      get_kangaroo_grippers_robot_cfg,
     )
+    from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS
+
+    env_cfg.scene.entities["robot"] = dataclasses.replace(
+      KANGAROO_GRIPPERS, entity_cfg_fn=get_kangaroo_grippers_robot_cfg
+    ).build_entity_cfg()
   model = Scene(env_cfg.scene, "cpu").compile()
   # The env applies its solver settings (2 ms, elliptic cone, impratio 10, iteration
   # counts) to the compiled model inside Simulation; do the same here so anything stepped
@@ -61,11 +66,13 @@ def nominal_data(model: mujoco.MjModel, init_state=None) -> mujoco.MjData:
   values straight into ``qpos`` so a pose can be inspected without stepping. The mocap body
   that welds the base is already at its spawn pose in ``model``, so ``mj_forward`` alone
   puts the robot where the env puts it.
+
+  Defaults to ``MANIPULATION_INIT_STATE``, the pose the tabletop tasks start from.
   """
-  from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import INIT_STATE
+  from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import MANIPULATION_INIT_STATE
 
   if init_state is None:
-    init_state = INIT_STATE
+    init_state = MANIPULATION_INIT_STATE
   data = mujoco.MjData(model)
   set_joint_pos(model, data, init_state.joint_pos)
   mujoco.mj_forward(model, data)
