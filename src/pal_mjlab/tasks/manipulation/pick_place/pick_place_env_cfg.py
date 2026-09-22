@@ -22,8 +22,9 @@ from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.robot_cfg import ManipulationRobotCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
+  DR_LEVELS_THAT_MOVE_THE_TABLE,
   OBJECT,
-  apply_dr_level,
+  TABLE,
   apply_play_overrides,
   make_tabletop_env_cfg,
 )
@@ -66,6 +67,44 @@ def _object_pose_range(spawn_xy: tuple[float, float]) -> dict[str, tuple[float, 
   }
 
 
+def _command_cfg(target_xy: tuple[float, float], dr: str):
+  """The goal: a fixed point on the table, expressed in whichever way the DR level allows.
+
+  Below `DR-scene` the table does not move, so the goal is a degenerate "dynamic" range --
+  a sampled point of zero width. That is not `difficulty="fixed"`, which hardcodes
+  (0.4, 0, 0.3) and is 46 cm below this table; and keeping it a sampled quantity is what
+  makes v1 -- a target the policy has to read -- a change to two numbers.
+
+  At `DR-scene` the table height varies per env, and a constant goal z is then wrong by up
+  to 2 cm against a 2.5 cm success threshold. The goal becomes an offset from the table's
+  own surface instead, read out of physics -- the same two quantities the spawn event reads,
+  so the goal and the spawn agree about where the table is. When the table does not move the
+  two commands produce the same point; `test_dr_scene_goal_matches_the_fixed_goal` checks it.
+  """
+  if dr in DR_LEVELS_THAT_MOVE_THE_TABLE:
+    return mdp.SurfaceOffsetCommandCfg(
+      entity_name=OBJECT,
+      surface_name=TABLE,
+      offset=(target_xy[0] - scene.TABLE_POS[0], target_xy[1] - scene.TABLE_POS[1]),
+      resampling_time_range=(1e9, 1e9),
+      success_threshold=GOAL_THRESHOLD,
+      debug_vis=True,
+    )
+  return LiftingCommandCfg(
+    entity_name=OBJECT,
+    difficulty="dynamic",
+    target_position_range=LiftingCommandCfg.TargetPositionRangeCfg(
+      x=(target_xy[0], target_xy[0]),
+      y=(target_xy[1], target_xy[1]),
+      z=(TARGET_Z, TARGET_Z),
+    ),
+    object_pose_range=None,  # Placement is the reset event's job; it knows about the table.
+    resampling_time_range=(1e9, 1e9),  # One goal per episode.
+    success_threshold=GOAL_THRESHOLD,
+    debug_vis=True,
+  )
+
+
 def make_pick_place_env_cfg(
   robot: ManipulationRobotCfg,
   gripper_name: str | None = None,
@@ -87,24 +126,9 @@ def make_pick_place_env_cfg(
   cfg = make_tabletop_env_cfg(
     robot,
     gripper_name=gripper_name,
-    command_cfg=LiftingCommandCfg(
-      entity_name=OBJECT,
-      # A degenerate "dynamic" range rather than difficulty="fixed": mjlab's fixed mode
-      # hardcodes (0.4, 0, 0.3), which is 46 cm below this table. Keeping the target a
-      # sampled quantity with zero width is also what makes v1 -- a target the policy has
-      # to read -- a change to two numbers rather than a change of command term.
-      difficulty="dynamic",
-      target_position_range=LiftingCommandCfg.TargetPositionRangeCfg(
-        x=(target_xy[0], target_xy[0]),
-        y=(target_xy[1], target_xy[1]),
-        z=(TARGET_Z, TARGET_Z),
-      ),
-      object_pose_range=None,  # Placement is the reset event's job; it knows about the table.
-      resampling_time_range=(1e9, 1e9),  # One goal per episode.
-      success_threshold=GOAL_THRESHOLD,
-      debug_vis=True,
-    ),
+    command_cfg=_command_cfg(target_xy, dr),
     object_pose_range=_object_pose_range(spawn_xy),
+    dr_level=dr,
   )
 
   gripper = robot.gripper(gripper_name)
@@ -143,7 +167,6 @@ def make_pick_place_env_cfg(
     },
   )
 
-  apply_dr_level(cfg, dr)
   if play:
     apply_play_overrides(cfg)
   return cfg

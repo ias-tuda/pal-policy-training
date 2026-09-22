@@ -30,6 +30,7 @@ with them cannot be driven on hardware until the C++ node is extended. Keep thes
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 from mjlab.entity import EntityCfg
@@ -120,6 +121,7 @@ def make_tabletop_env_cfg(
   min_separation: float = 0.0,
   episode_length_s: float = 20.0,
   hold_nominal: bool = True,
+  dr_level: str | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -135,6 +137,9 @@ def make_tabletop_env_cfg(
     hold_nominal: command the joints the policy does not drive to their defaults instead of
       to zero. Off is the pre-S4 behaviour and is kept only so the two can be compared; it
       collapses the legs within 0.2 s.
+    dr_level: domain-randomisation rung by name, or None to leave the base cfg's own
+      randomisation alone. See `DR_LEVELS`. Spelled `dr_level` rather than `dr` only because
+      this module imports mjlab's `dr` term namespace; the task factories expose it as `dr`.
   """
   gripper = robot.gripper(gripper_name)
   if objects is None:
@@ -344,7 +349,7 @@ def make_tabletop_env_cfg(
   }
   entities.update(objects)
 
-  return ManagerBasedRlEnvCfg(
+  cfg = ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),
       entities=entities,
@@ -388,32 +393,194 @@ def make_tabletop_env_cfg(
     decimation=10,
     episode_length_s=episode_length_s,
   )
+  if dr_level is not None:
+    apply_dr_level(cfg, dr_level, action_joints)
+  return cfg
 
 
-#: The domain-randomisation ladder, as far as it is built. S2 of the pick-and-place plan
-#: defines the rest (DR-object, DR-contact, DR-robot, DR-obs, DR-scene); only the bottom rung
-#: exists today, and a task that asks for a level above it gets an error rather than silently
-#: training at DR0.
-DR_LEVELS = ("DR0",)
+#: The domain-randomisation ladder (S2 of the pick-and-place plan), lowest rung first. Each
+#: rung *adds* to the one below, so a task states its level and the config records it instead
+#: of a report claiming it. `None` -- the default -- leaves the base cfg exactly as it is,
+#: which is what lift and stack have always run; note that the base cfg is **not** DR0, since
+#: it randomises pad friction at startup and jitters the commanded joints at reset.
+#:
+#: What each rung adds:
+#:
+#: * ``DR0`` -- nothing varies. Removes the two things the base cfg randomises.
+#: * ``DR-object`` -- the object's physics: sliding friction and mass.
+#: * ``DR-contact`` -- the gripper side: the base cfg's pad friction, restored.
+#: * ``DR-robot`` -- actuation: PD gains and joint friction on the driven joints.
+#: * ``DR-obs`` -- perception: wider object noise and an encoder bias.
+#: * ``DR-scene`` -- layout: table height and a wider spawn box.
+#:
+#: v0 trains at DR0 and DR-object only; the rest are defined so that climbing is a change of
+#: one string. Two caveats are recorded rather than hidden:
+#:
+#: * **DR-scene moves the table, so a goal with a hardcoded z stops being right.** A 2 cm
+#:   table offset eats 2 cm of a 2.5 cm success threshold. A task that uses this rung needs a
+#:   goal that reads the surface out of physics -- `mdp.SurfaceOffsetCommand` is that goal,
+#:   and `pick_place_env_cfg._command_cfg` is one way to switch to it.
+#: * **Randomising the cube's size is deliberately not here**, even though `dr.geom_size`
+#:   works: the cube's resting height is a function of its size, so it breaks a hardcoded
+#:   goal z the same way the table does. It would be safe to add for a task already using
+#:   `mdp.SurfaceOffsetCommand`, which reads the object's half-height, and unsafe for one
+#:   that is not -- and a rung that is conditionally correct is worse than a missing one.
+DR_LEVELS = ("DR0", "DR-object", "DR-contact", "DR-robot", "DR-obs", "DR-scene")
+
+#: Rungs at and above this one move the table; see the caveat on `DR_LEVELS`.
+DR_LEVELS_THAT_MOVE_THE_TABLE = ("DR-scene",)
+
+#: DR-object: the cube's sliding friction, and its mass in kg -- 30 g to 100 g brackets a
+#: light plastic cube and a heavy wooden one, and the point of the rung is that the policy
+#: cannot assume the 50 g it was built with.
+#:
+#: The mass goes through `dr.pseudo_inertia`, not `dr.body_mass`, on mjlab's own instruction:
+#: `body_mass` changes the mass and leaves `body_inertia` alone, which models a point mass
+#: bolted to the COM rather than a denser cube, and it warns as much at runtime. A 100 g cube
+#: carrying the rotational inertia of a 50 g one is exactly the quantity a grasp has to
+#: resist, so the approximation is not one to make here. `alpha` is a log density scale --
+#: mass and inertia both scale by exp(2*alpha) -- so the kg range is converted rather than
+#: written out, and the conversion is what `test_ranges_land_where_the_config_says` checks.
+_DR_OBJECT_FRICTION = (0.5, 1.2)
+_DR_OBJECT_MASS_KG = (0.03, 0.10)
+_CUBE_NOMINAL_MASS_KG = 0.05  # scene.get_cube_spec's default
+_DR_OBJECT_ALPHA = tuple(
+  math.log(mass / _CUBE_NOMINAL_MASS_KG) / 2 for mass in _DR_OBJECT_MASS_KG
+)
+
+#: DR-robot: +/-20% on the PD gains of the driven joints, and a small absolute joint friction.
+#: The friction range is a starting value and is not tuned -- the arms inherit MuJoCo's
+#: default `frictionloss` of 0, so anything here is new behaviour rather than a perturbation.
+_DR_ROBOT_GAIN_SCALE = (0.8, 1.2)
+_DR_ROBOT_JOINT_FRICTION = (0.0, 0.1)
+
+#: DR-obs: what the policy is allowed to be wrong about. The base cfg uses +/-5 mm on the
+#: object position; this is the 1-2 cm the plan asks for, plus an encoder bias, which is a
+#: per-episode constant offset rather than per-step noise.
+_DR_OBS_OBJECT_POS = 0.015
+_DR_OBS_OBJECT_YAW = 0.05
+_DR_OBS_ENCODER_BIAS = 0.005
+
+#: DR-scene: table height, and how much wider the spawn box gets. Additive rather than a
+#: factor, because the tasks' nominal spawn ranges differ by an order of magnitude (2 cm for
+#: pick-and-place, 15 cm for lift) and a factor would push the larger ones off the table.
+_DR_SCENE_TABLE_HEIGHT = 0.02
+_DR_SCENE_EXTRA_SPAWN = 0.03
 
 
-def apply_dr_level(cfg: ManagerBasedRlEnvCfg, level: str) -> ManagerBasedRlEnvCfg:
-  """Set the environment's domain randomisation to a named level, in place.
-
-  The point of naming the level is that a run's config records it. The base cfg above is
-  *not* DR0 -- it randomises pad friction at startup and jitters the commanded joints at
-  reset -- so "no randomisation" is something a task has to ask for explicitly.
-  """
+def _dr_index(level: str) -> int:
   if level not in DR_LEVELS:
-    raise ValueError(
-      f"unknown DR level {level!r}; have {DR_LEVELS}. The rungs above DR0 are S2 of "
-      "../docs/pick-place-v0-plan.md and are not implemented yet."
+    raise ValueError(f"unknown DR level {level!r}; have {DR_LEVELS}")
+  return DR_LEVELS.index(level)
+
+
+def apply_dr_level(
+  cfg: ManagerBasedRlEnvCfg,
+  level: str,
+  action_joints: SceneEntityCfg,
+  object_name: str = OBJECT,
+) -> ManagerBasedRlEnvCfg:
+  """Set the environment's domain randomisation to a named rung, in place.
+
+  Cumulative: every rung includes the ones below it. See `DR_LEVELS`.
+  """
+  rung = _dr_index(level)
+
+  # DR0 and up: the base cfg's own randomisation is off unless a rung puts it back.
+  if rung < _dr_index("DR-contact"):
+    for term in ("pad_friction_slide", "pad_friction_spin"):
+      cfg.events.pop(term, None)
+  cfg.events["reset_robot_joints"].params["position_range"] = (0.0, 0.0)
+
+  if rung >= _dr_index("DR-object"):
+    object_geom = SceneEntityCfg(object_name, geom_names=(f"{object_name}_geom",))
+    cfg.events["object_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": object_geom,
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],  # sliding only; torsional friction is the pads' business.
+        "ranges": _DR_OBJECT_FRICTION,
+      },
     )
-  # DR0: nothing varies between envs or between episodes.
-  for term in ("pad_friction_slide", "pad_friction_spin"):
-    cfg.events.pop(term, None)
-  jitter = cfg.events["reset_robot_joints"]
-  jitter.params["position_range"] = (0.0, 0.0)
+    cfg.events["object_mass"] = EventTermCfg(
+      mode="startup",
+      func=dr.pseudo_inertia,
+      params={
+        "asset_cfg": SceneEntityCfg(object_name, body_names=(object_name,)),
+        "alpha_range": _DR_OBJECT_ALPHA,
+        "distribution": "uniform",
+      },
+    )
+
+  if rung >= _dr_index("DR-robot"):
+    cfg.events["actuator_gains"] = EventTermCfg(
+      mode="startup",
+      func=dr.pd_gains,
+      params={
+        "asset_cfg": action_joints,
+        "kp_range": _DR_ROBOT_GAIN_SCALE,
+        "kd_range": _DR_ROBOT_GAIN_SCALE,
+        "operation": "scale",
+      },
+    )
+    cfg.events["joint_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.joint_friction,
+      params={
+        "asset_cfg": action_joints,
+        "operation": "abs",
+        "distribution": "uniform",
+        "ranges": _DR_ROBOT_JOINT_FRICTION,
+      },
+    )
+    # Action delay is *not* here, and cannot be: mjlab's delay buffer is configured on the
+    # actuator (`delay_min_lag`/`delay_max_lag` and friends, `mjlab/actuator/actuator.py:67-85`),
+    # so it is a property of the robot cfg rather than something an event can switch on. Per-env
+    # lags can then be randomised through `Actuator.set_lags`. Adding it means a robot variant,
+    # which is why this rung stops short of it.
+
+  if rung >= _dr_index("DR-obs"):
+    # The actor and critic groups share their term objects (`make_tabletop_env_cfg` copies the
+    # dict, not the terms), but only the actor has corruption enabled, so writing the actor's
+    # noise is enough and does not leak a noisy critic.
+    terms = cfg.observations["actor"].terms
+    terms["object_pos"].noise = Unoise(
+      n_min=-_DR_OBS_OBJECT_POS, n_max=_DR_OBS_OBJECT_POS
+    )
+    terms["object_yaw"].noise = Unoise(
+      n_min=-_DR_OBS_OBJECT_YAW, n_max=_DR_OBS_OBJECT_YAW
+    )
+    cfg.events["encoder_bias"] = EventTermCfg(
+      mode="reset",
+      func=dr.encoder_bias,
+      params={
+        "asset_cfg": action_joints,
+        "bias_range": (-_DR_OBS_ENCODER_BIAS, _DR_OBS_ENCODER_BIAS),
+      },
+    )
+
+  if rung >= _dr_index("DR-scene"):
+    cfg.events["table_height"] = EventTermCfg(
+      mode="startup",
+      func=dr.body_pos,
+      params={
+        "asset_cfg": SceneEntityCfg(TABLE, body_names=(TABLE,)),
+        "operation": "add",
+        "distribution": "uniform",
+        "axes": [2],
+        "ranges": (-_DR_SCENE_TABLE_HEIGHT, _DR_SCENE_TABLE_HEIGHT),
+      },
+    )
+    # The spawn box widens about its own centre. `reset_objects_on_surface` reads the table's
+    # height out of physics, so the cube still lands on the surface wherever the table is.
+    pose_range = cfg.events["reset_objects"].params["pose_range"]
+    for axis in ("x", "y"):
+      lo, hi = pose_range[axis]
+      pose_range[axis] = (lo - _DR_SCENE_EXTRA_SPAWN, hi + _DR_SCENE_EXTRA_SPAWN)
+
   return cfg
 
 

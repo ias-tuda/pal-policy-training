@@ -26,7 +26,12 @@ from mjlab.tasks.manipulation.mdp import (
   target_position,
 )
 
-from .commands import EntityOffsetCommand, EntityOffsetCommandCfg
+from .commands import (
+  EntityOffsetCommand,
+  EntityOffsetCommandCfg,
+  SurfaceOffsetCommand,
+  SurfaceOffsetCommandCfg,
+)
 from .events import hold_nominal_targets, reset_objects_on_surface, surface_top_z
 from .observations import (
   ee_position_b,
@@ -59,6 +64,8 @@ __all__ = [
   # Commands.
   "EntityOffsetCommand",
   "EntityOffsetCommandCfg",
+  "SurfaceOffsetCommand",
+  "SurfaceOffsetCommandCfg",
   # Events.
   "hold_nominal_targets",
   "reset_objects_on_surface",

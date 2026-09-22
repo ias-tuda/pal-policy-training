@@ -3,8 +3,8 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-22 (pick-and-place v0 stages S1, S3 and S4 complete; reports in
-`../docs/reports/pick-place-v0/`).*
+*Last updated: 2026-09-22 (pick-and-place v0 stages S1-S4 complete; only S5 remains. Reports
+in `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
 
@@ -29,7 +29,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S1 (scene, start pose, reach map, collision model) | ✅ complete — `../docs/reports/pick-place-v0/s1-report.md` |
 | Pick-and-place v0 S4 (holding the body) | ✅ complete — `../docs/reports/pick-place-v0/s4-report.md`, decision `../docs/decisions/0001-*.md` |
 | Pick-and-place v0 S3 (env + DR0) | ✅ complete — `Mjlab-PickPlace-Pal-Kangaroo-Grippers` registered, `../docs/reports/pick-place-v0/s3-report.md`. Cost per iteration still unmeasured (no GPU here) |
-| Pick-and-place v0 S2 (DR ladder above DR0), S5 (rewards, C0-C3) | ❌ not started |
+| Pick-and-place v0 S2 (DR ladder) | ✅ complete — six rungs, `../docs/reports/pick-place-v0/s2-report.md`. Only DR0 and DR-object are in v0's scope; ranges above them are untuned |
+| Pick-and-place v0 S5 (rewards, C0-C3) | ❌ not started |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
 | Any training run | ❌ none recorded |
 | `../docs/` (roadmap, decisions, reports, status summary) | 🟡 only `pick-place-v0-plan.md` so far |
@@ -71,9 +72,12 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
   (0.36, 0.07) would give 8.2 cm at the same separation if it is ever revisited. Both live in
   `pick_place_env_cfg.py` as `SPAWN_XY` / `TARGET_XY`.
 - **DR level is a named argument, not prose** (`dr="DR0"`, `tabletop_env_cfg.apply_dr_level`).
-  The base tabletop cfg is *not* DR0: it randomises pad friction at startup and jitters the
-  commanded joints at reset, so "no randomisation" has to be asked for. Only DR0 is built;
-  asking for a higher rung raises.
+  Six cumulative rungs: DR0, DR-object, DR-contact, DR-robot, DR-obs, DR-scene. The base
+  tabletop cfg is *not* DR0 — it randomises pad friction at startup and jitters the commanded
+  joints at reset — so "no randomisation" has to be asked for; `dr_level=None` (the default)
+  keeps lift and stack exactly as they were. Asking for an unknown rung raises.
+  `tests/test_manipulation_dr_ladder.py` asserts each rung varies what it claims and nothing
+  else, against the compiled model rather than the config.
 
 ## 4. Load-bearing facts
 
@@ -113,6 +117,16 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 - **`reset_objects_on_surface`'s `pose_range` is relative to the table centre**, while
   `LiftingCommand`'s `target_position_range` is relative to the *env origin*. A spawn point
   measured in the env frame must be converted; the two are 0.55 m apart in x on this table.
+- **Use `dr.pseudo_inertia`, not `dr.body_mass`, for a density change.** `body_mass` leaves
+  `body_inertia` alone — a point mass at the COM — and mjlab warns as much at runtime. Its
+  `alpha` is a log scale: mass and inertia both scale by `exp(2*alpha)`.
+- **`root_link_pos_w` of a fixed-base entity is its *spawn* pose, not where its body is.**
+  Randomise the table height with `dr.body_pos` and `data.geom_xpos` moves while
+  `root_link_pos_w` stays put, so `EntityOffsetCommand` cannot track it. `mdp.SurfaceOffsetCommand`
+  reads the surface out of physics instead, the same way `mdp.events.surface_top_z` does.
+- **mjlab's actuator delay is a cfg field, not an event.** `delay_min_lag`/`delay_max_lag`
+  and friends on `ActuatorCfg` (`mjlab/actuator/actuator.py:67-85`), with per-env lags via
+  `Actuator.set_lags`. Switching it on needs a robot-cfg variant, so it is not in DR-robot.
 - **`JointPositionAction` is absolute**: `target = default_joint_pos + scale * action`
   (`mjlab/envs/mdp/actions/actions.py:212-224`), and `clip_actions` defaults to `None`. With
   the manipulation scales (0.10 rad on arm 1-5, 0.05 on the wrist) an action of magnitude 1
@@ -168,6 +182,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S1 scene probe, 2026-09-21 | `Mjlab-Lift-Pal-Kangaroo-Grippers`, play cfg, `num_envs=1`, cpu, torch seed 0 | local Mac (CPU, no `mujoco_warp_io.patch`) | 500 steps survived under both `zero` and `random`; no NaN, no auto-reset; cube rests at z = 0.785; 0 robot-robot contacts; legs collapse (§5.1) | `../docs/reports/pick-place-v0/s1-checkin-1-look-pose-reach.md` |
 | S1 reach map, 2026-09-22 | `scripts/reach_map.py --samples 50000 --seeds 48`, seed 0 | local Mac | 445 graspable cells pre-S1.4, 353 after | `s1-report.md`, `s1_reach_map_{baseline,tabletop}.npz` |
 | S1.4 collision model, 2026-09-22 | `get_kangaroo_grippers_tabletop_robot_cfg` | local Mac | 36 → 50 active robot colliders, 0 robot-robot contacts at rest, 21% of the graspable table lost | `s1-report.md` §4 |
+| S2 DR ladder, 2026-09-22 | `tests/test_manipulation_dr_ladder.py`, 4 envs per rung, CPU | local Mac | every rung varies exactly the model fields it claims; DR0 varies none; object mass lands in 0.030-0.098 kg with inertia tracking it | `s2-report.md` |
 | S3 env validation, 2026-09-22 | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, `num_envs=1`, CPU | local Mac | `--agent zero` 500 steps: left arm max \|dq\| 0.0005 rad (limit 0.02). `--agent random` 1000 steps: no auto-reset, no termination, no NaN. 11.8 control steps/s — a laptop number, not a cost | `s3-report.md` |
 | S4 hold check, 2026-09-22 | `scripts/hold_check.py --steps 1000`, seed 0, 4 configurations | local Mac | before: pelvis 0.357 rad, right arm 0.246, leg length 0.491 m. After hold event + gravcomp: 0.007 / 0.019 / 0.004 — S4 acceptance PASS at steady state | `s4-report.md` |
 | *(no training run yet)* | | | | |
@@ -186,11 +201,12 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0. **Pick-and-place v0: S1, S3 and S4 are done; the task id exists and runs.** Next:
-   (a) **measure per-iteration cost** on `Geoffery`/`blackwell` at 1024/2048/4096 envs — the
-   one S3 exit criterion not met, and what C0's sizing depends on (command in `s3-report.md`
-   §6); (b) **S5's C0 smoke run**; (c) **S2's rungs above DR0**. Create
-   `../docs/status_summary.md` and the per-task document before the first real run.
+0. **Pick-and-place v0: S1-S4 are done; only S5 remains.** Next:
+   (a) **measure per-iteration cost** on `Geoffery`/`blackwell` at 1024/2048/4096 envs, at
+   DR0 and DR-object separately — the one S3 exit criterion not met, and what C0's sizing
+   depends on (command in `s3-report.md` §6); (b) **S5's C0 smoke run**, then C1.
+   Create `../docs/status_summary.md` and `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md`
+   before the first real run — CLAUDE.md requires both and neither exists.
 1. Write down what Oppsie is (§1 here and the header of `CLAUDE.md`), and its non-goals.
 2. Create the `siwei` branch off `main` and work there.
 3. Smoke-test the new manipulation tasks: `list_envs --keyword pal`, then `play
