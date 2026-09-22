@@ -21,6 +21,19 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **The tabletop manipulation tasks now hold the pose they start in.** Two fixes.
+  First, a ``hold_nominal_targets`` reset event commands every joint to its
+  configured default: mjlab zeroes all joint targets on reset and only the joints
+  an action term names get one written back, so the legs, the telescopic leg drive
+  and the pelvis were commanded to zero for the whole episode. Without it
+  ``leg_*_length_joint`` collapsed from 0.600 m to its 0.128 m mechanical minimum
+  within 0.2 s of every reset. Second, the torso, both arms and both grippers are
+  now gravity-compensated in simulation, leaving PAL's impedance gains untouched;
+  those gains need a tenth of the torque gravity actually applies, and without
+  compensation the left shoulder sagged 0.4 rad. Both apply only to
+  ``Mjlab-Lift-Pal-Kangaroo-Grippers`` and ``Mjlab-Stack-Pal-Kangaroo-Grippers``;
+  the velocity and reaching tasks are unaffected.
+
 - **The tabletop manipulation tasks get a collision model above the elbow, and a
   start pose over the table.** ``Mjlab-Lift-Pal-Kangaroo-Grippers`` and
   ``Mjlab-Stack-Pal-Kangaroo-Grippers`` now instantiate a new

@@ -119,6 +119,7 @@ def make_tabletop_env_cfg(
   object_pose_range: Mapping[str, tuple[float, float]] | None = None,
   min_separation: float = 0.0,
   episode_length_s: float = 20.0,
+  hold_nominal: bool = True,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -131,6 +132,9 @@ def make_tabletop_env_cfg(
     object_pose_range: XY/yaw spawn range on the table, relative to the table centre.
     min_separation: minimum XY gap enforced between spawned objects.
     episode_length_s: episode timeout.
+    hold_nominal: command the joints the policy does not drive to their defaults instead of
+      to zero. Off is the pre-S4 behaviour and is kept only so the two can be compared; it
+      collapses the legs within 0.2 s.
   """
   gripper = robot.gripper(gripper_name)
   if objects is None:
@@ -222,6 +226,13 @@ def make_tabletop_env_cfg(
         "asset_cfg": SceneEntityCfg(ROBOT, joint_names=(".*",)),
       },
     ),
+    # Then tell the actuators to hold that pose. Without this the reset zeroes every joint
+    # target and only the action joints get one written back, so the legs, the telescopic
+    # drive and the pelvis are commanded to 0 for the whole episode -- see
+    # mdp.hold_nominal_targets.
+    "hold_nominal_targets": EventTermCfg(
+      func=mdp.hold_nominal_targets, mode="reset", params={}
+    ),
     # Only then jitter the commanded joints. The legs are deliberately excluded: perturbing
     # them independently would violate the four-bar mimic.
     "reset_robot_joints": EventTermCfg(
@@ -266,6 +277,8 @@ def make_tabletop_env_cfg(
       },
     ),
   }
+  if not hold_nominal:
+    del events["hold_nominal_targets"]
   if not robot.fixed_base:
     events["reset_base"] = EventTermCfg(
       func=mdp.reset_root_state_uniform,
