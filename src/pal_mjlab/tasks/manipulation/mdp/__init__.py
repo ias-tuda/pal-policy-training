@@ -55,7 +55,7 @@ from .rewards import (
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
-from .terminations import entity_below_height, object_placed
+from .terminations import entity_below_height, non_finite_state, object_placed
 
 __all__ = [
   # mjlab manipulation terms, re-exported so a task needs one namespace.
@@ -98,5 +98,6 @@ __all__ = [
   "released_at_goal",
   # Terminations.
   "entity_below_height",
+  "non_finite_state",
   "object_placed",
 ]
