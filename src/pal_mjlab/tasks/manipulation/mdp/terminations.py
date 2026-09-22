@@ -36,3 +36,27 @@ def entity_below_height(
   """Failure: an entity has dropped below ``min_height`` -- knocked off the table."""
   entity: Entity = env.scene[entity_name]
   return entity.data.root_link_pos_w[:, 2] < min_height
+
+
+def non_finite_state(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """True for any world whose physics state has gone non-finite.
+
+  Contact-rich GPU simulation diverges occasionally, and `mujoco_warp` has no equivalent of
+  MuJoCo's automatic reset on a bad `qacc`: a world that blows up stays blown up and feeds
+  NaN to the learner, which raises and takes the whole run with it. Measured on this task
+  at four scales, the rate is roughly **one per 0.5M world-steps** and does not depend on
+  `num_envs` -- 246k, 737k and 1.1M world-steps to the first failure at 1024, 2048 and 256
+  environments. Over a 20k-iteration run that is a thousand-odd events, so surviving them is
+  not optional.
+
+  Terminating recycles the world: mjlab resets terminated environments *before* it computes
+  observations (`manager_based_rl_env.py`, step order), so the learner sees the fresh state
+  rather than the NaN. Rewards are computed *before* that reset and are handled separately --
+  see `_finite` in the reward builder.
+
+  Counted as a time-out rather than a failure. The policy did not do anything wrong, and
+  teaching it that this state is terminal-bad would be teaching it about the solver.
+  """
+  return ~torch.isfinite(env.sim.data.qpos).all(dim=-1) | ~torch.isfinite(
+    env.sim.data.qvel
+  ).all(dim=-1)
