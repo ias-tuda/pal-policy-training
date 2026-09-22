@@ -21,6 +21,20 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **A named domain-randomisation ladder for the tabletop manipulation tasks.**
+  ``make_tabletop_env_cfg`` takes a ``dr_level`` (and the pick-and-place factory a
+  ``dr``), one of ``DR0``, ``DR-object``, ``DR-contact``, ``DR-robot``, ``DR-obs``
+  or ``DR-scene``, each adding to the one below: object friction and density,
+  then gripper pad friction, then actuator gains and joint friction, then
+  observation noise and encoder bias, then table height and a wider spawn box.
+  The point is that a training run's config records its randomisation level
+  instead of a report claiming it. Asking for an unknown level is an error rather
+  than a silent fallback. Leaving ``dr_level`` unset keeps the previous behaviour
+  exactly, so lift and stack are unchanged. Also adds
+  ``mdp.SurfaceOffsetCommand``, a goal that sits on a surface whose height is read
+  from physics -- needed once the table itself moves, since a goal with a fixed
+  height is wrong by more than the success threshold.
+
 - **New pick-and-place task for the Kangaroo:**
   ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. The robot takes a 5 cm cube from a
   lightly noised spot on the table and puts it down on a fixed target 20 cm

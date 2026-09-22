@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 from mjlab.entity import Entity
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.manipulation.mdp.commands import LiftingCommand, LiftingCommandCfg
 
 if TYPE_CHECKING:
@@ -68,6 +69,61 @@ class EntityOffsetCommand(LiftingCommand):
     super()._update_command(env_ids)
     # Recomputed every step, so the goal follows the reference if it gets knocked.
     self.target_pos = self._goal_from_reference()
+
+
+class SurfaceOffsetCommand(LiftingCommand):
+  """A goal at a point on a surface, with the surface read out of physics every step.
+
+  :class:`EntityOffsetCommand` above cannot do this. It reads the reference's
+  ``root_link_pos_w``, and for a fixed-base entity -- which a table is -- that is the pose
+  the entity was *spawned* at, not where its body currently is. Randomise the table height
+  with ``dr.body_pos`` and ``geom_xpos`` moves while ``root_link_pos_w`` stays at 0.74, so
+  the goal silently stops being on the table: a 2 cm offset against a 2.5 cm success
+  threshold leaves nothing for the placement error itself.
+
+  This reads the same two quantities ``mdp.events.reset_objects_on_surface`` does -- the
+  surface geom's world XY and the height of its top face -- so the goal and the cube's
+  spawn agree about where the table is by construction.
+  """
+
+  cfg: SurfaceOffsetCommandCfg
+
+  def __init__(self, cfg: SurfaceOffsetCommandCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg, env)
+    self._surface_cfg = SceneEntityCfg(cfg.surface_name)
+    self._offset = torch.tensor(cfg.offset, device=self.device, dtype=torch.float32)
+
+  def _goal_on_surface(self) -> torch.Tensor:
+    from pal_mjlab.tasks.manipulation.mdp.events import (
+      _surface_centre_xy,
+      surface_top_z,
+    )
+
+    centre_xy = _surface_centre_xy(self._env, self._surface_cfg)
+    top_z = surface_top_z(self._env, self._surface_cfg)
+    half_z = self._env.sim.model.geom_size[:, self.object.indexing.geom_ids[0], 2]
+    return torch.cat([centre_xy + self._offset, (top_z + half_z).unsqueeze(-1)], dim=-1)
+
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    super()._resample_command(env_ids)
+    self.target_pos[env_ids] = self._goal_on_surface()[env_ids]
+
+  def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
+    super()._update_command(env_ids)
+    self.target_pos = self._goal_on_surface()
+
+
+@dataclass(kw_only=True)
+class SurfaceOffsetCommandCfg(LiftingCommandCfg):
+  surface_name: str
+  """Scene entity whose first geom is the surface. Its top face sets the goal height."""
+
+  offset: tuple[float, float] = (0.0, 0.0)
+  """XY offset from the surface geom's centre. The height is not an input -- it is the
+  surface plus the object's own half-height, which is what "resting on it" means."""
+
+  def build(self, env: ManagerBasedRlEnv) -> SurfaceOffsetCommand:
+    return SurfaceOffsetCommand(self, env)
 
 
 @dataclass(kw_only=True)

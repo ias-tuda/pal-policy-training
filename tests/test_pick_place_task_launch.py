@@ -19,9 +19,7 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   SPAWN_XY,
   TARGET_XY,
   TARGET_Z,
-  make_pick_place_env_cfg,
 )
-from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 
 TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 
@@ -117,17 +115,11 @@ def test_spawn_box_is_relative_to_the_table_not_the_env():
 
 
 def test_dr0_removes_the_randomisation_the_base_cfg_turns_on():
+  """v0 trains at DR0; test_manipulation_dr_ladder covers the rungs above it."""
   cfg = load_env_cfg(TASK, play=False)
   assert "pad_friction_slide" not in cfg.events
   assert "pad_friction_spin" not in cfg.events
   assert cfg.events["reset_robot_joints"].params["position_range"] == (0.0, 0.0)
-
-
-def test_an_unbuilt_dr_level_is_an_error_not_a_silent_dr0():
-  with pytest.raises(ValueError, match="DR-object"):
-    make_pick_place_env_cfg(
-      KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", dr="DR-object"
-    )
 
 
 def test_release_and_success_are_present():
