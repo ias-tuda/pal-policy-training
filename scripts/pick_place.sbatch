@@ -47,6 +47,11 @@ DR="${DR:-DR0}"
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
+# Extra flags for a diagnostic run, e.g. --enable-nan-guard True. Word-split on purpose;
+# keep them simple. Whatever goes here is echoed into the log, so a run that was not the
+# plain configuration says so in its own provenance.
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
 cd "$REPO"
 actual_commit="$(git rev-parse HEAD)"
 if [ "$actual_commit" != "$EXPECTED_COMMIT" ]; then
@@ -71,6 +76,7 @@ echo "seed        $SEED"
 echo "num_envs    $NUM_ENVS"
 echo "iterations  $MAX_ITERATIONS"
 echo "reward/DR   $REWARD / $DR"
+echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
 uv pip list 2>/dev/null | grep -E '^(mjlab|mujoco|mujoco-warp|warp-lang|torch) ' || true
 # Whether mujoco_warp_io.patch is applied is part of a result's provenance: the patch
@@ -83,7 +89,9 @@ else
 fi
 echo "=================="
 
+# shellcheck disable=SC2086  # EXTRA_ARGS is meant to word-split.
 exec uv run --extra cu128 train "$TASK" \
+  $EXTRA_ARGS \
   --env.scene.num-envs "$NUM_ENVS" \
   --env.seed "$SEED" \
   --agent.seed "$SEED" \
