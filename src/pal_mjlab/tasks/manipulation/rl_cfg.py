@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from mjlab.rl import RslRlModelCfg, RslRlPpoAlgorithmCfg
+
+from pal_mjlab.tasks.manipulation.runner import ManipulationRunnerCfg
 
 
 def manipulation_ppo_runner_cfg(
   experiment_name: str,
   max_iterations: int = 20_000,
-) -> RslRlOnPolicyRunnerCfg:
+) -> ManipulationRunnerCfg:
   """PPO for the manipulation tasks.
 
   Kept identical to mjlab's own lift-cube recipe apart from the horizon: the point of the
   first tasks is to validate the framework, so any divergence in learning behaviour should
   be attributable to the environment, not to a re-tuned optimiser.
   """
-  return RslRlOnPolicyRunnerCfg(
+  return ManipulationRunnerCfg(
     actor=RslRlModelCfg(
       hidden_dims=(512, 256, 128),
       activation="elu",
@@ -46,7 +48,10 @@ def manipulation_ppo_runner_cfg(
       max_grad_norm=1.0,
     ),
     experiment_name=experiment_name,
-    save_interval=100,
+    # Every 1000 iterations, not mjlab's 50 or the 100 this used before: a 20k-iteration run
+    # wrote 201 checkpoints, and nothing reads the intermediate ones. 21 is still dense
+    # enough that a crash costs at most ~40 min at C1's 2.4 s/iteration.
+    save_interval=1000,
     num_steps_per_env=24,
     max_iterations=max_iterations,
   )
