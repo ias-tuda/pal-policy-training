@@ -1,3 +1,3 @@
 """Tabletop manipulation tasks for PAL robots."""
 
-from . import lift, stack  # noqa: F401
+from . import lift, pick_place, stack  # noqa: F401

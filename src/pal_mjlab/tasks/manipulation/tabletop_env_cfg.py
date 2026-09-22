@@ -390,6 +390,33 @@ def make_tabletop_env_cfg(
   )
 
 
+#: The domain-randomisation ladder, as far as it is built. S2 of the pick-and-place plan
+#: defines the rest (DR-object, DR-contact, DR-robot, DR-obs, DR-scene); only the bottom rung
+#: exists today, and a task that asks for a level above it gets an error rather than silently
+#: training at DR0.
+DR_LEVELS = ("DR0",)
+
+
+def apply_dr_level(cfg: ManagerBasedRlEnvCfg, level: str) -> ManagerBasedRlEnvCfg:
+  """Set the environment's domain randomisation to a named level, in place.
+
+  The point of naming the level is that a run's config records it. The base cfg above is
+  *not* DR0 -- it randomises pad friction at startup and jitters the commanded joints at
+  reset -- so "no randomisation" is something a task has to ask for explicitly.
+  """
+  if level not in DR_LEVELS:
+    raise ValueError(
+      f"unknown DR level {level!r}; have {DR_LEVELS}. The rungs above DR0 are S2 of "
+      "../docs/pick-place-v0-plan.md and are not implemented yet."
+    )
+  # DR0: nothing varies between envs or between episodes.
+  for term in ("pad_friction_slide", "pad_friction_spin"):
+    cfg.events.pop(term, None)
+  jitter = cfg.events["reset_robot_joints"]
+  jitter.params["position_range"] = (0.0, 0.0)
+  return cfg
+
+
 def apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   """Turn an env cfg into its ``--play`` variant: no corruption, no timeout, no curriculum."""
   cfg.episode_length_s = int(1e9)
