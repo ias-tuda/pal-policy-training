@@ -5,6 +5,9 @@ can teleport its object, but only into an axis-aligned box in world coordinates 
 nothing about a table, and nothing about a second object it must not spawn inside. Since
 every task beyond the simplest needs both, placement is an event, which is the manager that
 owns reset-time state anyway.
+
+The second event here answers the opposite question -- what happens to the joints the policy
+does *not* drive -- and is just as reset-time a concern.
 """
 
 from __future__ import annotations
@@ -16,6 +19,10 @@ from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
+
+#: Same module-level singleton the observation terms use: a SceneEntityCfg built in an
+#: argument default is evaluated once at import and shared, which ruff flags as B008.
+_ROBOT = SceneEntityCfg("robot")
 
 
 def surface_top_z(env: ManagerBasedRlEnv, surface_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -37,6 +44,32 @@ def _surface_centre_xy(
   surface: Entity = env.scene[surface_cfg.name]
   geom_id = surface.indexing.geom_ids[0]
   return env.sim.data.geom_xpos[:, geom_id, 0:2]
+
+
+def hold_nominal_targets(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  asset_cfg: SceneEntityCfg = _ROBOT,
+) -> None:
+  """Command every joint to its configured default, not to zero.
+
+  ``Entity.clear_state`` zeroes ``joint_pos_target`` on every reset
+  (``mjlab/entity/data.py:238``), and only the joints named by an action term get a target
+  written back: everything else is commanded to 0 for the whole episode. On a humanoid with
+  the base welded that is not a small error. Measured on the Kangaroo grippers variant,
+  without this event: ``leg_*_length_joint`` runs from its nominal 0.600 m to 0.128 m -- its
+  mechanical minimum -- in 0.2 s, the feet leave the floor after the first control step, and
+  ``pelvis_1_joint`` sits on its hard limit for the rest of the episode.
+
+  Runs after ``Entity.clear_state`` because the event manager runs after ``scene.reset``
+  (``mjlab/envs/manager_based_rl_env.py:580-590``). Writes every joint, including the ones
+  the policy drives: the action term overwrites those on the first step anyway, and naming
+  them here would duplicate the action regex in a second place.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  asset.set_joint_position_target(
+    asset.data.default_joint_pos[env_ids], env_ids=env_ids
+  )
 
 
 def reset_objects_on_surface(

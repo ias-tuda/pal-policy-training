@@ -284,7 +284,31 @@ _TABLETOP_CONTACT_EXCLUDES: tuple[tuple[str, str], ...] = tuple(
 )
 
 
-def get_kangaroo_grippers_tabletop_spec() -> mujoco.MjSpec:
+#: Bodies whose weight the simulated plant carries for the actuator, rather than the
+#: actuator carrying it: the torso, both arms and both grippers. Everything from `pelvis_1`
+#: outwards, and nothing below it -- the legs keep their real weight, so foot contact and
+#: the leg four-bar behave exactly as they did.
+#:
+#: PAL's impedance gains (`_pal_impedance_params`) are the ones their deployed controller
+#: runs, and against raw gravity they are nowhere near enough to hold an arm: at the tabletop
+#: start pose `arm_left_1_joint` needs 16.19 Nm and has a stiffness of 40, which is 0.405 rad
+#: of droop, and `arm_left_4_joint` needs 10.30 Nm at a stiffness of 20, which is 0.515 rad.
+#: A real 7-DoF arm running those gains does not sag half a radian, so the plant those gains
+#: were tuned against is a gravity-compensated one. **That inference is not verified against
+#: PAL's controller** -- nothing in this repo documents a feedforward gravity term -- and it
+#: is the thing that would overturn this choice; see
+#: ../docs/decisions/0001-gravity-compensation-for-tabletop-manipulation.md.
+_TABLETOP_GRAVCOMP_BODIES = (
+  "pelvis_1_link",
+  "pelvis_2_link",
+  "arm_left_",
+  "arm_right_",
+  "gripper_left_",
+  "gripper_right_",
+)
+
+
+def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   """The grippers model with a collision set a tabletop task can trust.
 
   The shipped MJCF gives the grippers variant collision geometry for the feet, the legs,
@@ -293,6 +317,10 @@ def get_kangaroo_grippers_tabletop_spec() -> mujoco.MjSpec:
   through the table. This adds them, in code, leaving PAL's XML untouched (see CLAUDE.md,
   *External Dependencies*): three boxes per arm and one for the torso, all sized from the
   link meshes, plus the four contact excludes they make necessary.
+
+  It also switches on gravity compensation for the torso and the arms -- see
+  `_TABLETOP_GRAVCOMP_BODIES`, which is a decision, not a detail. `gravcomp=False` is there
+  to measure against, not to train with: without it the arm droops half a radian.
   """
   spec = _load_spec(KANGAROO_GRIPPERS_XML)
   collision_class = spec.find_default("collision")
@@ -319,6 +347,11 @@ def get_kangaroo_grippers_tabletop_spec() -> mujoco.MjSpec:
       # The links carry explicit <inertial> elements, so geom density never reaches the
       # body mass; set it to zero anyway so that stays true if an inertial is ever dropped.
       geom.density = 0.0
+
+  if gravcomp:
+    for body in spec.bodies:
+      if body.name.startswith(_TABLETOP_GRAVCOMP_BODIES):
+        body.gravcomp = 1.0
 
   for body_a, body_b in _TABLETOP_CONTACT_EXCLUDES:
     spec.add_exclude(name=f"{body_a}__{body_b}", bodyname1=body_a, bodyname2=body_b)
@@ -626,15 +659,22 @@ def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
   return _make_robot_cfg("grippers")
 
 
-def get_kangaroo_grippers_tabletop_robot_cfg() -> EntityCfg:
-  """The grippers variant for tabletop manipulation: full arm/torso colliders, arm-up pose.
+def get_kangaroo_grippers_tabletop_robot_cfg(gravcomp: bool = True) -> EntityCfg:
+  """The grippers variant for tabletop manipulation.
 
-  Separate from `get_kangaroo_grippers_robot_cfg` on purpose. That one is what
+  Full arm and torso colliders, an arm-up start pose, and a gravity-compensated torso and
+  arms. Separate from `get_kangaroo_grippers_robot_cfg` on purpose: that one is what
   `Mjlab-Velocity-*-Pal-Kangaroo-Grippers` and `Mjlab-Reaching-Flat-Pal-Kangaroo-Grippers`
-  instantiate, and neither wants a different collision set or a different starting pose
-  under it.
+  instantiate, and none of the three changes belongs under those tasks.
+
+  `gravcomp=False` reproduces the plant before S4, for measuring against.
   """
-  return _make_robot_cfg("grippers_tabletop", MANIPULATION_INIT_STATE)
+  cfg = _make_robot_cfg("grippers_tabletop", MANIPULATION_INIT_STATE)
+  if not gravcomp:
+    cfg = dataclasses.replace(
+      cfg, spec_fn=lambda: get_kangaroo_grippers_tabletop_spec(gravcomp=False)
+    )
+  return cfg
 
 
 _EXCLUDED_JOINTS = {

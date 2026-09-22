@@ -3,8 +3,8 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-22 (pick-and-place v0 stage S1 complete; stage report in
-`../docs/reports/pick-place-v0/s1-report.md`).*
+*Last updated: 2026-09-22 (pick-and-place v0 stages S1 and S4 complete; reports in
+`../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
 
@@ -27,7 +27,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Gripper actuators on the KANGAROO grippers model | ✅ commit `7a0c7fb` (kangaroo_constants.py, kangaroo_grippers.xml) |
 | Manipulation training framework (lift + stack, tabletop scene, MDP terms) | 🟡 commit `f33baec` — **first exercised 2026-09-21**: `Mjlab-Lift-Pal-Kangaroo-Grippers` builds and runs 500 steps on CPU under zero and random actions, no NaN, no auto-reset. Two defects found, see §5 |
 | Pick-and-place v0 S1 (scene, start pose, reach map, collision model) | ✅ complete — `../docs/reports/pick-place-v0/s1-report.md` |
-| Pick-and-place v0 S2-S5 | ❌ not started |
+| Pick-and-place v0 S4 (holding the body) | ✅ complete — `../docs/reports/pick-place-v0/s4-report.md`, decision `../docs/decisions/0001-*.md` |
+| Pick-and-place v0 S2, S3, S5 | ❌ not started |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
 | Any training run | ❌ none recorded |
 | `../docs/` (roadmap, decisions, reports, status summary) | 🟡 only `pick-place-v0-plan.md` so far |
@@ -56,6 +57,13 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
   elbow at pi/2 and the open jaw over the table. The velocity and reaching tasks keep
   `get_kangaroo_grippers_robot_cfg` unchanged — that boundary is what
   `tests/test_kangaroo_collision_model.py` guards.
+- **Gravity compensation, not stiffer gains, for tabletop manipulation** (decision 0001,
+  2026-09-22). PAL's impedance gains need 16.19 Nm at a stiffness of 40 on `arm_left_1_joint`
+  at the tabletop pose — 0.405 rad of droop — so the torso, both arms and both grippers carry
+  `body gravcomp="1"` and PAL's K/D are untouched. Raising stiffness 15x also passes the S4
+  acceptance but discards the one actuator parameter traceable to the real robot. **The
+  premise — that PAL's real controller compensates gravity below the impedance loop — is an
+  inference, not a citation, and is what would overturn the decision.**
 - **Pick-and-place v0 geometry (user decision, 2026-09-22):** object spawn centre
   (0.42, 0.27) +/- 2 cm, fixed target (0.42, 0.07, 0.785), 20 cm apart. Spawn clearance
   14.0 cm, target 4.5 cm — the target is 0.5 cm under the plan's 5 cm rule after S1.4;
@@ -117,25 +125,13 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 5. What doesn't work / open problems
 
-1. **Nothing holds the non-commanded joints — the robot collapses at every reset.** `ctrl` is
-   0 for all 30 actuators after `reset()`; the action term then writes only the 16 arm/jaw
-   actuators, leaving both legs, both `leg_*_length_joint` and `pelvis_1/2` commanded to 0.
-   `leg_*_length_joint` goes 0.600 → 0.128 m (its mechanical minimum) in **0.2 s**, the feet
-   leave the floor after one control step, and `pelvis_1` sits at its hard limit ±0.349.
-   This answers the plan's S4.1 question: **keyframe `ctrl` does not survive reset in mjlab
-   1.6.0.** Fix is a `hold_nominal_targets` reset event (plan D3).
-2. **PAL's arm gains cannot hold the arm against gravity.** At the tabletop start pose the
-   holding torque is 16.19 Nm on `arm_left_1_joint` (stiffness 40 → **0.405 rad** of droop)
-   and 10.30 Nm on `arm_left_4_joint` (stiffness 20 → **0.515 rad**). A
-   `hold_nominal_targets` reset event does *not* fix this: with every actuator held at
-   nominal the grasp point still falls from z = 0.886 to 0.793 in 10 s and `pelvis_1` still
-   reaches its limit. S3's "max |Δq| < 0.02 rad" acceptance criterion is unmeetable as
-   written. Options for S4: MuJoCo `gravcomp` on the arm/torso bodies; a
-   `MANIPULATION_HOLD_GAINS` block (arm 1 would need ~800 Nm/rad, not credible against the
-   50 Nm effort limit); or welding the torso instead of `base_link`.
-3. **`tests/` still covers none of `tasks/manipulation/`'s MDP terms** (the new collision
-   test covers the robot model only), and no `Mjlab-Lift-*` / `Mjlab-Stack-*` training run is
-   recorded.
+1. *(fixed 2026-09-22, S4)* `ctrl` is 0 for all 30 actuators after `reset()` --
+   `Entity.clear_state` zeroes `joint_pos_target` (`mjlab/entity/data.py:238`) and only action
+   joints get one written back. `mdp.hold_nominal_targets` now writes the defaults back. Left
+   alone it collapsed `leg_*_length_joint` 0.600 → 0.128 m in 0.2 s.
+2. **`tests/` still covers none of `tasks/manipulation/`'s MDP terms** (the new tests cover
+   the robot model and the hold/gravcomp boundary only), and no `Mjlab-Lift-*` /
+   `Mjlab-Stack-*` training run is recorded.
 5. **`pyright` is disabled in CI** ("TODO: make pyright work", commented out in `ci.yaml`). Type
    errors will not be caught for you.
 6. **No roadmap, decision records or status summary yet** in `../docs/`. Create them on
@@ -157,6 +153,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S1 scene probe, 2026-09-21 | `Mjlab-Lift-Pal-Kangaroo-Grippers`, play cfg, `num_envs=1`, cpu, torch seed 0 | local Mac (CPU, no `mujoco_warp_io.patch`) | 500 steps survived under both `zero` and `random`; no NaN, no auto-reset; cube rests at z = 0.785; 0 robot-robot contacts; legs collapse (§5.1) | `../docs/reports/pick-place-v0/s1-checkin-1-look-pose-reach.md` |
 | S1 reach map, 2026-09-22 | `scripts/reach_map.py --samples 50000 --seeds 48`, seed 0 | local Mac | 445 graspable cells pre-S1.4, 353 after | `s1-report.md`, `s1_reach_map_{baseline,tabletop}.npz` |
 | S1.4 collision model, 2026-09-22 | `get_kangaroo_grippers_tabletop_robot_cfg` | local Mac | 36 → 50 active robot colliders, 0 robot-robot contacts at rest, 21% of the graspable table lost | `s1-report.md` §4 |
+| S4 hold check, 2026-09-22 | `scripts/hold_check.py --steps 1000`, seed 0, 4 configurations | local Mac | before: pelvis 0.357 rad, right arm 0.246, leg length 0.491 m. After hold event + gravcomp: 0.007 / 0.019 / 0.004 — S4 acceptance PASS at steady state | `s4-report.md` |
 | *(no training run yet)* | | | | |
 
 ## 8. Compute state
@@ -173,10 +170,10 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0. **Pick-and-place v0: S1 is done** (`../docs/reports/pick-place-v0/s1-report.md`). Next is
-   **S4/D3 before S3**: the holding problem in §5.2 above makes one of S3's acceptance
-   criteria unmeetable, and every episode currently starts by collapsing. Then S2's DR0 and
-   S3's env cfg, which consume the spawn/target above.
+0. **Pick-and-place v0: S1 and S4 are done.** Next is **S2's DR0 plus S3's env cfg**, which
+   consume the spawn/target above; then the S5 baseline. S3's acceptance criterion needs
+   restating first — "max |Δq| < 0.02 rad" is met under zero actions but not as a peak under
+   random ones (`s4-report.md` §5).
 1. Write down what Oppsie is (§1 here and the header of `CLAUDE.md`), and its non-goals.
 2. Create the `siwei` branch off `main` and work there.
 3. Smoke-test the new manipulation tasks: `list_envs --keyword pal`, then `play
