@@ -363,10 +363,16 @@ def make_tabletop_env_cfg(
     ),
   }
   if guard_divergence:
-    # A time-out, not a failure: the solver diverged, the policy did not do anything
-    # wrong, and teaching it that this state is terminal-bad teaches it about the solver.
+    # A failure, not a truncation -- the plan's D9. Both are defensible: a failure pushes
+    # the policy away from the configurations that blow up, at the cost of a shaping term
+    # whose size is whatever V(s') happened to be; a truncation injects no value signal but
+    # bootstraps from a state that is either corrupted or, here, freshly reset -- the value
+    # of a new episode, not of this one's continuation. D9 chose failure because V(s')=0 is
+    # at least a consistent defined choice, and nothing measured since overturns it: the
+    # rate is 0.056-0.074% of episodes (jobs 157183/157184), so the choice moves ~0.06% of
+    # transitions either way.
     terminations["non_finite_state"] = TerminationTermCfg(
-      func=mdp.non_finite_state, time_out=True
+      func=mdp.non_finite_state, time_out=False
     )
     # The backstop, for a state that is finite in qpos/qvel but produces a non-finite
     # observation anyway -- a velocity or sensor reading that overflows on the way out.
