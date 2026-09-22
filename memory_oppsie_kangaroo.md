@@ -3,8 +3,8 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-21 (pick-and-place v0 stage S1 steps 1-3 measured; check-in report in
-`../docs/reports/pick-place-v0/s1-checkin-1-look-pose-reach.md`).*
+*Last updated: 2026-09-22 (pick-and-place v0 stage S1 complete; stage report in
+`../docs/reports/pick-place-v0/s1-report.md`).*
 
 ## 1. What we are building
 
@@ -26,7 +26,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Fork restarted at upstream `pal_mjlab` main `a461dc3` | ✅ commit `3b05cf6` |
 | Gripper actuators on the KANGAROO grippers model | ✅ commit `7a0c7fb` (kangaroo_constants.py, kangaroo_grippers.xml) |
 | Manipulation training framework (lift + stack, tabletop scene, MDP terms) | 🟡 commit `f33baec` — **first exercised 2026-09-21**: `Mjlab-Lift-Pal-Kangaroo-Grippers` builds and runs 500 steps on CPU under zero and random actions, no NaN, no auto-reset. Two defects found, see §5 |
-| Pick-and-place v0 S1.1-S1.3 (look, nominal pose, reach map) | 🟡 measured, awaiting decisions; S1.4 collision work not started |
+| Pick-and-place v0 S1 (scene, start pose, reach map, collision model) | ✅ complete — `../docs/reports/pick-place-v0/s1-report.md` |
+| Pick-and-place v0 S2-S5 | ❌ not started |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
 | Any training run | ❌ none recorded |
 | `../docs/` (roadmap, decisions, reports, status summary) | 🟡 only `pick-place-v0-plan.md` so far |
@@ -45,10 +46,20 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 - **uv, not conda,** for this project's environment — `make sync`, `uv run`, with mutually
   exclusive `cpu` / `cu128` torch extras.
 - **S1 tooling is kinematics-only and lives in a new top-level `scripts/`**
-  (`scene_model.py`, `reach_map.py`, `nominal_pose.py`, `render_scene.py`). They compile the
-  task's scene with `Scene(cfg).compile()` instead of constructing `ManagerBasedRlEnv`: 5 s
-  against ~60 s of warp kernel build, no GPU, and the same model with the task's own solver
-  settings applied.
+  (`scene_model.py`, `reach_map.py`, `nominal_pose.py`, `render_scene.py`,
+  `fit_link_colliders.py`). They compile the task's scene with `Scene(cfg).compile()` instead
+  of constructing `ManagerBasedRlEnv`: 5 s against ~60 s of warp kernel build, no GPU, and
+  the same model with the task's own solver settings applied.
+- **Tabletop manipulation gets its own robot cfg** (`get_kangaroo_grippers_tabletop_robot_cfg`,
+  2026-09-22): collision boxes for the torso and for arm 2-4 of both arms, PAL's oversized
+  `arm_*_4_collision` capsule replaced, four contact excludes, and a start pose with the left
+  elbow at pi/2 and the open jaw over the table. The velocity and reaching tasks keep
+  `get_kangaroo_grippers_robot_cfg` unchanged — that boundary is what
+  `tests/test_kangaroo_collision_model.py` guards.
+- **Pick-and-place v0 geometry (user decision, 2026-09-22):** object spawn centre
+  (0.42, 0.27) +/- 2 cm, fixed target (0.42, 0.07, 0.785), 20 cm apart. Spawn clearance
+  14.0 cm, target 4.5 cm — the target is 0.5 cm under the plan's 5 cm rule after S1.4;
+  (0.36, 0.07) would give 8.2 cm at the same separation if it is ever revisited.
 
 ## 4. Load-bearing facts
 
@@ -92,11 +103,17 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 - **Collision geometry can only be changed in the `MjSpec`, before compile.** MuJoCo drops
   non-colliding geoms from the BVH, so setting `contype` on a compiled `MjModel` is a silent
   no-op. In mjlab: edit the entity's `CollisionCfg` before `Scene.compile()`.
-- **Kangaroo left-arm workspace at table height (measured 2026-09-21):** top-down grasp of a
-  cube on the table is possible on **425 of 1200** 2 cm cells, a band at
-  **x ∈ [0.26, 0.58], y ∈ [−0.29, 0.39]** (torso collider enabled). The table's far 27 cm in
-  x is unreachable. The gripper pads reach **25.6 mm beyond `tcp_left`**, so a top-down grasp
-  puts the TCP at z = 0.796, not at the cube centre 0.785.
+- **Kangaroo left-arm workspace at table height (measured 2026-09-22, 48 IK seeds per cell):**
+  top-down grasp of a cube on the table is possible on **353 of 1200** 2 cm cells with the
+  S1.4 collision set (445 without it), a band at **x ∈ [0.26, 0.58], y ∈ [−0.29, 0.39]**. The
+  table's far 27 cm in x is unreachable. The gripper pads reach **25.6 mm beyond `tcp_left`**,
+  so a top-down grasp puts the TCP at z = 0.796, not at the cube centre 0.785.
+- **A reach map is only as good as its IK restart count.** At 8 restarts per cell the same
+  measurement returns 58 cells where 48 restarts return 88: it was measuring the solver. Quote
+  `--seeds` with any workspace number.
+- **The arm's real meshes come within 1 mm of the torso**, and within 9.2 mm for arm 5 vs
+  arm 7 — those self-collisions are real. Arm 2 vs arm 4 (82.8 mm) and arm 4 vs arm 6
+  (71.7 mm) cannot touch; their proxies only overlap at the joint, and they are excluded.
 
 ## 5. What doesn't work / open problems
 
@@ -107,14 +124,18 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    leave the floor after one control step, and `pelvis_1` sits at its hard limit ±0.349.
    This answers the plan's S4.1 question: **keyframe `ctrl` does not survive reset in mjlab
    1.6.0.** Fix is a `hold_nominal_targets` reset event (plan D3).
-2. **The commanded arms sag 0.19 rad under gravity** at PAL's impedance gains (K = 20,
-   D = 1.0). Any "holds its pose to 0.02 rad" acceptance criterion is unachievable without
-   gravity compensation or higher hold gains.
-3. **`INIT_STATE` is the locomotion pose**: the left grasp point starts at
-   (0.178, 0.326, 0.558) — 20 cm below the table top, behind its near edge. A
-   `MANIPULATION_INIT_STATE` is proposed in the S1 check-in report.
-4. **`tests/` still covers none of `tasks/manipulation/`**, and no `Mjlab-Lift-*` /
-   `Mjlab-Stack-*` training run is recorded.
+2. **PAL's arm gains cannot hold the arm against gravity.** At the tabletop start pose the
+   holding torque is 16.19 Nm on `arm_left_1_joint` (stiffness 40 → **0.405 rad** of droop)
+   and 10.30 Nm on `arm_left_4_joint` (stiffness 20 → **0.515 rad**). A
+   `hold_nominal_targets` reset event does *not* fix this: with every actuator held at
+   nominal the grasp point still falls from z = 0.886 to 0.793 in 10 s and `pelvis_1` still
+   reaches its limit. S3's "max |Δq| < 0.02 rad" acceptance criterion is unmeetable as
+   written. Options for S4: MuJoCo `gravcomp` on the arm/torso bodies; a
+   `MANIPULATION_HOLD_GAINS` block (arm 1 would need ~800 Nm/rad, not credible against the
+   50 Nm effort limit); or welding the torso instead of `base_link`.
+3. **`tests/` still covers none of `tasks/manipulation/`'s MDP terms** (the new collision
+   test covers the robot model only), and no `Mjlab-Lift-*` / `Mjlab-Stack-*` training run is
+   recorded.
 5. **`pyright` is disabled in CI** ("TODO: make pyright work", commented out in `ci.yaml`). Type
    errors will not be caught for you.
 6. **No roadmap, decision records or status summary yet** in `../docs/`. Create them on
@@ -134,7 +155,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Run | Task id / config / seed | Host | Result | Where recorded |
 |---|---|---|---|---|
 | S1 scene probe, 2026-09-21 | `Mjlab-Lift-Pal-Kangaroo-Grippers`, play cfg, `num_envs=1`, cpu, torch seed 0 | local Mac (CPU, no `mujoco_warp_io.patch`) | 500 steps survived under both `zero` and `random`; no NaN, no auto-reset; cube rests at z = 0.785; 0 robot-robot contacts; legs collapse (§5.1) | `../docs/reports/pick-place-v0/s1-checkin-1-look-pose-reach.md` |
-| S1 reach map, 2026-09-21 | `scripts/reach_map.py`, 50k samples, seed 0, 3 collision variants | local Mac | 440 / 425 / 336 graspable cells for as-is / +torso / +torso+elbow | same report, `s1_reach_map_*.npz` |
+| S1 reach map, 2026-09-22 | `scripts/reach_map.py --samples 50000 --seeds 48`, seed 0 | local Mac | 445 graspable cells pre-S1.4, 353 after | `s1-report.md`, `s1_reach_map_{baseline,tabletop}.npz` |
+| S1.4 collision model, 2026-09-22 | `get_kangaroo_grippers_tabletop_robot_cfg` | local Mac | 36 → 50 active robot colliders, 0 robot-robot contacts at rest, 21% of the graspable table lost | `s1-report.md` §4 |
 | *(no training run yet)* | | | | |
 
 ## 8. Compute state
@@ -151,12 +173,10 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0. **Pick-and-place v0 is at the S1 check-in.** Report:
-   `../docs/reports/pick-place-v0/s1-checkin-1-look-pose-reach.md`. Waiting on: D5
-   (spawn/target — measured proposal (0.42, 0.23) / (0.42, 0.07), 16 cm apart, or the 20 cm
-   alternative (0.42, 0.27) / (0.42, 0.07)); the S1.4 collision set (recommendation: add
-   `pelvis_2_collision`, costs 3.4 % of the workspace; do **not** enable `arm_*_4_collision`
-   as it stands, it costs 24 %); and whether the D3 hold-nominal fix moves ahead of S3.
+0. **Pick-and-place v0: S1 is done** (`../docs/reports/pick-place-v0/s1-report.md`). Next is
+   **S4/D3 before S3**: the holding problem in §5.2 above makes one of S3's acceptance
+   criteria unmeetable, and every episode currently starts by collapsing. Then S2's DR0 and
+   S3's env cfg, which consume the spawn/target above.
 1. Write down what Oppsie is (§1 here and the header of `CLAUDE.md`), and its non-goals.
 2. Create the `siwei` branch off `main` and work there.
 3. Smoke-test the new manipulation tasks: `list_envs --keyword pal`, then `play

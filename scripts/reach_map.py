@@ -14,11 +14,11 @@ Two filters, reported separately:
   down, so the cube can be taken from above. A point the wrist can only touch edge-on is
   not a pick-and-place target, so this is the set the spawn and the target are chosen from.
 
-The collision model matters, and today's is incomplete: ``MANIPULATION_COLLISION``
-(``kangaroo_constants.py``) enables only feet, arm 5-7 and the gripper, so the torso capsule
-that ships in the XML (``pelvis_2_collision``) is switched off and the arm may pass through
-the chest. ``--torso`` turns it back on; the difference between the two runs is the evidence
-for the S1.4 collision decision.
+The collision model matters. The tabletop robot (``TABLETOP_COLLISION``, S1.4) collides on
+the torso, the upper arm and the elbow as well as on arm 5-7 and the gripper; the model the
+manipulation tasks had before it (``MANIPULATION_COLLISION``) had none of the first three, so
+the arm passed through the chest and the table. ``--baseline`` measures that older model, and
+the difference between the two runs is what the S1.4 colliders cost.
 
 Output: an ``.npz`` of the accepted samples and an occupancy grid, plus a plot. The spawn and
 target proposal comes from the graspable grid: the cells furthest from any unreachable cell,
@@ -40,7 +40,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from scene_model import (  # noqa: E402
   DEFAULT_TASK,
   compile_scene,
-  geom_id,
   joint_qadr,
   nominal_data,
   site_id,
@@ -64,6 +63,14 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--task", default=DEFAULT_TASK)
   p.add_argument("--samples", type=int, default=50_000)
   p.add_argument("--seed", type=int, default=0)
+  p.add_argument(
+    "--seeds",
+    type=int,
+    default=8,
+    help="IK restarts per table cell. A cell is only called unreachable after all of them "
+    "fail, so this is the number that decides whether the map is measuring the robot or "
+    "the solver",
+  )
   p.add_argument(
     "--band",
     type=float,
@@ -106,19 +113,32 @@ def parse_args() -> argparse.Namespace:
     help="height of the pre-grasp waypoint above the grasp pose (m)",
   )
   p.add_argument(
-    "--torso",
+    "--baseline",
     action="store_true",
-    help="re-enable pelvis_2_collision (the torso capsule the variant filters out)",
+    help="measure the pre-S1.4 robot instead: feet, arm 5-7 and the gripper only, with no "
+    "torso, upper-arm or elbow collider",
   )
   p.add_argument(
-    "--arm4",
-    action="store_true",
-    help="re-enable arm_left_4_collision, the elbow capsule MANIPULATION_COLLISION drops "
-    "because it swallows arm 5-7; its contacts with those children are ignored, which is "
-    "what a <contact><exclude> block would do",
+    "--check",
+    type=float,
+    nargs="+",
+    default=None,
+    metavar="X Y",
+    help="report the graspability and edge clearance of these XY points, so a spawn or "
+    "target chosen from an earlier run can be re-checked against a new collision model",
   )
   p.add_argument("--out", type=pathlib.Path, default=None)
   return p.parse_args()
+
+
+def _init_state(args: argparse.Namespace):
+  """The start pose that goes with the robot variant being measured."""
+  from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
+    INIT_STATE,
+    MANIPULATION_INIT_STATE,
+  )
+
+  return INIT_STATE if args.baseline else MANIPULATION_INIT_STATE
 
 
 def _park_free_bodies(model: mujoco.MjModel, data: mujoco.MjData) -> None:
@@ -140,29 +160,6 @@ def _park_free_bodies(model: mujoco.MjModel, data: mujoco.MjData) -> None:
       model.geom_conaffinity[gid] = 0
 
 
-ARM4_GEOM = "arm_left_4_collision"
-TORSO_GEOM = "pelvis_2_collision"
-
-
-def extra_geoms(args: argparse.Namespace) -> tuple[str, ...]:
-  """The geom patterns the ``--torso`` / ``--arm4`` variants add to the collision set."""
-  extra = []
-  if args.torso:
-    extra.append(TORSO_GEOM)
-  if args.arm4:
-    extra.append(ARM4_GEOM)
-  return tuple(extra)
-
-
-def elbow_geoms(model: mujoco.MjModel, args: argparse.Namespace) -> set[int]:
-  return {geom_id(model, f"robot/{ARM4_GEOM}")} if args.arm4 else set()
-
-
-def _skip(elbow: set[int], is_arm: np.ndarray, g1: int, g2: int) -> bool:
-  """Elbow-capsule contacts with its own children, which an ``<exclude>`` would remove."""
-  return bool(elbow) and ((g1 in elbow and is_arm[g2]) or (g2 in elbow and is_arm[g1]))
-
-
 def left_arm_geoms(model: mujoco.MjModel) -> np.ndarray:
   """Every collidable geom on the left arm from the shoulder down, as a boolean mask.
 
@@ -180,9 +177,8 @@ def left_arm_geoms(model: mujoco.MjModel) -> np.ndarray:
 
 
 def sample(args: argparse.Namespace) -> dict:
-  model = compile_scene(args.task, extra_geoms(args))
-  elbow = elbow_geoms(model, args)
-  data = nominal_data(model)
+  model = compile_scene(args.task, baseline=args.baseline)
+  data = nominal_data(model, _init_state(args))
   _park_free_bodies(model, data)
 
   qadr = joint_qadr(model, ARM_JOINTS)
@@ -213,7 +209,7 @@ def sample(args: argparse.Namespace) -> dict:
     seen = set()
     for c in range(data.ncon):
       g1, g2 = int(data.contact[c].geom1), int(data.contact[c].geom2)
-      if _skip(elbow, is_arm, g1, g2) or not (is_arm[g1] or is_arm[g2]):
+      if not (is_arm[g1] or is_arm[g2]):
         continue
       hits[i] += 1
       seen.add((gname(min(g1, g2)), gname(max(g1, g2))))
@@ -228,8 +224,8 @@ def sample(args: argparse.Namespace) -> dict:
 
   print(
     f"{args.samples} samples in {elapsed:.1f}s "
-    f"({1e3 * elapsed / args.samples:.2f} ms/sample), torso collider "
-    f"{'ON' if args.torso else 'OFF'}"
+    f"({1e3 * elapsed / args.samples:.2f} ms/sample), "
+    f"{'pre-S1.4 baseline' if args.baseline else 'S1.4 collision set'}"
   )
   print(f"  collision-free            {free.sum():7d}  ({100 * free.mean():5.1f}%)")
   print(
@@ -270,36 +266,50 @@ def _ik_top_down(
   q_init: np.ndarray,
   iters: int = 120,
   tol: float = 2e-3,
+  free: np.ndarray | None = None,
+  pos_mask: tuple[bool, bool, bool] = (True, True, True),
 ) -> np.ndarray | None:
   """Damped least squares onto "grasp point at ``goal``, jaw pointing straight down".
 
   Six residuals (three position, three axis alignment) on seven joints, clamped to the soft
   limits every step so a solution that only exists outside them is never reported. Returns
   the joint vector, or ``None`` if it did not converge inside ``tol``.
+
+  ``free`` masks which joints the solver may move; a joint left out keeps its value from
+  ``q_init``, which is how a pinned elbow is imposed. ``pos_mask`` masks which components of
+  the position goal are constrained: dropping z asks for "directly above (x, y), at whatever
+  height the arm likes", which is the only well-posed request once the elbow is pinned --
+  with a fixed elbow the grasp point lies on a surface, and naming a height as well usually
+  names a point that is not on it.
   """
+  if free is None:
+    free = np.ones(len(qadr), dtype=bool)
   jacp = np.zeros((3, model.nv))
   jacr = np.zeros((3, model.nv))
   dofs = np.asarray(
     [model.jnt_dofadr[model.jnt_qposadr.tolist().index(a)] for a in qadr]
-  )
+  )[free]
   q = q_init.copy()
   down = np.array([0.0, 0.0, -1.0])
+  rows = np.asarray(pos_mask, dtype=bool)
+  n_res = int(rows.sum()) + 3
   for _ in range(iters):
     data.qpos[qadr] = q
     mujoco.mj_kinematics(model, data)
     mujoco.mj_comPos(model, data)
-    err_p = goal - data.site_xpos[tcp]
+    err_p = (goal - data.site_xpos[tcp])[rows]
     axis = data.xmat[hand].reshape(3, 3)[:, 2]
     err_r = np.cross(axis, down)
     err = np.concatenate([err_p, err_r])
     if np.linalg.norm(err_p) < tol and np.linalg.norm(err_r) < 0.05:
       return q
     mujoco.mj_jacSite(model, data, jacp, jacr, tcp)
-    jac = np.vstack([jacp[:, dofs], jacr[:, dofs]])
+    jac = np.vstack([jacp[rows][:, dofs], jacr[:, dofs]])
     # Levenberg-Marquardt: lambda big enough to survive the wrist singularity.
     lam = 0.05
-    dq = jac.T @ np.linalg.solve(jac @ jac.T + lam * np.eye(6), err)
-    q = np.clip(q + np.clip(dq, -0.4, 0.4), lo, hi)
+    step = np.zeros_like(q)
+    step[free] = jac.T @ np.linalg.solve(jac @ jac.T + lam * np.eye(n_res), err)
+    q = np.clip(q + np.clip(step, -0.4, 0.4), lo, hi)
   return None
 
 
@@ -321,7 +331,7 @@ def pad_offset(model: mujoco.MjModel, data: mujoco.MjData) -> float:
   return float(max(np.dot(p - tcp, axis) for p in pads))
 
 
-def ik_grid(args: argparse.Namespace, seeds: int = 8) -> dict:
+def ik_grid(args: argparse.Namespace, seeds: int | None = None) -> dict:
   """Per-cell answer to "can the jaw take a cube from directly above this point?".
 
   Rejection sampling (``sample``) measures the workspace but concentrates its samples where
@@ -330,9 +340,8 @@ def ik_grid(args: argparse.Namespace, seeds: int = 8) -> dict:
   and asks it twice: at the grasp pose, and at a pre-grasp waypoint ``--pregrasp`` above it,
   because a grasp the arm cannot descend into is not a grasp.
   """
-  model = compile_scene(args.task, extra_geoms(args))
-  elbow = elbow_geoms(model, args)
-  data = nominal_data(model)
+  model = compile_scene(args.task, baseline=args.baseline)
+  data = nominal_data(model, _init_state(args))
   offset = pad_offset(model, data)
   _park_free_bodies(model, data)
 
@@ -366,12 +375,11 @@ def ik_grid(args: argparse.Namespace, seeds: int = 8) -> dict:
     mujoco.mj_collision(model, data)
     for c in range(data.ncon):
       g1, g2 = int(data.contact[c].geom1), int(data.contact[c].geom2)
-      if _skip(elbow, is_arm, g1, g2):
-        continue
       if is_arm[g1] or is_arm[g2]:
         return None, "collision"
     return q, None
 
+  seeds = args.seeds if seeds is None else seeds
   rng = np.random.default_rng(args.seed)
   t0 = time.time()
   for i, x in enumerate(xs):
@@ -482,6 +490,31 @@ def widest_pair(grid: np.ndarray, origin: tuple, margin: float):
   return (xy[a], dist[ix[a], iy[a]]), (xy[b], dist[ix[b], iy[b]])
 
 
+def report_points(grid: np.ndarray, origin: tuple, args: argparse.Namespace) -> None:
+  """Graspability and edge clearance at explicitly requested XY points.
+
+  Printed before any proposal is attempted: a spawn and target chosen against one collision
+  model are exactly what one wants re-checked against the next, and that answer must not be
+  lost because the proposal step found nothing.
+  """
+  if not args.check:
+    return
+  if len(args.check) % 2:
+    raise SystemExit("--check takes pairs of numbers")
+  x0, y0, cell = origin
+  dist = clearance(grid, cell)
+  print("\n  requested points:")
+  for x, y in zip(args.check[::2], args.check[1::2], strict=True):
+    i = int(round((x - x0) / cell))
+    j = int(round((y - y0) / cell))
+    inside = 0 <= i < grid.shape[0] and 0 <= j < grid.shape[1] and grid[i, j]
+    depth = dist[i, j] if inside else 0.0
+    print(
+      f"    ({x:.3f}, {y:.3f})  {'graspable' if inside else 'NOT GRASPABLE'}"
+      f"   clearance {depth * 100:.1f} cm"
+    )
+
+
 def plot_ik(ik: dict, spawn, target, args, out: pathlib.Path) -> None:
   import matplotlib
 
@@ -535,7 +568,7 @@ def plot_ik(ik: dict, spawn, target, args, out: pathlib.Path) -> None:
   ax.set_title(
     f"Left jaw, top-down grasp of a cube on the table (grasp point z = {ik['grasp_z']:.3f})\n"
     f"{ok.sum()} / {ok.size} cells solvable, collision-free, inside soft limits"
-    f"  [torso {'ON' if args.torso else 'OFF'}, elbow {'ON' if args.arm4 else 'OFF'}]\n"
+    f"  [{'pre-S1.4 baseline' if args.baseline else 'S1.4 collision set'}]\n"
     "clearance runs to the edge of the region or of the table, whichever is nearer",
     fontsize=10,
   )
@@ -605,7 +638,8 @@ def plot(
     )
   fig.suptitle(
     f"Kangaroo left-gripper workspace at table height  "
-    f"[torso collider {'ON' if args.torso else 'OFF'}, {args.samples} samples, seed {args.seed}]"
+    f"[{'pre-S1.4 baseline' if args.baseline else 'S1.4 collision set'}, "
+    f"{args.samples} samples, seed {args.seed}]"
   )
   fig.tight_layout()
   fig.savefig(out, dpi=140)
@@ -616,7 +650,7 @@ def main() -> None:
   args = parse_args()
   out_dir = args.out or pathlib.Path("../docs/reports/pick-place-v0")
   out_dir.mkdir(parents=True, exist_ok=True)
-  tag = "torso_on" if args.torso else "torso_off"
+  tag = "baseline" if args.baseline else "tabletop"
 
   result = sample(args)
   grid, origin = occupancy(result["pos"], result["reachable"], args.cell)
@@ -625,6 +659,7 @@ def main() -> None:
   ik = ik_grid(args)
   ok = _largest_component(ik["ok"])
   ik_origin = (float(ik["xs"][0]), float(ik["ys"][0]), args.cell)
+  report_points(ok, ik_origin, args)
   spawn, target = propose(ok, ik_origin, args.margin, args.separation)
 
   print(f"\ngraspable region: {ok.sum()} cells of {args.cell * 100:.0f} cm")

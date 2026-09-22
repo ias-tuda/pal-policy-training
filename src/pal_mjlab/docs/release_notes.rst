@@ -21,6 +21,19 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **The tabletop manipulation tasks get a collision model above the elbow, and a
+  start pose over the table.** ``Mjlab-Lift-Pal-Kangaroo-Grippers`` and
+  ``Mjlab-Stack-Pal-Kangaroo-Grippers`` now instantiate a new
+  ``get_kangaroo_grippers_tabletop_robot_cfg``. It adds collision boxes for the
+  torso and for the upper arm, forearm and elbow of both arms, sized from the
+  link meshes, and replaces the shipped ``arm_*_4_collision`` capsule, which
+  enclosed arm 5-7 rather than arm 4. Before this the torso and the whole upper
+  arm passed through the table. The robot also starts with the left elbow square
+  and the open jaw above the table rather than hanging at its side. The velocity
+  and reaching tasks are unaffected: they keep
+  ``get_kangaroo_grippers_robot_cfg``, whose collision set and initial pose are
+  unchanged.
+
 - **Removing custom height targets and weights for foot_swing_height and
   foot_clearance rewards in Kangaroo rough velocity task.** Removing values
   optimized for rough terrains consisting mainly of structured stairs (where

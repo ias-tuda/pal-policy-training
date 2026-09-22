@@ -13,6 +13,7 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (  # noqa: F401
   REGEX_FEMUR_AND_KNEE_LINKS,
   REGEX_LEG_LENGTH_JOINTS_ONLY,
   get_kangaroo_grippers_robot_cfg,
+  get_kangaroo_grippers_tabletop_robot_cfg,
   get_kangaroo_hands_robot_cfg,
   get_kangaroo_lower_body_robot_cfg,
   get_kangaroo_robot_cfg,
