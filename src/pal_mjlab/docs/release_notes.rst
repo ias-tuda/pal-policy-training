@@ -21,6 +21,28 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **Fixed: the goal of every tabletop manipulation task was unreachable with
+  more than one environment.** ``Mjlab-Lift-``, ``Mjlab-Stack-`` and
+  ``Mjlab-PickPlace-Pal-Kangaroo-Grippers`` inherited the locomotion default of
+  ``env_spacing=2.5``. mjlab simulates environments as batched worlds with
+  identical geometry, but a scene carrying a terrain still lays ``env_origins``
+  out on a grid of that spacing. The object placement event reads the table's
+  position out of physics and ignores the grid, while the lifting command adds
+  it to its target, so the goal ended up 1.6-1.9 m from the cube in every
+  environment except the first. At one environment the grid is zero and nothing
+  is wrong, which is why it survived every smoke test. The tabletop scene now
+  uses ``env_spacing=0.0``.
+
+- **Reward variants for the pick-and-place task, selected by name.**
+  ``make_pick_place_env_cfg(reward=...)`` takes ``R-A`` (the framework's own
+  reward, and the default), ``R-B`` (sparse: reach, goal, success only), ``R-C``
+  (phase-gated, with a bounded lift height and a transport term that only pays
+  once the object is off the table), ``R-D`` (eight bounding-box keypoints under
+  a logistic kernel) or ``R-E`` (a per-step time cost with a larger terminal
+  bonus and a shorter horizon). Every variant carries the same regularisers, so
+  a comparison between them is a comparison of the thing that differs. Adds a
+  hand-versus-table contact sensor and the reward terms the variants need.
+
 - **A named domain-randomisation ladder for the tabletop manipulation tasks.**
   ``make_tabletop_env_cfg`` takes a ``dr_level`` (and the pick-and-place factory a
   ``dr``), one of ``DR0``, ``DR-object``, ``DR-contact``, ``DR-robot``, ``DR-obs``
