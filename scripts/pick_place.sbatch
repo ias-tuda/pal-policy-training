@@ -24,6 +24,12 @@
 
 set -euo pipefail
 
+# A batch step runs a non-login shell, so ~/.profile is never sourced and uv -- which
+# installs itself to ~/.local/bin -- is not on PATH. Without this the job dies at exec
+# with status 127 after the commit guard has already passed, which is a confusing way to
+# find out. (Job 157122 did exactly that.)
+export PATH="$HOME/.local/bin:$PATH"
+
 REPO=$HOME/repo/humanoids/pal_mjlab_kangaroo_talos
 TASK=Mjlab-PickPlace-Pal-Kangaroo-Grippers
 
