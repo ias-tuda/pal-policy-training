@@ -32,16 +32,17 @@ def test_the_default_is_c1s_configuration(monkeypatch):
   cfg = kangaroo_pick_place_env_cfg()
   assert DEFAULT_REWARD == "R-A" and DEFAULT_DR == "DR0"
   assert cfg.rewards["reach"].func.__name__ == "staged_position_reward"
-  assert "reset_was_lifted" not in cfg.events
+  assert "support_sensor_name" not in cfg.terminations["success"].params
 
 
 @pytest.mark.parametrize("arm", sorted(REWARD_VARIANTS))
 def test_every_registered_arm_can_be_selected(arm, monkeypatch):
   monkeypatch.setenv(REWARD_ENV_VAR, arm)
   cfg = kangaroo_pick_place_env_cfg()
-  # The strict arm is the one that brings the latch, and it must bring all of it.
+  # Every arm resets the latch -- the eval reads it on all of them -- but only the strict
+  # arm gates its success termination on it.
+  assert "reset_was_lifted" in cfg.events
   strict = arm in REQUIRE_LIFTED
-  assert ("reset_was_lifted" in cfg.events) is strict
   assert ("support_sensor_name" in cfg.terminations["success"].params) is strict
 
 

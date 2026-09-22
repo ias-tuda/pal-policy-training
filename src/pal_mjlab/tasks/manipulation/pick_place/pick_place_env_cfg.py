@@ -170,15 +170,18 @@ def make_pick_place_env_cfg(
     "grasp_sensor_name": grasp_sensor,
     "threshold": GOAL_THRESHOLD,
   }
+  # Unconditionally, not only for the arms that gate on it. The latch is allocated by the
+  # first thing that reads it, and `scripts/eval_pick_place.py` reads it on *every* arm so
+  # that `placed ∧ was_lifted` is measured the same way for all of them. Without a reset
+  # here that evaluation would latch True after the first lift and stay there for the rest
+  # of the run. The term is a no-op when nothing ever reads the latch, which is the case
+  # during training on every arm outside `REQUIRE_LIFTED`.
+  cfg.events["reset_was_lifted"] = EventTermCfg(func=mdp.reset_was_lifted, mode="reset")
   if reward in REQUIRE_LIFTED:
     # Gating the reward without gating the termination would still let a slid cube end the
     # episode early, which is worth remaining-time to the policy even with the bonus
     # withheld. `SUPPORT_SENSOR` is what turns `_placed_bool` into `placed ∧ was_lifted`.
     success_params["support_sensor_name"] = SUPPORT_SENSOR
-    # The latch is episode state, so it has to be cleared when the episode is.
-    cfg.events["reset_was_lifted"] = EventTermCfg(
-      func=mdp.reset_was_lifted, mode="reset"
-    )
   cfg.terminations["success"] = TerminationTermCfg(
     func=mdp.object_placed, params=success_params
   )
