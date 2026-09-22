@@ -128,3 +128,31 @@ def test_release_and_success_are_present():
   assert "release" in cfg.rewards
   assert "success" in cfg.rewards
   assert "success" in cfg.terminations
+
+
+@pytest.mark.parametrize("num_envs", [1, 2, 8])
+def test_the_goal_is_reachable_from_the_object(num_envs):
+  """The goal and the cube must agree about which world they are in.
+
+  mjlab batches environments as identical worlds, but a scene carrying a terrain still lays
+  `env_origins` out on a grid. `reset_objects_on_surface` reads the table out of physics and
+  ignores that grid; `LiftingCommand` adds it to its target. With a non-zero `env_spacing`
+  the two disagree and the goal lands 1.6-1.9 m from the cube in every env but the first --
+  invisible at `num_envs=1`, fatal at any training scale, and it looks like a task that will
+  not learn rather than a config that cannot.
+  """
+  import torch
+  from mjlab.envs import ManagerBasedRlEnv
+
+  torch.manual_seed(0)
+  cfg = load_env_cfg(TASK, play=True)
+  cfg.scene.num_envs = num_envs
+  env = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
+  env.reset()
+  object_pos = env.scene["object"].data.root_link_pos_w
+  goal = env.command_manager.get_term("goal_pose").command
+  distance = torch.norm(goal - object_pos, dim=-1)
+  env.close()
+
+  # 20 cm apart by design, plus the 2 cm spawn box.
+  assert distance.max() < 0.25, f"goal is {distance.max():.2f} m from the cube"
