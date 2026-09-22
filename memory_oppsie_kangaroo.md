@@ -180,6 +180,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      `ObservationGroupCfg.nan_policy` implements warn/sanitize/error — it just defaults to
      `"disabled"`, which is why the NaN reached rsl_rl and raised. A first version of the fix
      duplicated the reward half for nothing (`9adc904`, removed in `3cc2b1b`).
+   - **What diverges is the gripper jaw four-bar, measured, not guessed** (job 157187,
+     `--enable-nan-guard`, `scripts/nan_dump_report.py`): the two passive
+     `gripper_left_fingertip_*_joint` hit 71 and 63 rad/s and cross 20 rad/s 32 steps before
+     the actuated jaw joint, while `arm_left_5_joint` never exceeds 2.8 rad/s. The velocity
+     trace oscillates and grows over ~0.18 s — a stiff linkage ringing, not a contact
+     impulse. Consistent with the four-bar's 1e-4 armature. **Not fixed**: raising it touches
+     `kangaroo_constants.py`, which every grippers task instantiates, and the rate already
+     clears the abort gate.
    - **Time-to-first-failure with n=1 is a badly biased rate estimate.** Three such
      observations gave "one per 0.5 M world-steps"; measuring properly once runs survived
      gave **one per 2.76 M** — 5.5x out.
