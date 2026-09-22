@@ -14,16 +14,24 @@ map is an unlearnable task, not a hard one.
 from __future__ import annotations
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 
 from pal_mjlab.tasks.manipulation import mdp, scene
+from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  DEFAULT_EPISODE_LENGTH_S,
+  EPISODE_LENGTH_S,
+  RewardContext,
+  build_rewards,
+  reward_curriculum_cfg,
+)
 from pal_mjlab.tasks.manipulation.robot_cfg import ManipulationRobotCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
   DR_LEVELS_THAT_MOVE_THE_TABLE,
   OBJECT,
+  ROBOT,
   TABLE,
   apply_play_overrides,
   make_tabletop_env_cfg,
@@ -111,6 +119,7 @@ def make_pick_place_env_cfg(
   target_xy: tuple[float, float] = TARGET_XY,
   spawn_xy: tuple[float, float] = SPAWN_XY,
   dr: str = "DR0",
+  reward: str = "R-A",
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a fixed target.
@@ -121,6 +130,8 @@ def make_pick_place_env_cfg(
     target_xy: where the cube has to end up, in the env frame.
     spawn_xy: centre of the cube's spawn box, in the env frame.
     dr: domain-randomisation level, by name. See ``tabletop_env_cfg.DR_LEVELS``.
+    reward: reward variant, by name. See ``rewards.REWARD_VARIANTS``. R-A is the framework's
+      own reward and the baseline every other arm is measured against.
     play: apply the play overrides (no observation noise, no timeout).
   """
   cfg = make_tabletop_env_cfg(
@@ -129,34 +140,27 @@ def make_pick_place_env_cfg(
     command_cfg=_command_cfg(target_xy, dr),
     object_pose_range=_object_pose_range(spawn_xy),
     dr_level=dr,
+    episode_length_s=EPISODE_LENGTH_S.get(reward, DEFAULT_EPISODE_LENGTH_S),
   )
 
   gripper = robot.gripper(gripper_name)
   grasp_sensor = gripper.contact_sensor_name
 
-  # Release shaping, exactly as in `stack`. Without it the policy converges on holding the
-  # cube at the goal forever: every distance reward is already maximal there, and letting go
-  # can only lose points.
-  cfg.rewards["release"] = RewardTermCfg(
-    func=mdp.released_at_goal,
-    weight=2.0,
-    params={
-      "command_name": COMMAND,
-      "object_name": OBJECT,
-      "grasp_sensor_name": grasp_sensor,
-      "threshold": GOAL_THRESHOLD,
-    },
+  # The whole reward dict comes from the named variant, replacing the base cfg's. Replacing
+  # rather than patching is what makes the arms of the comparison comparable: two variants
+  # cannot differ by a term one of them forgot to remove.
+  cfg.rewards = build_rewards(
+    reward,
+    RewardContext(
+      tcp=SceneEntityCfg(ROBOT, site_names=(gripper.tcp_site,)),
+      action_joints=SceneEntityCfg(ROBOT, joint_names=robot.action_joint_regex),
+      grasp_sensor=grasp_sensor,
+      surface_sensor=gripper.surface_sensor_name,
+      threshold=GOAL_THRESHOLD,
+    ),
   )
-  cfg.rewards["success"] = RewardTermCfg(
-    func=mdp.object_placed_reward,
-    weight=10.0,
-    params={
-      "command_name": COMMAND,
-      "object_name": OBJECT,
-      "grasp_sensor_name": grasp_sensor,
-      "threshold": GOAL_THRESHOLD,
-    },
-  )
+  cfg.curriculum = reward_curriculum_cfg()
+
   cfg.terminations["success"] = TerminationTermCfg(
     func=mdp.object_placed,
     params={

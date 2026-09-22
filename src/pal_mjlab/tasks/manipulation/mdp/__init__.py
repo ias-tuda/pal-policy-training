@@ -22,6 +22,7 @@ from mjlab.tasks.manipulation.mdp import (
   illegal_contact,
   joint_velocity_hinge_penalty,
   object_to_goal_distance,
+  reward_curriculum,
   staged_position_reward,
   target_position,
 )
@@ -42,11 +43,16 @@ from .observations import (
   object_yaw_b,
 )
 from .rewards import (
+  bring_object_when_lifted,
+  contact_penalty,
   entity_lin_vel_l2,
   grasped,
   joint_pos_limits,
+  keypoint_distance_reward,
+  lift_height,
   object_lifted,
   released_at_goal,
+  time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
 from .terminations import entity_below_height, object_placed
@@ -59,6 +65,7 @@ __all__ = [
   "illegal_contact",
   "joint_velocity_hinge_penalty",
   "object_to_goal_distance",
+  "reward_curriculum",
   "staged_position_reward",
   "target_position",
   # Commands.
@@ -78,8 +85,13 @@ __all__ = [
   "object_position_b",
   "object_yaw_b",
   # Rewards.
+  "bring_object_when_lifted",
+  "contact_penalty",
   "entity_lin_vel_l2",
   "grasped",
+  "keypoint_distance_reward",
+  "lift_height",
+  "time_penalty",
   "joint_pos_limits",
   "object_lifted",
   "object_placed_reward",

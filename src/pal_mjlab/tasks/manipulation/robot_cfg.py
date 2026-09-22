@@ -64,6 +64,10 @@ class GripperCfg:
   def ground_sensor_name(self) -> str:
     return f"{self.name}_hand_ground_contact"
 
+  @property
+  def surface_sensor_name(self) -> str:
+    return f"{self.name}_hand_surface_contact"
+
 
 @dataclasses.dataclass(frozen=True)
 class ManipulationRobotCfg:

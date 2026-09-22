@@ -112,6 +112,26 @@ def make_hand_ground_sensor(gripper: GripperCfg) -> ContactSensorCfg:
   )
 
 
+def make_hand_surface_sensor(
+  gripper: GripperCfg, surface_name: str = TABLE
+) -> ContactSensorCfg:
+  """Hand-vs-table contact, so a task can penalise leaning on the work surface.
+
+  Distinct from the ground sensor above, which watches the floor. Scraping or resting the
+  jaw on the table is a cheap way for a simulated policy to stabilise a grasp, and it is the
+  first thing that stops working on a real table.
+  """
+  return ContactSensorCfg(
+    name=gripper.surface_sensor_name,
+    primary=ContactMatch(mode="subtree", pattern=gripper.hand_body, entity=ROBOT),
+    secondary=ContactMatch(mode="body", pattern=surface_name, entity=surface_name),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=1,
+    history_length=4,
+  )
+
+
 def make_tabletop_env_cfg(
   robot: ManipulationRobotCfg,
   gripper_name: str | None = None,
@@ -341,6 +361,7 @@ def make_tabletop_env_cfg(
     make_grasp_sensor(gripper, OBJECT),
     make_support_sensor(OBJECT),
     make_hand_ground_sensor(gripper),
+    make_hand_surface_sensor(gripper),
   ]
 
   entities: dict[str, EntityCfg] = {
@@ -355,7 +376,16 @@ def make_tabletop_env_cfg(
       entities=entities,
       sensors=tuple(sensors),
       num_envs=1,
-      env_spacing=2.5,
+      # Zero, not the locomotion default. mjlab simulates the envs as batched worlds with
+      # identical geometry -- every world's table is at the same place -- but a scene with a
+      # terrain still lays `env_origins` out on a grid of `env_spacing`, which is what a
+      # locomotion task needs to spread its robots over the terrain. Nothing here honours
+      # that grid: `reset_objects_on_surface` reads the table out of physics, so the cube
+      # lands on the table, while `LiftingCommand` adds `env_origins` to its target, so the
+      # goal walks off into space. At the default 2.5 the goal sits 1.6-1.9 m from the cube
+      # in every env but the first, and no policy can reach it. Measured; see
+      # `test_the_goal_is_reachable_from_the_object`.
+      env_spacing=0.0,
       extent=2.5,
     ),
     observations=observations,
