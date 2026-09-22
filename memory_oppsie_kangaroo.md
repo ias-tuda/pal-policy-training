@@ -32,7 +32,10 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S2 (DR ladder) | ✅ complete — six rungs, `../docs/reports/pick-place-v0/s2-report.md`. Only DR0 and DR-object are in v0's scope; ranges above them are untuned |
 | Pick-and-place v0 S5 implementation (5 reward variants, regularisers, sbatch) | ✅ `../docs/reports/pick-place-v0/s5-report-part1.md` |
 | Pick-and-place v0 S5 **C0** | ✅ **done 2026-09-22** — jobs 157183-157186, all 200/200 on IAS. Throughput and divergence rate measured, see §6/§7 |
-| Pick-and-place v0 S5 C1-C3 | ❌ C1 sized (2048 envs, 3 seeds, ~15 h each), not launched |
+| Pick-and-place v0 S5 **C1** | ⏳ **running** 157188-157190, R-A/DR0, 3 seeds, 2048 envs, 20 k iters, ~13 h |
+| Pick-and-place v0 S5 **C2** | ⏳ **running** 157239 (R-C, 1 seed) + 157240/1 (R-C-strict, 2 seeds), commit `e27a9b5` |
+| D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
+| Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
 | Any training run to completion | ❌ none — C0 is a 200-iteration smoke test, not a policy |
 | `../docs/` (decisions, reports, status summary, per-task doc) | 🟡 all exist except `roadmap.md` |
@@ -188,6 +191,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      impulse. Consistent with the four-bar's 1e-4 armature. **Not fixed**: raising it touches
      `kangaroo_constants.py`, which every grippers task instantiates, and the rate already
      clears the abort gate.
+   - **Contact sensors are empty until the first step after a reset**, and a teleport does
+     not refresh them. Reading `object_table_contact` straight after `reset()` reports "not
+     on the surface" for a cube visibly resting on one, which makes `object_lifted` collapse
+     to `grasped`. Any test that places an object and reads a contact term must step first.
+   - **`ruff format` can silently defeat a string-replacement edit.** Adding
+     `support_sensor_name` to `terminations.object_placed` updated the signature but not the
+     reflowed call body, so the parameter was accepted and ignored. Caught only because the
+     plan mandated a behavioural test. Check the call site, not just the signature.
    - **Time-to-first-failure with n=1 is a badly biased rate estimate.** Three such
      observations gave "one per 0.5 M world-steps"; measuring properly once runs survived
      gave **one per 2.76 M** — 5.5x out.
@@ -261,6 +272,13 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
+0a. **C2 RUNNING since 2026-09-22 21:5x**, commit `e27a9b5`: **157239** C2-a = R-C 1 seed,
+   **157240/157241** C2-b = R-C-strict 2 seeds; 2048 envs, DR0, 20 k iters, `--time=30:00:00`.
+   **Read at 3-4 k iterations (~2-3 h), not at the end** -- whether `Episode_Reward/grasp`
+   ever leaves zero is visible by then, and a dead arm is `scancel`led. R-C-strict is the arm
+   most exposed to Isaac Lab #204; if `grasp` is still 0 at ~600 iters the pre-agreed fix is
+   a `+1·grasped` term or `lift` weight 30-50, **as a follow-up run, not an edit to a running
+   one**. R-B/R-D/R-E wait until some arm is shown to pick.
 0. **Pick-and-place v0: S1-S5 implemented, C0 done, C1 RUNNING since 2026-09-22 20:26.**
    Jobs **157188 / 157189 / 157190**, seeds 1-3, 2048 envs, 20 000 iterations, commit
    `e84d270`, `--time=30:00:00`. wandb `lq7yhwlm` / `0mk128al` / `jbs6n4w6` in
