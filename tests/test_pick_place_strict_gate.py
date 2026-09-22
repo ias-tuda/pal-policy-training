@@ -16,12 +16,13 @@ import pytest
 import torch
 from conftest import get_test_device
 from mjlab.envs import ManagerBasedRlEnv
-from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
+from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED, _placed_bool
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   OBJECT,
   make_pick_place_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import SUPPORT_SENSOR
 
 NUM_ENVS = 2
 #: Terms a slid cube must not earn under R-C-strict.
@@ -157,5 +158,27 @@ def test_the_other_arms_are_untouched(reward):
     KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=reward
   )
   assert "support_sensor_name" not in cfg.terminations["success"].params
-  assert "reset_was_lifted" not in cfg.events
   assert "support_sensor_name" not in cfg.rewards["release"].params
+  # The latch reset is present on every arm (the eval needs it) but does nothing here,
+  # because on an ungated arm nothing reads the latch during training.
+  assert "reset_was_lifted" in cfg.events
+
+
+def test_the_latch_resets_on_an_ungated_arm_too():
+  """The eval reads `placed ∧ was_lifted` on every arm, so every arm must reset the latch.
+
+  Regression: the reset event was originally added only for `REQUIRE_LIFTED` arms, because
+  only they read the latch during training. Evaluating R-A would then latch True on the
+  first lift of the run and report every later episode as a pick.
+  """
+  env = _env("R-A")
+  env.reset()
+  _slide_cube_to_the_goal(env)
+  # Read it the way the eval does, through `_placed_bool`, which allocates it.
+  _placed_bool(
+    env, "goal_pose", OBJECT, "left_pad_contact", 0.025, 0.05, SUPPORT_SENSOR
+  )
+  getattr(env, _WAS_LIFTED)[:] = True
+  env.reset()
+  assert not bool(getattr(env, _WAS_LIFTED).any())
+  env.close()
