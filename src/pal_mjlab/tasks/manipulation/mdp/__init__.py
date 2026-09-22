@@ -33,7 +33,12 @@ from .commands import (
   SurfaceOffsetCommand,
   SurfaceOffsetCommandCfg,
 )
-from .events import hold_nominal_targets, reset_objects_on_surface, surface_top_z
+from .events import (
+  hold_nominal_targets,
+  reset_objects_on_surface,
+  reset_was_lifted,
+  surface_top_z,
+)
 from .observations import (
   ee_position_b,
   goal_position_b,
@@ -51,6 +56,7 @@ from .rewards import (
   keypoint_distance_reward,
   lift_height,
   object_lifted,
+  reach_only,
   released_at_goal,
   time_penalty,
 )
@@ -99,5 +105,7 @@ __all__ = [
   # Terminations.
   "entity_below_height",
   "non_finite_state",
+  "reach_only",
+  "reset_was_lifted",
   "object_placed",
 ]

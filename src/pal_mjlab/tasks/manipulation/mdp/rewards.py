@@ -20,6 +20,7 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
   _grasped_bool,
   _on_surface_bool,
   _placed_bool,
+  _was_lifted_bool,
 )
 
 _ROBOT = SceneEntityCfg("robot")
@@ -45,23 +46,51 @@ def object_lifted(
   ).float()
 
 
+def reach_only(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  reaching_std: float,
+  asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """The reaching half of mjlab's `staged_position_reward`, without the goal factor.
+
+  `staged_position_reward` returns `G(d_r) * (1 + G(d_g))`, and that second factor pays for
+  the object being near the goal however it got there -- so on a table-height goal it is one
+  of the terms a sliding policy collects. This is the same Gaussian on tool-to-object
+  distance with the factor dropped.
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  obj: Entity = env.scene[object_name]
+  ee_pos_w = robot.data.site_pos_w[:, asset_cfg.site_ids].squeeze(1)
+  reach_error = torch.sum(torch.square(ee_pos_w - obj.data.root_link_pos_w), dim=-1)
+  return torch.exp(-reach_error / reaching_std**2)
+
+
 def released_at_goal(
   env: ManagerBasedRlEnv,
   command_name: str,
   object_name: str,
   grasp_sensor_name: str,
   threshold: float = 0.05,
+  support_sensor_name: str | None = None,
 ) -> torch.Tensor:
   """1.0 when the object is at the goal and no longer held.
 
   The shaping counterpart to :func:`~.terminations.object_placed`: it pays as soon as the
   jaw opens in the right place, without waiting for the object to settle, which is what
   stops the policy from converging on holding the object at the goal forever.
+
+  `¬grasped` is also true of an object that was never grasped, so on a table-height goal
+  this pays a slide. Passing `support_sensor_name` additionally requires the `was_lifted`
+  latch; leaving it None is the pre-C2 behaviour.
   """
   obj: Entity = env.scene[object_name]
   command = env.command_manager.get_term(command_name)
   at_goal = torch.norm(command.command - obj.data.root_link_pos_w, dim=-1) < threshold
-  return (at_goal & ~_grasped_bool(env, grasp_sensor_name)).float()
+  released = at_goal & ~_grasped_bool(env, grasp_sensor_name)
+  if support_sensor_name is not None:
+    released &= _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  return released.float()
 
 
 def object_placed(
@@ -71,8 +100,13 @@ def object_placed(
   grasp_sensor_name: str,
   threshold: float = 0.05,
   velocity_threshold: float = 0.05,
+  support_sensor_name: str | None = None,
 ) -> torch.Tensor:
-  """1.0 on full success: at the goal, released, and come to rest."""
+  """1.0 on full success: at the goal, released, and come to rest.
+
+  With `support_sensor_name`, additionally requires that the object was lifted at some
+  point in the episode -- see `_placed_bool`.
+  """
   return _placed_bool(
     env,
     command_name,
@@ -80,6 +114,7 @@ def object_placed(
     grasp_sensor_name,
     threshold,
     velocity_threshold,
+    support_sensor_name,
   ).float()
 
 

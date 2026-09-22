@@ -16,6 +16,7 @@ def object_placed(
   grasp_sensor_name: str,
   threshold: float = 0.05,
   velocity_threshold: float = 0.05,
+  support_sensor_name: str | None = None,
 ) -> torch.Tensor:
   """Success: the object is at the goal, has been let go, and has come to rest.
 
@@ -24,9 +25,19 @@ def object_placed(
   up with a command that owned the goal, the grasp test and the success latch all at once.
   "Released and settled" is also the truer condition for a stack: a cube held motionless at
   the goal is not stacked, and a cube dropped from above is at the goal only briefly.
+
+  With `support_sensor_name`, additionally requires that the object was lifted at some
+  point this episode -- see `_placed_bool`. Gating only the success *reward* is not enough:
+  ending the episode early is itself worth the remaining time to a policy.
   """
   return _placed_bool(
-    env, command_name, object_name, grasp_sensor_name, threshold, velocity_threshold
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    velocity_threshold,
+    support_sensor_name,
   )
 
 

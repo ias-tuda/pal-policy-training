@@ -20,6 +20,8 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
 
+from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
+
 #: Same module-level singleton the observation terms use: a SceneEntityCfg built in an
 #: argument default is evaluated once at import and shared, which ruff flags as B008.
 _ROBOT = SceneEntityCfg("robot")
@@ -146,3 +148,16 @@ def reset_objects_on_surface(
     asset.write_root_link_velocity_to_sim(
       torch.zeros(n, 6, device=device), env_ids=env_ids
     )
+
+
+def reset_was_lifted(
+  env: ManagerBasedRlEnv, env_ids: Sequence[int] | torch.Tensor
+) -> None:
+  """Clear the `was_lifted` latch for the environments being reset.
+
+  Without this the latch is set once and never falls, so every episode after the first in a
+  given world would count a slide as a pick.
+  """
+  latch = getattr(env, _WAS_LIFTED, None)
+  if latch is not None:
+    latch[env_ids] = False

@@ -230,6 +230,52 @@ def r_c_phase_gated(ctx: RewardContext) -> dict[str, RewardTermCfg]:
   }
 
 
+def r_c_strict(ctx: RewardContext) -> dict[str, RewardTermCfg]:
+  """R-C with the slide path closed everywhere, not just on the `goal` term.
+
+  R-C gates only `goal` on the object being lifted, which leaves three terms that a policy
+  can collect by pushing the cube along the table into the target:
+
+  ===========  ==========================================================================
+  ``reach``    ``staged_position_reward`` = ``G(d_r)*(1 + G(d_g))``; the ``G(d_g)`` factor
+               is ungated, so it pays for the object being near the goal however it got
+               there.
+  ``release``  ``released_at_goal`` is ``at_goal ∧ ¬grasped``, and a cube never grasped is
+               trivially "released".
+  ``success``  ``_placed_bool`` uses the same ``¬grasped``, for both the 10-weight reward
+               and the termination that ends the episode.
+  ===========  ==========================================================================
+
+  So: ``reach`` drops to the reaching Gaussian alone, and ``release``, ``success`` and the
+  success *termination* all additionally require the `was_lifted` episode latch. What
+  remains payable without a lift is the approach itself, which is the point -- the policy
+  still gets a gradient towards the cube from step one.
+
+  The gate on the termination matters as much as the one on the reward: without it a slid
+  cube ends the episode, and the policy collects the remaining-time saving even with the
+  bonus withheld.
+
+  **This is the arm most exposed to Isaac Lab #204** (reach saturates, `lifting_object`
+  stays exactly 0), because nothing pays for closing the jaw until `lift_height` does. The
+  plan's pre-agreed fix is a `+1·grasped` term or `lift` weight 30-50 -- as a follow-up run,
+  not an edit to a running one.
+  """
+  staged = r_c_phase_gated(ctx)
+  staged["reach"] = RewardTermCfg(
+    func=mdp.reach_only,
+    weight=1.0,
+    params={"object_name": OBJECT, "reaching_std": 0.2, "asset_cfg": ctx.tcp},
+  )
+  lifted = {**ctx.grasp_params, "support_sensor_name": SUPPORT_SENSOR}
+  staged["release"] = RewardTermCfg(
+    func=mdp.released_at_goal, weight=2.0, params=lifted
+  )
+  staged["success"] = RewardTermCfg(
+    func=mdp.object_placed_reward, weight=10.0, params=lifted
+  )
+  return staged
+
+
 def r_d_keypoints(ctx: RewardContext) -> dict[str, RewardTermCfg]:
   """R-A with the centre-distance goal term replaced by eight-corner keypoints."""
   return {
@@ -263,9 +309,15 @@ REWARD_VARIANTS = {
   "R-A": r_a_framework,
   "R-B": r_b_sparse,
   "R-C": r_c_phase_gated,
+  "R-C-strict": r_c_strict,
   "R-D": r_d_keypoints,
   "R-E": r_e_time_penalty,
 }
+
+#: Arms whose success *termination* must also require the `was_lifted` latch. The reward
+#: dict cannot carry this on its own -- the termination is built by the tabletop factory --
+#: so `make_pick_place_env_cfg` reads this set.
+REQUIRE_LIFTED = frozenset({"R-C-strict"})
 
 #: Episode length per variant, where it differs. R-E buys its time penalty a shorter horizon.
 EPISODE_LENGTH_S = {"R-E": 12.0}
