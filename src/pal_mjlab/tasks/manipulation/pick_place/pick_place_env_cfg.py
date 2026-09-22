@@ -14,6 +14,7 @@ map is an unlearnable task, not a hard one.
 from __future__ import annotations
 
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
@@ -22,6 +23,7 @@ from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
+  REQUIRE_LIFTED,
   RewardContext,
   build_rewards,
   reward_curriculum_cfg,
@@ -32,6 +34,7 @@ from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   DR_LEVELS_THAT_MOVE_THE_TABLE,
   OBJECT,
   ROBOT,
+  SUPPORT_SENSOR,
   TABLE,
   apply_play_overrides,
   make_tabletop_env_cfg,
@@ -161,14 +164,23 @@ def make_pick_place_env_cfg(
   )
   cfg.curriculum = reward_curriculum_cfg()
 
+  success_params = {
+    "command_name": COMMAND,
+    "object_name": OBJECT,
+    "grasp_sensor_name": grasp_sensor,
+    "threshold": GOAL_THRESHOLD,
+  }
+  if reward in REQUIRE_LIFTED:
+    # Gating the reward without gating the termination would still let a slid cube end the
+    # episode early, which is worth remaining-time to the policy even with the bonus
+    # withheld. `SUPPORT_SENSOR` is what turns `_placed_bool` into `placed ∧ was_lifted`.
+    success_params["support_sensor_name"] = SUPPORT_SENSOR
+    # The latch is episode state, so it has to be cleared when the episode is.
+    cfg.events["reset_was_lifted"] = EventTermCfg(
+      func=mdp.reset_was_lifted, mode="reset"
+    )
   cfg.terminations["success"] = TerminationTermCfg(
-    func=mdp.object_placed,
-    params={
-      "command_name": COMMAND,
-      "object_name": OBJECT,
-      "grasp_sensor_name": grasp_sensor,
-      "threshold": GOAL_THRESHOLD,
-    },
+    func=mdp.object_placed, params=success_params
   )
 
   if play:

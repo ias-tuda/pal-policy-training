@@ -41,8 +41,14 @@ SEED="${SEED:?SEED must be set, e.g. sbatch --export=ALL,SEED=1 ...}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-20000}"
 RUN_TAG="${RUN_TAG:-c1}"
+# D10: one task id; the arm and the rung are selected by these two variables, which
+# `pick_place/kangaroo/env_cfg.py` reads at registration and validates against the names in
+# `rewards.py` / the DR ladder. They must be *exported*, not just set: a value supplied via
+# --export is already in the environment, but a default assigned here would otherwise be a
+# plain shell variable and the training process would silently get R-A/DR0.
 REWARD="${REWARD:-R-A}"
 DR="${DR:-DR0}"
+export REWARD DR
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -59,15 +65,18 @@ if [ "$actual_commit" != "$EXPECTED_COMMIT" ]; then
   exit 1
 fi
 
-# The reward variant and the DR level are not CLI flags on the task: the registered id
-# carries R-A at DR0, which is what C0 and C1 run. C2 needs a way to select the other
-# arms, and that is a decision for the C1 check-in -- refuse rather than train R-A
-# under a run name that claims otherwise.
-if [ "$REWARD" != "R-A" ] || [ "$DR" != "DR0" ]; then
-  echo "Refusing to run: this task id is R-A at DR0; asked for $REWARD at $DR." >&2
-  echo "Selecting a variant is a C2 question and is not wired to the CLI yet." >&2
+# Validate the names before the job takes a GPU for the ~4 min warp compile. The authority
+# is the registry itself -- this imports the same module `train` will, so there is one list
+# of valid names and it cannot drift from this script.
+if ! uv run --extra cu128 python -c \
+     "from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import kangaroo_pick_place_env_cfg as f; f()" \
+     >/dev/null 2>"$REPO/.reward_check.$$"; then
+  echo "Refusing to run: REWARD=$REWARD DR=$DR did not validate." >&2
+  tail -3 "$REPO/.reward_check.$$" >&2
+  rm -f "$REPO/.reward_check.$$"
   exit 1
 fi
+rm -f "$REPO/.reward_check.$$"
 
 echo "=== provenance ==="
 echo "commit      $actual_commit"
