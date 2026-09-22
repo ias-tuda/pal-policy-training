@@ -215,7 +215,11 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
   | 512 | RTX 3090 | 10 146 | 1.21 | 6.7 h |
   | 1024 | RTX 3090 | 15 320 | 1.60 | 8.9 h |
   | 2048 | RTX A5000 | 18 595 | 2.64 | 14.7 h |
+  | 2048 | **RTX 3090** | **19 930 - 21 847** | **2.21** | **~12 h** |
 
+  **The GPU is a bigger factor than `num_envs` co-location.** The three C1 seeds hit
+  19 930 / 20 349 / 21 847 steps/s; the two sharing gn03 are not the slow pair. Compare rows
+  only within a GPU -- the A5000 row understates 2048 envs by ~18 %.
   **4096 envs OOMs** (`Warp CUDA error 2` at graph launch) on the 24 GB cards
   `-C 'vram48gb|rtx3090|a5000'` selects, at both solver settings. Doubling `num_envs` buys
   1.75x / 1.51x / 1.21x — 2 CPUs cannot feed the GPU faster. Still ❌ on every other host.
@@ -257,12 +261,13 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0. **Pick-and-place v0: S1-S5 implemented, C0 done, C1 sized and not launched.**
-   C1 = R-A at DR0, 3 seeds, **2048 envs**, 20 000 iterations, `--time=30:00:00`
-   (14.7 h measured x 1.5 for node variance x margin). 2048 because 4096 OOMs and it is the
-   closest fit to the PPO recipe's assumed scale. Command template in
-   `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md`; `scripts/pick_place.sbatch` carries the
-   commit guard.
+0. **Pick-and-place v0: S1-S5 implemented, C0 done, C1 RUNNING since 2026-09-22 20:26.**
+   Jobs **157188 / 157189 / 157190**, seeds 1-3, 2048 envs, 20 000 iterations, commit
+   `e84d270`, `--time=30:00:00`. wandb `lq7yhwlm` / `0mk128al` / `jbs6n4w6` in
+   `20260922_oppsie`. **Health confirmed by API at 20:38** (state=running, iters 271-298,
+   20-22 k fps, no traceback/CUDA error in any log). Steady state 2.21 s/iter, **ETA ~12 h**,
+   so expect them finished ~2026-09-23 08:30. Read with `Episode_Reward/grasp` first --
+   see 1.
 1. **Report C1 as a transport result, not a picking one.** Every C0 run succeeds with
    `Episode_Reward/grasp` exactly 0: the goal sits at the cube's resting height
    (`TABLE_TOP_Z + 0.025`) and `_placed_bool`'s `released` is `~grasped`, so sliding the cube
