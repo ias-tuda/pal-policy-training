@@ -21,6 +21,18 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **New pick-and-place task for the Kangaroo:**
+  ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. The robot takes a 5 cm cube from a
+  lightly noised spot on the table and puts it down on a fixed target 20 cm
+  away, using the left arm only -- eight actions, seven arm joints and the jaw --
+  with the right arm held at its nominal pose and left out of the observation
+  vector. Built on the same ``make_tabletop_env_cfg`` as lift and stack, with
+  stack's release and success shaping and no second cube. The spawn and target
+  are not arbitrary: they are the two points in the measured top-down grasp map
+  of the table that are 20 cm apart with the most clearance to the edge of the
+  reachable region. Domain randomisation is selected by name (``dr="DR0"``, the
+  only level built so far), so a run's config records it.
+
 - **The tabletop manipulation tasks now hold the pose they start in.** Two fixes.
   First, a ``hold_nominal_targets`` reset event commands every joint to its
   configured default: mjlab zeroes all joint targets on reset and only the joints

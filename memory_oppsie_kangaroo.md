@@ -3,7 +3,7 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-22 (pick-and-place v0 stages S1 and S4 complete; reports in
+*Last updated: 2026-09-22 (pick-and-place v0 stages S1, S3 and S4 complete; reports in
 `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
@@ -28,7 +28,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Manipulation training framework (lift + stack, tabletop scene, MDP terms) | 🟡 commit `f33baec` — **first exercised 2026-09-21**: `Mjlab-Lift-Pal-Kangaroo-Grippers` builds and runs 500 steps on CPU under zero and random actions, no NaN, no auto-reset. Two defects found, see §5 |
 | Pick-and-place v0 S1 (scene, start pose, reach map, collision model) | ✅ complete — `../docs/reports/pick-place-v0/s1-report.md` |
 | Pick-and-place v0 S4 (holding the body) | ✅ complete — `../docs/reports/pick-place-v0/s4-report.md`, decision `../docs/decisions/0001-*.md` |
-| Pick-and-place v0 S2, S3, S5 | ❌ not started |
+| Pick-and-place v0 S3 (env + DR0) | ✅ complete — `Mjlab-PickPlace-Pal-Kangaroo-Grippers` registered, `../docs/reports/pick-place-v0/s3-report.md`. Cost per iteration still unmeasured (no GPU here) |
+| Pick-and-place v0 S2 (DR ladder above DR0), S5 (rewards, C0-C3) | ❌ not started |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
 | Any training run | ❌ none recorded |
 | `../docs/` (roadmap, decisions, reports, status summary) | 🟡 only `pick-place-v0-plan.md` so far |
@@ -67,7 +68,12 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 - **Pick-and-place v0 geometry (user decision, 2026-09-22):** object spawn centre
   (0.42, 0.27) +/- 2 cm, fixed target (0.42, 0.07, 0.785), 20 cm apart. Spawn clearance
   14.0 cm, target 4.5 cm — the target is 0.5 cm under the plan's 5 cm rule after S1.4;
-  (0.36, 0.07) would give 8.2 cm at the same separation if it is ever revisited.
+  (0.36, 0.07) would give 8.2 cm at the same separation if it is ever revisited. Both live in
+  `pick_place_env_cfg.py` as `SPAWN_XY` / `TARGET_XY`.
+- **DR level is a named argument, not prose** (`dr="DR0"`, `tabletop_env_cfg.apply_dr_level`).
+  The base tabletop cfg is *not* DR0: it randomises pad friction at startup and jitters the
+  commanded joints at reset, so "no randomisation" has to be asked for. Only DR0 is built;
+  asking for a higher rung raises.
 
 ## 4. Load-bearing facts
 
@@ -104,6 +110,15 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 - Motion conversion: `uv run -m pal_mjlab.scripts.csv_to_npz --input-file motions/<m>.csv
   --output-name <m> --input-fps 30 --output-fps 50 --robot-name <robot> --render True`.
 - **The console script is `list-envs`, not `list_envs`.**
+- **`reset_objects_on_surface`'s `pose_range` is relative to the table centre**, while
+  `LiftingCommand`'s `target_position_range` is relative to the *env origin*. A spawn point
+  measured in the env frame must be converted; the two are 0.55 m apart in x on this table.
+- **`JointPositionAction` is absolute**: `target = default_joint_pos + scale * action`
+  (`mjlab/envs/mdp/actions/actions.py:212-224`), and `clip_actions` defaults to `None`. With
+  the manipulation scales (0.10 rad on arm 1-5, 0.05 on the wrist) an action of magnitude 1
+  moves the Kangaroo's grasp point up to 16.3 cm — measured — so the start pose decides what
+  an untrained policy can reach. From the S1.2 pose both the spawn and the target are inside
+  the |action| <= 1 envelope.
 - **`MANIPULATION_COLLISION` filters out colliders that exist in the XML.** The grippers
   variant collides on feet, arm 5-7 and the gripper only — 43 of 110 geoms in the lift scene.
   `pelvis_2_collision` (torso capsule) and `arm_*_4_collision` are in `kangaroo_grippers.xml`
@@ -153,6 +168,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S1 scene probe, 2026-09-21 | `Mjlab-Lift-Pal-Kangaroo-Grippers`, play cfg, `num_envs=1`, cpu, torch seed 0 | local Mac (CPU, no `mujoco_warp_io.patch`) | 500 steps survived under both `zero` and `random`; no NaN, no auto-reset; cube rests at z = 0.785; 0 robot-robot contacts; legs collapse (§5.1) | `../docs/reports/pick-place-v0/s1-checkin-1-look-pose-reach.md` |
 | S1 reach map, 2026-09-22 | `scripts/reach_map.py --samples 50000 --seeds 48`, seed 0 | local Mac | 445 graspable cells pre-S1.4, 353 after | `s1-report.md`, `s1_reach_map_{baseline,tabletop}.npz` |
 | S1.4 collision model, 2026-09-22 | `get_kangaroo_grippers_tabletop_robot_cfg` | local Mac | 36 → 50 active robot colliders, 0 robot-robot contacts at rest, 21% of the graspable table lost | `s1-report.md` §4 |
+| S3 env validation, 2026-09-22 | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, `num_envs=1`, CPU | local Mac | `--agent zero` 500 steps: left arm max \|dq\| 0.0005 rad (limit 0.02). `--agent random` 1000 steps: no auto-reset, no termination, no NaN. 11.8 control steps/s — a laptop number, not a cost | `s3-report.md` |
 | S4 hold check, 2026-09-22 | `scripts/hold_check.py --steps 1000`, seed 0, 4 configurations | local Mac | before: pelvis 0.357 rad, right arm 0.246, leg length 0.491 m. After hold event + gravcomp: 0.007 / 0.019 / 0.004 — S4 acceptance PASS at steady state | `s4-report.md` |
 | *(no training run yet)* | | | | |
 
@@ -170,10 +186,11 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0. **Pick-and-place v0: S1 and S4 are done.** Next is **S2's DR0 plus S3's env cfg**, which
-   consume the spawn/target above; then the S5 baseline. S3's acceptance criterion needs
-   restating first — "max |Δq| < 0.02 rad" is met under zero actions but not as a peak under
-   random ones (`s4-report.md` §5).
+0. **Pick-and-place v0: S1, S3 and S4 are done; the task id exists and runs.** Next:
+   (a) **measure per-iteration cost** on `Geoffery`/`blackwell` at 1024/2048/4096 envs — the
+   one S3 exit criterion not met, and what C0's sizing depends on (command in `s3-report.md`
+   §6); (b) **S5's C0 smoke run**; (c) **S2's rungs above DR0**. Create
+   `../docs/status_summary.md` and the per-task document before the first real run.
 1. Write down what Oppsie is (§1 here and the header of `CLAUDE.md`), and its non-goals.
 2. Create the `siwei` branch off `main` and work there.
 3. Smoke-test the new manipulation tasks: `list_envs --keyword pal`, then `play

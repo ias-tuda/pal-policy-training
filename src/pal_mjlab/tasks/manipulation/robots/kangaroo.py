@@ -7,6 +7,8 @@ Everything else -- tasks, rewards, observations -- goes through
 
 from __future__ import annotations
 
+import dataclasses
+
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
   get_kangaroo_grippers_tabletop_robot_cfg,
 )
@@ -65,4 +67,18 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
   # Tabletop manipulation only: balance is PAL's controller's job, and a Kangaroo that
   # topples over drowns the manipulation reward signal in fall recovery.
   fixed_base=True,
+)
+
+
+# One-arm variant. Dropping the right arm from the action regex drops it from the observation
+# vector too -- `make_tabletop_env_cfg` builds `joint_pos`/`joint_vel` from the same
+# `action_joint_regex` -- so a single-arm task neither drives nor sees the arm it is not
+# using. Action dim 8: seven joints and the jaw.
+#
+# What holds the right arm once the policy stops commanding it is
+# `mdp.hold_nominal_targets` plus the gravity compensation from S4; before those, an arm
+# taken out of the action space was an arm commanded to zero.
+KANGAROO_GRIPPERS_LEFT_ARM = dataclasses.replace(
+  KANGAROO_GRIPPERS,
+  action_joint_regex=(r"arm_left_[1-7]_joint", r"gripper_left_finger_joint"),
 )
