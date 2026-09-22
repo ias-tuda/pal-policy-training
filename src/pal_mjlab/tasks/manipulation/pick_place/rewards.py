@@ -40,7 +40,6 @@ from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   OBJECT,
   SUPPORT_SENSOR,
   TABLE,
-  guard_reward_terms,
 )
 
 
@@ -276,7 +275,4 @@ DEFAULT_EPISODE_LENGTH_S = 20.0
 def build_rewards(name: str, ctx: RewardContext) -> dict[str, RewardTermCfg]:
   if name not in REWARD_VARIANTS:
     raise ValueError(f"unknown reward variant {name!r}; have {tuple(REWARD_VARIANTS)}")
-  # Every arm is guarded, so a divergence costs one zero-scored step in one world rather
-  # than the whole run. It replaces `.func` with a memoised wrapper, so terms that were the
-  # same function before still are -- see `guard_reward_terms`.
-  return guard_reward_terms(REWARD_VARIANTS[name](ctx))
+  return REWARD_VARIANTS[name](ctx)

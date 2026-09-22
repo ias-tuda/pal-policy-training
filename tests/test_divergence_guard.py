@@ -9,10 +9,11 @@ died at iteration 10 (1024 envs, 246k world-steps) and 15 (2048 envs, 737k), and
 whether divergence happens but whether the run survives it.
 
 The divergence itself is rare and GPU-only, so these tests do not wait for one -- they
-inject it, which is also the only way to assert the recovery deterministically. The two
-halves of the guard are checked separately because they fail separately: the termination
-alone still lets a NaN reward through (mjlab scores the step *before* it resets), and the
-reward wrapper alone leaves the world diverged forever.
+inject it, which is also the only way to assert the recovery deterministically. The guard is one term plus one config field, and most of the work is already mjlab's:
+`RewardManager.compute` sanitises every reward term unconditionally
+(`reward_manager.py:129`), and `ObservationGroupCfg.nan_policy` sanitises observations once
+it is switched on from its `"disabled"` default. What neither does is *recycle* the world,
+which is the part that matters -- a sanitised diverged world returns zeros forever.
 """
 
 import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
@@ -33,7 +34,11 @@ def _env(guard: bool = True, num_envs: int = NUM_ENVS) -> ManagerBasedRlEnv:
   cfg = make_pick_place_env_cfg(KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left")
   cfg.scene.num_envs = num_envs
   if not guard:
+    # Both halves, or this is not the pre-guard state: the sanitiser alone hides the NaN
+    # from the observations while leaving the world diverged forever.
     del cfg.terminations["non_finite_state"]
+    for group in cfg.observations.values():
+      group.nan_policy = "disabled"
   return ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
 
 
@@ -63,8 +68,12 @@ def test_a_diverged_world_is_terminated_and_recycled():
 
   assert bool(truncated[POISONED]), "the diverged world should have been truncated"
   assert not bool(truncated.sum() > 1), "only the poisoned world should have ended"
-  assert torch.isfinite(obs["actor"]).all(), "observations must be finite after the reset"
-  assert torch.isfinite(env.sim.data.qvel[POISONED]).all(), "the reset must clear the NaN"
+  assert torch.isfinite(obs["actor"]).all(), (
+    "observations must be finite after the reset"
+  )
+  assert torch.isfinite(env.sim.data.qvel[POISONED]).all(), (
+    "the reset must clear the NaN"
+  )
 
   # And the world keeps running afterwards rather than being permanently poisoned.
   obs, _, _, _, _ = _step(env)
@@ -100,7 +109,8 @@ def test_without_the_guard_the_nan_is_exactly_what_kills_a_run():
   """The positive control: the failure mode is real, and the guard is what removes it.
 
   Without this, the tests above would pass just as well on an environment that never
-  diverges in the first place.
+  diverges in the first place -- which is how the run that produced job 157178's traceback
+  would have looked to a test suite.
   """
   env = _env(guard=False)
   env.reset()
@@ -114,14 +124,18 @@ def test_without_the_guard_the_nan_is_exactly_what_kills_a_run():
 
 
 @pytest.mark.parametrize("variant", ["R-A", "R-C", "R-D"])
-def test_every_reward_term_is_wrapped(variant):
-  """A term added later and left unwrapped is the whole failure mode back again."""
+def test_observations_are_sanitised_on_every_variant(variant):
+  """mjlab's own backstop, which defaults to off and is useless left there.
+
+  It covers the residual case the termination cannot: a state finite in qpos/qvel that
+  still produces a non-finite observation, e.g. a velocity or sensor reading that
+  overflows on the way out.
+  """
   cfg = make_pick_place_env_cfg(
     KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=variant
   )
-  unwrapped = [
-    name
-    for name, term in cfg.rewards.items()
-    if getattr(term.func, "__wrapped__", None) is None
-  ]
-  assert not unwrapped, f"{variant}: unguarded reward terms {unwrapped}"
+  for name, group in cfg.observations.items():
+    assert group.nan_policy == "sanitize", f"{variant}/{name} left at mjlab's default"
+    # Per-term checking costs a host sync per term per step and answers a question
+    # `non_finite_state` has already answered.
+    assert not group.nan_check_per_term
