@@ -31,11 +31,12 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S3 (env + DR0) | ✅ complete — `Mjlab-PickPlace-Pal-Kangaroo-Grippers` registered, `../docs/reports/pick-place-v0/s3-report.md`. Cost per iteration still unmeasured (no GPU here) |
 | Pick-and-place v0 S2 (DR ladder) | ✅ complete — six rungs, `../docs/reports/pick-place-v0/s2-report.md`. Only DR0 and DR-object are in v0's scope; ranges above them are untuned |
 | Pick-and-place v0 S5 implementation (5 reward variants, regularisers, sbatch) | ✅ `../docs/reports/pick-place-v0/s5-report-part1.md` |
-| Pick-and-place v0 S5 experiments (C0-C3) | ❌ **not launched** — deployed to IAS and waiting on a go; cost still unmeasured |
+| Pick-and-place v0 S5 **C0** | ✅ **done 2026-09-22** — jobs 157183-157186, all 200/200 on IAS. Throughput and divergence rate measured, see §6/§7 |
+| Pick-and-place v0 S5 C1-C3 | ❌ C1 sized (2048 envs, 3 seeds, ~15 h each), not launched |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
-| Any training run | ❌ none recorded |
-| `../docs/` (roadmap, decisions, reports, status summary) | 🟡 only `pick-place-v0-plan.md` so far |
-| Per-run cost on any host | ❌ not measured |
+| Any training run to completion | ❌ none — C0 is a 200-iteration smoke test, not a policy |
+| `../docs/` (decisions, reports, status summary, per-task doc) | 🟡 all exist except `roadmap.md` |
+| Per-run cost | 🟡 measured on **IAS only** (§6); ❌ on every other host |
 
 ## 3. Design decisions taken
 
@@ -169,6 +170,20 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 5. What doesn't work / open problems
 
+0. **mujoco_warp does not reset a diverged world; MuJoCo's C engine does** (`mj_checkPos` /
+   `mj_checkVel` / `mj_checkAcc` reset `mjData` on a bad state; no such symbol exists in
+   `mujoco_warp/_src/`). A blown-up world therefore stays blown up and feeds NaN to the
+   learner forever. Handled by `mdp.non_finite_state` (commit `e84d270`); rate measured at
+   **0.031 % of episodes**, see §6.
+   - **Check what mjlab already does before writing a guard.** `RewardManager.compute`
+     sanitises every reward term unconditionally (`reward_manager.py:129`), and
+     `ObservationGroupCfg.nan_policy` implements warn/sanitize/error — it just defaults to
+     `"disabled"`, which is why the NaN reached rsl_rl and raised. A first version of the fix
+     duplicated the reward half for nothing (`9adc904`, removed in `3cc2b1b`).
+   - **Time-to-first-failure with n=1 is a badly biased rate estimate.** Three such
+     observations gave "one per 0.5 M world-steps"; measuring properly once runs survived
+     gave **one per 2.76 M** — 5.5x out.
+
 1. *(fixed 2026-09-22, S4)* `ctrl` is 0 for all 30 actuators after `reset()` --
    `Entity.clear_state` zeroes `joint_pos_target` (`mjlab/entity/data.py:238`) and only action
    joints get one written back. `mdp.hold_nominal_targets` now writes the defaults back. Left
@@ -183,8 +198,24 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 6. Current best settings
 
-- **Cost:** ❌ unmeasured on every host. Measure minutes per 1000 PPO iterations at a fixed
-  `--env.scene.num-envs` once per host and record it here; all sizing keys off it.
+- **Cost — IAS cluster, `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, measured 2026-09-22**
+  (at iteration 199, so warp's ~3.5 min cold compile is excluded; `num_steps_per_env=24`):
+
+  | envs | GPU | steps/s | s/iter | 20 k iters |
+  |---|---|---|---|---|
+  | 256 | — | 5 786 | 1.14 | 6.3 h |
+  | 512 | RTX 3090 | 10 146 | 1.21 | 6.7 h |
+  | 1024 | RTX 3090 | 15 320 | 1.60 | 8.9 h |
+  | 2048 | RTX A5000 | 18 595 | 2.64 | 14.7 h |
+
+  **4096 envs OOMs** (`Warp CUDA error 2` at graph launch) on the 24 GB cards
+  `-C 'vram48gb|rtx3090|a5000'` selects, at both solver settings. Doubling `num_envs` buys
+  1.75x / 1.51x / 1.21x — 2 CPUs cannot feed the GPU faster. Still ❌ on every other host.
+- **Solver divergence rate:** 8 events over 22.1 M world-steps, four configurations =
+  **0.031 % of episodes, 95 % CI [0.013 %, 0.061 %]**, one per 2.76 M world-steps. The plan's
+  abort gate is 0.1 % and this clears it. Raising `iterations`/`ls_iterations` to 100/50 is
+  **not** shown to help: the one run that tried it was on different hardware and its lower
+  count (1 vs 3) is consistent with the same Poisson rate.
 - **Known-good configuration:** `make sync` (= `uv sync --all-extras --all-packages`);
   `make test` (= `uv run --extra cpu pytest`, `FORCE_CPU=1` to force CPU on a GPU box);
   `make format` (ruff format + `ruff check --fix`). Upstream README's suggested training scale is
@@ -201,36 +232,40 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S2 DR ladder, 2026-09-22 | `tests/test_manipulation_dr_ladder.py`, 4 envs per rung, CPU | local Mac | every rung varies exactly the model fields it claims; DR0 varies none; object mass lands in 0.030-0.098 kg with inertia tracking it | `s2-report.md` |
 | S3 env validation, 2026-09-22 | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, `num_envs=1`, CPU | local Mac | `--agent zero` 500 steps: left arm max \|dq\| 0.0005 rad (limit 0.02). `--agent random` 1000 steps: no auto-reset, no termination, no NaN. 11.8 control steps/s — a laptop number, not a cost | `s3-report.md` |
 | S4 hold check, 2026-09-22 | `scripts/hold_check.py --steps 1000`, seed 0, 4 configurations | local Mac | before: pelvis 0.357 rad, right arm 0.246, leg length 0.491 m. After hold event + gravcomp: 0.007 / 0.019 / 0.004 — S4 acceptance PASS at steady state | `s4-report.md` |
-| *(no training run yet)* | | | | |
+| **C0, 2026-09-22** | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, R-A/DR0, seed 1, 200 iters, jobs **157183-157186** @ `9adc904` | IAS (gn02/gn03/gn08; 3090 + A5000), `mujoco_warp_io.patch` NOT applied | **all four 200/200.** Throughput and divergence rate in §6. The same 1024-env config died at iteration 10 before the guard (157178). `Episode_Reward/grasp` = 0.0000 in every run while `success` fires — the policy slides the cube; see below | wandb `20260922_oppsie` tag `c0r`; `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md` |
+| Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
 
 | host | what is installed / checked out there | last verified |
 |---|---|---|
-| local Mac | this checkout, `main` @ `f33baec`, clean; git source of truth | 2026-09-21 |
+| local Mac | this checkout, **`siwei` @ `e84d270`**, clean; git source of truth. Nothing pushed to `origin` — no push has been authorised | 2026-09-22 |
 | `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified | — |
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
 | `limx4090` | not verified for this repo | — |
-| IAS Slurm (`mn.ias...`) | **this repo deployed 2026-09-22**: `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` @ `4257e90`, hash-verified; `uv` 0.12.17 at `~/.local/bin`; `uv sync --frozen --extra cu128` done (same versions as the Mac); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` created. Deployed by git bundle over scp, not by pushing to origin. ~7 free GPUs matching `vram48gb\|rtx3090\|a5000` at deploy time | 2026-09-22 |
+| IAS Slurm (`mn.ias...`) | **this repo deployed 2026-09-22**: `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` @ **`e84d270`**, hash-verified per file; `uv` 0.12.17 at `~/.local/bin`; `uv sync --frozen --extra cu128` done (same versions as the Mac); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` created. Deployed by git bundle over scp, not by pushing to origin. ~7 free GPUs matching `vram48gb\|rtx3090\|a5000` at deploy time | 2026-09-22 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
 
-0. **Pick-and-place v0: S1-S4 done, S5 implemented and deployed to IAS; nothing launched.**
-   Next, in order: (a) **C0** — 1 seed, 256 envs, 200 iterations, ~1 GPU-hour, the exact
-   `sbatch` line is in `s5-report-part1.md` §4. It is the first GPU run of this task and the
-   only source of the per-iteration cost everything else is sized from; (b) size and launch
-   **C1** (R-A, DR0, 3 seeds) from C0's numbers; (c) the plan's check-in before C2.
-   Decide before launching: the wandb project name (`oppsie-pick-place-v0`, does not exist
-   yet) and how C2 selects a reward arm (more task ids goes beyond D7).
-   Create `../docs/status_summary.md` and `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md`
-   with C0's numbers — CLAUDE.md requires both and neither exists.
-1. Write down what Oppsie is (§1 here and the header of `CLAUDE.md`), and its non-goals.
-2. Create the `siwei` branch off `main` and work there.
-3. Smoke-test the new manipulation tasks: `list_envs --keyword pal`, then `play
-   Mjlab-Lift-Pal-Kangaroo-Grippers --agent zero` and `--agent random`; add a launch test under
-   `tests/` mirroring `test_kangaroo_velocity_task_launch.py`.
-4. Pick the training host, install the repo there with `uv`, and measure the per-iteration cost;
-   fill §6.
-5. Create `../docs/roadmap.md` and `../docs/status_summary.md` before the first real run.
+0. **Pick-and-place v0: S1-S5 implemented, C0 done, C1 sized and not launched.**
+   C1 = R-A at DR0, 3 seeds, **2048 envs**, 20 000 iterations, `--time=30:00:00`
+   (14.7 h measured x 1.5 for node variance x margin). 2048 because 4096 OOMs and it is the
+   closest fit to the PPO recipe's assumed scale. Command template in
+   `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md`; `scripts/pick_place.sbatch` carries the
+   commit guard.
+1. **Report C1 as a transport result, not a picking one.** Every C0 run succeeds with
+   `Episode_Reward/grasp` exactly 0: the goal sits at the cube's resting height
+   (`TABLE_TOP_Z + 0.025`) and `_placed_bool`'s `released` is `~grasped`, so sliding the cube
+   20 cm satisfies success. The plan predicted this and R-C exists to gate it.
+2. **Decide how C2 selects a reward arm.** The registered id is R-A at DR0 and the sbatch
+   refuses anything else. Four more task ids goes beyond the plan's D7 — a decision, not a
+   judgment call.
+3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
+   non-goals. Still the oldest open item in the repo.
+4. Create `../docs/roadmap.md` — named in `CLAUDE.md` as the entry point, still missing.
+5. Measure per-iteration cost on `Geoffery` / `blackwell` / `limxH100`; §6 covers IAS only.
+6. `tests/` covers the manipulation MDP terms only through the pick-place suites; no
+   `Mjlab-Lift-*` / `Mjlab-Stack-*` training run is recorded, and their `env_spacing` bug
+   means any pre-`2f4671a` result against them would have been invalid anyway.
