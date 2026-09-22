@@ -30,12 +30,9 @@ with them cannot be driven on hardware until the C++ node is extended. Keep thes
 
 from __future__ import annotations
 
-import functools
-import inspect
 import math
 from collections.abc import Mapping
 
-import torch
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -135,42 +132,6 @@ def make_hand_surface_sensor(
   )
 
 
-@functools.lru_cache(maxsize=None)
-def _finite(func):
-  """Wrap a reward term so a diverged world scores zero instead of NaN.
-
-  `non_finite_state` recycles a diverged world, but mjlab computes rewards *before* it
-  resets (`manager_based_rl_env.py`: terminations -> rewards -> events -> `_reset_idx`),
-  so that step's reward is still read off the blown-up state. rsl_rl's `check_nan` checks
-  rewards as well as observations, so without this the run still dies -- one step later.
-
-  Zero is the right value: the step did not happen, as far as the task is concerned.
-  `nan_to_num` also clamps +-inf, which a large-but-finite state produces before it goes
-  fully non-finite.
-
-  Memoised so that wrapping is idempotent in identity as well as behaviour -- two cfgs
-  built from the same term function still compare equal on `.func`, which is how the
-  reward-variant tests tell a swapped term from an untouched one.
-  """
-  if inspect.isclass(func):  # mjlab instantiates class terms itself; leave them be.
-    return func
-
-  @functools.wraps(func)
-  def finite(*args, **kwargs):
-    return torch.nan_to_num(func(*args, **kwargs), nan=0.0, posinf=0.0, neginf=0.0)
-
-  return finite
-
-
-def guard_reward_terms(
-  rewards: dict[str, RewardTermCfg],
-) -> dict[str, RewardTermCfg]:
-  """Apply `_finite` to every term in a reward dict, in place."""
-  for term in rewards.values():
-    term.func = _finite(term.func)
-  return rewards
-
-
 def make_tabletop_env_cfg(
   robot: ManipulationRobotCfg,
   gripper_name: str | None = None,
@@ -200,7 +161,8 @@ def make_tabletop_env_cfg(
     dr_level: domain-randomisation rung by name, or None to leave the base cfg's own
       randomisation alone. See `DR_LEVELS`. Spelled `dr_level` rather than `dr` only because
       this module imports mjlab's `dr` term namespace; the task factories expose it as `dr`.
-    guard_divergence: terminate and zero-score any world whose physics goes non-finite.
+    guard_divergence: terminate any world whose physics goes non-finite, and sanitise
+      observations as a backstop.
       On by default because contact-rich GPU sim diverges at a measured ~1 per 0.5M
       world-steps here and `mujoco_warp` does not reset a diverged world by itself; off
       reproduces the pre-guard behaviour, in which the first divergence kills the run.
@@ -406,7 +368,16 @@ def make_tabletop_env_cfg(
     terminations["non_finite_state"] = TerminationTermCfg(
       func=mdp.non_finite_state, time_out=True
     )
-    guard_reward_terms(rewards)
+    # The backstop, for a state that is finite in qpos/qvel but produces a non-finite
+    # observation anyway -- a velocity or sensor reading that overflows on the way out.
+    # Rewards need no equivalent: mjlab's RewardManager.compute already sanitises every
+    # term unconditionally (reward_manager.py:129).
+    for group in observations.values():
+      group.nan_policy = "sanitize"
+      # One check on the concatenated group rather than one per term. Per-term checking
+      # forces a host sync per term per step, and the term is not the interesting answer
+      # anyway -- `non_finite_state` already says the physics diverged.
+      group.nan_check_per_term = False
 
   sensors = [
     make_grasp_sensor(gripper, OBJECT),
