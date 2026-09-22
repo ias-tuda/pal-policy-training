@@ -191,6 +191,13 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      impulse. Consistent with the four-bar's 1e-4 armature. **Not fixed**: raising it touches
      `kangaroo_constants.py`, which every grippers task instantiates, and the rate already
      clears the abort gate.
+   - **`Metrics/goal_pose/episode_success` is NOT the placed rate and overstates it.** It is
+     `at_goal` *latched* -- a pure distance test, no release, no settle -- so a cube shoved
+     through the goal region counts forever. `placed` needs `at_goal ∧ released ∧ settled`
+     at the same instant. Measured 2026-09-22 (job 157248, C1 seed 1 @ 2300 iters): 2.6 %
+     `episode_success` against **0.0 % placed over 200 episodes**, with `grasped` at 0 %.
+     Report the placed rate from `scripts/eval_pick_place.py`; use `episode_success` only as
+     a between-arm comparator.
    - **Contact sensors are empty until the first step after a reset**, and a teleport does
      not refresh them. Reading `object_table_contact` straight after `reset()` reports "not
      on the surface" for a cube visibly resting on one, which makes `object_lifted` collapse
