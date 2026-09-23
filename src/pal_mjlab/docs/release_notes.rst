@@ -21,6 +21,33 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **Changed: the Kangaroo arm and pelvis gains, for every task.** The arms
+  and pelvis now use the SysID training gains (stiffness 49.94 / 26.18 N·m/rad,
+  damping 3.18 / 1.67, effort 50 / 25 N·m for shoulder / rest of the arm; both
+  pelvis joints 49.94 / 3.18 / 50) instead of PAL's impedance-controller
+  values. This affects the velocity, reaching and tracking tasks as well; in the
+  velocity and reaching tasks the ``pelvis_2`` action scale drops from 0.625 to
+  0.25 rad as a result. Results trained before this change used different arm
+  and pelvis dynamics.
+
+- **Changed: the tabletop Kangaroo robot (Lift, Stack, PickPlace) is aligned
+  with the stacking branch.** Five changes, from Claudius Kienle's
+  ``fix-stack-exploration-collapse`` branch:
+
+  - The torso, pelvis, base and upper arms now collide, using PAL's own
+    collision hulls and the arm meshes (``kangaroo_grippers.xml``).
+  - Both arms start in front of the torso, above the table.
+  - The arms' commanded targets move no faster than the hardware's joint speeds
+    (1.95 / 2.35 rad/s).
+  - Gravity compensation counts against the joint effort limits.
+  - A new ``trunk_clearance`` penalty discourages the arms from approaching the
+    torso, and a new ``out_of_reach`` termination ends an episode when the cube
+    is more than 0.75 m from the robot.
+
+  In ``Mjlab-PickPlace-Pal-Kangaroo-Grippers`` the arm action scales are
+  re-derived for the new start pose (0.60-0.75 rad, and 2.35 on the wrist). A
+  scripted pick-and-place still succeeds in 10 of 10 spawns.
+
 - **Changed: ``Mjlab-PickPlace-Pal-Kangaroo-Grippers`` trains with a new PPO
   recipe by default.** Exploration now starts narrower and is bounded: a
   log-space action std starting at 0.35 and clamped to [0.001, 0.5], entropy
