@@ -273,17 +273,66 @@ def waypoints(
   return out
 
 
+#: IK restarts per waypoint: seeds around the previous waypoint first (their spread widening
+#: in rad), then seeds uniform over the soft limits. Interpolated configurations checked per
+#: joint-space segment.
+IK_LOCAL_ATTEMPTS = 24
+IK_SEED_STD = (0.3, 0.6, 1.0)
+IK_GLOBAL_ATTEMPTS = 96
+SEGMENT_CHECKS = 12
+
+
+def segment_free(kin: Kin, a: np.ndarray, b: np.ndarray) -> bool:
+  """No arm contact anywhere on the straight joint-space path from ``a`` to ``b`` -- the path
+  the rollout interpolates along."""
+  return not any(
+    kin.in_collision(a + (b - a) * (k / SEGMENT_CHECKS))
+    for k in range(1, SEGMENT_CHECKS + 1)
+  )
+
+
 def _solve(kin: Kin, name: str, goal: np.ndarray, hand_x: np.ndarray, q: np.ndarray):
-  """IK seeded from ``q`` first -- to stay on its solution branch -- then restarts near it."""
+  """A contact-free IK solution reachable from ``q`` along a contact-free straight path.
+
+  Seeded from ``q`` first -- to stay on its solution branch -- then restarts around it, then
+  (only if none of those works) seeds spread over the whole joint range, keeping the
+  candidate closest to ``q``. Changed 2026-09-23 (S5.1): with the item-8 mesh colliders, the
+  smallest-excursion solution for `carry` over the target folds arm 3-4 64 mm into the torso
+  hull, which S1.4's boxes had let through; the elbow-out branch exists (a global search
+  finds it) but the pull toward the start pose never reaches it. The segment check matters
+  as much as the endpoint: an elbow-in `lift` followed by an elbow-out `carry` is two
+  contact-free poses with the chest between them.
+  """
   rng = np.random.default_rng(0)
-  for attempt in range(8):
+  last_hits: list[tuple[str, str]] = []
+
+  def accept(sol):
+    nonlocal last_hits
+    if sol is None:
+      return False
+    last_hits = kin.in_collision(sol)
+    return not last_hits and segment_free(kin, q, sol)
+
+  for attempt in range(IK_LOCAL_ATTEMPTS):
+    std = IK_SEED_STD[attempt * len(IK_SEED_STD) // IK_LOCAL_ATTEMPTS]
     seed = (
-      q if attempt == 0 else np.clip(q + rng.normal(0, 0.3, q.shape), kin.lo, kin.hi)
+      q if attempt == 0 else np.clip(q + rng.normal(0, std, q.shape), kin.lo, kin.hi)
     )
     sol = kin.ik(goal, hand_x, seed)
-    if sol is not None:
+    if accept(sol):
       return sol
-  raise RuntimeError(f"no IK for {name} at {goal.round(3)}")
+  best = None
+  for _ in range(IK_GLOBAL_ATTEMPTS):
+    sol = kin.ik(goal, hand_x, rng.uniform(kin.lo, kin.hi))
+    if accept(sol):
+      d = float(np.abs(sol - q).max())
+      if best is None or d < best[0]:
+        best = (d, sol)
+  if best is not None:
+    return best[1]
+  if last_hits:
+    raise RuntimeError(f"{name} at {goal.round(3)} collides: {last_hits[:3]}")
+  raise RuntimeError(f"no contact-free IK for {name} at {goal.round(3)}")
 
 
 def replan_place(
@@ -377,7 +426,7 @@ def derive(args: argparse.Namespace) -> dict:
     )
     print(
       f"{name:18s} {kin.q_default[j]:8.3f} {dev[j]:8.3f} {need:7.3f} "
-      f"{current[name]:8.2f} {cap:6.2f} {scale:6.2f}  {worst[j]}"
+      f"{current[name]:8.4f} {cap:6.2f} {scale:6.2f}  {worst[j]}"
     )
   result = dict(
     task=TASK,
@@ -399,16 +448,15 @@ def _jid(model: mujoco.MjModel, name: str) -> int:
 
 
 def _current_arm_scales() -> list[float]:
-  """The scales C1/C2 ran with -- the floor of the rule, per the plan."""
-  import re
+  """The floor of the rule: the SysID training scale 0.25 * effort / K of each arm joint
+  (S5.1 item 3: "use his 0.25 where it suffices") -- 0.2503 rad on arm 1-2, 0.2388 on 3-7.
+  Until S5.1 the floor was the scales C1/C2 ran with."""
+  from pal_mjlab.robots.pal_kangaroo import kangaroo_constants as kc
 
-  from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS
+  def sysid(block: dict) -> float:
+    return 0.25 * block["effort_limit"] / block["stiffness"]
 
-  scale = KANGAROO_GRIPPERS.action_scale
-  assert isinstance(scale, dict)
-  return [
-    next(v for pat, v in scale.items() if re.fullmatch(pat, j)) for j in ARM_JOINTS
-  ]
+  return [sysid(kc.S_PLUS)] * 2 + [sysid(kc.S_MINUS)] * 3 + [sysid(kc.XS)] * 2
 
 
 # --------------------------------------------------------------------------------------
