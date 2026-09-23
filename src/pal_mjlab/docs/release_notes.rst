@@ -21,6 +21,28 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **Changed: ``Mjlab-PickPlace-Pal-Kangaroo-Grippers`` trains with a new PPO
+  recipe by default.** Exploration now starts narrower and is bounded: a
+  log-space action std starting at 0.35 and clamped to [0.001, 0.5], entropy
+  bonus 0.001 instead of 0.005, learning rate 3e-4 instead of 1e-3, and 32
+  steps per environment per iteration instead of 24. The recipe comes from
+  Claudius Kienle's stacking branch (``fix-stack-exploration-collapse``). As
+  with the reward and DR level, it is selected by an environment variable,
+  ``PPO=PPO-stack`` (the default) or ``PPO=PPO-A`` for the previous recipe, and
+  ``scripts/pick_place.sbatch`` puts it in the run name and wandb tags. Lift
+  and Stack are unchanged.
+
+- **Changed: the ``DR-robot`` and ``DR-obs`` levels of the tabletop
+  domain-randomisation ladder.** ``DR-robot`` now randomises joint friction
+  per joint group (arm 0-1.0 N·m, jaw 0-0.02 N·m, previously 0-0.1 N·m on
+  every driven joint) and adds joint damping (arm 0-0.05, jaw 0.02-0.04
+  N·m·s/rad). ``DR-obs`` replaces its ±15 mm / ±0.05 rad zero-mean object noise
+  with a tracker error model: an 8 mm / 0.03 rad offset held for the episode,
+  2 mm / 0.01 rad per-step jitter, and 0-2 control steps of lag, on the
+  policy's observations only. Both are on the driven arm and jaw only; a parked
+  arm is not randomised. ``DR0`` through ``DR-contact``, which is what has been
+  trained so far, are unchanged.
+
 - **Changed: the Kangaroo jaw is stable in the tabletop manipulation tasks.**
   Driven over its full range, the gripper's passive linkage joints vibrated at
   up to ~2000 rad/s until the simulation diverged, and at the old jaw gain a
