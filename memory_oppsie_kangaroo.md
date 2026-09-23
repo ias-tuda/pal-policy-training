@@ -37,6 +37,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S5 **C2** | 🛑 cancelled 2026-09-23 and **invalidated** (157239-157241), same cause |
 | Pick-and-place v0 **S5.0** (make the grasp possible) | ✅ **done 2026-09-23** @ `a566363`: gate 1 scripted pick-and-place 9/10 (10/10 grasped + lifted, now a test); gate 2 reach 43.5 cm; **gate 3 NaN 0.011 %** (IAS job 157575, gate 0.1 %) — `../docs/reports/pick-place-v0/s5-0-report.md` |
 | Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
+| Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **implemented 2026-09-23** on `siwei-s5.1-chain` @ `b0f8b85` (**merge into `siwei` pending, a check-in**) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
+| Pick-and-place v0 **c1a screen** | ⏳ 10 jobs 157648–157657 on IAS (`-align` checkout, `b0f8b85`), started 2026-09-23 ~22:25, read at 3–4 k iters; ids in `../docs/run_log.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -251,6 +253,20 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      affected. Draft issue `../docs/upstream/mjlab-additive-bias-random-walk.md`.
    - **mjlab string-keyed DR `ranges` ignore `asset_cfg.joint_names`** — the keys match every
      joint of the entity. `tabletop_env_cfg._on_joints` restricts them to the action joints.
+   - **`actgravcomp` alone is unbounded under mjlab position actuators.** mjlab puts the
+     effort limit on the actuator `forcerange` (PD only); MuJoCo clamps an actgravcomp joint
+     only by the *joint* `actuatorfrcrange`, which mjlab leaves unset (46 N·m through a 1 N·m
+     limit). Set both (`kangaroo_constants._route_gravcomp_through_actuators`).
+   - **Claudius's trunk/arm 1-4 colliders are inert on his branch** (his robot keeps
+     `MANIPULATION_COLLISION`, which zeroes unlisted geoms). Live here since S5.1 item 8: 49
+     robot colliders, 0 at rest, none colliding by construction over 2000 random poses.
+   - **With live mesh colliders the pick-place target is only reachable elbow-out**: the
+     start-pose-seeded IK folds arm 3-4 64 mm into the torso at `carry`; 2/87 random-seed
+     solutions are contact-free. `scripted_pick_place._solve` now demands contact-free
+     waypoints *and* segments. The home pose (gripper looking forward) makes every top-down
+     grasp turn the wrist ~1.5 rad: wrist scale 2.35.
+   - **Per env-step the aligned config costs the same on GPU** as the 0002 config (0.101 s,
+     ~20 200 env-steps/s on a 3090); PPO-stack's 32 steps/env is the whole iteration increase.
    - **`Metrics/goal_pose/episode_success` is NOT the placed rate and overstates it.** It is
      `at_goal` *latched* -- a pure distance test, no release, no settle -- so a cube shoved
      through the goal region counts forever. `placed` needs `at_goal ∧ released ∧ settled`
@@ -328,6 +344,9 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S5.0 envelope + shake, 2026-09-23 | `scripts/action_envelope.py --scales {old,new}`, 32 envs, seed 0, CPU | local Mac | reached 14.4 → **43.5 cm**; four-bar peak 93 → **307 rad/s**; 0 `non_finite_state` in 32 k env-steps each | `s5-0-report.md` §6-7, `artifacts/s5.0/envelope_*` |
 | **S5.0 gate 3, 2026-09-23** | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, R-A/DR0, seed 1, 2048 envs, 200 iters, job **157575** @ `a566363` (jaw 0.95, S5.0 scales, pre-S6 four-bar) | IAS gn06 A5000, patch NOT applied | 200/200 in 11:30, 2.88 s/iter. **2 `non_finite_state` (iters 130, 169) in ~18 700 episodes = 0.011 %**, CI [0.0013, 0.039] % — no rise vs C0 despite 3.3x local shake excitation (policy noise is gentler than uniform random). `object_dropped` now ~46 % of terminations | wandb `20260922_oppsie` `loi5qo2r`; `s5-0-report.md` §8 |
 | **S5.1 four-bar bench, 2026-09-23** | `scripts/gripper_bench.py` (fixed @ `2348670`), 256 worlds x 20 s + random at 1024 worlds (10.24 M steps) + 64 x 5 s shake ablation; S5.0 model @ `f44f68a` | local Mac, CPU | divergences in 10.24 M: S5.0 42, 0002 / CK-tabletop / CK-stack / hybrid 0. Held-cube grasp: 0002 and hybrid 64/64, 0 drops (5 s); Claudius's kp-20 jaw buckles or does not hold | `s5-1-parallel-report.md` §3, `artifacts/s5.1-bench/` (worktree) |
+| **S5.1 chain gate 1, 2026-09-23** | `scripted_pick_place.py rollout --num-envs 10` @ `40ed408` | local Mac | 10/10 placed and lifted, 0 clipped, 0 over-slew | `s5-1-report.md` §2 |
+| **S5.1 NaN gate, 2026-09-23** | R-A/DR0 s1, 2048 envs, 200 iters, PPO-stack, job **157646** @ `b0f8b85` | IAS gn02 3090 | 3 `non_finite_state` / ~16 300 episodes = 0.021 % (CI 0.004-0.054); 3.24 s/iter | wandb `k3ylpaa1`; `s5-1-report.md` §3 |
+| **c1a screen, 2026-09-23** | 10 jobs 157648-157657 @ `b0f8b85` (R-A x2, R-C x2, R-C-strict x3, lift30, 2x PPO-A) | IAS | ⏳ running | `run_log.md`, `s5-1-report.md` §4 |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -340,31 +359,18 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | `limxH100` | not verified for this repo | — |
 | `limx4090` | not verified for this repo | — |
 | IAS Slurm (`mn.ias...`) | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` fast-forwarded to **`a566363`** 2026-09-23 (bundle `~/siwei_a566363.bundle`, md5-verified); `uv sync --frozen --extra cu128` current (mjlab 1.6.0, mujoco/mujoco-warp 3.11.0, warp 1.15.0, torch 2.10.0); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` exists. First deployed 2026-09-22 at `e84d270` | 2026-09-23 |
+| IAS `-align` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-align`, cloned from bundle `~/align_s51.bundle` (sha256-verified) on branch `siwei-s5.1-chain` @ `b0f8b85`; own `uv sync --frozen --extra cu128` (same pins), own `slurm_logs/`; jobs pass `REPO=` to `pick_place.sbatch`. The main checkout is not touched by S5.1 | 2026-09-23 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
 
-0. ~~S5.0 gate 3~~ **passed**, job 157575: 0.011 % (see §7). S5.0 is done.
-   **Note (S6):** ~~bench rejects the rate limit (0/64 grasps)~~ *(bench artefact, fixed
-   `2348670`: 0002 + slew grasps 64/64)*; bench rates today's model + S5.0
-   clip as the worst divergence configuration -- consider running gate 3 on the
-   decision-0002 model. *(S5.0, after 157575: at training's own action distribution that
-   configuration measured 0.011 %, so the bench's ranking is about uniform-random stimuli;
-   a C1r on the 0002 model still needs its own gate-3 re-check.)*
-1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
-   `c1r`/`c2r`, read at 3-4 k iters with `eval_pick_place.py`. A check-in before submission.
-   Once `siwei-s5.1-parallel` is merged they run `PPO=PPO-stack` by default (32 steps/env:
-   ~33 % more per iteration than §6's costs). S5.1 item 5 is closed: **0002 is the jaw**
-   (user, 2026-09-23); Claudius's four-bar settings are not ported. S5.1 item 4 (arm slew)
-   is unaffected -- it is about the arms, and still in the 🔗 chain.
-2. **S6: decision 0002 landed** (`72d02fb`; deploy `siwei` @ `17009cc`). `make test` 159
-   passed. The scripted gate first failed on it (2/10); the cause was the *script* (every
-   cube 26-41 mm off at release on either jaw, the old 9/10 was drift), fixed in `0fc65d9`
-   with settle waits + a lifted xy place correction: 10/10 on both jaws. **Next: one
-   C0-style IAS job on `17009cc`** (RUN_TAG s50nan0002; needs user approval) -- it is 0002's
-   acceptance (<= 0.01 %) and gate 3 on the new jaw; 157575 was the old jaw. The S5 session
-   agreed to own that job, then exited before it got the hash. Open: 3.2 deg pad wedge lets
-   a cube creep ~2 mm/s under violent shaking (geometry, not stability).
+0. **Read the c1a screen at 3-4 k iterations** (jobs 157648-157657): grasp/lift curves,
+   `non_finite_state`, `eval_pick_place.py` placed and placed∧was_lifted; fill
+   `s5-1-report.md` §4 and `run_log.md`. The #204 fallback (lift 30) is already one arm.
+1. **Merge `siwei-s5.1-chain` into `siwei`** (a check-in; do not push). Gate 2 (reach
+   envelope) result goes in the report first.
+2. **The jaw misses its own 0.01 % NaN bar** on both 0002 configs (157635 0.026 %, 157646
+   0.021 %); the plan's 0.1 % gate passes. Decision 0002 records it; not blocking the screen.
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
    non-goals. Still the oldest open item in the repo.
 4. Create `../docs/roadmap.md` — named in `CLAUDE.md` as the entry point, still missing.
