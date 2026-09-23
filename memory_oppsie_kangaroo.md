@@ -223,9 +223,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      `gripper_left_fingertip_*_joint` hit 71 and 63 rad/s and cross 20 rad/s 32 steps before
      the actuated jaw joint, while `arm_left_5_joint` never exceeds 2.8 rad/s. The velocity
      trace oscillates and grows over ~0.18 s — a stiff linkage ringing, not a contact
-     impulse. Consistent with the four-bar's 1e-4 armature. **Not fixed**: raising it touches
-     `kangaroo_constants.py`, which every grippers task instantiates, and the rate already
-     clears the abort gate.
+     impulse. Consistent with the four-bar's 1e-4 armature. **S6 bench (2026-09-23,
+     `scripts/gripper_bench.py`, `../docs/reports/pick-place-v0/s6-report.md`) reproduces
+     it** (fingertip joints lead) and finds the fix: passive armature 5e-3 + jaw kp 20 -> 8
+     + jaw clip 0.78 = peak 2013 -> 8.3 rad/s, CPU divergences 4 -> 0 in 2.56 M physics
+     steps. **Proposed as decision 0002, not landed.** Also measured: softer equalities
+     (plan's L4 suspect) are *worse*; kp 20 buckles the linkage on a centred cube (~117 N
+     per pad); the jaw physically stops at 0.824 rad, not 0.95 (fingertip-joint limits);
+     **S5.0's clip [0, 0.95] on today's model raises CPU divergences 4 -> 13** (p ~ 0.025).
    - **`Metrics/goal_pose/episode_success` is NOT the placed rate and overstates it.** It is
      `at_goal` *latched* -- a pure distance test, no release, no settle -- so a cube shoved
      through the goal region counts forever. `placed` needs `at_goal ∧ released ∧ settled`
@@ -320,11 +325,15 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    R-A, DR0, seed 1) and read `Episode_Termination/non_finite_state` against the 0.1 %
    gate. **Needs explicit approval** (CLAUDE.md, shared scheduler). Needs a fresh bundle to
    IAS — the checkout there is at `e84d270` — and `EXPECTED_COMMIT` set to the S5.0 commit.
-   Above 0.1 % -> plan S5.0 row 0.4 (jaw rate limit), else wait for S6.
+   Above 0.1 % -> plan S5.0 row 0.4 (jaw rate limit), else wait for S6. **Note (S6):** the
+   bench rejects the rate limit (0/64 grasps) and rates today's model + S5.0 clip as the
+   worst divergence configuration -- consider running gate 3 on the decision-0002 model.
 1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
    `c1r`/`c2r`, read at 3-4 k iters with `eval_pick_place.py`. A check-in before submission.
-2. **S6 (gripper four-bar) runs in parallel** — `scripts/gripper_bench.py` (`95c92b1`).
-   When it lands, re-check the S5 winner on the new model.
+2. **S6: check-in on decision 0002** (`../docs/decisions/0002-*.md`). If accepted: land it
+   (tabletop-only), `make test`, re-run S5.0's scripted feasibility on the new jaw, then the
+   C0-style IAS NaN job (acceptance <= 0.01 % of episodes). Open: 3.2 deg pad wedge lets a
+   cube creep ~2 mm/s under violent shaking (geometry, not stability).
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
    non-goals. Still the oldest open item in the repo.
 4. Create `../docs/roadmap.md` — named in `CLAUDE.md` as the entry point, still missing.
