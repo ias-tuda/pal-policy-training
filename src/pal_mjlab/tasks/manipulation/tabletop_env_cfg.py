@@ -145,6 +145,7 @@ def make_tabletop_env_cfg(
   hold_nominal: bool = True,
   dr_level: str | None = None,
   guard_divergence: bool = True,
+  trunk_clearance_penalty: float = 1.0,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -168,6 +169,8 @@ def make_tabletop_env_cfg(
       On by default because contact-rich GPU sim diverges at a measured ~1 per 0.5M
       world-steps here and `mujoco_warp` does not reset a diverged world by itself; off
       reproduces the pre-guard behaviour, in which the first divergence kills the run.
+    trunk_clearance_penalty: weight of ``trunk_clearance`` (see `trunk_clearance_rewards`),
+      for a robot with a ``trunk_keepout``; 0 turns it off.
   """
   gripper = robot.gripper(gripper_name)
   if objects is None:
@@ -355,6 +358,7 @@ def make_tabletop_env_cfg(
     "joint_pos_limits": RewardTermCfg(
       func=mdp.joint_pos_limits, weight=-10.0, params={"asset_cfg": action_joints}
     ),
+    **trunk_clearance_rewards(robot, trunk_clearance_penalty),
   }
 
   # -- Terminations ---------------------------------------------------------------
@@ -365,6 +369,16 @@ def make_tabletop_env_cfg(
       params={"entity_name": OBJECT, "min_height": scene.TABLE_TOP_Z - 0.2},
     ),
   }
+  if robot.reach is not None:
+    terminations["out_of_reach"] = TerminationTermCfg(
+      func=mdp.entity_out_of_reach,
+      params={
+        "entity_names": tuple(objects),
+        "max_distance": robot.reach.max_distance,
+        "reference_body": robot.reach.reference_body,
+        "robot_name": ROBOT,
+      },
+    )
   if guard_divergence:
     # A failure, not a truncation -- the plan's D9. Both are defensible: a failure pushes
     # the policy away from the configurations that blow up, at the cost of a shaping term
@@ -459,6 +473,35 @@ def make_tabletop_env_cfg(
   if dr_level is not None:
     apply_dr_level(cfg, dr_level, action_joints)
   return cfg
+
+
+def trunk_clearance_rewards(
+  robot: ManipulationRobotCfg, weight: float = 1.0
+) -> dict[str, RewardTermCfg]:
+  """``trunk_clearance``: a penalty for arm links approaching the trunk's keep-out box.
+
+  S5.1 item 8 (Claudius's 82c4450). The trunk colliders stop an arm at the chest; this
+  prices the approach, so the policy does not learn to lean an elbow on it. Weight 1.0 is
+  his: ~10 % of what the top of his stack reward pays per step. A separate function because
+  a task that replaces the reward dict wholesale (pick-and-place's variants) has to add it
+  back, and every variant must carry it the same way.
+  """
+  keepout = robot.trunk_keepout
+  if keepout is None or not weight:
+    return {}
+  return {
+    "trunk_clearance": RewardTermCfg(
+      func=mdp.keepout_box_penalty,
+      weight=-abs(weight),
+      params={
+        "center": keepout.center,
+        "half_extents": keepout.half_extents,
+        "margin": keepout.margin,
+        "reference_body": keepout.reference_body,
+        "asset_cfg": SceneEntityCfg(ROBOT, body_names=keepout.body_name_regex),
+      },
+    )
+  }
 
 
 #: The domain-randomisation ladder (S2 of the pick-and-place plan), lowest rung first. Each

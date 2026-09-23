@@ -76,6 +76,46 @@ class GripperCfg:
 
 
 @dataclasses.dataclass(frozen=True)
+class KeepoutBoxCfg:
+  """A box, fixed in one of the robot's own frames, that named links must stay out of.
+
+  The trunk of a humanoid is the obvious instance: the arms can fold into the chest, and the
+  trunk colliders only stop them once they touch. This is the volume they must keep clear,
+  so the penalty starts *before* the contact. (S5.1 item 8, from Claudius's 82c4450.)
+  """
+
+  reference_body: str
+  """Body whose frame the box is fixed in -- the trunk link, so it follows the torso."""
+
+  body_name_regex: tuple[str, ...]
+  """Links that must stay out, matched against body names. A link whose origin is inside
+  the box at the start pose must not be listed: it would pay the full penalty from the
+  first step of every episode (on Kangaroo, the shoulder link)."""
+
+  center: tuple[float, float, float]
+  """Box centre in ``reference_body``'s frame, metres."""
+
+  half_extents: tuple[float, float, float]
+  """Box half-extents, metres, taken from the trunk's collision geom."""
+
+  margin: float = 0.05
+  """Distance from the box surface at which the penalty starts, metres. It stands in for
+  the watched links' own thickness -- the term scores link *origins* -- and must stay below
+  the tightest clearance the start pose holds, or the penalty is on before the policy acts."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ReachCfg:
+  """How far from the robot an object can be and still be worth reaching for."""
+
+  reference_body: str
+  """Body the distance is measured from, horizontally. The base link."""
+
+  max_distance: float
+  """Planar distance beyond which an object is out of reach, metres."""
+
+
+@dataclasses.dataclass(frozen=True)
 class ManipulationRobotCfg:
   """A robot, described in the terms a manipulation task needs."""
 
@@ -110,6 +150,13 @@ class ManipulationRobotCfg:
   takes it. None leaves targets unclamped. mjlab builds position actuators with
   ``ctrllimited=False``, so a target past a joint limit is not clamped by the simulator --
   the actuator pushes the joint into its limit at up to its full effort."""
+
+  trunk_keepout: KeepoutBoxCfg | None = None
+  """Clearance volume around the trunk, penalised as ``trunk_clearance``; ``None`` for none."""
+
+  reach: ReachCfg | None = None
+  """Usable workspace radius; an object beyond it ends the episode as ``out_of_reach``.
+  ``None`` never calls an object unreachable."""
 
   def __post_init__(self) -> None:
     if not self.grippers:

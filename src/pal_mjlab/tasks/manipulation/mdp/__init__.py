@@ -53,6 +53,7 @@ from .rewards import (
   entity_lin_vel_l2,
   grasped,
   joint_pos_limits,
+  keepout_box_penalty,
   keypoint_distance_reward,
   lift_height,
   object_lifted,
@@ -61,9 +62,16 @@ from .rewards import (
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
-from .terminations import entity_below_height, non_finite_state, object_placed
+from .terminations import (
+  entity_below_height,
+  entity_out_of_reach,
+  non_finite_state,
+  object_placed,
+)
 
 __all__ = [
+  "entity_out_of_reach",
+  "keepout_box_penalty",
   # mjlab manipulation terms, re-exported so a task needs one namespace.
   "bring_object_reward",
   "ee_to_object_distance",
