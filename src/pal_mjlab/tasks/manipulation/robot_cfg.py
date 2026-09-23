@@ -50,6 +50,12 @@ class GripperCfg:
   hand_body: str
   """Body whose subtree is the hand, for the end-effector/ground collision sensor."""
 
+  grasp_geom_regex: str
+  """The two opposing pad geoms the grasp sensor watches -- exactly one per jaw side. A grasp
+  is both of them touching the object. Narrower than ``pad_geom_regex`` on purpose: that one
+  also names geoms deeper in the finger (friction surfaces), which a small object held at
+  the pads never touches, and requiring *every* friction geom made the grasp unreachable."""
+
   def __post_init__(self) -> None:
     if len(self.pad_sites) != 2:
       raise ValueError(
@@ -98,6 +104,12 @@ class ManipulationRobotCfg:
 
   root_free_joint: str = "origin"
   """Name of the root free joint. Used to locate the root body when ``fixed_base`` is set."""
+
+  action_clip: dict[str, tuple[float, float]] | None = None
+  """Per-actuator clamp on the *processed* joint target, as ``JointPositionActionCfg.clip``
+  takes it. None leaves targets unclamped. mjlab builds position actuators with
+  ``ctrllimited=False``, so a target past a joint limit is not clamped by the simulator --
+  the actuator pushes the joint into its limit at up to its full effort."""
 
   def __post_init__(self) -> None:
     if not self.grippers:

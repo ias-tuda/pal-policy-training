@@ -86,6 +86,12 @@ class Tally:
   this episode". Placed states persist -- the cube stays where it was put -- so reading the
   state at the top of each step catches them even though the terminal state, which the
   env has already reset by the time `step` returns, is never seen.
+
+  Except when the placement is what *ended* the episode. An arm with a `success`
+  termination is reset in the same step the cube comes to rest on the goal, so the placed
+  state never exists at the top of any step; those episodes have to be banked from the
+  termination itself, with `terminal`, before `finish`. Until 2026-09-23 they were not,
+  and every such episode was counted as a failure (found by S5.0's scripted rollout).
   """
 
   FIELDS = (
@@ -111,6 +117,19 @@ class Tally:
     newly = flags["placed"] & (self.first_place < 0)
     self.first_place = torch.where(newly, self.age, self.first_place)
     self.age += 1
+
+  def terminal(self, success: torch.Tensor) -> None:
+    """Credit the episodes a `success` termination just ended, which `observe` cannot see.
+
+    `success` fires only on a placement, so it sets `placed`; it counts as `placed and
+    lifted` if a lift was observed earlier in the same episode -- the same test
+    `_placed_bool` applies through the `was_lifted` latch. Call after `step`, before
+    `finish`. Does not advance `age`: this is the same step `observe` already counted.
+    """
+    self.live["placed"] |= success
+    self.live["placed_and_lifted"] |= success & self.live["lifted"]
+    newly = success & (self.first_place < 0)
+    self.first_place = torch.where(newly, self.age - 1, self.first_place)
 
   def finish(self, env_ids: torch.Tensor) -> None:
     """Bank the episodes that just ended and clear their latches."""
@@ -169,6 +188,18 @@ def probe(env: ManagerBasedRlEnv, grasp_sensor: str) -> dict[str, torch.Tensor]:
     < env.cfg.terminations["object_dropped"].params["min_height"],
     "held_at_goal": at_goal & grasped,
   }
+
+
+def success_flags(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Which envs the last `step` ended through the `success` termination.
+
+  The termination manager keeps each term's value from the step it just computed, before
+  the reset, so this is readable after `step` returns. All False for an arm without one.
+  """
+  tm = env.termination_manager
+  if "success" not in tm.active_terms:
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  return tm.get_term("success").bool()
 
 
 def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
@@ -253,6 +284,7 @@ def main() -> None:
     while len(tally.done) < args.episodes:
       tally.observe(**probe(env, grasp_sensor))
       obs, _, dones, extras = wrapped.step(policy(obs))
+      tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()
       if finished.numel():
         tally.finish(finished)

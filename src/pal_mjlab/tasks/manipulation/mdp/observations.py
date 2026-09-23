@@ -84,8 +84,13 @@ def _grasped_bool(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
   sensor: ContactSensor = env.scene[sensor_name]
   found = sensor.data.found
   assert found is not None, f"sensor {sensor_name!r} does not provide 'found'"
-  # found is (B, P) over the pad geoms: a grasp needs every pad in contact, not any.
-  return found.bool().all(dim=-1)
+  # found is (B, P * num_slots), primary-major (mjlab's contact_sensor layout). A pad is in
+  # contact if any of its slots is; a grasp needs every pad in contact, not any. Reading
+  # the raw (B, P * num_slots) with `.all` -- as this did until 2026-09-23 -- also demanded
+  # a second simultaneous contact on every pad, and together with deeper finger geoms in
+  # the sensor made a real grasp all but unreachable (S5.0).
+  per_pad = found.view(found.shape[0], -1, sensor.cfg.num_slots).bool().any(dim=-1)
+  return per_pad.all(dim=-1)
 
 
 def is_on_surface(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:

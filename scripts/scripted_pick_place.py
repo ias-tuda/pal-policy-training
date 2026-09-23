@@ -1,0 +1,606 @@
+"""A scripted pick-and-place, driven through the exact action interface the policy uses.
+
+S5.0 of the pick-and-place plan. C1 and C2 spent ~750 M steps each on a task that was not
+possible through its action space: the jaw could be commanded to 22 % of its range and the
+arm could move the grasp point ~12 cm. S1 had proved the *robot* could reach the cube with
+IK over the full joint limits; nothing had proved the *policy* could. This is that proof,
+and it is two things:
+
+``derive``
+    Solve IK for every configuration the task needs -- pre-grasp, grasp, lift, carry, place,
+    retreat -- at the spawn box's corners (x, y +-2 cm, yaw +-10 deg), its centre and the
+    target, and turn the joint excursions into action scales by the plan's rule:
+    ``scale_j = max(current_j, 1.5 * max |q_ik,j - q_default,j|)``, rounded up to 0.05 rad
+    and capped at half the joint's range. CPU MuJoCo only, no env.
+
+``rollout``
+    Build the real env, put the cube at those corners (and at random jitters), and run the
+    waypoints as raw actions ``a = (q_target - offset) / scale``, clipped to [-1, 1], through
+    the env's own ``JointPositionAction`` at 50 Hz. Reports, per episode, whether the grasp
+    sensor fired, the cube left the table, and it ended up placed within 2.5 cm and released.
+
+    uv run --extra cpu python scripts/scripted_pick_place.py derive
+    uv run --extra cpu python scripts/scripted_pick_place.py rollout --num-envs 10
+
+``tests/test_pick_place_scripted_feasibility.py`` runs the rollout, so a scale or pose
+change that makes the task impossible again fails the suite instead of a training run.
+
+The IK is "grasp point at p, jaw pointing straight down, pads closing across a cube face".
+The last part matters: the jaw closes along the hand's -x, which sits at 25 deg of yaw in
+the start pose, so a cube at yaw 0 is taken 25 deg off its faces unless the wrist turns.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib.util
+import json
+import math
+import pathlib
+import sys
+
+import mujoco
+import numpy as np
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from scene_model import joint_qadr, nominal_data, site_id, soft_limits  # noqa: E402
+
+TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
+ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
+JAW_JOINT = "gripper_left_finger_joint"
+TCP_SITE = "robot/tcp_left"
+HAND_BODY = "robot/arm_left_7_link"
+PAD_SITES = (
+  "robot/gripper_left_fingertip_left_site",
+  "robot/gripper_left_fingertip_right_site",
+)
+
+#: How far above the grasp pose the pre-grasp, lift, carry and retreat waypoints sit.
+CLEAR_HEIGHT = 0.10
+#: Pads above the table top at the grasp pose, as in the S1 reach map.
+PAD_CLEARANCE = 0.01
+#: The plan's margin on the IK excursion, and the grid scales are rounded up to.
+MARGIN = 1.5
+ROUND = 0.05
+
+#: Phases of the scripted episode: (name, waypoint to move to, jaw closed?, control steps).
+#: Joint-space linear interpolation from the previous waypoint over that many 20 ms steps.
+#: `place` and `retreat` are re-planned at the end of `steady`, from where the cube actually
+#: sits in the hand -- see `replan_place`.
+PHASES = (
+  ("approach", "pregrasp", False, 60),
+  ("descend", "grasp", False, 40),
+  ("close", "grasp", True, 30),
+  ("lift", "lift", True, 40),
+  ("carry", "carry", True, 60),
+  ("steady", "carry", True, 15),
+  ("lower", "place", True, 40),
+  ("hold", "place", True, 20),
+  ("open", "place", False, 30),
+  ("retreat", "retreat", False, 40),
+  ("settle", "retreat", False, 20),
+)
+#: Where the cube is released: this far above its resting height, so it drops onto the
+#: table rather than being pressed into it.
+RELEASE_HEIGHT = 0.003
+
+
+@dataclasses.dataclass
+class Kin:
+  """The left arm's kinematics on a compiled single-world model."""
+
+  model: mujoco.MjModel
+  data: mujoco.MjData
+  qadr: np.ndarray
+  dofs: np.ndarray
+  lo: np.ndarray
+  hi: np.ndarray
+  q_default: np.ndarray
+  tcp: int
+  hand: int
+  is_arm: np.ndarray
+
+  @classmethod
+  def from_model(cls, model: mujoco.MjModel) -> Kin:
+    data = nominal_data(model)
+    _park_free_bodies(model, data)
+    qadr = joint_qadr(model, ARM_JOINTS)
+    dofs = np.asarray(
+      [model.jnt_dofadr[list(model.jnt_qposadr).index(a)] for a in qadr]
+    )
+    lo, hi = soft_limits(model, ARM_JOINTS)
+    is_arm = np.zeros(model.ngeom, dtype=bool)
+    for gid in range(model.ngeom):
+      bare = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").split(
+        "/", 1
+      )[-1]
+      is_arm[gid] = bare.startswith(("arm_left_", "gripper_left_"))
+    return cls(
+      model=model,
+      data=data,
+      qadr=qadr,
+      dofs=dofs,
+      lo=lo,
+      hi=hi,
+      q_default=data.qpos[qadr].copy(),
+      tcp=site_id(model, TCP_SITE),
+      hand=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, HAND_BODY),
+      is_arm=is_arm,
+    )
+
+  def fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    self.data.qpos[self.qadr] = q
+    mujoco.mj_kinematics(self.model, self.data)
+    mujoco.mj_comPos(self.model, self.data)
+    return self.data.site_xpos[self.tcp].copy(), self.data.xmat[self.hand].reshape(
+      3, 3
+    ).copy()
+
+  def pad_offset(self) -> float:
+    """How far the pads reach past the grasp point along the approach axis (S1.3)."""
+    tcp, rot = self.fk(self.q_default)
+    pads = [self.data.site_xpos[site_id(self.model, s)] for s in PAD_SITES]
+    return float(max(np.dot(p - tcp, rot[:, 2]) for p in pads))
+
+  def in_collision(self, q: np.ndarray) -> list[tuple[str, str]]:
+    self.fk(q)
+    mujoco.mj_collision(self.model, self.data)
+    hits = []
+    for c in range(self.data.ncon):
+      g1, g2 = int(self.data.contact[c].geom1), int(self.data.contact[c].geom2)
+      if self.is_arm[g1] or self.is_arm[g2]:
+        name = lambda g: mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, g)  # noqa: E731
+        hits.append((name(g1), name(g2)))
+    return hits
+
+  def ik(
+    self, goal: np.ndarray, hand_x: np.ndarray, q_init: np.ndarray, iters: int = 300
+  ) -> np.ndarray | None:
+    """Damped least squares onto a full pose: grasp point at ``goal``, hand +z straight
+    down, hand +x along ``hand_x``. Clamped to the soft limits every step.
+
+    Six residuals on seven joints leave one free direction. It is spent pulling toward the
+    start pose, so the solution is the one with the smallest excursion -- which is what the
+    action scales are sized from."""
+    z_des = np.array([0.0, 0.0, -1.0])
+    x_des = hand_x / np.linalg.norm(hand_x)
+    r_des = np.column_stack([x_des, np.cross(z_des, x_des), z_des])
+    jacp = np.zeros((3, self.model.nv))
+    jacr = np.zeros((3, self.model.nv))
+    q = q_init.copy()
+    for _ in range(iters):
+      pos, rot = self.fk(q)
+      err_p = goal - pos
+      err_r = 0.5 * sum(np.cross(rot[:, i], r_des[:, i]) for i in range(3))
+      if np.linalg.norm(err_p) < 1e-3 and np.linalg.norm(err_r) < 1e-2:
+        return q
+      mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.tcp)
+      jac = np.vstack([jacp[:, self.dofs], jacr[:, self.dofs]])
+      err = np.concatenate([err_p, err_r])
+      pinv = jac.T @ np.linalg.inv(jac @ jac.T + 1e-3 * np.eye(6))
+      null = np.eye(len(q)) - pinv @ jac
+      step = pinv @ err + null @ (0.2 * (self.q_default - q))
+      q = np.clip(q + np.clip(step, -0.2, 0.2), self.lo, self.hi)
+    return None
+
+
+def _park_free_bodies(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+  """Move the cube out of the way; the waypoints are checked against robot and table only."""
+  for jid in range(model.njnt):
+    if model.jnt_type[jid] != mujoco.mjtJoint.mjJNT_FREE:
+      continue
+    adr = model.jnt_qposadr[jid]
+    data.qpos[adr : adr + 3] = (0.0, 0.0, -10.0)
+
+
+def hand_x_for(kin: Kin, cube_yaw: float) -> np.ndarray:
+  """The hand +x direction that closes the pads across a pair of cube faces.
+
+  Any of the four face directions ``cube_yaw + k*90 deg`` will do for a symmetric jaw; take
+  the one closest to the start pose's, so the wrist turns as little as possible.
+  """
+  _, rot = kin.fk(kin.q_default)
+  yaw0 = math.atan2(rot[1, 0], rot[0, 0])
+  cands = [cube_yaw + k * math.pi / 2 for k in range(4)]
+  best = min(cands, key=lambda a: abs(math.remainder(a - yaw0, 2 * math.pi)))
+  return np.array([math.cos(best), math.sin(best), 0.0])
+
+
+def waypoints(
+  kin: Kin, cube_xy: np.ndarray, cube_yaw: float, target_xy: np.ndarray
+) -> dict[str, np.ndarray]:
+  """Joint configurations for every phase, each IK seeded from the previous one so the
+  sequence stays on one solution branch. Raises if any waypoint has no solution or puts
+  the arm in contact."""
+  from pal_mjlab.tasks.manipulation import scene
+
+  z_grasp = scene.TABLE_TOP_Z + kin.pad_offset() + PAD_CLEARANCE
+  z_high = z_grasp + CLEAR_HEIGHT
+  hand_x = hand_x_for(kin, cube_yaw)
+  goals = {
+    "pregrasp": (cube_xy, z_high),
+    "grasp": (cube_xy, z_grasp),
+    "lift": (cube_xy, z_high),
+    "carry": (target_xy, z_high),
+    "place": (target_xy, z_grasp),
+    "retreat": (target_xy, z_high),
+  }
+  out: dict[str, np.ndarray] = {}
+  q = kin.q_default
+  for name, (xy, z) in goals.items():
+    goal = np.array([xy[0], xy[1], z])
+    sol = _solve(kin, name, goal, hand_x, q)
+    # Only the free-space waypoints must be contact-free; at grasp/place the pads are
+    # 1 cm off the table by construction and anything they touch is the (parked) cube.
+    hits = kin.in_collision(sol)
+    if hits:
+      raise RuntimeError(f"{name} at {goal.round(3)} collides: {hits[:3]}")
+    out[name] = sol
+    q = sol
+  return out
+
+
+def _solve(kin: Kin, name: str, goal: np.ndarray, hand_x: np.ndarray, q: np.ndarray):
+  """IK seeded from ``q`` first -- to stay on its solution branch -- then restarts near it."""
+  rng = np.random.default_rng(0)
+  for attempt in range(8):
+    seed = (
+      q if attempt == 0 else np.clip(q + rng.normal(0, 0.3, q.shape), kin.lo, kin.hi)
+    )
+    sol = kin.ik(goal, hand_x, seed)
+    if sol is not None:
+      return sol
+  raise RuntimeError(f"no IK for {name} at {goal.round(3)}")
+
+
+def replan_place(
+  kin: Kin,
+  plan: dict[str, np.ndarray],
+  hand_x: np.ndarray,
+  tcp_actual: np.ndarray,
+  cube_actual: np.ndarray,
+  goal: np.ndarray,
+) -> None:
+  """Re-plan `place` and `retreat` from the cube's measured position in the hand.
+
+  The open-loop plan assumes the cube ends up centred under the grasp point. It does not:
+  it slides while the jaw closes, and the PD loop leaves the arm a centimetre or two off its
+  target. Both are measured here, with the arm holding still at the carry waypoint, and the
+  place target is shifted so that the *cube* lands on the goal: the grasp point goes to
+  ``goal + (tcp - cube)``, commanded as that minus the current tracking bias. The policy
+  observes the cube's pose too, so this uses nothing it does not have.
+  """
+  tcp_planned, _ = kin.fk(plan["carry"])
+  bias = tcp_actual - tcp_planned
+  want = goal + (tcp_actual - cube_actual) + np.array([0.0, 0.0, RELEASE_HEIGHT])
+  plan["place"] = _solve(kin, "place", want - bias, hand_x, plan["carry"])
+  plan["retreat"] = _solve(
+    kin,
+    "retreat",
+    want - bias + np.array([0.0, 0.0, CLEAR_HEIGHT]),
+    hand_x,
+    plan["place"],
+  )
+
+
+def spawn_corners(
+  spawn_xy: tuple[float, float], jitter_xy: float, jitter_yaw: float
+) -> list[tuple[np.ndarray, float]]:
+  """The eight corners of the spawn box, and its centre."""
+  out = [(np.asarray(spawn_xy, dtype=float), 0.0)]
+  for dx in (-jitter_xy, jitter_xy):
+    for dy in (-jitter_xy, jitter_xy):
+      for yaw in (-jitter_yaw, jitter_yaw):
+        out.append((np.asarray(spawn_xy) + (dx, dy), yaw))
+  return out
+
+
+# --------------------------------------------------------------------------------------
+# derive
+# --------------------------------------------------------------------------------------
+
+
+def derive(args: argparse.Namespace) -> dict:
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+  from scene_model import compile_scene
+
+  kin = Kin.from_model(compile_scene(TASK))
+  corners = spawn_corners(pp.SPAWN_XY, pp.SPAWN_JITTER_XY, pp.SPAWN_JITTER_YAW)
+  target = np.asarray(pp.TARGET_XY)
+
+  dev = np.zeros(len(ARM_JOINTS))
+  worst: list[str] = [""] * len(ARM_JOINTS)
+  for xy, yaw in corners:
+    wps = waypoints(kin, xy, yaw, target)
+    for name, q in wps.items():
+      d = np.abs(q - kin.q_default)
+      for j in np.nonzero(d > dev)[0]:
+        worst[j] = f"{name} @ ({xy[0]:.2f},{xy[1]:.2f},{math.degrees(yaw):+.0f}deg)"
+      dev = np.maximum(dev, d)
+
+  current = {j: s for j, s in zip(ARM_JOINTS, _current_arm_scales(), strict=True)}
+  lo = [kin.model.jnt_range[_jid(kin.model, j)][0] for j in ARM_JOINTS]
+  hi = [kin.model.jnt_range[_jid(kin.model, j)][1] for j in ARM_JOINTS]
+  rows = []
+  print(
+    f"{'joint':18s} {'default':>8s} {'max|dq|':>8s} {'x1.5':>7s} {'current':>8s} "
+    f"{'cap':>6s} {'scale':>6s}  worst waypoint"
+  )
+  for j, name in enumerate(ARM_JOINTS):
+    need = MARGIN * dev[j]
+    cap = 0.5 * (hi[j] - lo[j])
+    scale = min(max(current[name], math.ceil(need / ROUND - 1e-9) * ROUND), cap)
+    rows.append(
+      dict(
+        joint=name,
+        default=float(kin.q_default[j]),
+        max_dev=float(dev[j]),
+        need=float(need),
+        current=current[name],
+        cap=float(cap),
+        scale=round(scale, 4),
+        worst=worst[j],
+      )
+    )
+    print(
+      f"{name:18s} {kin.q_default[j]:8.3f} {dev[j]:8.3f} {need:7.3f} "
+      f"{current[name]:8.2f} {cap:6.2f} {scale:6.2f}  {worst[j]}"
+    )
+  result = dict(
+    task=TASK,
+    spawn_xy=list(pp.SPAWN_XY),
+    target_xy=list(pp.TARGET_XY),
+    corners=[[float(xy[0]), float(xy[1]), float(yaw)] for xy, yaw in corners],
+    rule=f"max(current, ceil({MARGIN} * max|dq| / {ROUND}) * {ROUND}), capped at half range",
+    joints=rows,
+  )
+  if args.json:
+    args.json.parent.mkdir(parents=True, exist_ok=True)
+    args.json.write_text(json.dumps(result, indent=2))
+    print(f"wrote {args.json}")
+  return result
+
+
+def _jid(model: mujoco.MjModel, name: str) -> int:
+  return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{name}")
+
+
+def _current_arm_scales() -> list[float]:
+  """The scales C1/C2 ran with -- the floor of the rule, per the plan."""
+  import re
+
+  from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS
+
+  scale = KANGAROO_GRIPPERS.action_scale
+  assert isinstance(scale, dict)
+  return [
+    next(v for pat, v in scale.items() if re.fullmatch(pat, j)) for j in ARM_JOINTS
+  ]
+
+
+# --------------------------------------------------------------------------------------
+# rollout
+# --------------------------------------------------------------------------------------
+
+
+def _eval_module():
+  spec = importlib.util.spec_from_file_location(
+    "eval_pick_place", pathlib.Path(__file__).parent / "eval_pick_place.py"
+  )
+  assert spec and spec.loader
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+def rollout(
+  num_envs: int = 10,
+  device: str = "cpu",
+  seed: int = 0,
+  reward: str = "R-A",
+  corners_first: bool = True,
+  verbose: bool = True,
+) -> list[dict]:
+  """One scripted episode per env; returns eval_pick_place's per-episode flags.
+
+  Envs ``0..8`` get the spawn box's centre and eight corners when ``corners_first`` is
+  set; the rest keep the reset event's own random jitter.
+  """
+  import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
+  import torch
+  from mjlab.envs import ManagerBasedRlEnv
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+  from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+
+  ev = _eval_module()
+  cfg = pp.make_pick_place_env_cfg(
+    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=reward
+  )
+  cfg.scene.num_envs = num_envs
+  cfg.seed = seed
+  env = ManagerBasedRlEnv(cfg=cfg, device=device)
+  grasp_sensor = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").contact_sensor_name
+
+  term = env.action_manager.get_term("joint_pos")
+  names = [n.split("/", 1)[-1] for n in term.target_names]
+  arm_idx = [names.index(j) for j in ARM_JOINTS]
+  jaw_idx = names.index(JAW_JOINT)
+  scale = (
+    term.scale
+    if isinstance(term.scale, torch.Tensor)
+    else torch.full((num_envs, len(names)), float(term.scale), device=env.device)
+  )
+  offset = term.offset
+  jaw_closed = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").closed_pos
+
+  env.reset()
+  obj = env.scene[pp.OBJECT]
+  origins = env.scene.env_origins
+  if corners_first:
+    pose = obj.data.root_link_pose_w.clone()
+    for i, (xy, yaw) in enumerate(
+      spawn_corners(pp.SPAWN_XY, pp.SPAWN_JITTER_XY, pp.SPAWN_JITTER_YAW)[:num_envs]
+    ):
+      pose[i, 0] = origins[i, 0] + float(xy[0])
+      pose[i, 1] = origins[i, 1] + float(xy[1])
+      pose[i, 3:7] = torch.tensor(
+        [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
+      )
+    obj.write_root_link_pose_to_sim(pose)
+    obj.write_root_link_velocity_to_sim(torch.zeros_like(obj.data.root_link_vel_w))
+    # A teleport is not visible to the entity's data views until the sim has stepped; one
+    # idle step (action 0 = hold the start pose) also lets the cube settle on the table.
+    with torch.inference_mode():
+      env.step(torch.zeros(env.action_space.shape, device=env.device))
+
+  # Plan every env's waypoints from where its cube actually is.
+  kin = Kin.from_model(env.sim.mj_model)
+  if not np.allclose(kin.q_default, offset[0, arm_idx].cpu().numpy(), atol=1e-4):
+    raise RuntimeError("the IK model's default pose is not the action term's offset")
+  pos = (obj.data.root_link_pos_w - origins).cpu().numpy()
+  quat = obj.data.root_link_quat_w.cpu().numpy()
+  target = np.asarray(pp.TARGET_XY)
+  plans = []
+  hand_xs = []
+  for i in range(num_envs):
+    w, x, y, z = quat[i]
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    plans.append(waypoints(kin, pos[i, :2], yaw, target))
+    hand_xs.append(hand_x_for(kin, yaw))
+    if verbose:
+      print(
+        f"env {i}: cube at ({pos[i, 0]:.3f}, {pos[i, 1]:.3f}), yaw {math.degrees(yaw):+.1f} deg"
+      )
+
+  tally = ev.Tally(num_envs, env.device)
+  ended = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+  why = [""] * num_envs
+  order: list[int] = []  # env id of each row of tally.done, which is in finish order
+  robot = env.scene["robot"]
+  tcp_idx = robot.site_names.index(KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site)
+  goal_w = env.command_manager.get_term("goal_pose").command
+  diag: dict[str, np.ndarray] = {}
+  clipped = 0
+  prev = np.stack([kin.q_default] * num_envs)
+  with torch.inference_mode():
+    for phase, wp, closed, steps in PHASES:
+      if bool(ended.all()):
+        break
+      if phase == "lower":
+        tcp_a = (robot.data.site_pos_w[:, tcp_idx] - origins).cpu().numpy()
+        cube_a = (obj.data.root_link_pos_w - origins).cpu().numpy()
+        goal = (goal_w - origins).cpu().numpy()
+        for i in torch.nonzero(~ended).flatten().tolist():
+          replan_place(kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i])
+      nxt = np.stack([p[wp] for p in plans])
+      for s in range(1, steps + 1):
+        q = prev + (nxt - prev) * (s / steps)
+        target_q = offset.clone()
+        target_q[:, arm_idx] = torch.as_tensor(
+          q, dtype=torch.float32, device=env.device
+        )
+        target_q[:, jaw_idx] = jaw_closed if closed else 0.0
+        raw = (target_q - offset) / scale
+        clipped += int((raw.abs() > 1.0 + 1e-6).any(dim=-1).sum())
+        tally.observe(**ev.probe(env, grasp_sensor))
+        _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
+        tally.terminal(ev.success_flags(env) & ~ended)
+        done = (terminated | truncated) & ~ended
+        for i in torch.nonzero(done).flatten().tolist():
+          why[i] = ",".join(
+            n
+            for n in env.termination_manager.active_terms
+            if bool(env.termination_manager.get_term(n)[i])
+          )
+        if done.any():
+          order += torch.nonzero(done).flatten().tolist()
+          tally.finish(torch.nonzero(done).flatten())
+          ended |= done
+      prev = nxt
+      if phase == "close":
+        tcp = robot.data.site_pos_w[:, tcp_idx]
+        diag["tcp_to_cube_mm"] = (
+          1e3 * torch.norm(tcp - obj.data.root_link_pos_w, dim=-1).cpu().numpy()
+        )
+        diag["jaw_q"] = (
+          robot.data.joint_pos[:, robot.joint_names.index(JAW_JOINT)].cpu().numpy()
+        )
+    goal = env.command_manager.get_term("goal_pose").command
+    d = obj.data.root_link_pos_w - goal
+    diag["final_cube_to_goal_mm"] = 1e3 * torch.norm(d, dim=-1).cpu().numpy()
+    diag["final_cube_dz_mm"] = 1e3 * d[:, 2].cpu().numpy()
+    diag["final_cube_speed"] = (
+      torch.norm(obj.data.root_link_lin_vel_w, dim=-1).cpu().numpy()
+    )
+    still = torch.nonzero(~ended).flatten()
+    if still.numel():
+      tally.observe(**ev.probe(env, grasp_sensor))
+      order += still.tolist()
+      tally.finish(still)
+  rows = [
+    r | {"env": i}
+    for i, r in sorted(zip(order, tally.done, strict=True), key=lambda t: t[0])
+  ]
+
+  env.close()
+  if verbose:
+    print(f"\n{clipped} env-steps needed an action outside [-1, 1] (clipped)")
+    print(
+      f"{'env':>3s} {'grasped':>8s} {'lifted':>7s} {'placed':>7s} {'pl&lift':>8s} "
+      f"{'steps':>6s} {'tcp-cube':>9s} {'jaw':>6s} {'cube-goal':>10s}  ended by"
+    )
+    for i, r in enumerate(rows):
+      print(
+        f"{i:3d} {r['grasped']!s:>8s} {r['lifted']!s:>7s} {r['placed']!s:>7s} "
+        f"{r['placed_and_lifted']!s:>8s} {r['length']:6d} "
+        f"{diag.get('tcp_to_cube_mm', [np.nan] * num_envs)[i]:7.1f}mm "
+        f"{diag.get('jaw_q', [np.nan] * num_envs)[i]:6.3f} "
+        f"{diag['final_cube_to_goal_mm'][i]:8.1f}mm  {why[i] or '(script end)'}"
+      )
+    ok = sum(r["placed_and_lifted"] for r in rows)
+    print(f"\nplaced and lifted: {ok} / {len(rows)}")
+  for i, r in enumerate(rows):
+    r["clipped_env_steps"] = clipped
+    r["ended_by"] = why[i]
+    for key, v in diag.items():
+      r[key] = float(v[i])
+  return rows
+
+
+def parse_args() -> argparse.Namespace:
+  p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+  sub = p.add_subparsers(dest="cmd", required=True)
+  d = sub.add_parser("derive", help="IK waypoints -> arm action scales")
+  d.add_argument("--json", type=pathlib.Path, default=None)
+  r = sub.add_parser("rollout", help="scripted episodes through the real env")
+  r.add_argument("--num-envs", type=int, default=10)
+  r.add_argument("--device", default="cpu")
+  r.add_argument("--seed", type=int, default=0)
+  r.add_argument("--reward", default="R-A")
+  r.add_argument("--random-only", action="store_true", help="no forced corners")
+  r.add_argument("--json", type=pathlib.Path, default=None)
+  return p.parse_args()
+
+
+def main() -> None:
+  args = parse_args()
+  if args.cmd == "derive":
+    derive(args)
+    return
+  rows = rollout(
+    num_envs=args.num_envs,
+    device=args.device,
+    seed=args.seed,
+    reward=args.reward,
+    corners_first=not args.random_only,
+  )
+  if args.json:
+    args.json.parent.mkdir(parents=True, exist_ok=True)
+    args.json.write_text(json.dumps(rows, indent=2))
+    print(f"wrote {args.json}")
+
+
+if __name__ == "__main__":
+  main()

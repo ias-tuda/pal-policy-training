@@ -71,7 +71,7 @@ def make_grasp_sensor(gripper: GripperCfg, object_name: str) -> ContactSensorCfg
   """Pads-vs-object contact: the ground-truth grasp signal."""
   return ContactSensorCfg(
     name=gripper.contact_sensor_name,
-    primary=ContactMatch(mode="geom", pattern=gripper.pad_geom_regex, entity=ROBOT),
+    primary=ContactMatch(mode="geom", pattern=gripper.grasp_geom_regex, entity=ROBOT),
     secondary=ContactMatch(mode="body", pattern=object_name, entity=object_name),
     fields=("found", "force"),
     reduce="none",
@@ -226,6 +226,7 @@ def make_tabletop_env_cfg(
       entity_name=ROBOT,
       actuator_names=robot.action_joint_regex,
       scale=robot.action_scale,
+      clip=robot.action_clip,
       use_default_offset=True,
     )
   }

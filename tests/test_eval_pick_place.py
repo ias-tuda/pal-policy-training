@@ -89,6 +89,23 @@ def test_the_summary_reports_both_placed_rates():
   assert out["placed"] - out["placed_and_lifted"] == 1 / 3
 
 
+def test_a_placement_that_ends_the_episode_is_still_counted():
+  """Under a `success` termination the env resets in the step the cube comes to rest, so
+  `observe` never sees it placed. `terminal` banks it from the termination -- and credits
+  `placed and lifted` only if a lift was seen earlier in the episode."""
+  tally = Tally(2, "cpu")
+  tally.observe(
+    **{k: torch.tensor([False, False]) for k in Tally.FIELDS}
+    | {"lifted": torch.tensor([True, False])}
+  )
+  tally.terminal(torch.tensor([True, True]))
+  tally.finish(torch.tensor([0, 1]))
+  carried, slid = tally.done
+  assert carried["placed"] and carried["placed_and_lifted"]
+  assert slid["placed"] and not slid["placed_and_lifted"]
+  assert carried["steps_to_place"] == 0
+
+
 def test_time_to_place_is_none_when_nothing_was_placed():
   """A dead policy must not divide by zero on the way to reporting that it is dead."""
   tally = Tally(1, "cpu")
