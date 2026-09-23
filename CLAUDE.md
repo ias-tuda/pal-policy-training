@@ -161,6 +161,14 @@ Claims that have already been wrong here:
 - **"At jaw scale 1.0 the grasp sensor fires" was wrong for a jaw closing on a free cube.** The
   jaw stops at 0.39 rad against the cube and the inner fingers never touch. A test that pins the
   object in place is not a grasp test. Use `scripts/scripted_pick_place.py rollout`.
+- **"A jaw rate limit fails the grasp" (S6 bench) was a bench artefact.** `gripper_bench.py`
+  applied the limit once per `set_jaw` call, and the `step`/`shake` stimuli call it once, so
+  the jaw never closed. Fixed in `2348670`; with it, 0002 + a 0.2 rad/step slew grasps 64/64.
+- **mjlab's `NoiseModelWithAdditiveBias` does not redraw its bias at reset, it adds to it**
+  (default `operation="add"`), so the "per-episode" bias random-walks: 65 mm after 20 resets
+  against an 8 mm range. Set `operation="abs"` on `bias_noise_cfg`. (Measured 2026-09-23.)
+- **A string-keyed DR `ranges` dict is not scoped by `asset_cfg.joint_names`** in mjlab:
+  each key is matched against every joint of the entity. `arm_.*` randomises a parked arm too.
 - *(Add every further claim that turns out wrong. These lines are the most valuable in the file.)*
 
 ---
