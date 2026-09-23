@@ -152,22 +152,15 @@ def _calc_leg_params(
 def _pal_impedance_params(
   stiffness: float, damping: float, effort: float, armature: float
 ) -> dict:
-  """Actuator params taken straight from PAL's deployed impedance controller.
+  """Actuator params for the impedance-driven joints: K, D, effort and armature, explicit.
 
-  ``pal_local_joint_control`` runs tau = K*(q_des - q) + D*(dq_des - dq), and its per-joint
-  K/D ship in ``kangaroo_controller_configuration/config/local_joint_control/
-  impedance_control/*.yaml``. That is the path the RL deployer drives (policy ->
-  /subscriber_controller/desired_state -> subscriber_controller pass-through ->
-  pal_local_joint_control), so those gains -- not a design formula -- are what a trained
-  policy will actually meet on hardware.
-
-  ``_calc_leg_params`` already does exactly this for the legs: its values reproduce PAL's
-  *RL* leg gains to three decimals. The arms were instead left on ``_calc_actuator_params``,
-  which gives K 49.9/26.2 and D 3.18/1.67 against PAL's 40/20 and 1.0 -- damping out by up
-  to 3.2x. This brings the arms into line with the legs, from the same source.
-
-  Damping is passed explicitly rather than derived: PAL's arm damping does *not* follow the
-  2*zeta*K/omega_n rule the leg helper uses (that would give 2.55 at K=40).
+  History: these were PAL's deployed impedance-controller gains
+  (``kangaroo_controller_configuration/.../impedance_control/*.yaml``: arm K 40/20, D 1.0,
+  torque_clamp 50), which is what ``pal_local_joint_control`` runs on hardware. Since S5.1
+  (2026-09-23) they are the SysID training gains -- see the blocks below. Those equal what
+  ``_calc_actuator_params`` derives from the drivetrain (K 49.9/26.2, D 3.18/1.67), which
+  PAL's values had been measured against. Whether the deployed controller is retuned to
+  match is a sim-to-real question this file does not answer.
 
   Armature stays from ``_calc_actuator_params`` -- it models reflected rotor inertia, which
   is a property of the drivetrain and independent of the controller gains.
@@ -184,12 +177,18 @@ def _pal_impedance_params(
 _ARMATURE_S_PLUS = FACTOR * 1.728e-5 * 121**2  # arm 1-2, pelvis
 _ARMATURE_S_MINUS = FACTOR * 1.3e-5 * 101**2  # arm 3-7
 
-# K/D from PAL's impedance config; effort from its uniform torque_clamp: 50.
-S_PLUS = _pal_impedance_params(40.0, 1.0, 50, _ARMATURE_S_PLUS)  # arm_*_1, arm_*_2
-S_MINUS = _pal_impedance_params(20.0, 1.0, 50, _ARMATURE_S_MINUS)  # arm_*_3,4,5
-XS = _pal_impedance_params(20.0, 1.0, 50, _ARMATURE_S_MINUS)  # arm_*_6,7
-PELVIS_1 = _pal_impedance_params(50.0, 2.0, 50, _ARMATURE_S_PLUS)
-PELVIS_2 = _pal_impedance_params(20.0, 2.0, 50, _ARMATURE_S_PLUS)
+# The SysID training gains (S5.1 item 1, 2026-09-23; Claudius's
+# `origin/fix-stack-exploration-collapse` 42aa79f, "fix gains from Nico"): K/D from the
+# drivetrain model -- the `_calc_actuator_params` values quoted above -- and effort 50 on the
+# S+ drives, 25 on the S- drives. They replace PAL's impedance-config 40/20 K, 1.0/2.0 D and
+# uniform 50 N.m clamp. Both pelvis joints get the S+ values. Global: every Kangaroo variant
+# and task uses these blocks. A knock-on in the velocity/reaching tasks, whose non-arm
+# action scales are 0.25 * effort / K: pelvis_2's scale goes 0.625 -> 0.250 rad.
+S_PLUS = _pal_impedance_params(49.940, 3.179, 50, _ARMATURE_S_PLUS)  # arm_*_1, arm_*_2
+S_MINUS = _pal_impedance_params(26.177, 1.666, 25, _ARMATURE_S_MINUS)  # arm_*_3,4,5
+XS = _pal_impedance_params(26.177, 1.666, 25, _ARMATURE_S_MINUS)  # arm_*_6,7
+PELVIS_1 = _pal_impedance_params(49.940, 3.179, 50, _ARMATURE_S_PLUS)
+PELVIS_2 = _pal_impedance_params(49.940, 3.179, 50, _ARMATURE_S_PLUS)
 
 # The gripper is driven by gripper_controller (a JointTrajectoryController), not by the
 # impedance path, so it has no impedance_control entry. PAL's nominal is pids.yaml
@@ -425,8 +424,8 @@ KANGAROO_LEG_ACTUATORS = (
 )
 
 # Arms & Torso
-# Split out of S_PLUS: PAL gives the two pelvis joints different stiffness (50 / 20) and a
-# different damping (2.0) from the arms.
+# Kept apart from S_PLUS so the pelvis can be tuned on its own; under the SysID gains both
+# pelvis joints currently carry the S_PLUS values.
 KANGAROO_PELVIS_1_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
   target_names_expr=("pelvis_1_joint",),
   **PELVIS_1,
