@@ -88,6 +88,7 @@ class Levers:
   solimp_width: float | None = None  # L4, solimp[2] of the jaw equalities
   kp: float | None = None  # L5, jaw actuator stiffness
   kv: float | None = None  # L5, jaw actuator damping
+  jaw_armature: float | None = None  # armature of the actuated finger joint itself
   rate_limit: float | None = None  # L6, max jaw-target change per control step (rad)
   # Not in the plan's list: clamp the jaw target to [0, jaw_clip]. The actuator is not
   # ctrllimited and mjlab does not clip, so a full-range action commands -0.95 rad into
@@ -184,6 +185,15 @@ def build_model(lv: Levers) -> mujoco.MjModel:
         model.actuator_biasprm[a, 1] = -lv.kp
       if lv.kv is not None:
         model.actuator_biasprm[a, 2] = -lv.kv
+      if lv.jaw_armature is not None:
+        # The actuator cfg writes this joint's armature after spec_fn runs, so it cannot
+        # go in apply_spec_levers; set it here and recompute the compile-time constants
+        # (dof_invweight0 etc.) that depend on it.
+        model.dof_armature[model.jnt_dofadr[model.actuator_trnid[a, 0]]] = (
+          lv.jaw_armature
+        )
+  if lv.jaw_armature is not None:
+    mujoco.mj_setConst(model, mujoco.MjData(model))
   return model
 
 
