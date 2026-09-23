@@ -153,8 +153,12 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
   is the half-width of the commandable box, not a step size. Pick-place's scales since S5.0:
   arm 1-7 **0.20 / 0.55 / 0.40 / 0.55 / 0.55 / 0.50 / 1.05**, sized by
   `scripts/scripted_pick_place.py derive` (1.5 x the largest IK excursion over the task's
-  waypoints); jaw **0.95** = full range. Commanded TCP envelope at |a| <= 1: 59.5 cm max (was
-  13.9 cm with 0.10/0.05 — S3's 16.3 cm does not reproduce).
+  waypoints); jaw **0.95** = full range. TCP envelope at |a| <= 1, commanded / physically
+  reached: **59.5 / 43.5 cm** (was 13.9 / 14.4 cm at 0.10/0.05; neither S3's 16.3 nor the
+  per-task doc's 12.1 reproduces). `scripts/action_envelope.py`.
+- **The full-range jaw shakes the four-bar 3.3x harder** (local, 32 envs x 1000 random-action
+  steps): passive-joint peak |qvel| 307 rad/s (median 223) vs 93 (76) at jaw scale 0.20;
+  0 divergences either way. Expect the NaN rate to rise; S5.0 gate 3 measures it.
 - **mjlab position actuators do not clamp their target** (`ctrllimited=False`,
   `mjlab/utils/spec.py`). A target past a joint limit presses into the stop at up to full
   effort. Pick-place clips the jaw target to [0, 0.95] via `ManipulationRobotCfg.action_clip`
@@ -305,13 +309,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | **C0, 2026-09-22** | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, R-A/DR0, seed 1, 200 iters, jobs **157183-157186** @ `9adc904` | IAS (gn02/gn03/gn08; 3090 + A5000), `mujoco_warp_io.patch` NOT applied | **all four 200/200.** Throughput and divergence rate in §6. The same 1024-env config died at iteration 10 before the guard (157178). `Episode_Reward/grasp` = 0.0000 in every run while `success` fires — the policy slides the cube; see below | wandb `20260922_oppsie` tag `c0r`; `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md` |
 | S5.0 scale derivation, 2026-09-23 | `scripts/scripted_pick_place.py derive`, 9 spawns (centre + 8 corners) x 6 waypoints + target | local Mac | arm scales 0.20/0.55/0.40/0.55/0.55/0.50/1.05; none capped; wrist roll needs most (35 deg to square the pads to a -10 deg cube) | `s5-0-report.md` §2, `artifacts/s5.0/derive.json` |
 | **S5.0 scripted feasibility, 2026-09-23** | `scripts/scripted_pick_place.py rollout --num-envs 10`, R-A/DR0, seed 0, CPU | local Mac | **9/10 placed ∧ lifted, 10/10 grasped and lifted**, 0 clipped actions. Miss: corner (0.44, 0.29, −10°), released 51 mm off. Needed the grasp-sensor fix; open-loop place 1/10, closed-loop on cube pose 9/10 | `s5-0-report.md` §5, `artifacts/s5.0/rollout_corners.json` |
+| S5.0 envelope + shake, 2026-09-23 | `scripts/action_envelope.py --scales {old,new}`, 32 envs, seed 0, CPU | local Mac | reached 14.4 → **43.5 cm**; four-bar peak 93 → **307 rad/s**; 0 `non_finite_state` in 32 k env-steps each | `s5-0-report.md` §6-7, `artifacts/s5.0/envelope_*` |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
 
 | host | what is installed / checked out there | last verified |
 |---|---|---|
-| local Mac | this checkout, **`siwei` @ `e84d270`**, clean; git source of truth. Nothing pushed to `origin` — no push has been authorised | 2026-09-22 |
+| local Mac | this checkout, **`siwei` @ `a566363`** (S5.0) plus the S6 session's commits; git source of truth. Nothing pushed to `origin` — no push has been authorised | 2026-09-22 |
 | `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified | — |
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
@@ -325,7 +330,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    R-A, DR0, seed 1) and read `Episode_Termination/non_finite_state` against the 0.1 %
    gate. **Needs explicit approval** (CLAUDE.md, shared scheduler). Needs a fresh bundle to
    IAS — the checkout there is at `e84d270` — and `EXPECTED_COMMIT` set to the S5.0 commit.
-   Above 0.1 % -> plan S5.0 row 0.4 (jaw rate limit), else wait for S6. **Note (S6):** the
+   Above 0.1 % -> plan S5.0 row 0.4 (jaw rate limit), else wait for S6. The local proxy
+   already shows the four-bar peaking at 307 rad/s (3.3x the old scale), so a rise is likely. **Note (S6):** the
    bench rejects the rate limit (0/64 grasps) and rates today's model + S5.0 clip as the
    worst divergence configuration -- consider running gate 3 on the decision-0002 model.
 1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
