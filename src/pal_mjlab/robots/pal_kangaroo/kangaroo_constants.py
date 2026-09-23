@@ -2,6 +2,7 @@
 
 import dataclasses
 import math
+import re
 from pathlib import Path
 
 import mujoco
@@ -198,6 +199,14 @@ PELVIS_2 = _pal_impedance_params(20.0, 2.0, 50, _ARMATURE_S_PLUS)
 # UNCALIBRATED against the real grip force.
 GRIPPER = _pal_impedance_params(20.0, 0.5, 20, 1e-4)
 
+# The tabletop tasks' jaw (decision 0002, S6). At kp 20 the jaw closes on a centred 5 cm cube
+# at ~117 N per pad, and that load buckles the four-bar -- the equalities stretch by ~31 mm
+# and the cube is thrown out. kp 8 grips at ~36 N per pad, still ~70x what a 50 g cube needs,
+# and with the passive armature below it keeps every passive joint under 10 rad/s
+# (`scripts/gripper_bench.py`). Equally UNCALIBRATED against the real grip force. Tabletop
+# only: the velocity/reaching grippers tasks keep GRIPPER.
+GRIPPER_TABLETOP = _pal_impedance_params(8.0, 0.5, 20, 1e-4)
+
 ##
 # MJCF & Assets
 ##
@@ -308,6 +317,24 @@ _TABLETOP_GRAVCOMP_BODIES = (
 )
 
 
+#: The jaw four-bar's passive joints: everything in a gripper but the actuated
+#: `gripper_*_finger_joint`. They follow it only through the MJCF's <equality> block.
+_GRIPPER_PASSIVE_JOINT_REGEX = (
+  r"gripper_(left|right)_(inner_finger_(left|right)|fingertip_(left|right)"
+  r"|outer_finger_right)_joint"
+)
+
+#: Armature on those joints for tabletop work (decision 0002, S6). The XML's 1e-4 is "the
+#: smallest value that holds" at rest, but under a full-range jaw the fingertip joints ring
+#: to ~2000 rad/s and the world diverges -- they are the joints every NaN dump names first.
+#: 5e-3 slows that mode enough that no passive joint exceeds ~8 rad/s under random jaw
+#: actions, a full-stroke step or a shaken grasp, with no divergence in 2.56 M CPU steps,
+#: while the open gap (79.27 mm) and the pad-gap curve (within 0.3 mm) are unchanged.
+#: Numerical, like the 1e-4 it replaces -- not a claim about the real linkage. Softer
+#: equality constraints, the other obvious lever, make every one of those numbers worse.
+_TABLETOP_GRIPPER_PASSIVE_ARMATURE = 5e-3
+
+
 def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   """The grippers model with a collision set a tabletop task can trust.
 
@@ -317,6 +344,9 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   through the table. This adds them, in code, leaving PAL's XML untouched (see CLAUDE.md,
   *External Dependencies*): three boxes per arm and one for the torso, all sized from the
   link meshes, plus the four contact excludes they make necessary.
+
+  It raises the armature on the jaw four-bar's passive joints to
+  `_TABLETOP_GRIPPER_PASSIVE_ARMATURE` (decision 0002).
 
   It also switches on gravity compensation for the torso and the arms -- see
   `_TABLETOP_GRAVCOMP_BODIES`, which is a decision, not a detail. `gravcomp=False` is there
@@ -347,6 +377,10 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
       # The links carry explicit <inertial> elements, so geom density never reaches the
       # body mass; set it to zero anyway so that stays true if an inertial is ever dropped.
       geom.density = 0.0
+
+  for joint in spec.joints:
+    if re.fullmatch(_GRIPPER_PASSIVE_JOINT_REGEX, joint.name):
+      joint.armature = _TABLETOP_GRIPPER_PASSIVE_ARMATURE
 
   if gravcomp:
     for body in spec.bodies:
@@ -423,6 +457,11 @@ KANGAROO_XS_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
 KANGAROO_GRIPPER_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
   target_names_expr=(r"gripper_.*_finger_joint",),
   **GRIPPER,
+)
+
+KANGAROO_GRIPPER_TABLETOP_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
+  target_names_expr=(r"gripper_.*_finger_joint",),
+  **GRIPPER_TABLETOP,
 )
 
 COMMON_ACTUATORS = KANGAROO_LEG_ACTUATORS + (
@@ -601,6 +640,12 @@ KANGAROO_GRIPPERS_ARTICULATION = EntityArticulationInfoCfg(
   + (KANGAROO_XS_ACTUATOR_CFG, KANGAROO_GRIPPER_ACTUATOR_CFG),
   soft_joint_pos_limit_factor=0.9,
 )
+# Same as KANGAROO_GRIPPERS_ARTICULATION but for the jaw gain (decision 0002).
+KANGAROO_GRIPPERS_TABLETOP_ARTICULATION = EntityArticulationInfoCfg(
+  actuators=COMMON_ACTUATORS
+  + (KANGAROO_XS_ACTUATOR_CFG, KANGAROO_GRIPPER_TABLETOP_ACTUATOR_CFG),
+  soft_joint_pos_limit_factor=0.9,
+)
 
 
 _ROBOT_CONFIGS = {
@@ -622,7 +667,7 @@ _ROBOT_CONFIGS = {
   ),
   "grippers_tabletop": (
     get_kangaroo_grippers_tabletop_spec,
-    KANGAROO_GRIPPERS_ARTICULATION,
+    KANGAROO_GRIPPERS_TABLETOP_ARTICULATION,
     TABLETOP_COLLISION,
   ),
 }
