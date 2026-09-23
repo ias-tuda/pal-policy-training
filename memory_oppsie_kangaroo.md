@@ -4,8 +4,8 @@
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
 *Last updated: 2026-09-23 (pick-and-place v0: C1/C2 cancelled and invalidated; **S5.0
-implemented — scripted pick-and-place 9/10 through the policy's action space**; S5.0 gate 3
-(IAS NaN job) awaiting approval. Reports in `../docs/reports/pick-place-v0/`).*
+implemented — scripted pick-and-place 9/10 through the policy's action space**; all three S5.0 gates
+passed (gate 3: IAS job 157575, NaN 0.011 %). Reports in `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
 
@@ -35,7 +35,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S5 **C0** | ✅ **done 2026-09-22** — jobs 157183-157186, all 200/200 on IAS. Throughput and divergence rate measured, see §6/§7 |
 | Pick-and-place v0 S5 **C1** | 🛑 cancelled 2026-09-23 and **invalidated** (157188-157190) — the task was not possible through the action space, §5 −1 |
 | Pick-and-place v0 S5 **C2** | 🛑 cancelled 2026-09-23 and **invalidated** (157239-157241), same cause |
-| Pick-and-place v0 **S5.0** (make the grasp possible) | 🟡 **gate 1 ✅** scripted pick-and-place 9/10 placed ∧ lifted, 10/10 grasped + lifted (`tests/test_pick_place_scripted_feasibility.py`); **gate 3 ⏳** IAS NaN job not submitted — `../docs/reports/pick-place-v0/s5-0-report.md` |
+| Pick-and-place v0 **S5.0** (make the grasp possible) | ✅ **done 2026-09-23** @ `a566363`: gate 1 scripted pick-and-place 9/10 (10/10 grasped + lifted, now a test); gate 2 reach 43.5 cm; **gate 3 NaN 0.011 %** (IAS job 157575, gate 0.1 %) — `../docs/reports/pick-place-v0/s5-0-report.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -310,6 +310,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S5.0 scale derivation, 2026-09-23 | `scripts/scripted_pick_place.py derive`, 9 spawns (centre + 8 corners) x 6 waypoints + target | local Mac | arm scales 0.20/0.55/0.40/0.55/0.55/0.50/1.05; none capped; wrist roll needs most (35 deg to square the pads to a -10 deg cube) | `s5-0-report.md` §2, `artifacts/s5.0/derive.json` |
 | **S5.0 scripted feasibility, 2026-09-23** | `scripts/scripted_pick_place.py rollout --num-envs 10`, R-A/DR0, seed 0, CPU | local Mac | **9/10 placed ∧ lifted, 10/10 grasped and lifted**, 0 clipped actions. Miss: corner (0.44, 0.29, −10°), released 51 mm off. Needed the grasp-sensor fix; open-loop place 1/10, closed-loop on cube pose 9/10 | `s5-0-report.md` §5, `artifacts/s5.0/rollout_corners.json` |
 | S5.0 envelope + shake, 2026-09-23 | `scripts/action_envelope.py --scales {old,new}`, 32 envs, seed 0, CPU | local Mac | reached 14.4 → **43.5 cm**; four-bar peak 93 → **307 rad/s**; 0 `non_finite_state` in 32 k env-steps each | `s5-0-report.md` §6-7, `artifacts/s5.0/envelope_*` |
+| **S5.0 gate 3, 2026-09-23** | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, R-A/DR0, seed 1, 2048 envs, 200 iters, job **157575** @ `a566363` (jaw 0.95, S5.0 scales, pre-S6 four-bar) | IAS gn06 A5000, patch NOT applied | 200/200 in 11:30, 2.88 s/iter. **2 `non_finite_state` (iters 130, 169) in ~18 700 episodes = 0.011 %**, CI [0.0013, 0.039] % — no rise vs C0 despite 3.3x local shake excitation (policy noise is gentler than uniform random). `object_dropped` now ~46 % of terminations | wandb `20260922_oppsie` `loi5qo2r`; `s5-0-report.md` §8 |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -321,19 +322,17 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
 | `limx4090` | not verified for this repo | — |
-| IAS Slurm (`mn.ias...`) | **this repo deployed 2026-09-22**: `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` @ **`e84d270`**, hash-verified per file; `uv` 0.12.17 at `~/.local/bin`; `uv sync --frozen --extra cu128` done (same versions as the Mac); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` created. Deployed by git bundle over scp, not by pushing to origin. ~7 free GPUs matching `vram48gb\|rtx3090\|a5000` at deploy time | 2026-09-22 |
+| IAS Slurm (`mn.ias...`) | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` fast-forwarded to **`a566363`** 2026-09-23 (bundle `~/siwei_a566363.bundle`, md5-verified); `uv sync --frozen --extra cu128` current (mjlab 1.6.0, mujoco/mujoco-warp 3.11.0, warp 1.15.0, torch 2.10.0); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` exists. First deployed 2026-09-22 at `e84d270` | 2026-09-23 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
 
-0. **S5.0 gate 3: submit one C0-style IAS job at the new jaw scale** (2048 envs, 200 iters,
-   R-A, DR0, seed 1) and read `Episode_Termination/non_finite_state` against the 0.1 %
-   gate. **Needs explicit approval** (CLAUDE.md, shared scheduler). Needs a fresh bundle to
-   IAS — the checkout there is at `e84d270` — and `EXPECTED_COMMIT` set to the S5.0 commit.
-   Above 0.1 % -> plan S5.0 row 0.4 (jaw rate limit), else wait for S6. The local proxy
-   already shows the four-bar peaking at 307 rad/s (3.3x the old scale), so a rise is likely. **Note (S6):** the
-   bench rejects the rate limit (0/64 grasps) and rates today's model + S5.0 clip as the
-   worst divergence configuration -- consider running gate 3 on the decision-0002 model.
+0. ~~S5.0 gate 3~~ **passed**, job 157575: 0.011 % (see §7). S5.0 is done.
+   **Note (S6):** bench rejects the rate limit (0/64 grasps) and rates today's model + S5.0
+   clip as the worst divergence configuration -- consider running gate 3 on the
+   decision-0002 model. *(S5.0, after 157575: at training's own action distribution that
+   configuration measured 0.011 %, so the bench's ranking is about uniform-random stimuli;
+   a C1r on the 0002 model still needs its own gate-3 re-check.)*
 1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
    `c1r`/`c2r`, read at 3-4 k iters with `eval_pick_place.py`. A check-in before submission.
 2. **S6: check-in on decision 0002** (`../docs/decisions/0002-*.md`). If accepted: land it
