@@ -15,6 +15,9 @@ not depend on the variable still being set when someone reads it later.
 
 Unknown names raise here rather than falling back to a default: a typo that silently trained
 R-A under a run named `R-C-strict` is the failure this decision exists to prevent.
+
+The PPO recipe is selected the same way, by `PPO` (S5.1 item 9). Unlike the other two its
+default is not C1's: C1r/C2r run `PPO-stack`, and `PPO=PPO-A` gives back what C0-C2 ran.
 """
 
 from __future__ import annotations
@@ -27,16 +30,20 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   make_pick_place_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
+from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+from pal_mjlab.tasks.manipulation.runner import ManipulationRunnerCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DR_LEVELS
 
 #: Environment variables read at registration. Named as the plan names them.
 REWARD_ENV_VAR = "REWARD"
 DR_ENV_VAR = "DR"
+PPO_ENV_VAR = "PPO"
 
-#: What a run with neither variable set gets: C1's configuration.
+#: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
 DEFAULT_DR = "DR0"
+DEFAULT_PPO = "PPO-stack"
 
 
 def _select(var: str, default: str, valid) -> str:
@@ -63,3 +70,9 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     dr=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     play=play,
   )
+
+
+def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
+  """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
+  recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
+  return PPO_RECIPES[recipe]("kangaroo_pick_place")
