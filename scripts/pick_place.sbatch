@@ -30,7 +30,9 @@ set -euo pipefail
 # find out. (Job 157122 did exactly that.)
 export PATH="$HOME/.local/bin:$PATH"
 
-REPO=$HOME/repo/humanoids/pal_mjlab_kangaroo_talos
+# Overridable so a separate checkout (e.g. the S5.1 alignment's `-align`) can run without
+# touching the main one; the commit guard below still pins the code.
+REPO="${REPO:-$HOME/repo/humanoids/pal_mjlab_kangaroo_talos}"
 TASK=Mjlab-PickPlace-Pal-Kangaroo-Grippers
 
 # The point of the guard is that the job refuses to run rather than silently training
