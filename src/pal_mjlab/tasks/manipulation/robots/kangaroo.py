@@ -12,7 +12,12 @@ import dataclasses
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
   get_kangaroo_grippers_tabletop_robot_cfg,
 )
-from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg, ManipulationRobotCfg
+from pal_mjlab.tasks.manipulation.robot_cfg import (
+  GripperCfg,
+  KeepoutBoxCfg,
+  ManipulationRobotCfg,
+  ReachCfg,
+)
 
 #: Jaw travel. The pads are 79.3 mm apart at q=0 (measured on the shipped PAL meshes).
 #: "Closed" is the commanded close, not the joint's 0.95 rad upper limit: the fingertip
@@ -74,6 +79,22 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
   # Tabletop manipulation only: balance is PAL's controller's job, and a Kangaroo that
   # topples over drowns the manipulation reward signal in fall recovery.
   fixed_base=True,
+  # S5.1 item 8 (Claudius's 82c4450). The box is `torso_collision`'s bounding box in
+  # `pelvis_2_link`'s frame, measured on the compiled model (his centre is 3.7 mm higher).
+  # `arm_.*_1_link` is left out: its origin is the shoulder, inside the box by construction.
+  # The 0.05 m margin must stay below the closest any watched link origin sits to the box at
+  # the start pose; `tests/test_trunk_keepout_and_reach.py` checks that it does.
+  trunk_keepout=KeepoutBoxCfg(
+    reference_body="pelvis_2_link",
+    body_name_regex=(r"arm_.*_[2-7]_link",),
+    center=(0.0, 0.0, 0.2368),
+    half_extents=(0.1344, 0.1609, 0.2367),
+    margin=0.05,
+  ),
+  # Horizontal distance from `base_link` past which the cube is out of reach and the episode
+  # fails. His 0.75 m: the cube spawns ~0.4-0.6 m out, and at 0.75 m the arm is near full
+  # extension -- past it the episode is not worth running.
+  reach=ReachCfg(reference_body="base_link", max_distance=0.75),
 )
 
 

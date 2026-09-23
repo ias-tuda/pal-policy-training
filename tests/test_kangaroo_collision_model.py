@@ -25,8 +25,14 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 #: What `MANIPULATION_COLLISION` selects: feet, arm 5-7 and the gripper, nothing above the
 #: elbow. Recorded here so that a change to it fails a test rather than a training run.
 _BASELINE_ROBOT_COLLIDERS = 36
-_TABLETOP_EXTRA_COLLIDERS = ("pelvis_2_collision",) + tuple(
-  f"arm_{side}_{i}_collision" for side in ("left", "right") for i in (2, 3, 4)
+#: What `TABLETOP_COLLISION` adds since S5.1 item 8: PAL's trunk hulls and arm 1-4.
+_TABLETOP_EXTRA_COLLIDERS = (
+  "base_link_collision",
+  "pelvis_1_collision",
+  "pelvis_2_collision",
+  "torso_collision",
+) + tuple(
+  f"arm_{side}_{i}_collision" for side in ("left", "right") for i in (1, 2, 3, 4)
 )
 
 
@@ -79,14 +85,15 @@ def test_tabletop_adds_the_torso_and_upper_arm(baseline, tabletop):
   }
 
 
-def test_tabletop_colliders_are_primitives(tabletop):
-  """The links this adds get boxes and capsules, not meshes: they are proxies, not shapes."""
+def test_tabletop_colliders_are_the_xml_meshes(tabletop):
+  """S5.1 item 8: PAL's hulls and the arm meshes, not the code-built boxes they replaced.
+
+  `get_kangaroo_grippers_tabletop_spec` used to overwrite pelvis_2 and arm 2-4 with boxes by
+  name; if it ever does again, these come back as boxes and this fails.
+  """
   for name in _TABLETOP_EXTRA_COLLIDERS:
     gid = mujoco.mj_name2id(tabletop, mujoco.mjtObj.mjOBJ_GEOM, f"robot/{name}")
-    assert tabletop.geom_type[gid] in (
-      mujoco.mjtGeom.mjGEOM_BOX,
-      mujoco.mjtGeom.mjGEOM_CAPSULE,
-    ), name
+    assert tabletop.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH, name
 
 
 def test_tabletop_colliders_add_no_mass(baseline, tabletop):

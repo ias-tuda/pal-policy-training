@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
@@ -71,3 +73,29 @@ def non_finite_state(env: ManagerBasedRlEnv) -> torch.Tensor:
   return ~torch.isfinite(env.sim.data.qpos).all(dim=-1) | ~torch.isfinite(
     env.sim.data.qvel
   ).all(dim=-1)
+
+
+def entity_out_of_reach(
+  env: ManagerBasedRlEnv,
+  entity_names: Sequence[str],
+  max_distance: float,
+  reference_body: str,
+  robot_name: str = "robot",
+) -> torch.Tensor:
+  """Failure: some entity is further from the robot, horizontally, than it can reach. (B,)
+
+  A failure rather than a ``time_out``: pushing the cube out of reach is something the
+  policy did, and the critic must not bootstrap past it. Ported from Claudius's 82c4450
+  (S5.1 item 8).
+  """
+  robot: Entity = env.scene[robot_name]
+  ref_id = robot.body_names.index(reference_body)
+  base_xy = robot.data.body_link_pos_w[:, ref_id, :2]
+  out: torch.Tensor | None = None
+  for name in entity_names:
+    entity: Entity = env.scene[name]
+    distance = torch.norm(entity.data.root_link_pos_w[:, :2] - base_xy, dim=-1)
+    term = distance > max_distance
+    out = term if out is None else (out | term)
+  assert out is not None, "entity_names must name at least one entity"
+  return out

@@ -15,6 +15,7 @@ import torch
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from pal_mjlab.tasks.manipulation.mdp.observations import (
   _grasped_bool,
@@ -258,3 +259,36 @@ def contact_penalty(
   from mjlab.tasks.manipulation.mdp import illegal_contact
 
   return illegal_contact(env, sensor_name, force_threshold).float()
+
+
+def keepout_box_penalty(
+  env: ManagerBasedRlEnv,
+  center: tuple[float, float, float],
+  half_extents: tuple[float, float, float],
+  margin: float,
+  reference_body: str,
+  asset_cfg: SceneEntityCfg = _ROBOT,
+) -> torch.Tensor:
+  """How far the watched bodies have pushed into a keep-out box. (B,)
+
+  The box is fixed in ``reference_body``'s frame. Each watched link origin scores 1 at the
+  box surface, falling linearly to 0 at ``margin`` outside it and clamped at 1 inside; the
+  term is their sum, so it is positive and a penalty takes a negative weight. Ported from
+  Claudius's 82c4450 (S5.1 item 8).
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  ref_id = robot.body_names.index(reference_body)
+  ref_pos = robot.data.body_link_pos_w[:, ref_id]  # (B, 3)
+  ref_quat = robot.data.body_link_quat_w[:, ref_id]  # (B, 4)
+  pos_w = robot.data.body_link_pos_w[:, asset_cfg.body_ids]  # (B, N, 3)
+  n = pos_w.shape[1]
+  local = quat_apply_inverse(
+    ref_quat.unsqueeze(1).expand(-1, n, -1), pos_w - ref_pos.unsqueeze(1)
+  )
+  kwargs = {"device": local.device, "dtype": local.dtype}
+  offset = torch.abs(local - torch.tensor(center, **kwargs)) - torch.tensor(
+    half_extents, **kwargs
+  )
+  # Euclidean distance from the box surface, zero anywhere inside it.
+  outside = torch.norm(offset.clamp_min(0.0), dim=-1)
+  return torch.sum((1.0 - outside / margin).clamp(0.0, 1.0), dim=-1)

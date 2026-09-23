@@ -30,11 +30,15 @@
     <material name="bright_orange"  rgba="1 0.65 0 0.2"/>
     <!-- meshes -->
     <mesh name="base_link_with_pelvis"    content_type="model/stl" file="base/base_link_with_pelvis.STL" />
+    <mesh name="base_link_collision"      content_type="model/stl" file="base/base_link_collision.STL" />
     <mesh name="handle"                   content_type="model/stl" file="base/handle.STL" />
     <mesh name="pelvis_base_link"         content_type="model/stl" file="pelvis/pelvis_base_link.STL" />
     <mesh name="pelvis_1_link"            content_type="model/stl" file="pelvis/pelvis_1_link.STL" />
+    <mesh name="pelvis_1_link_collision"  content_type="model/stl" file="pelvis/pelvis_1_link_collision.STL" maxhullvert="64"/>
     <mesh name="pelvis_2_link"            content_type="model/stl" file="pelvis/pelvis_2_link.STL" />
+    <mesh name="pelvis_2_link_collision"  content_type="model/stl" file="pelvis/pelvis_2_link_collision.STL" maxhullvert="64"/>
     <mesh name="torso_link"               content_type="model/stl" file="torso/torso_link.STL" />
+    <mesh name="torso_link_collision"     content_type="model/stl" file="torso/torso_link_collision.STL" maxhullvert="64"/>
     <mesh name="leg_left_1_link"          content_type="model/stl" file="leg/leg_left_1_link.STL" />
     <mesh name="leg_left_2_link"          content_type="model/stl" file="leg/leg_left_2_link.STL" />
     <mesh name="leg_left_3_link"          content_type="model/stl" file="leg/leg_left_3_link.STL" />
@@ -68,10 +72,12 @@
       <geom type="mesh" class="visual" mesh="base_link_with_pelvis" />
       <geom type="mesh" class="visual" mesh="handle" />
       <geom pos="-0.0918 0 -0.0455" quat="1 0 0 0" type="mesh" class="visual" mesh="pelvis_base_link" />
+      <geom name="base_link_collision" class="collision" type="mesh" mesh="base_link_collision" density="0"/>
       <body name="pelvis_1_link" pos="-0.0918 0 0.0065" quat="0.707105 0 0.707108 0">
         <inertial pos="-0.019996 -2e-06 0.003623" quat="0.999691 0 0.0248385 0" mass="1.61061" diaginertia="0.00677426 0.006367 0.00383074"/>
         <joint name="pelvis_1_joint" axis="0 0 -1" range="-0.349066 0.349066" />
         <geom type="mesh" class="visual" mesh="pelvis_1_link" />
+        <geom name="pelvis_1_collision" class="collision" type="mesh" mesh="pelvis_1_link_collision" density="0"/>
         <body name="pelvis_2_link" pos="-0.0591 0 0" quat="0.707105 0 -0.707108 0">
           <inertial pos="-0.008953 0.001581 0.216619" quat="0.999943 0.00619727 0.00134963 -0.0085383" mass="15.1027" diaginertia="0.342274 0.311149 0.128841"/>
           <joint name="pelvis_2_joint" axis="0 0 -1" range="-1.309 1.309" />
@@ -79,25 +85,31 @@
           <geom pos="0 0 0.0061" quat="1 0 0 0" type="mesh" class="visual" mesh="torso_link" />
           <geom pos="0 0.105954 0.390496" quat="0.642802 -0.766033 1.86923e-06 1.63502e-07" type="mesh" class="visual" mesh="arm_base_link" />
           <geom pos="0 -0.105954 0.390496" quat="1.01637e-06 8.52866e-07 0.766033 -0.642802" type="mesh" class="visual" mesh="arm_base_link" />
-          <geom name="pelvis_2_collision" size="0.163724 0.162985" pos="4.77798e-07 -1.67441e-06 0.234507" quat="1 -3.97075e-06 -1.19191e-05 0" class="collision"/>
+          <!-- PAL's own collision hulls, replacing a hand-fitted capsule that was 164 mm
+               in radius against a torso 134 mm deep and stopped 69 mm below its top. -->
+          <geom name="pelvis_2_collision" class="collision" type="mesh" mesh="pelvis_2_link_collision" density="0"/>
+          <geom name="torso_collision" class="collision" type="mesh" mesh="torso_link_collision" pos="0 0 0.0061" density="0"/>
           <site name="imu" pos="0.071 -0.0014 0.0261" quat="0 -0.707107 0.707107 0"/>
           <body name="arm_left_1_link" pos="0 0.105954 0.390496" quat="-4.68302e-06 -2.52466e-06 0.642799 -0.766035">
             <inertial pos="0.0070639 0.0030301 -0.05724" quat="0.991252 0.0809813 -0.0910271 0.0507521" mass="1.1788" diaginertia="0.00192068 0.00177268 0.000875278" />
             <joint name="arm_left_1_joint" axis="0 0 -1" range="-2.61799 2.61799" />
             <geom type="mesh" class="visual" mesh="arm1_link" />
+            <geom name="arm_left_1_collision" class="collision" type="mesh" mesh="arm1_link" density="0"/>
             <body name="arm_left_2_link" pos="0.03711 0.02 -0.17011" quat="0.707105 0 0.707108 0">
               <inertial pos="0.029543 -0.0049762 -0.03224" quat="0.0848392 0.690549 -0.0139433 0.718157" mass="1.2955" diaginertia="0.00278545 0.00260446 0.00100708" />
               <joint name="arm_left_2_joint" range="-1.13446 2.44346" />
               <geom type="mesh" class="visual" mesh="arm2_link" />
+              <geom name="arm_left_2_collision" class="collision" type="mesh" mesh="arm2_link" density="0"/>
               <body name="arm_left_3_link" pos="0.15989 -0.02 -0.03711" quat="0.707105 0 -0.707108 0">
                 <inertial pos="-0.00706385 -0.00303013 -0.0572396" quat="0.991251 -0.0809737 0.0910312 0.0507756" mass="1.17879" diaginertia="0.00192065 0.00177272 0.000875276" />
                 <joint name="arm_left_3_joint" axis="0 0 -1" range="-2.61799 2.61799" />
                 <geom type="mesh" class="visual" mesh="arm3_link" />
+                <geom name="arm_left_3_collision" class="collision" type="mesh" mesh="arm3_link" density="0"/>
                 <body name="arm_left_4_link" pos="-0.03711 -0.02 -0.17011" quat="0.707105 0 -0.707108 0">
                   <inertial pos="-0.0666639 0.0102985 -0.0351108" quat="0.0552758 0.727273 -0.0700841 0.68052" mass="1.80676" diaginertia="0.00263554 0.00245424 0.00145523" />
                   <joint name="arm_left_4_joint" range="-1.13446 2.44346"/>
                   <geom class="visual" mesh="arm4_link" />
-                  <geom name="arm_left_4_collision" size="0.07" fromto="-0.3 0 -0.05  0 0 -0.05" class="collision"/>
+                  <geom name="arm_left_4_collision" class="collision" type="mesh" mesh="arm4_link" density="0"/>
                   <body name="arm_left_5_link" pos="-0.17011 0.02 -0.03711" quat="0.707105 0 -0.707108 0">
                     <inertial pos="0.0266059 -9.73534e-06 0.0673257" quat="0.989898 -7.96043e-05 0.141782 -0.000384017" mass="0.348015" diaginertia="0.0015535 0.0014601 0.000311872" />
                     <joint name="arm_left_5_joint" pos="0 0 0" axis="0 0 -1" range="-3.66519 1.5708" />
@@ -166,19 +178,22 @@
             <inertial pos="0.0070639 0.0030301 -0.05724" quat="0.991252 0.0809813 -0.0910271 0.0507521" mass="1.1788" diaginertia="0.00192068 0.00177268 0.000875278" />
             <joint name="arm_right_1_joint" axis="0 0 -1" range="-2.61799 2.61799" />
             <geom type="mesh" class="visual" mesh="arm1_link" />
+            <geom name="arm_right_1_collision" class="collision" type="mesh" mesh="arm1_link" density="0"/>
             <body name="arm_right_2_link" pos="0.03711 0.02 -0.17011" quat="0.707105 0 0.707108 0">
               <inertial pos="0.029543 -0.0049762 -0.03224" quat="0.0848392 0.690549 -0.0139433 0.718157" mass="1.2955" diaginertia="0.00278545 0.00260446 0.00100708" />
               <joint name="arm_right_2_joint" range="-1.13446 2.44346" />
               <geom type="mesh" class="visual" mesh="arm2_link" />
+              <geom name="arm_right_2_collision" class="collision" type="mesh" mesh="arm2_link" density="0"/>
               <body name="arm_right_3_link" pos="0.15989 -0.02 -0.03711" quat="0.707105 0 -0.707108 0">
                 <inertial pos="-0.00706385 -0.00303013 -0.0572396" quat="0.991251 -0.0809737 0.0910312 0.0507756" mass="1.17879" diaginertia="0.00192065 0.00177272 0.000875276" />
                 <joint name="arm_right_3_joint" axis="0 0 -1" range="-2.61799 2.61799" />
                 <geom type="mesh" class="visual" mesh="arm3_link" />
+                <geom name="arm_right_3_collision" class="collision" type="mesh" mesh="arm3_link" density="0"/>
                 <body name="arm_right_4_link" pos="-0.03711 -0.02 -0.17011" quat="0.707105 0 -0.707108 0">
                   <inertial pos="-0.0666639 0.0102985 -0.0351108" quat="0.0552758 0.727273 -0.0700841 0.68052" mass="1.80676" diaginertia="0.00263554 0.00245424 0.00145523" />
                   <joint name="arm_right_4_joint" range="-1.13446 2.44346"/>
                   <geom class="visual" mesh="arm4_link" />
-                  <geom name="arm_right_4_collision" size="0.07" fromto="-0.3 0 -0.05  0 0 -0.05" class="collision"/>
+                  <geom name="arm_right_4_collision" class="collision" type="mesh" mesh="arm4_link" density="0"/>
                   <body name="arm_right_5_link" pos="-0.17011 0.02 -0.03711" quat="0.707105 0 -0.707108 0">
                     <inertial pos="0.0266059 -9.73534e-06 0.0673257" quat="0.989898 -7.96043e-05 0.141782 -0.000384017" mass="0.348015" diaginertia="0.0015535 0.0014601 0.000311872" />
                     <joint name="arm_right_5_joint" pos="0 0 0" axis="0 0 -1" range="-1.5708 3.66519" />
@@ -383,6 +398,16 @@
   </equality>
 
   <contact>
+    <!-- The base hull and the torso capsule overlap by construction: they are two
+         links apart (base_link -> pelvis_1 -> pelvis_2), so MuJoCo's parent-child
+         filter does not catch them, and they penetrate in every pose. Measured over
+         400 random arm poses this pair alone accounted for 5 contacts in 400/400 of
+         them before it was excluded. -->
+    <exclude body1="base_link" body2="pelvis_2_link"/>
+    <!-- The pelvis yaw housing is nested inside the base shell, so PAL's two hulls
+         overlap wherever the joint is: measured at 54 mm of penetration in 400/400
+         random arm poses. Physically they are one assembly, not two colliders. -->
+    <exclude body1="base_link" body2="pelvis_1_link"/>
     <!-- Left leg closed chain -->
     <exclude body1="leg_left_1_link" body2="leg_left_femur_link"/>
     <exclude body1="leg_left_ankle_link" body2="leg_left_knee_link"/>

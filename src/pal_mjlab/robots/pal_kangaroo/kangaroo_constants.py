@@ -1,7 +1,6 @@
 """Pal Robotics KANGAROO constants."""
 
 import dataclasses
-import math
 import re
 from pathlib import Path
 
@@ -232,49 +231,6 @@ def get_kangaroo_grippers_spec() -> mujoco.MjSpec:
   return _load_spec(KANGAROO_GRIPPERS_XML)
 
 
-# Collision proxies for the links a tabletop task needs and the shipped MJCF does not give
-# usable ones for: the torso, and the upper arm / forearm / elbow of both arms. Each is the
-# link-frame bounding box of that link's visual meshes -- an oriented box, since MuJoCo
-# boxes rotate with their body. Fitted with `scripts/fit_link_colliders.py` against
-# kangaroo_grippers.xml, 2026-09-22; re-run it if PAL ships new meshes. Left and right come
-# out identical in their own link frames (the meshes are shared and the mirroring lives in
-# the body frames), so one entry covers both.
-#
-# Boxes rather than capsules, and the difference is not cosmetic. A capsule that *contains*
-# a link has to put a full hemisphere beyond each end of the mesh; on the upper arm that is
-# 74 mm deep and points straight into the chest, and the shoulder then reports contact with
-# the torso in 46% of sampled arm configurations. Measured over the same configurations, the
-# arm's real meshes come within 1 mm of the torso -- these are genuine pairs, so they cannot
-# simply be excluded -- but the capsule fires roughly 10 cm early. Boxes have no overhang and
-# are 2.4x smaller by volume.
-#
-# `arm_*_4_collision` is a *replacement*, not an addition. PAL's is a hand-authored capsule
-# running from x=-0.30 to x=0 of radius 0.07, but the arm-4 mesh only spans x in
-# [-0.155, 0.043]: the extra 0.145 m reaches down the forearm and swallows arm 5-7, which is
-# why MANIPULATION_COLLISION drops it rather than fixing it.
-_TABLETOP_BOXES = {
-  "pelvis_2_collision": (
-    "pelvis_2_link",
-    (0.0000, 0.0000, 0.2328),
-    (0.1344, 0.1609, 0.2406),
-  ),
-  "arm_{side}_2_collision": (
-    "arm_{side}_2_link",
-    (0.0655, -0.0100, -0.0432),
-    (0.1090, 0.0535, 0.0497),
-  ),
-  "arm_{side}_3_collision": (
-    "arm_{side}_3_link",
-    (-0.0061, -0.0100, -0.1144),
-    (0.0497, 0.0535, 0.0993),
-  ),
-  "arm_{side}_4_collision": (
-    "arm_{side}_4_link",
-    (-0.0558, 0.0100, -0.0447),
-    (0.0992, 0.0535, 0.0511),
-  ),
-}
-
 #: Link pairs whose proxies overlap without the links being anywhere near each other. Both
 #: are a link and its grandparent across one joint, where neighbouring boxes necessarily
 #: interpenetrate at the joint; MuJoCo already excludes parent/child pairs itself, and these
@@ -380,12 +336,15 @@ def _route_gravcomp_through_actuators(spec: mujoco.MjSpec) -> None:
 def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   """The grippers model with a collision set a tabletop task can trust.
 
-  The shipped MJCF gives the grippers variant collision geometry for the feet, the legs,
-  arm 5-7 and the gripper, and `MANIPULATION_COLLISION` narrows that to the feet, arm 5-7
-  and the gripper. Nothing above the elbow collides, so the upper arm and the torso sweep
-  through the table. This adds them, in code, leaving PAL's XML untouched (see CLAUDE.md,
-  *External Dependencies*): three boxes per arm and one for the torso, all sized from the
-  link meshes, plus the four contact excludes they make necessary.
+  `MANIPULATION_COLLISION` narrows the grippers model's colliders to the feet, arm 5-7 and
+  the gripper, so nothing above the elbow collides and the upper arm and torso sweep
+  through the table. `TABLETOP_COLLISION` switches the rest on. Their geometry lives in
+  ``kangaroo_grippers.xml`` since S5.1 item 8 (Claudius's 602cd9d / 57af0d3): PAL's collision
+  hulls for the base, pelvis_1, pelvis_2 and torso, and the visual meshes as colliders for
+  arm 1-4 -- an edit to PAL's XML, recorded as an exception to D4. (Before, this function
+  built oriented boxes for pelvis_2 and arm 2-4 in code, fitted by
+  `scripts/fit_link_colliders.py`; the meshes replace them.) It adds the four arm contact
+  excludes below.
 
   It raises the armature on the jaw four-bar's passive joints to
   `_TABLETOP_GRIPPER_PASSIVE_ARMATURE` (decision 0002).
@@ -397,30 +356,6 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   to measure against, not to train with: without it the arm droops half a radian.
   """
   spec = _load_spec(KANGAROO_GRIPPERS_XML)
-  collision_class = spec.find_default("collision")
-
-  for side in ("left", "right"):
-    for template, (body, pos, half) in _TABLETOP_BOXES.items():
-      geom_name = template.format(side=side)
-      existing = next((g for g in spec.geoms if g.name == geom_name), None)
-      if existing is not None:
-        geom = existing
-      else:
-        # The `collision` default class carries group 3, the orange debug material and
-        # contype/conaffinity 1, exactly as the geoms already in the XML get them.
-        geom = spec.body(body.format(side=side)).add_geom(
-          name=geom_name, default=collision_class
-        )
-      geom.type = mujoco.mjtGeom.mjGEOM_BOX
-      geom.pos = pos
-      geom.size = half
-      geom.quat = (1.0, 0.0, 0.0, 0.0)
-      # `arm_*_4_collision` ships as a fromto capsule, and MuJoCo rejects a geom that has
-      # both a fromto and a pos. NaN is how a spec marks fromto unset.
-      geom.fromto = (math.nan,) * 6
-      # The links carry explicit <inertial> elements, so geom density never reaches the
-      # body mass; set it to zero anyway so that stays true if an inertial is ever dropped.
-      geom.density = 0.0
 
   for joint in spec.joints:
     if re.fullmatch(_GRIPPER_PASSIVE_JOINT_REGEX, joint.name):
@@ -645,24 +580,31 @@ MANIPULATION_COLLISION = CollisionCfg(
   solimp={_PAD_REGEX: (0.95, 0.99, 0.001, 0.5, 2.0)},
 )
 
-# The manipulation set plus the links `get_kangaroo_grippers_tabletop_spec` gives usable
-# colliders: the torso, and the upper arm, forearm and elbow of both arms. Everything else --
-# pad condim, priority, friction, the stiff pad contact -- is inherited unchanged, so the
-# only physics difference against MANIPULATION_COLLISION is which links exist to be hit.
-# Active robot colliders go from 36 to 50.
+# The manipulation set plus the trunk and upper-arm colliders `kangaroo_grippers.xml` carries
+# since S5.1 item 8: PAL's hulls for the base, pelvis_1, pelvis_2 and torso, and arm 1-4's
+# visual meshes. Everything else -- pad condim, priority, friction, the stiff pad contact -- is
+# inherited unchanged, so the only physics difference against MANIPULATION_COLLISION is which
+# links exist to be hit. Active robot colliders go from 36 to 49.
 #
-# It costs workspace, and the cost is measured, not estimated: of the 1200 2 cm cells of the
-# table top, the left jaw can take a cube from above on 445 under MANIPULATION_COLLISION and
-# on 353 under this one, a 21% loss (../docs/reports/pick-place-v0/s1-report.md). Most of it
-# is the torso, and it is not an artifact -- the arm's real meshes come within 1 mm of the
-# torso, so it was passing straight through the chest before.
+# These names have to be listed here to collide at all: `CollisionCfg` zeroes contype and
+# conaffinity on every geom it does not match. On Claudius's branch, where the meshes come
+# from, they are *not* listed (his robot keeps MANIPULATION_COLLISION), so there they are
+# inert and only the keep-out penalty keeps the arms off the torso. Here they are live:
+# over 2000 random arm poses nothing collides by construction (the most frequent pair, arm 4
+# vs torso, in 3.5 % of poses), and the start pose has no robot-robot contact.
+#
+# It costs workspace. Under S1.4's boxes, of the 1200 2 cm cells of the table top the left
+# jaw could take a cube from above on 445 under MANIPULATION_COLLISION and 353 under the boxes
+# (../docs/reports/pick-place-v0/s1-report.md); the meshes have not been re-mapped.
 TABLETOP_COLLISION = dataclasses.replace(
   MANIPULATION_COLLISION,
   geom_names_expr=(
     _FOOT_REGEX,
     _HAND_REGEX,
-    r"arm_.*_[234]_collision",
-    "pelvis_2_collision",
+    r"arm_.*_[1234]_collision",
+    r"pelvis_[12]_collision",
+    "torso_collision",
+    "base_link_collision",
   ),
 )
 

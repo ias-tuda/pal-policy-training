@@ -38,6 +38,7 @@ from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   TABLE,
   apply_play_overrides,
   make_tabletop_env_cfg,
+  trunk_clearance_rewards,
 )
 
 #: Where the cube starts and where it has to end up, in the env frame. Measured, see the
@@ -162,6 +163,8 @@ def make_pick_place_env_cfg(
       threshold=GOAL_THRESHOLD,
     ),
   )
+  # Not part of any arm's comparison: every variant carries the same trunk penalty.
+  cfg.rewards.update(trunk_clearance_rewards(robot))
   cfg.curriculum = reward_curriculum_cfg()
 
   success_params = {
