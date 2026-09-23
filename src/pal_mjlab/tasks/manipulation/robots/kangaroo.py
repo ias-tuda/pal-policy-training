@@ -14,10 +14,14 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 )
 from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg, ManipulationRobotCfg
 
-#: Jaw travel, measured on the shipped PAL meshes: the pads are 79.3 mm apart at q=0 and
-#: closed at the joint's upper limit.
+#: Jaw travel. The pads are 79.3 mm apart at q=0 (measured on the shipped PAL meshes).
+#: "Closed" is the commanded close, not the joint's 0.95 rad upper limit: the fingertip
+#: joints' own -0.803 rad limits stop the linkage at ~0.82 rad, so any target above that
+#: leaves the actuator pushing the four-bar against its limits for as long as it is held.
+#: 0.78 keeps the target inside what the linkage can reach (decision 0002, S6). It is also
+#: the action scale and the clip's upper bound below, so action +1 is exactly this target.
 _JAW_OPEN = 0.0
-_JAW_CLOSED = 0.95
+_JAW_CLOSED = 0.78
 
 
 def _gripper(side: str) -> GripperCfg:
@@ -89,8 +93,8 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
 # sized from the task instead: `scripts/scripted_pick_place.py derive` solves IK for
 # pre-grasp, grasp, lift, carry, place and retreat at the spawn box's corners and the target,
 # and each scale is 1.5x the largest excursion from the start pose, rounded up to 0.05 rad.
-# The jaw scale is its full range, so action +1 is fully closed; the clip stops action < 0
-# from commanding a target below the open limit, which the simulator does not clamp
+# The jaw scale spans open to `_JAW_CLOSED`, so action +1 is fully closed; the clip stops
+# action < 0 from commanding a target below the open limit, which the simulator does not clamp
 # (mjlab position actuators are `ctrllimited=False`) and which would press the four-bar
 # into its stop at up to 19 N.m.
 #

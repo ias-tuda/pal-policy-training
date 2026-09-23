@@ -21,6 +21,20 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **Changed: the Kangaroo jaw is stable in the tabletop manipulation tasks.**
+  Driven over its full range, the gripper's passive linkage joints vibrated at
+  up to ~2000 rad/s until the simulation diverged, and at the old jaw gain a
+  closing jaw squeezed a cube hard enough to buckle the linkage and throw the
+  cube out. The tabletop robot model now gives the ten passive gripper joints
+  more armature (1e-4 to 5e-3) and the jaw a gentler gain (stiffness 20 to 8,
+  about 36 N per pad on a 5 cm cube). In ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``
+  the jaw's "closed" target is now 0.78 rad, the furthest the linkage can
+  actually close, instead of the joint's 0.95 rad limit. The open gap and the
+  pad-gap-against-angle curve are unchanged. Affects ``Mjlab-Lift-``,
+  ``Mjlab-Stack-`` and ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``; the velocity
+  and reaching Grippers tasks are unchanged. Results trained before this change
+  were on a different jaw.
+
 - **Fixed: the grasp signal of every tabletop manipulation task could not
   register a grasp.** The grasp sensor watched four geoms per gripper
   (fingertip and inner finger, both sides) and ``is_grasped`` required every

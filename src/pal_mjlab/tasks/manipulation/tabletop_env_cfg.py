@@ -441,7 +441,9 @@ def make_tabletop_env_cfg(
         # 2 ms, matching the locomotion tasks. The gripper four-bar is a stiff closed
         # linkage whose passive joints carry only 1e-4 armature; at 5 ms they diverge
         # (measured: |qvel| past 900 rad/s and NaN within ~40 control steps under random
-        # actions). Decimation is raised to keep the control rate at 50 Hz.
+        # actions). Decimation is raised to keep the control rate at 50 Hz. That was measured
+        # before decision 0002 raised the tabletop overlay's passive armature to 5e-3; whether
+        # a longer step is now viable is untested.
         timestep=0.002,
         iterations=10,
         ls_iterations=20,
