@@ -10,6 +10,8 @@ Four environments each, on the test device. The levels are cumulative, so each r
 ``EXPECTED`` is the full set of fields that should vary at that rung.
 """
 
+import re
+
 import mujoco
 import numpy as np
 import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
@@ -31,7 +33,7 @@ ADDS = {
   "DR0": (),
   "DR-object": ("object friction", "object mass"),
   "DR-contact": ("pad friction",),
-  "DR-robot": ("actuator gains", "joint friction"),
+  "DR-robot": ("actuator gains", "joint friction", "joint damping"),
   "DR-obs": ("encoder bias",),
   "DR-scene": ("table height",),
 }
@@ -74,6 +76,7 @@ def _measure(env: ManagerBasedRlEnv) -> dict[str, float]:
     ),
     "actuator gains": _spread_across_envs(model.actuator_gainprm[:, :, 0]),
     "joint friction": _spread_across_envs(model.dof_frictionloss),
+    "joint damping": _spread_across_envs(model.dof_damping),
     "encoder bias": _spread_across_envs(env.scene["robot"].data.encoder_bias),
     "table height": _spread_across_envs(model.body_pos[:, body("table/table"), 2]),
   }
@@ -200,3 +203,115 @@ def test_dr_scene_goal_tracks_the_table():
   assert goal[:, 0] == pytest.approx(cfg_mod.TARGET_XY[0], abs=1e-6)
   assert goal[:, 1] == pytest.approx(cfg_mod.TARGET_XY[1], abs=1e-6)
   assert goal[:, 2] == pytest.approx(top_z + 0.025, abs=1e-6)
+
+
+def _dofs(env: ManagerBasedRlEnv, pattern: str) -> list[int]:
+  mj_model = env.sim.mj_model
+  out = []
+  for j in range(mj_model.njnt):
+    name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+    if re.fullmatch(pattern, name.split("/", 1)[-1]):
+      out.append(int(mj_model.jnt_dofadr[j]))
+  assert out, pattern
+  return out
+
+
+def test_dr_robot_leaves_the_parked_arm_alone():
+  """Joint friction/damping vary on the driven arm and jaw only (S5.1 item +).
+
+  mjlab resolves string-keyed ranges against every joint of the entity, so without
+  `tabletop_env_cfg._on_joints` the right arm -- outside a one-arm task's action space --
+  would be randomised too.
+  """
+  from pal_mjlab.tasks.manipulation import tabletop_env_cfg as base
+
+  env = _pick_place_env("DR-robot", num_envs=64)
+  model = env.sim.model
+  friction, damping = model.dof_frictionloss.numpy(), model.dof_damping.numpy()
+  dofs_of = {
+    p: _dofs(env, p)
+    for p in (
+      r"arm_left_[1-7]_joint",
+      r"gripper_left_finger_joint",
+      r"arm_right_[1-7]_joint",
+      r"gripper_right_finger_joint",
+    )
+  }
+  env.close()
+
+  for group, pattern in (
+    ("arm", r"arm_left_[1-7]_joint"),
+    ("jaw", r"gripper_left_finger_joint"),
+  ):
+    dofs = dofs_of[pattern]
+    key = r"arm_.*_[1-7]_joint" if group == "arm" else r"gripper_.*_finger_joint"
+    for values, ranges in (
+      (friction, base._DR_ROBOT_JOINT_FRICTION),
+      (damping, base._DR_ROBOT_JOINT_DAMPING),
+    ):
+      lo, hi = ranges[key]
+      assert _spread_across_envs(values[:, dofs]) > 0.0, pattern
+      assert lo <= values[:, dofs].min() and values[:, dofs].max() <= hi, pattern
+  for pattern in (r"arm_right_[1-7]_joint", r"gripper_right_finger_joint"):
+    dofs = dofs_of[pattern]
+    assert _spread_across_envs(friction[:, dofs]) == 0.0, pattern
+    assert _spread_across_envs(damping[:, dofs]) == 0.0, pattern
+
+
+def test_dr_obs_gives_the_actor_a_tracker_error_model_and_the_critic_the_truth():
+  """S5.1 item +: per-episode bias, per-step jitter and 0-2 steps of lag, actor only."""
+  from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
+
+  for level in DR_LEVELS:
+    cfg = make_pick_place_env_cfg(
+      KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", dr=level
+    )
+    actor, critic = cfg.observations["actor"].terms, cfg.observations["critic"].terms
+    on = DR_LEVELS.index(level) >= DR_LEVELS.index("DR-obs")
+    for name in ("object_pos", "object_yaw"):
+      assert isinstance(actor[name].noise, NoiseModelWithAdditiveBiasCfg) is on, level
+      assert (actor[name].delay_max_lag, actor[name].delay_min_lag) == (
+        (2, 0) if on else (0, 0)
+      ), level
+      assert critic[name].delay_max_lag == 0, level
+      assert not isinstance(critic[name].noise, NoiseModelWithAdditiveBiasCfg), level
+
+
+def test_dr_obs_error_is_bounded_and_biased():
+  """The actor's object position differs from the critic's by at most bias + jitter,
+  and by a per-env constant, which is what makes it a bias and not noise."""
+  from pal_mjlab.tasks.manipulation import tabletop_env_cfg as base
+
+  env = _pick_place_env("DR-obs", num_envs=16)
+  zero = torch.zeros(env.num_envs, env.action_manager.total_action_dim)
+  # Many episodes first: the bias must be redrawn at each reset, not accumulated. mjlab's
+  # default "add" bias operation random-walks it (see `tabletop_env_cfg`, DR-obs).
+  for _ in range(20):
+    env.reset()
+  errors = []
+  for _ in range(10):
+    obs = env.step(zero)[0]
+    # Past the 2-step lag, and the cube is resting, so lag contributes nothing here.
+    actor, critic = (_object_pos(env, obs, g) for g in ("actor", "critic"))
+    errors.append(actor - critic)
+  env.close()
+  err = torch.stack(errors[3:]).numpy()  # (T, B, 3)
+  bound = base._DR_OBS_OBJECT_POS_BIAS + base._DR_OBS_OBJECT_POS_NOISE + 1e-4
+  assert np.abs(err).max() <= bound
+  mean = err.mean(axis=0)
+  assert _spread_across_envs(mean) > 2 * base._DR_OBS_OBJECT_POS_NOISE, "no bias"
+
+
+def _object_pos(env: ManagerBasedRlEnv, obs, group: str) -> torch.Tensor:
+  """Slice `object_pos` out of one concatenated observation group."""
+  manager = env.observation_manager
+  group_obs = obs[group]
+  names = manager.active_terms[group]
+  dims = manager.group_obs_term_dim[group]
+  start = 0
+  for name, dim in zip(names, dims, strict=True):
+    width = int(np.prod(dim))
+    if name == "object_pos":
+      return group_obs[:, start : start + width]
+    start += width
+  raise KeyError("object_pos")

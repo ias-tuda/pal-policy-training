@@ -30,6 +30,7 @@ with them cannot be driven on hardware until the C++ node is extended. Keep thes
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Mapping
 
@@ -49,6 +50,7 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 from mjlab.terrains import TerrainEntityCfg
+from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
@@ -468,8 +470,10 @@ def make_tabletop_env_cfg(
 #: * ``DR0`` -- nothing varies. Removes the two things the base cfg randomises.
 #: * ``DR-object`` -- the object's physics: sliding friction and mass.
 #: * ``DR-contact`` -- the gripper side: the base cfg's pad friction, restored.
-#: * ``DR-robot`` -- actuation: PD gains and joint friction on the driven joints.
-#: * ``DR-obs`` -- perception: wider object noise and an encoder bias.
+#: * ``DR-robot`` -- actuation: PD gains, joint friction and joint damping on the driven
+#:   joints.
+#: * ``DR-obs`` -- perception: an object-tracker error model (per-episode bias, per-step
+#:   jitter, 0-2 steps of lag) and an encoder bias.
 #: * ``DR-scene`` -- layout: table height and a wider spawn box.
 #:
 #: v0 trains at DR0 and DR-object only; the rest are defined so that climbing is a change of
@@ -507,17 +511,40 @@ _DR_OBJECT_ALPHA = tuple(
   math.log(mass / _CUBE_NOMINAL_MASS_KG) / 2 for mass in _DR_OBJECT_MASS_KG
 )
 
-#: DR-robot: +/-20% on the PD gains of the driven joints, and a small absolute joint friction.
-#: The friction range is a starting value and is not tuned -- the arms inherit MuJoCo's
-#: default `frictionloss` of 0, so anything here is new behaviour rather than a perturbation.
+#: DR-robot: +/-20% on the PD gains of the driven joints, and absolute joint-level friction
+#: and viscous damping per joint group, keyed by joint regex.
+#:
+#: The friction and damping ranges are Claudius's (`origin/fix-stack-exploration-collapse`,
+#: 860554a, `joint_friction_range` / `joint_damping_range` in his `robots/kangaroo.py`),
+#: folded in by S5.1 of the pick-and-place plan. The arms carry no `frictionloss` and no
+#: joint `damping` in the model at all -- their damping lives in the actuator kd -- so both
+#: are absolute and are new behaviour rather than a perturbation: 1.0 N.m of stiction is 2 %
+#: of the arm's 50 N.m effort limit, 0.05 N.m.s/rad is ~5 % of an arm kd of 1.0. The jaw
+#: ships with `damping="0.03"` (`kangaroo_grippers.xml`), which its range brackets, and gets
+#: three orders of magnitude less stiction than an arm, since anything larger stalls it.
 _DR_ROBOT_GAIN_SCALE = (0.8, 1.2)
-_DR_ROBOT_JOINT_FRICTION = (0.0, 0.1)
+_DR_ROBOT_JOINT_FRICTION = {
+  r"arm_.*_[1-7]_joint": (0.0, 1.0),
+  r"gripper_.*_finger_joint": (0.0, 0.02),
+}
+_DR_ROBOT_JOINT_DAMPING = {
+  r"arm_.*_[1-7]_joint": (0.0, 0.05),
+  r"gripper_.*_finger_joint": (0.02, 0.04),
+}
 
-#: DR-obs: what the policy is allowed to be wrong about. The base cfg uses +/-5 mm on the
-#: object position; this is the 1-2 cm the plan asks for, plus an encoder bias, which is a
-#: per-episode constant offset rather than per-step noise.
-_DR_OBS_OBJECT_POS = 0.015
-_DR_OBS_OBJECT_YAW = 0.05
+#: DR-obs: what the policy is allowed to be wrong about. The object pose gets a tracker
+#: error model rather than wider zero-mean noise: a per-episode bias, a small per-step
+#: jitter, and 0-2 control steps (0-40 ms) of lag sampled per env. The numbers are
+#: Claudius's (860554a, `OBJECT_*` in his `tabletop_env_cfg.py`), sized for a marker-based
+#: tracker with headroom, and folded in by S5.1. The point of the bias is that it cannot be
+#: averaged away over a few frames, which zero-mean noise resampled every step can -- the
+#: base cfg's +/-5 mm, and the +/-15 mm this rung used before, both left the policy
+#: effectively reading ground truth. Plus an encoder bias, also a per-episode constant.
+_DR_OBS_OBJECT_POS_BIAS = 0.008  # m
+_DR_OBS_OBJECT_POS_NOISE = 0.002  # m
+_DR_OBS_OBJECT_YAW_BIAS = 0.03  # rad
+_DR_OBS_OBJECT_YAW_NOISE = 0.01  # rad
+_DR_OBS_OBJECT_LAG = (0, 2)  # control steps
 _DR_OBS_ENCODER_BIAS = 0.005
 
 #: DR-scene: table height, and how much wider the spawn box gets. Additive rather than a
@@ -525,6 +552,23 @@ _DR_OBS_ENCODER_BIAS = 0.005
 #: pick-and-place, 15 cm for lift) and a factor would push the larger ones off the table.
 _DR_SCENE_TABLE_HEIGHT = 0.02
 _DR_SCENE_EXTRA_SPAWN = 0.03
+
+
+def _on_joints(
+  ranges: Mapping[str, tuple[float, float]], joint_regex: tuple[str, ...]
+) -> dict[str, tuple[float, float]]:
+  """Restrict joint-regex keyed DR ranges to the joints matched by ``joint_regex``.
+
+  mjlab matches a string-keyed ``ranges`` against *every* joint of the entity and ignores
+  the event's ``asset_cfg.joint_names`` (`_randomize_with_string_ranges` in
+  `mjlab/envs/mdp/dr/_core.py`), so ``arm_.*`` would also randomise an arm the task has
+  parked outside its action space. Each key becomes "matches the group *and* one of the
+  action regexes": the lookahead asserts the group pattern over the whole name, then the
+  alternation must match it too. A group with no action joint still raises in mjlab, which
+  is the loud failure wanted.
+  """
+  either = "|".join(f"(?:{r})" for r in joint_regex)
+  return {rf"(?=(?:{group})$)(?:{either})": rng for group, rng in ranges.items()}
 
 
 def _dr_index(level: str) -> int:
@@ -585,16 +629,20 @@ def apply_dr_level(
         "operation": "scale",
       },
     )
-    cfg.events["joint_friction"] = EventTermCfg(
-      mode="startup",
-      func=dr.joint_friction,
-      params={
-        "asset_cfg": action_joints,
-        "operation": "abs",
-        "distribution": "uniform",
-        "ranges": _DR_ROBOT_JOINT_FRICTION,
-      },
-    )
+    for name, func, ranges in (
+      ("joint_friction", dr.joint_friction, _DR_ROBOT_JOINT_FRICTION),
+      ("joint_damping", dr.joint_damping, _DR_ROBOT_JOINT_DAMPING),
+    ):
+      cfg.events[name] = EventTermCfg(
+        mode="startup",
+        func=func,
+        params={
+          "asset_cfg": action_joints,
+          "operation": "abs",
+          "distribution": "uniform",
+          "ranges": _on_joints(ranges, tuple(action_joints.joint_names)),
+        },
+      )
     # Action delay is *not* here, and cannot be: mjlab's delay buffer is configured on the
     # actuator (`delay_min_lag`/`delay_max_lag` and friends, `mjlab/actuator/actuator.py:67-85`),
     # so it is a property of the robot cfg rather than something an event can switch on. Per-env
@@ -603,15 +651,28 @@ def apply_dr_level(
 
   if rung >= _dr_index("DR-obs"):
     # The actor and critic groups share their term objects (`make_tabletop_env_cfg` copies the
-    # dict, not the terms), but only the actor has corruption enabled, so writing the actor's
-    # noise is enough and does not leak a noisy critic.
+    # dict, not the terms), so the actor's terms are *replaced*, not edited. That matters for
+    # the lag: `enable_corruption=False` switches off a group's noise but not its delay, so an
+    # edited shared term would feed the critic stale object poses too. The critic runs only in
+    # sim and keeps the true pose.
     terms = cfg.observations["actor"].terms
-    terms["object_pos"].noise = Unoise(
-      n_min=-_DR_OBS_OBJECT_POS, n_max=_DR_OBS_OBJECT_POS
-    )
-    terms["object_yaw"].noise = Unoise(
-      n_min=-_DR_OBS_OBJECT_YAW, n_max=_DR_OBS_OBJECT_YAW
-    )
+    for name, bias, noise in (
+      ("object_pos", _DR_OBS_OBJECT_POS_BIAS, _DR_OBS_OBJECT_POS_NOISE),
+      ("object_yaw", _DR_OBS_OBJECT_YAW_BIAS, _DR_OBS_OBJECT_YAW_NOISE),
+    ):
+      terms[name] = dataclasses.replace(
+        terms[name],
+        noise=NoiseModelWithAdditiveBiasCfg(
+          noise_cfg=Unoise(n_min=-noise, n_max=noise),
+          # "abs", not the default "add": mjlab 1.6.0's `NoiseModelWithAdditiveBias.reset`
+          # computes `bias = bias_noise_cfg.apply(bias)`, so with "add" every reset adds a
+          # fresh draw to the old bias and it random-walks across episodes (measured: 15 mm
+          # against an 8 mm bound after the first reset alone). "abs" replaces it.
+          bias_noise_cfg=Unoise(n_min=-bias, n_max=bias, operation="abs"),
+        ),
+        delay_min_lag=_DR_OBS_OBJECT_LAG[0],
+        delay_max_lag=_DR_OBS_OBJECT_LAG[1],
+      )
     cfg.events["encoder_bias"] = EventTermCfg(
       mode="reset",
       func=dr.encoder_bias,
