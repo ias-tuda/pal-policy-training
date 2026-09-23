@@ -68,6 +68,12 @@ def test_no_scripted_action_needed_clipping(episodes):
   assert episodes[0]["clipped_env_steps"] == 0
 
 
+def test_the_script_respects_the_arm_slew_limit(episodes):
+  """S5.1 item 4: no scripted step asks the arm to move faster than the hardware can, so the
+  feasibility result is not bought with commands the rate-limited action term would lag."""
+  assert episodes[0]["over_slew_env_steps"] == 0
+
+
 def test_the_jaw_spans_its_range_and_no_further():
   """Action +1 is the fully closed jaw; any action <= 0 is the open jaw, never a target
   below the open limit. mjlab's position actuators are `ctrllimited=False`, so without the

@@ -465,6 +465,19 @@ def rollout(
   )
   offset = term.offset
   jaw_closed = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").closed_pos
+  # The arm's slew limit, rad per control step (S5.1 item 4; inf where there is none). Every
+  # interpolation below is stretched so no step asks for more than this: the action term
+  # would enforce it anyway, but a script that outruns it drifts from its own schedule and
+  # its settle checks start measuring lag, not arrival.
+  slew = (
+    term._rate[0, arm_idx].cpu().numpy()
+    if hasattr(term, "_rate")
+    else np.full(len(arm_idx), np.inf)
+  )
+
+  def n_steps(a: np.ndarray, b: np.ndarray, base: int) -> int:
+    need = int(np.ceil((np.abs(b - a) / slew).max() - 1e-9))
+    return max(base, need)
 
   env.reset()
   obj = env.scene[pp.OBJECT]
@@ -518,11 +531,17 @@ def rollout(
   arm_q = [robot.joint_names.index(j) for j in ARM_JOINTS]
   settle_steps: dict[str, int] = {}
   place_corrections = 0
+  last_q = prev.copy()
+  over_slew = (
+    0  # env-steps whose commanded arm move exceeded the slew limit; should stay 0
+  )
+  stretched: dict[str, int] = {}
 
   def move_and_settle(a: np.ndarray, b: np.ndarray, closed: bool) -> None:
     """Interpolate the arm from pose ``a`` to ``b``, then hold ``b`` until it settles."""
-    for s in range(1, PLACE_CORRECTION_STEPS + 1):
-      step_to(a + (b - a) * (s / PLACE_CORRECTION_STEPS), closed)
+    n = n_steps(a, b, PLACE_CORRECTION_STEPS)
+    for s in range(1, n + 1):
+      step_to(a + (b - a) * (s / n), closed)
     for _ in range(SETTLE_MAX_STEPS):
       if bool(ended.all()):
         return
@@ -533,7 +552,9 @@ def rollout(
 
   def step_to(q: np.ndarray, closed: bool) -> None:
     """One control step toward arm pose ``q`` with the jaw open or closed."""
-    nonlocal clipped, ended, order
+    nonlocal clipped, ended, order, last_q, over_slew
+    over_slew += int((np.abs(q - last_q) > slew + 1e-6).any(axis=-1).sum())
+    last_q = np.array(q, copy=True)
     target_q = offset.clone()
     target_q[:, arm_idx] = torch.as_tensor(q, dtype=torch.float32, device=env.device)
     target_q[:, jaw_idx] = jaw_closed if closed else 0.0
@@ -565,8 +586,11 @@ def rollout(
         for i in torch.nonzero(~ended).flatten().tolist():
           replan_place(kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i])
       nxt = np.stack([p[wp] for p in plans])
-      for s in range(1, steps + 1):
-        step_to(prev + (nxt - prev) * (s / steps), closed)
+      n = n_steps(prev, nxt, steps)
+      if n > steps:
+        stretched[phase] = n
+      for s in range(1, n + 1):
+        step_to(prev + (nxt - prev) * (s / n), closed)
       if phase in SETTLE_AFTER:
         waited = 0
         while waited < SETTLE_MAX_STEPS and not bool(ended.all()):
@@ -648,6 +672,8 @@ def rollout(
     print(f"\n{clipped} env-steps needed an action outside [-1, 1] (clipped)")
     print(f"settle waits (control steps): {settle_steps}")
     print(f"place corrections applied: {place_corrections}")
+    print(f"phases stretched to respect the arm slew limit: {stretched}")
+    print(f"env-steps commanding faster than the slew limit: {over_slew}")
     print(
       f"{'env':>3s} {'grasped':>8s} {'lifted':>7s} {'placed':>7s} {'pl&lift':>8s} "
       f"{'steps':>6s} {'tcp-cube':>9s} {'jaw':>6s} {'cube-goal':>10s}  ended by"
@@ -666,6 +692,8 @@ def rollout(
     r["clipped_env_steps"] = clipped
     r["settle_steps"] = dict(settle_steps)
     r["place_corrections"] = place_corrections
+    r["slew_stretched_phases"] = dict(stretched)
+    r["over_slew_env_steps"] = over_slew
     r["ended_by"] = why[i]
     for key, v in diag.items():
       r[key] = float(v[i])

@@ -27,6 +27,10 @@ from mjlab.tasks.manipulation.mdp import (
   target_position,
 )
 
+from .actions import (
+  RateLimitedJointPositionAction,
+  RateLimitedJointPositionActionCfg,
+)
 from .commands import (
   EntityOffsetCommand,
   EntityOffsetCommandCfg,
@@ -70,6 +74,8 @@ from .terminations import (
 )
 
 __all__ = [
+  "RateLimitedJointPositionAction",
+  "RateLimitedJointPositionActionCfg",
   "entity_out_of_reach",
   "keepout_box_penalty",
   # mjlab manipulation terms, re-exported so a task needs one namespace.

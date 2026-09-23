@@ -95,6 +95,14 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
   # fails. His 0.75 m: the cube spawns ~0.4-0.6 m out, and at 0.75 m the arm is near full
   # extension -- past it the episode is not worth running.
   reach=ReachCfg(reference_body="base_link", max_distance=0.75),
+  # S5.1 item 4 (Claudius's 602cd9d): PAL's URDF joint speeds (`arm/4dof`, `arm/7dof`
+  # xacro), 1.95 rad/s on the shoulder pair and 2.35 from the humeral roll out, i.e.
+  # 0.039 / 0.047 rad per 20 ms control step. The jaw is not limited (decision 0002 was
+  # chosen over his jaw slew, S5.1 item 5).
+  joint_velocity_limits={
+    r"arm_.*_[12]_joint": 1.95,
+    r"arm_.*_[3-7]_joint": 2.35,
+  },
 )
 
 
