@@ -231,7 +231,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      `scripts/gripper_bench.py`, `../docs/reports/pick-place-v0/s6-report.md`) reproduces
      it** (fingertip joints lead) and finds the fix: passive armature 5e-3 + jaw kp 20 -> 8
      + jaw clip 0.78 = peak 2013 -> 8.3 rad/s, CPU divergences 4 -> 0 in 2.56 M physics
-     steps. **Proposed as decision 0002, not landed.** Also measured: softer equalities
+     steps. **Decision 0002, LANDED 2026-09-23 at `72d02fb`** (tabletop only: passive
+     armature 5e-3, tabletop jaw kp 8, `_JAW_CLOSED` 0.78 = jaw scale = clip). Also measured: softer equalities
      (plan's L4 suspect) are *worse*; kp 20 buckles the linkage on a centred cube (~117 N
      per pad); the jaw physically stops at 0.824 rad, not 0.95 (fingertip-joint limits);
      **S5.0's clip [0, 0.95] on today's model raises CPU divergences 4 -> 13** (p ~ 0.025).
@@ -335,10 +336,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    a C1r on the 0002 model still needs its own gate-3 re-check.)*
 1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
    `c1r`/`c2r`, read at 3-4 k iters with `eval_pick_place.py`. A check-in before submission.
-2. **S6: check-in on decision 0002** (`../docs/decisions/0002-*.md`). If accepted: land it
-   (tabletop-only), `make test`, re-run S5.0's scripted feasibility on the new jaw, then the
-   C0-style IAS NaN job (acceptance <= 0.01 % of episodes). Open: 3.2 deg pad wedge lets a
-   cube creep ~2 mm/s under violent shaking (geometry, not stability).
+2. **S6: decision 0002 landed** (`72d02fb`; deploy `siwei` @ `17009cc`). `make test` 159
+   passed. The scripted gate first failed on it (2/10); the cause was the *script* (every
+   cube 26-41 mm off at release on either jaw, the old 9/10 was drift), fixed in `0fc65d9`
+   with settle waits + a lifted xy place correction: 10/10 on both jaws. **Next: one
+   C0-style IAS job on `17009cc`** (RUN_TAG s50nan0002; needs user approval) -- it is 0002's
+   acceptance (<= 0.01 %) and gate 3 on the new jaw; 157575 was the old jaw. The S5 session
+   agreed to own that job, then exited before it got the hash. Open: 3.2 deg pad wedge lets
+   a cube creep ~2 mm/s under violent shaking (geometry, not stability).
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
    non-goals. Still the oldest open item in the repo.
 4. Create `../docs/roadmap.md` — named in `CLAUDE.md` as the entry point, still missing.
