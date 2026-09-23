@@ -173,6 +173,22 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 5. What doesn't work / open problems
 
+-1. **THE PICK-AND-PLACE TASK WAS NOT PHYSICALLY POSSIBLE (found 2026-09-23).** C1 and C2 --
+   six runs, ~750 M steps each -- all report `Episode_Reward/grasp` exactly 0.0000 at every
+   logged point and plateau by iteration ~1500. Cause: **`JointPositionAction` scale is an
+   absolute bound, not a per-step increment** (`target = raw*scale + offset`,
+   `actions.py:157`, `use_default_offset=True`). So:
+   - the jaw reaches only **0.206 of its 0-0.95 rad range**; with the cube held between the
+     pads and the jaw fully commanded, the grasp sensor **never fires** (min pad gap 7.64 cm
+     on a 5 cm cube). At scale 1.0 it **does** fire (6.85 cm). Geometry is fine; the scale
+     was the limit.
+   - the arm reaches a TCP envelope of only **12.1 cm** against a **13.5 cm** cube distance.
+   The source comment ("0.2 rad *per step* ... covers the 0.95 rad range in five steps")
+   assumed incremental control. **C1/C2 are invalid as reward comparisons.**
+   **Raising the jaw scale is not free:** it was lowered from 0.50 to 0.20 precisely because
+   0.50 peaked the four-bar at 129 rad/s, and that four-bar is what the NaN dumps name.
+   Expect the divergence rate to rise from its measured 0.031 %.
+
 0. **mujoco_warp does not reset a diverged world; MuJoCo's C engine does** (`mj_checkPos` /
    `mj_checkVel` / `mj_checkAcc` reset `mjData` on a bad state; no such symbol exists in
    `mujoco_warp/_src/`). A blown-up world therefore stays blown up and feeds NaN to the
