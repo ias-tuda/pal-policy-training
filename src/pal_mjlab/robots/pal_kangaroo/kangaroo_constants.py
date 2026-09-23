@@ -334,6 +334,49 @@ _GRIPPER_PASSIVE_JOINT_REGEX = (
 _TABLETOP_GRIPPER_PASSIVE_ARMATURE = 5e-3
 
 
+#: Effort limit of every joint whose gravity compensation is routed through its actuator,
+#: by regex -- the same numbers the actuator cfgs below carry (S_PLUS, S_MINUS, XS,
+#: PELVIS_*), restated because the spec is edited before the actuators exist.
+_TABLETOP_ACTGRAVCOMP_EFFORT = {
+  r"pelvis_[12]_joint": 50.0,
+  r"arm_(left|right)_[12]_joint": 50.0,
+  r"arm_(left|right)_[3-7]_joint": 25.0,
+}
+
+
+def _route_gravcomp_through_actuators(spec: mujoco.MjSpec) -> None:
+  """Make gravity compensation count against the pelvis/arm effort limits (S5.1 item 6).
+
+  With ``actgravcomp`` a joint's gravity compensation is added to ``qfrc_actuator``
+  instead of ``qfrc_passive``, like the feedforward a real torque-limited servo would carry
+  (Claudius's cee261a). On its own that does *not* bound it: MuJoCo clamps the sum only by
+  the joint's ``actuatorfrcrange``, and mjlab's ``BuiltinPositionActuatorCfg`` puts the
+  effort limit on the actuator's ``forcerange`` instead (`mjlab/utils/spec.py`), which
+  clamps the PD term alone. So the joint range is set here too: the PD term stays within
+  its own limit, and PD + gravity together within the same limit.
+  """
+  matched = 0
+  for joint in spec.joints:
+    effort = next(
+      (
+        e
+        for rx, e in _TABLETOP_ACTGRAVCOMP_EFFORT.items()
+        if re.fullmatch(rx, joint.name)
+      ),
+      None,
+    )
+    if effort is None:
+      continue
+    joint.actgravcomp = True
+    joint.actfrclimited = mujoco.mjtLimited.mjLIMITED_TRUE
+    joint.actfrcrange = (-effort, effort)
+    matched += 1
+  if matched != 16:
+    raise ValueError(
+      f"expected 16 pelvis/arm joints for actgravcomp, matched {matched}"
+    )
+
+
 def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   """The grippers model with a collision set a tabletop task can trust.
 
@@ -347,8 +390,10 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   It raises the armature on the jaw four-bar's passive joints to
   `_TABLETOP_GRIPPER_PASSIVE_ARMATURE` (decision 0002).
 
-  It also switches on gravity compensation for the torso and the arms -- see
-  `_TABLETOP_GRAVCOMP_BODIES`, which is a decision, not a detail. `gravcomp=False` is there
+  It also switches on gravity compensation for the torso, the arms and the grippers -- see
+  `_TABLETOP_GRAVCOMP_BODIES`, which is a decision, not a detail -- and routes it through
+  the pelvis/arm actuators so it counts against their effort limits
+  (`_route_gravcomp_through_actuators`). `gravcomp=False` is there
   to measure against, not to train with: without it the arm droops half a radian.
   """
   spec = _load_spec(KANGAROO_GRIPPERS_XML)
@@ -385,6 +430,7 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
     for body in spec.bodies:
       if body.name.startswith(_TABLETOP_GRAVCOMP_BODIES):
         body.gravcomp = 1.0
+    _route_gravcomp_through_actuators(spec)
 
   for body_a, body_b in _TABLETOP_CONTACT_EXCLUDES:
     spec.add_exclude(name=f"{body_a}__{body_b}", bodyname1=body_a, bodyname2=body_b)
