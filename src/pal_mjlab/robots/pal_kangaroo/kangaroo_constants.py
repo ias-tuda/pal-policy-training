@@ -460,10 +460,29 @@ KANGAROO_LOWER_BODY_ACTUATORS = KANGAROO_LEG_ACTUATORS + (
 # Initial State
 ##
 
-#: Left arm 1-7 for the tabletop pose. `arm_left_4_joint` is pinned at pi/2 -- elbow square
-#: -- and the remaining six solve for "open jaw directly above the working area, axis
-#: straight down"; see MANIPULATION_INIT_STATE.
-_MANIPULATION_LEFT_ARM = (-0.319, 1.468, 1.855, 1.571, 0.014, 1.894, -0.891)
+#: The tabletop arm pose: both hands in front of the torso just above the table's near edge,
+#: elbows down, grippers looking forward and slightly down at the work area. Claudius's
+#: `_ARM_HOME_POSE` (`origin/fix-stack-exploration-collapse` 980526a, kept through 82a6d5d),
+#: "solved by damped least-squares IK and picked for manipulability and joint-limit margin";
+#: no script for it was committed. Adopted by S5.1 item 2 (2026-09-23), replacing S1's
+#: left-arm-only pose (elbow at pi/2, jaw straight down, right arm left at its locomotion
+#: pose). It is also the action origin (`use_default_offset=True`).
+_MANIPULATION_ARM_HOME_POSE = {
+  "arm_left_1_joint": 0.102,
+  "arm_left_2_joint": 1.452,
+  "arm_left_3_joint": 1.777,
+  "arm_left_4_joint": 1.670,
+  "arm_left_5_joint": -0.458,
+  "arm_left_6_joint": 0.404,
+  "arm_left_7_joint": 0.009,
+  "arm_right_1_joint": -0.139,
+  "arm_right_2_joint": 1.480,
+  "arm_right_3_joint": -1.717,
+  "arm_right_4_joint": 1.691,
+  "arm_right_5_joint": 0.382,
+  "arm_right_6_joint": 0.368,
+  "arm_right_7_joint": -0.005,
+}
 
 INIT_STATE = EntityCfg.InitialStateCfg(
   pos=(0.0, 0.0, 0.9),
@@ -491,17 +510,10 @@ INIT_STATE = EntityCfg.InitialStateCfg(
 )
 
 # Tabletop starting pose. INIT_STATE is the locomotion pose: it names arm 1-4 only, leaves
-# arm 5-7 and the jaw at zero, and puts the left grasp point at (0.178, 0.326, 0.558) --
-# 20 cm below the table top and behind its near edge, arm hanging by the side. A
-# manipulation episode that starts there spends its first second getting the hand over the
-# table.
-#
-# This holds the *left* arm with the elbow square and the open jaw directly above the
-# working area, pointing straight down, so the policy starts where the work is. Legs,
-# pelvis and the right arm keep their locomotion values; the arm entries are written per
-# side rather than as `arm_.*_N_joint` patterns so that nothing here overlaps a pattern in
-# INIT_STATE. Solved by `scripts/nominal_pose.py --elbow 1.5708`; see
-# ../docs/reports/pick-place-v0/.
+# arm 5-7 and the jaw at zero, and hangs the arms by the robot's sides, below the table top.
+# This keeps its legs and pelvis and puts both arms at `_MANIPULATION_ARM_HOME_POSE`. The arm
+# entries are exact names, not `arm_.*_N_joint` patterns, so nothing here overlaps a pattern
+# in INIT_STATE (which would win over a later exact name).
 MANIPULATION_INIT_STATE = EntityCfg.InitialStateCfg(
   pos=INIT_STATE.pos,
   joint_pos={
@@ -510,17 +522,7 @@ MANIPULATION_INIT_STATE = EntityCfg.InitialStateCfg(
       for k, v in INIT_STATE.joint_pos.items()
       if k.startswith("leg_") or k.startswith("pelvis_")
     },
-    "arm_right_1_joint": -0.24,
-    "arm_right_2_joint": 1.32,
-    "arm_right_3_joint": -1.57,
-    "arm_right_4_joint": 0.8,
-    "arm_left_1_joint": _MANIPULATION_LEFT_ARM[0],
-    "arm_left_2_joint": _MANIPULATION_LEFT_ARM[1],
-    "arm_left_3_joint": _MANIPULATION_LEFT_ARM[2],
-    "arm_left_4_joint": _MANIPULATION_LEFT_ARM[3],
-    "arm_left_5_joint": _MANIPULATION_LEFT_ARM[4],
-    "arm_left_6_joint": _MANIPULATION_LEFT_ARM[5],
-    "arm_left_7_joint": _MANIPULATION_LEFT_ARM[6],
+    **_MANIPULATION_ARM_HOME_POSE,
   },
   joint_vel={".*": 0.0},
 )

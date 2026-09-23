@@ -127,11 +127,11 @@ def test_no_self_collision_at_the_start_pose(tabletop):
   )
 
 
-def test_start_pose_holds_the_left_elbow_square(tabletop):
-  """The pose is a decision, not an accident: elbow at pi/2, jaw open and over the table."""
-  assert MANIPULATION_INIT_STATE.joint_pos["arm_left_4_joint"] == pytest.approx(
-    1.571, abs=1e-3
-  )
+def test_start_pose_is_the_home_pose(tabletop):
+  """S5.1 item 2: both arms at Claudius's home pose; the jaw left open (at zero)."""
+  assert MANIPULATION_INIT_STATE.joint_pos["arm_left_4_joint"] == pytest.approx(1.670)
+  assert MANIPULATION_INIT_STATE.joint_pos["arm_right_4_joint"] == pytest.approx(1.691)
+  assert sum(k.startswith("arm_") for k in MANIPULATION_INIT_STATE.joint_pos) == 14
   assert "gripper_left_finger_joint" not in MANIPULATION_INIT_STATE.joint_pos
   # Legs and pelvis are inherited verbatim; only the arms differ from the locomotion pose.
   for key, value in INIT_STATE.joint_pos.items():
