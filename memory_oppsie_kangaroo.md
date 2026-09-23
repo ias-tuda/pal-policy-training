@@ -3,8 +3,9 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-22 (pick-and-place v0 S1-S4 complete, S5 implemented and deployed to
-the IAS cluster; no experiment launched. Reports in `../docs/reports/pick-place-v0/`).*
+*Last updated: 2026-09-23 (pick-and-place v0: C1/C2 cancelled and invalidated; **S5.0
+implemented — scripted pick-and-place 9/10 through the policy's action space**; S5.0 gate 3
+(IAS NaN job) awaiting approval. Reports in `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
 
@@ -32,8 +33,9 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S2 (DR ladder) | ✅ complete — six rungs, `../docs/reports/pick-place-v0/s2-report.md`. Only DR0 and DR-object are in v0's scope; ranges above them are untuned |
 | Pick-and-place v0 S5 implementation (5 reward variants, regularisers, sbatch) | ✅ `../docs/reports/pick-place-v0/s5-report-part1.md` |
 | Pick-and-place v0 S5 **C0** | ✅ **done 2026-09-22** — jobs 157183-157186, all 200/200 on IAS. Throughput and divergence rate measured, see §6/§7 |
-| Pick-and-place v0 S5 **C1** | ⏳ **running** 157188-157190, R-A/DR0, 3 seeds, 2048 envs, 20 k iters, ~13 h |
-| Pick-and-place v0 S5 **C2** | ⏳ **running** 157239 (R-C, 1 seed) + 157240/1 (R-C-strict, 2 seeds), commit `e27a9b5` |
+| Pick-and-place v0 S5 **C1** | 🛑 cancelled 2026-09-23 and **invalidated** (157188-157190) — the task was not possible through the action space, §5 −1 |
+| Pick-and-place v0 S5 **C2** | 🛑 cancelled 2026-09-23 and **invalidated** (157239-157241), same cause |
+| Pick-and-place v0 **S5.0** (make the grasp possible) | 🟡 **gate 1 ✅** scripted pick-and-place 9/10 placed ∧ lifted, 10/10 grasped + lifted (`tests/test_pick_place_scripted_feasibility.py`); **gate 3 ⏳** IAS NaN job not submitted — `../docs/reports/pick-place-v0/s5-0-report.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -147,11 +149,19 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
   and friends on `ActuatorCfg` (`mjlab/actuator/actuator.py:67-85`), with per-env lags via
   `Actuator.set_lags`. Switching it on needs a robot-cfg variant, so it is not in DR-robot.
 - **`JointPositionAction` is absolute**: `target = default_joint_pos + scale * action`
-  (`mjlab/envs/mdp/actions/actions.py:212-224`), and `clip_actions` defaults to `None`. With
-  the manipulation scales (0.10 rad on arm 1-5, 0.05 on the wrist) an action of magnitude 1
-  moves the Kangaroo's grasp point up to 16.3 cm — measured — so the start pose decides what
-  an untrained policy can reach. From the S1.2 pose both the spawn and the target are inside
-  the |action| <= 1 envelope.
+  (`mjlab/envs/mdp/actions/actions.py:157`), and `clip_actions` defaults to `None`. A scale
+  is the half-width of the commandable box, not a step size. Pick-place's scales since S5.0:
+  arm 1-7 **0.20 / 0.55 / 0.40 / 0.55 / 0.55 / 0.50 / 1.05**, sized by
+  `scripts/scripted_pick_place.py derive` (1.5 x the largest IK excursion over the task's
+  waypoints); jaw **0.95** = full range. Commanded TCP envelope at |a| <= 1: 59.5 cm max (was
+  13.9 cm with 0.10/0.05 — S3's 16.3 cm does not reproduce).
+- **mjlab position actuators do not clamp their target** (`ctrllimited=False`,
+  `mjlab/utils/spec.py`). A target past a joint limit presses into the stop at up to full
+  effort. Pick-place clips the jaw target to [0, 0.95] via `ManipulationRobotCfg.action_clip`
+  -> `JointPositionActionCfg.clip`.
+- **Contact sensor `found` is `(B, P x num_slots)`, primary-major.** Reduce over slots
+  before asking "is primary i in contact". The grasp is now **both fingertip pads**
+  (`GripperCfg.grasp_geom_regex`), any slot; see §5 −1.
 - **`MANIPULATION_COLLISION` filters out colliders that exist in the XML.** The grippers
   variant collides on feet, arm 5-7 and the gripper only — 43 of 110 geoms in the lift scene.
   `pelvis_2_collision` (torso capsule) and `arm_*_4_collision` are in `kangaroo_grippers.xml`
@@ -188,6 +198,15 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    **Raising the jaw scale is not free:** it was lowered from 0.50 to 0.20 precisely because
    0.50 peaked the four-bar at 129 rad/s, and that four-bar is what the NaN dumps name.
    Expect the divergence rate to rise from its measured 0.031 %.
+   **A second, independent blocker (found 2026-09-23, S5.0): the grasp sensor could not
+   register a grasp at all.** It watched 4 geoms (fingertip + inner finger, both sides) x 2
+   slots and `_grasped_bool` required all 8; a cube held at the pads touches only the two
+   fingertips (measured `found` = [0,0,2,2,0,0,2,2], ~60 N per pad, cube lifted and carried,
+   `grasped` False). The "fires at scale 1.0" line above was a pinned-cube test and does not
+   hold for a jaw closing on a free cube (it stops at 0.39 rad). **Both fixed in S5.0**
+   (approved check-in for the sensor): scales from IK, jaw 0.95 + clip, grasp = both
+   fingertip pads. Also fixed: `eval_pick_place.Tally` never counted a placement that ended
+   its own episode (`Tally.terminal`).
 
 0. **mujoco_warp does not reset a diverged world; MuJoCo's C engine does** (`mj_checkPos` /
    `mj_checkVel` / `mj_checkAcc` reset `mjData` on a bad state; no such symbol exists in
@@ -279,6 +298,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | S3 env validation, 2026-09-22 | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, `num_envs=1`, CPU | local Mac | `--agent zero` 500 steps: left arm max \|dq\| 0.0005 rad (limit 0.02). `--agent random` 1000 steps: no auto-reset, no termination, no NaN. 11.8 control steps/s — a laptop number, not a cost | `s3-report.md` |
 | S4 hold check, 2026-09-22 | `scripts/hold_check.py --steps 1000`, seed 0, 4 configurations | local Mac | before: pelvis 0.357 rad, right arm 0.246, leg length 0.491 m. After hold event + gravcomp: 0.007 / 0.019 / 0.004 — S4 acceptance PASS at steady state | `s4-report.md` |
 | **C0, 2026-09-22** | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, R-A/DR0, seed 1, 200 iters, jobs **157183-157186** @ `9adc904` | IAS (gn02/gn03/gn08; 3090 + A5000), `mujoco_warp_io.patch` NOT applied | **all four 200/200.** Throughput and divergence rate in §6. The same 1024-env config died at iteration 10 before the guard (157178). `Episode_Reward/grasp` = 0.0000 in every run while `success` fires — the policy slides the cube; see below | wandb `20260922_oppsie` tag `c0r`; `../docs/Mjlab-PickPlace-Pal-Kangaroo-Grippers.md` |
+| S5.0 scale derivation, 2026-09-23 | `scripts/scripted_pick_place.py derive`, 9 spawns (centre + 8 corners) x 6 waypoints + target | local Mac | arm scales 0.20/0.55/0.40/0.55/0.55/0.50/1.05; none capped; wrist roll needs most (35 deg to square the pads to a -10 deg cube) | `s5-0-report.md` §2, `artifacts/s5.0/derive.json` |
+| **S5.0 scripted feasibility, 2026-09-23** | `scripts/scripted_pick_place.py rollout --num-envs 10`, R-A/DR0, seed 0, CPU | local Mac | **9/10 placed ∧ lifted, 10/10 grasped and lifted**, 0 clipped actions. Miss: corner (0.44, 0.29, −10°), released 51 mm off. Needed the grasp-sensor fix; open-loop place 1/10, closed-loop on cube pose 9/10 | `s5-0-report.md` §5, `artifacts/s5.0/rollout_corners.json` |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -295,27 +316,15 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0a. **C2 RUNNING since 2026-09-22 21:5x**, commit `e27a9b5`: **157239** C2-a = R-C 1 seed,
-   **157240/157241** C2-b = R-C-strict 2 seeds; 2048 envs, DR0, 20 k iters, `--time=30:00:00`.
-   **Read at 3-4 k iterations (~2-3 h), not at the end** -- whether `Episode_Reward/grasp`
-   ever leaves zero is visible by then, and a dead arm is `scancel`led. R-C-strict is the arm
-   most exposed to Isaac Lab #204; if `grasp` is still 0 at ~600 iters the pre-agreed fix is
-   a `+1·grasped` term or `lift` weight 30-50, **as a follow-up run, not an edit to a running
-   one**. R-B/R-D/R-E wait until some arm is shown to pick.
-0. **Pick-and-place v0: S1-S5 implemented, C0 done, C1 RUNNING since 2026-09-22 20:26.**
-   Jobs **157188 / 157189 / 157190**, seeds 1-3, 2048 envs, 20 000 iterations, commit
-   `e84d270`, `--time=30:00:00`. wandb `lq7yhwlm` / `0mk128al` / `jbs6n4w6` in
-   `20260922_oppsie`. **Health confirmed by API at 20:38** (state=running, iters 271-298,
-   20-22 k fps, no traceback/CUDA error in any log). Steady state 2.21 s/iter, **ETA ~12 h**,
-   so expect them finished ~2026-09-23 08:30. Read with `Episode_Reward/grasp` first --
-   see 1.
-1. **Report C1 as a transport result, not a picking one.** Every C0 run succeeds with
-   `Episode_Reward/grasp` exactly 0: the goal sits at the cube's resting height
-   (`TABLE_TOP_Z + 0.025`) and `_placed_bool`'s `released` is `~grasped`, so sliding the cube
-   20 cm satisfies success. The plan predicted this and R-C exists to gate it.
-2. **Decide how C2 selects a reward arm.** The registered id is R-A at DR0 and the sbatch
-   refuses anything else. Four more task ids goes beyond the plan's D7 — a decision, not a
-   judgment call.
+0. **S5.0 gate 3: submit one C0-style IAS job at the new jaw scale** (2048 envs, 200 iters,
+   R-A, DR0, seed 1) and read `Episode_Termination/non_finite_state` against the 0.1 %
+   gate. **Needs explicit approval** (CLAUDE.md, shared scheduler). Needs a fresh bundle to
+   IAS — the checkout there is at `e84d270` — and `EXPECTED_COMMIT` set to the S5.0 commit.
+   Above 0.1 % -> plan S5.0 row 0.4 (jaw rate limit), else wait for S6.
+1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
+   `c1r`/`c2r`, read at 3-4 k iters with `eval_pick_place.py`. A check-in before submission.
+2. **S6 (gripper four-bar) runs in parallel** — `scripts/gripper_bench.py` (`95c92b1`).
+   When it lands, re-check the S5 winner on the new model.
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
    non-goals. Still the oldest open item in the repo.
 4. Create `../docs/roadmap.md` — named in `CLAUDE.md` as the entry point, still missing.

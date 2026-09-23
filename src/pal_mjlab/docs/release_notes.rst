@@ -21,6 +21,27 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **Fixed: the grasp signal of every tabletop manipulation task could not
+  register a grasp.** The grasp sensor watched four geoms per gripper
+  (fingertip and inner finger, both sides) and ``is_grasped`` required every
+  contact slot of all four at once. A 5 cm cube held at the pads touches only
+  the two fingertips, so ``grasped`` stayed False while the cube was lifted
+  and carried. It also meant a held cube counted as "released", so a
+  ``success`` termination could fire mid-carry. A grasp is now both fingertip
+  pads in contact (new ``GripperCfg.grasp_geom_regex``). Affects
+  ``Mjlab-Lift-``, ``Mjlab-Stack-`` and ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``;
+  the observation's shape is unchanged.
+
+- **Changed: ``Mjlab-PickPlace-Pal-Kangaroo-Grippers`` action scales.** The
+  action is an absolute joint target, and the inherited scales let the policy
+  command the jaw to only 22 % of its range and move the grasp point about
+  12 cm, so the task could not be done. The arm scales are now sized from IK
+  over the task's own waypoints (0.20-1.05 rad per joint). The jaw scale is its
+  full 0.95 rad range, with the target clipped at the open limit through the
+  new ``ManipulationRobotCfg.action_clip``. Lift and Stack are unchanged. A
+  scripted pick-and-place through the policy's action interface is now a test
+  (``tests/test_pick_place_scripted_feasibility.py``).
+
 - **Fixed: the goal of every tabletop manipulation task was unreachable with
   more than one environment.** ``Mjlab-Lift-``, ``Mjlab-Stack-`` and
   ``Mjlab-PickPlace-Pal-Kangaroo-Grippers`` inherited the locomotion default of

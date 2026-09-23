@@ -33,6 +33,9 @@ def _gripper(side: str) -> GripperCfg:
     open_pos=_JAW_OPEN,
     closed_pos=_JAW_CLOSED,
     hand_body=f"arm_{side}_7_link",
+    # The fingertip pads alone: the inner-finger geoms sit ~2 cm deeper and a 5 cm cube
+    # held at the pads never reaches them (measured 2026-09-23, S5.0).
+    grasp_geom_regex=rf"gripper_{side}_fingertip_(left|right)_collision",
   )
 
 
@@ -78,7 +81,32 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
 # What holds the right arm once the policy stops commanding it is
 # `mdp.hold_nominal_targets` plus the gravity compensation from S4; before those, an arm
 # taken out of the action space was an arm commanded to zero.
+#
+# Action scales (S5.0, 2026-09-23). The action is an *absolute* target, `default + scale *
+# action`, so a scale is the half-width of the box the policy can command -- not a step
+# size. KANGAROO_GRIPPERS' scales cap the jaw at 22 % of its range (it never closes on the
+# cube) and the arm at ~12 cm of grasp-point travel, which is what C1/C2 died on. These are
+# sized from the task instead: `scripts/scripted_pick_place.py derive` solves IK for
+# pre-grasp, grasp, lift, carry, place and retreat at the spawn box's corners and the target,
+# and each scale is 1.5x the largest excursion from the start pose, rounded up to 0.05 rad.
+# The jaw scale is its full range, so action +1 is fully closed; the clip stops action < 0
+# from commanding a target below the open limit, which the simulator does not clamp
+# (mjlab position actuators are `ctrllimited=False`) and which would press the four-bar
+# into its stop at up to 19 N.m.
+#
+# Only this variant: Lift and Stack keep KANGAROO_GRIPPERS' scales.
 KANGAROO_GRIPPERS_LEFT_ARM = dataclasses.replace(
   KANGAROO_GRIPPERS,
   action_joint_regex=(r"arm_left_[1-7]_joint", r"gripper_left_finger_joint"),
+  action_scale={
+    r"arm_left_1_joint": 0.20,
+    r"arm_left_2_joint": 0.55,
+    r"arm_left_3_joint": 0.40,
+    r"arm_left_4_joint": 0.55,
+    r"arm_left_5_joint": 0.55,
+    r"arm_left_6_joint": 0.50,
+    r"arm_left_7_joint": 1.05,
+    r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
+  },
+  action_clip={r"gripper_left_finger_joint": (_JAW_OPEN, _JAW_CLOSED)},
 )

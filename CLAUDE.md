@@ -149,6 +149,18 @@ Claims that have already been wrong here:
   that visibly intersect. Collision geometry has to be changed in the `MjSpec` — for mjlab, by
   editing the entity's `CollisionCfg` before `Scene.compile()`. Any "variant X costs nothing"
   result from this kind of experiment needs a positive control first.
+- **"The actuator's `ctrlrange` clamps a joint target at the joint limit" is wrong in mjlab.**
+  mjlab builds every position actuator with `ctrllimited=False` (`mjlab/utils/spec.py`), so a
+  target past a limit makes the actuator push the joint into its stop at up to full effort. Clamp
+  targets in the action term (`JointPositionActionCfg.clip`). (Measured 2026-09-23, S5.0.)
+- **A contact sensor's `found` is not `(B, num_primaries)`.** It is `(B, P × num_slots)`,
+  primary-major. `.all()` over the raw tensor demands every slot of every primary. Together with
+  inner-finger geoms in the grasp sensor, that made `grasped` unreachable for a cube held at the
+  pads. C1/C2's `grasp` = 0 had this cause as well as the action scale. Reduce over slots first.
+  (Found 2026-09-23, S5.0.)
+- **"At jaw scale 1.0 the grasp sensor fires" was wrong for a jaw closing on a free cube.** The
+  jaw stops at 0.39 rad against the cube and the inner fingers never touch. A test that pins the
+  object in place is not a grasp test. Use `scripts/scripted_pick_place.py rollout`.
 - *(Add every further claim that turns out wrong. These lines are the most valuable in the file.)*
 
 ---
