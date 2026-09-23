@@ -127,18 +127,25 @@ KANGAROO_GRIPPERS = ManipulationRobotCfg(
 # (mjlab position actuators are `ctrllimited=False`) and which would press the four-bar
 # into its stop at up to 19 N.m.
 #
+# Re-derived by S5.1 item 3 (2026-09-23) for the item-2 home pose, item-8 colliders and
+# item-1 gains, with the floor raised to the SysID training scale 0.25 * effort / K (~0.25
+# rad): it suffices on no joint. The wrist (arm 6) needs 2.35 because the home pose has the
+# gripper looking forward and every top-down grasp turns it ~1.5 rad; arm 1-5 and 7 need
+# 0.60-0.75. S5.0's scales were 0.20/0.55/0.40/0.55/0.55/0.50/1.05 from the S1 pose.
+# `artifacts/s5.1-chain/derive.json`.
+#
 # Only this variant: Lift and Stack keep KANGAROO_GRIPPERS' scales.
 KANGAROO_GRIPPERS_LEFT_ARM = dataclasses.replace(
   KANGAROO_GRIPPERS,
   action_joint_regex=(r"arm_left_[1-7]_joint", r"gripper_left_finger_joint"),
   action_scale={
-    r"arm_left_1_joint": 0.20,
-    r"arm_left_2_joint": 0.55,
-    r"arm_left_3_joint": 0.40,
-    r"arm_left_4_joint": 0.55,
-    r"arm_left_5_joint": 0.55,
-    r"arm_left_6_joint": 0.50,
-    r"arm_left_7_joint": 1.05,
+    r"arm_left_1_joint": 0.75,
+    r"arm_left_2_joint": 0.60,
+    r"arm_left_3_joint": 0.65,
+    r"arm_left_4_joint": 0.70,
+    r"arm_left_5_joint": 0.75,
+    r"arm_left_6_joint": 2.35,
+    r"arm_left_7_joint": 0.65,
     r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
   },
   action_clip={r"gripper_left_finger_joint": (_JAW_OPEN, _JAW_CLOSED)},
