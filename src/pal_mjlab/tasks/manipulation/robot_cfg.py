@@ -15,7 +15,7 @@ mentions a body part by name.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import mujoco
 from mjlab.entity import EntityCfg
@@ -153,6 +153,14 @@ class ManipulationRobotCfg:
 
   trunk_keepout: KeepoutBoxCfg | None = None
   """Clearance volume around the trunk, penalised as ``trunk_clearance``; ``None`` for none."""
+
+  joint_velocity_limits: Mapping[str, float] | None = None
+  """Hardware joint speed ceilings in rad/s, keyed by actuator-name regex, or ``None``.
+
+  `make_tabletop_env_cfg` turns them into a per-control-step slew limit on the commanded
+  target (`mdp.RateLimitedJointPositionAction`). Taken from the robot's URDF, not tuned: a
+  target that moves faster than the servo can follow trains against an actuator that does
+  not exist. (S5.1 item 4, Claudius's 602cd9d.)"""
 
   reach: ReachCfg | None = None
   """Usable workspace radius; an object beyond it ends the episode as ``out_of_reach``.

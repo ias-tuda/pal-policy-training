@@ -134,6 +134,13 @@ def make_hand_surface_sensor(
   )
 
 
+#: Physics step and control decimation: 2 ms x 10 = 50 Hz control. Named because the arm slew
+#: limit is a speed times the control period; see the sim cfg below for why 2 ms.
+SIM_TIMESTEP = 0.002
+DECIMATION = 10
+CONTROL_DT = SIM_TIMESTEP * DECIMATION
+
+
 def make_tabletop_env_cfg(
   robot: ManipulationRobotCfg,
   gripper_name: str | None = None,
@@ -226,13 +233,26 @@ def make_tabletop_env_cfg(
   }
 
   # -- Actions --------------------------------------------------------------------
+  # With `joint_velocity_limits` the commanded target may move at most limit * CONTROL_DT
+  # per control step (S5.1 item 4): still an absolute target, `default + scale * action`, so
+  # the deployment contract is unchanged, but a saturated action ramps instead of jumping.
+  # Joints without a limit -- the jaw -- behave exactly as `JointPositionActionCfg`.
+  joint_pos_kwargs = dict(
+    entity_name=ROBOT,
+    actuator_names=robot.action_joint_regex,
+    scale=robot.action_scale,
+    clip=robot.action_clip,
+    use_default_offset=True,
+  )
   actions: dict[str, ActionTermCfg] = {
-    "joint_pos": JointPositionActionCfg(
-      entity_name=ROBOT,
-      actuator_names=robot.action_joint_regex,
-      scale=robot.action_scale,
-      clip=robot.action_clip,
-      use_default_offset=True,
+    "joint_pos": JointPositionActionCfg(**joint_pos_kwargs)
+    if robot.joint_velocity_limits is None
+    else mdp.RateLimitedJointPositionActionCfg(
+      **joint_pos_kwargs,
+      rate_limit={
+        pattern: limit * CONTROL_DT
+        for pattern, limit in robot.joint_velocity_limits.items()
+      },
     )
   }
 
@@ -460,14 +480,14 @@ def make_tabletop_env_cfg(
         # actions). Decimation is raised to keep the control rate at 50 Hz. That was measured
         # before decision 0002 raised the tabletop overlay's passive armature to 5e-3; whether
         # a longer step is now viable is untested.
-        timestep=0.002,
+        timestep=SIM_TIMESTEP,
         iterations=10,
         ls_iterations=20,
         impratio=10,
         cone="elliptic",
       ),
     ),
-    decimation=10,
+    decimation=DECIMATION,
     episode_length_s=episode_length_s,
   )
   if dr_level is not None:
