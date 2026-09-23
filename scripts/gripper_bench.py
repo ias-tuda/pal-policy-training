@@ -340,6 +340,7 @@ class World:
     self.steps = 0
     self._warn = 0
     self._jaw_target = ids.default_ctrl[ids.jaw_act]
+    self._jaw_command = self._jaw_target
 
   def snapshot(self):
     return (
@@ -355,10 +356,24 @@ class World:
     mujoco.mj_forward(self.m, self.d)
     self._warn = self.d.warning[self.BADQACC].number
     self._jaw_target = self.d.ctrl[self.ids.jaw_act]
+    self._jaw_command = self._jaw_target
 
   def set_jaw(self, target: float):
+    """Command the jaw, as a policy action held until the next call would.
+
+    The command is clipped here; the rate limit is applied per control step in
+    `_advance_jaw`, so a command held over several steps ramps to its target the way
+    `RateLimitedJointPositionAction` does. (Until 2026-09-23 the limit was applied here,
+    once per call, so a stimulus that set the jaw once and held -- ``step``, ``shake`` --
+    left a rate-limited jaw parked one slew step from open. Every "rate limit fails the
+    grasp" result before then is that artefact.)
+    """
     if self.lv.jaw_clip is not None:
       target = float(np.clip(target, 0.0, self.lv.jaw_clip))
+    self._jaw_command = target
+
+  def _advance_jaw(self):
+    target = self._jaw_command
     if self.lv.rate_limit is not None:
       step = np.clip(target - self._jaw_target, -self.lv.rate_limit, self.lv.rate_limit)
       target = self._jaw_target + step
@@ -372,6 +387,7 @@ class World:
     violations are rolled back, since the steps just before a blow-up are unbounded by
     definition and would otherwise *be* the peak statistic.
     """
+    self._advance_jaw()
     mark = (len(self.samples), self.steps, self.jaw_speed, self.max_connect)
     mark += (self.max_joint_eq,)
     for _ in range(10):
