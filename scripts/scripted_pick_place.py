@@ -19,6 +19,14 @@ and it is two things:
     the env's own ``JointPositionAction`` at 50 Hz. Reports, per episode, whether the grasp
     sensor fired, the cube left the table, and it ended up placed within 2.5 cm and released.
 
+    Closed-loop where it has to be (changed 2026-09-23, S6): the arm is held at a waypoint
+    until it has stopped before the jaw closes, before the place is re-planned and before
+    release (`SETTLE_AFTER`), and the place is corrected from the cube's measured xy error
+    with the cube lifted 2 cm clear of the table (`PLACE_CORRECTIONS`). The fixed-duration
+    schedule it replaces placed 9/10 on the old jaw by timing luck -- every cube was 26-41 mm
+    off at release, inside 25 mm only after post-release drift -- and 2/10 on the decision
+    0002 jaw. Both jaws now place 10/10, 11-19 mm off at release.
+
     uv run --extra cpu python scripts/scripted_pick_place.py derive
     uv run --extra cpu python scripts/scripted_pick_place.py rollout --num-envs 10
 
@@ -82,6 +90,29 @@ PHASES = (
   ("retreat", "retreat", False, 40),
   ("settle", "retreat", False, 20),
 )
+#: Phases after which the arm is held at its waypoint until it has actually stopped: before
+#: the jaw closes (a still-swinging arm shoves the cube across the table as the pads meet
+#: it), before `replan_place` measures the tracking bias (a snapshot of a swinging arm is
+#: not a bias), and before release. Fixed durations were tuned to one jaw model: with the
+#: S6 gripper (decision 0002) the same timings left the arm moving and placed 2/10, and
+#: shortening `approach` broke the old model too (0/10). Measured 2026-09-23.
+SETTLE_AFTER = ("descend", "steady", "hold")
+#: "Stopped": every active env's arm joints under this speed (rad/s)...
+SETTLE_SPEED = 0.05
+#: ...or this many extra control steps, whichever comes first.
+SETTLE_MAX_STEPS = 50
+#: After `hold` has settled, and before the jaw opens: measure each cube's xy error to the
+#: goal and move the place target by it, up to this many times. `replan_place` alone left
+#: every cube 26-41 mm from the goal at release (old and S6 jaw alike, 2026-09-23), with
+#: the 25 mm tolerance met only by post-release drift. Uses only the cube pose, which the
+#: policy also observes.
+PLACE_CORRECTIONS = 2
+#: Skip the correction for an env already this close (m), and take this many control steps
+#: over each corrective move.
+PLACE_CORRECTION_TOL = 0.005
+PLACE_CORRECTION_STEPS = 15
+#: How far above the place pose the corrections are made (m).
+PLACE_CORRECTION_LIFT = 0.02
 #: Where the cube is released: this far above its resting height, so it drops onto the
 #: table rather than being pressed into it.
 RELEASE_HEIGHT = 0.003
@@ -484,6 +515,45 @@ def rollout(
   diag: dict[str, np.ndarray] = {}
   clipped = 0
   prev = np.stack([kin.q_default] * num_envs)
+  arm_q = [robot.joint_names.index(j) for j in ARM_JOINTS]
+  settle_steps: dict[str, int] = {}
+  place_corrections = 0
+
+  def move_and_settle(a: np.ndarray, b: np.ndarray, closed: bool) -> None:
+    """Interpolate the arm from pose ``a`` to ``b``, then hold ``b`` until it settles."""
+    for s in range(1, PLACE_CORRECTION_STEPS + 1):
+      step_to(a + (b - a) * (s / PLACE_CORRECTION_STEPS), closed)
+    for _ in range(SETTLE_MAX_STEPS):
+      if bool(ended.all()):
+        return
+      speed = robot.data.joint_vel[:, arm_q].abs().amax(dim=-1)
+      if bool((speed[~ended] < SETTLE_SPEED).all()):
+        return
+      step_to(b, closed)
+
+  def step_to(q: np.ndarray, closed: bool) -> None:
+    """One control step toward arm pose ``q`` with the jaw open or closed."""
+    nonlocal clipped, ended, order
+    target_q = offset.clone()
+    target_q[:, arm_idx] = torch.as_tensor(q, dtype=torch.float32, device=env.device)
+    target_q[:, jaw_idx] = jaw_closed if closed else 0.0
+    raw = (target_q - offset) / scale
+    clipped += int((raw.abs() > 1.0 + 1e-6).any(dim=-1).sum())
+    tally.observe(**ev.probe(env, grasp_sensor))
+    _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
+    tally.terminal(ev.success_flags(env) & ~ended)
+    done = (terminated | truncated) & ~ended
+    for i in torch.nonzero(done).flatten().tolist():
+      why[i] = ",".join(
+        n
+        for n in env.termination_manager.active_terms
+        if bool(env.termination_manager.get_term(n)[i])
+      )
+    if done.any():
+      order += torch.nonzero(done).flatten().tolist()
+      tally.finish(torch.nonzero(done).flatten())
+      ended |= done
+
   with torch.inference_mode():
     for phase, wp, closed, steps in PHASES:
       if bool(ended.all()):
@@ -496,28 +566,57 @@ def rollout(
           replan_place(kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i])
       nxt = np.stack([p[wp] for p in plans])
       for s in range(1, steps + 1):
-        q = prev + (nxt - prev) * (s / steps)
-        target_q = offset.clone()
-        target_q[:, arm_idx] = torch.as_tensor(
-          q, dtype=torch.float32, device=env.device
+        step_to(prev + (nxt - prev) * (s / steps), closed)
+      if phase in SETTLE_AFTER:
+        waited = 0
+        while waited < SETTLE_MAX_STEPS and not bool(ended.all()):
+          speed = robot.data.joint_vel[:, arm_q].abs().amax(dim=-1)
+          if bool((speed[~ended] < SETTLE_SPEED).all()):
+            break
+          step_to(nxt, closed)
+          waited += 1
+        settle_steps[phase] = waited
+      if phase == "hold":
+        # Corrections are made with the cube lifted clear of the table: resting on it, the
+        # cube's friction holds the hand against a centimetre-scale move (measured: a
+        # correction at release height left the error unchanged).
+        lift = np.array([0.0, 0.0, PLACE_CORRECTION_LIFT])
+        up = np.stack(
+          [
+            _solve(kin, "place", kin.fk(pl["place"])[0] + lift, hx, pl["place"])
+            for pl, hx in zip(plans, hand_xs, strict=True)
+          ]
         )
-        target_q[:, jaw_idx] = jaw_closed if closed else 0.0
-        raw = (target_q - offset) / scale
-        clipped += int((raw.abs() > 1.0 + 1e-6).any(dim=-1).sum())
-        tally.observe(**ev.probe(env, grasp_sensor))
-        _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
-        tally.terminal(ev.success_flags(env) & ~ended)
-        done = (terminated | truncated) & ~ended
-        for i in torch.nonzero(done).flatten().tolist():
-          why[i] = ",".join(
-            n
-            for n in env.termination_manager.active_terms
-            if bool(env.termination_manager.get_term(n)[i])
-          )
-        if done.any():
-          order += torch.nonzero(done).flatten().tolist()
-          tally.finish(torch.nonzero(done).flatten())
-          ended |= done
+        move_and_settle(nxt, up, True)
+        nxt = up
+        for _ in range(PLACE_CORRECTIONS):
+          err = (obj.data.root_link_pos_w - goal_w).cpu().numpy()
+          err[:, 2] = 0.0
+          fix = [
+            i
+            for i in torch.nonzero(~ended).flatten().tolist()
+            if np.linalg.norm(err[i]) > PLACE_CORRECTION_TOL
+          ]
+          if not fix:
+            break
+          shifted = nxt.copy()
+          for i in fix:
+            shifted[i] = _solve(
+              kin, "place", kin.fk(nxt[i])[0] - err[i], hand_xs[i], nxt[i]
+            )
+            plans[i]["place"] = _solve(
+              kin,
+              "place",
+              kin.fk(plans[i]["place"])[0] - err[i],
+              hand_xs[i],
+              plans[i]["place"],
+            )
+          move_and_settle(nxt, shifted, True)
+          nxt = shifted
+          place_corrections += 1
+        down = np.stack([pl["place"] for pl in plans])
+        move_and_settle(nxt, down, True)
+        nxt = down
       prev = nxt
       if phase == "close":
         tcp = robot.data.site_pos_w[:, tcp_idx]
@@ -547,6 +646,8 @@ def rollout(
   env.close()
   if verbose:
     print(f"\n{clipped} env-steps needed an action outside [-1, 1] (clipped)")
+    print(f"settle waits (control steps): {settle_steps}")
+    print(f"place corrections applied: {place_corrections}")
     print(
       f"{'env':>3s} {'grasped':>8s} {'lifted':>7s} {'placed':>7s} {'pl&lift':>8s} "
       f"{'steps':>6s} {'tcp-cube':>9s} {'jaw':>6s} {'cube-goal':>10s}  ended by"
@@ -563,6 +664,8 @@ def rollout(
     print(f"\nplaced and lifted: {ok} / {len(rows)}")
   for i, r in enumerate(rows):
     r["clipped_env_steps"] = clipped
+    r["settle_steps"] = dict(settle_steps)
+    r["place_corrections"] = place_corrections
     r["ended_by"] = why[i]
     for key, v in diag.items():
       r[key] = float(v[i])
