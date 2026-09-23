@@ -36,6 +36,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 S5 **C1** | 🛑 cancelled 2026-09-23 and **invalidated** (157188-157190) — the task was not possible through the action space, §5 −1 |
 | Pick-and-place v0 S5 **C2** | 🛑 cancelled 2026-09-23 and **invalidated** (157239-157241), same cause |
 | Pick-and-place v0 **S5.0** (make the grasp possible) | ✅ **done 2026-09-23** @ `a566363`: gate 1 scripted pick-and-place 9/10 (10/10 grasped + lifted, now a test); gate 2 reach 43.5 cm; **gate 3 NaN 0.011 %** (IAS job 157575, gate 0.1 %) — `../docs/reports/pick-place-v0/s5-0-report.md` |
+| Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -236,6 +237,20 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      (plan's L4 suspect) are *worse*; kp 20 buckles the linkage on a centred cube (~117 N
      per pad); the jaw physically stops at 0.824 rad, not 0.95 (fingertip-joint limits);
      **S5.0's clip [0, 0.95] on today's model raises CPU divergences 4 -> 13** (p ~ 0.025).
+   - **S5.1 bench (2026-09-23) vs Claudius's four-bar fix** (passive damping 0.05 + jaw
+     slew + kp 20 + clip 0.95): 0 CPU divergences in 10.24 M steps like 0002 (S5.0 config:
+     42), **but on a held cube kp 20 buckles the linkage (100-125 mm) and throws it**, with
+     or without his damping/slew; kp 8 alone does not fix it — the passive armature does.
+     0002 + his damping + slew ("hybrid") grasps 64/64, lowest ringing (5.5 rad/s).
+   - **`gripper_bench.py` applied the jaw rate limit once per `set_jaw` call** until
+     `2348670`, so `step`/`shake` never closed a rate-limited jaw. "Rate limit fails the
+     grasp" (§9 before, S6 L6, 0002's rate0.1 scan row) was that artefact.
+   - **mjlab 1.6.0 `NoiseModelWithAdditiveBias` random-walks its bias**: `reset` does
+     `bias = cfg.apply(bias)` and the default op is "add" (15 mm after 1 episode, 65 mm after
+     20, bound 8 mm). Use `operation="abs"` on `bias_noise_cfg`. Claudius's branch is
+     affected. Draft issue `../docs/upstream/mjlab-additive-bias-random-walk.md`.
+   - **mjlab string-keyed DR `ranges` ignore `asset_cfg.joint_names`** — the keys match every
+     joint of the entity. `tabletop_env_cfg._on_joints` restricts them to the action joints.
    - **`Metrics/goal_pose/episode_success` is NOT the placed rate and overstates it.** It is
      `at_goal` *latched* -- a pure distance test, no release, no settle -- so a cube shoved
      through the goal region counts forever. `placed` needs `at_goal ∧ released ∧ settled`
@@ -312,6 +327,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | **S5.0 scripted feasibility, 2026-09-23** | `scripts/scripted_pick_place.py rollout --num-envs 10`, R-A/DR0, seed 0, CPU | local Mac | **9/10 placed ∧ lifted, 10/10 grasped and lifted**, 0 clipped actions. Miss: corner (0.44, 0.29, −10°), released 51 mm off. Needed the grasp-sensor fix; open-loop place 1/10, closed-loop on cube pose 9/10 | `s5-0-report.md` §5, `artifacts/s5.0/rollout_corners.json` |
 | S5.0 envelope + shake, 2026-09-23 | `scripts/action_envelope.py --scales {old,new}`, 32 envs, seed 0, CPU | local Mac | reached 14.4 → **43.5 cm**; four-bar peak 93 → **307 rad/s**; 0 `non_finite_state` in 32 k env-steps each | `s5-0-report.md` §6-7, `artifacts/s5.0/envelope_*` |
 | **S5.0 gate 3, 2026-09-23** | `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, R-A/DR0, seed 1, 2048 envs, 200 iters, job **157575** @ `a566363` (jaw 0.95, S5.0 scales, pre-S6 four-bar) | IAS gn06 A5000, patch NOT applied | 200/200 in 11:30, 2.88 s/iter. **2 `non_finite_state` (iters 130, 169) in ~18 700 episodes = 0.011 %**, CI [0.0013, 0.039] % — no rise vs C0 despite 3.3x local shake excitation (policy noise is gentler than uniform random). `object_dropped` now ~46 % of terminations | wandb `20260922_oppsie` `loi5qo2r`; `s5-0-report.md` §8 |
+| **S5.1 four-bar bench, 2026-09-23** | `scripts/gripper_bench.py` (fixed @ `2348670`), 256 worlds x 20 s + random at 1024 worlds (10.24 M steps) + 64 x 5 s shake ablation; S5.0 model @ `f44f68a` | local Mac, CPU | divergences in 10.24 M: S5.0 42, 0002 / CK-tabletop / CK-stack / hybrid 0. Held-cube grasp: 0002 and hybrid 64/64, 0 drops (5 s); Claudius's kp-20 jaw buckles or does not hold | `s5-1-parallel-report.md` §3, `artifacts/s5.1-bench/` (worktree) |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -329,13 +345,18 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 ## 9. Next steps
 
 0. ~~S5.0 gate 3~~ **passed**, job 157575: 0.011 % (see §7). S5.0 is done.
-   **Note (S6):** bench rejects the rate limit (0/64 grasps) and rates today's model + S5.0
+   **Note (S6):** ~~bench rejects the rate limit (0/64 grasps)~~ *(bench artefact, fixed
+   `2348670`: 0002 + slew grasps 64/64)*; bench rates today's model + S5.0
    clip as the worst divergence configuration -- consider running gate 3 on the
    decision-0002 model. *(S5.0, after 157575: at training's own action distribution that
    configuration measured 0.011 %, so the bench's ranking is about uniform-random stimuli;
    a C1r on the 0002 model still needs its own gate-3 re-check.)*
 1. **Then C1r / C2r** (plan S5.0): R-A x1, R-C x1, R-C-strict x2, 2048 envs, DR0, run tags
    `c1r`/`c2r`, read at 3-4 k iters with `eval_pick_place.py`. A check-in before submission.
+   Once `siwei-s5.1-parallel` is merged they run `PPO=PPO-stack` by default (32 steps/env:
+   ~33 % more per iteration than §6's costs). S5.1 item 5 is closed: **0002 is the jaw**
+   (user, 2026-09-23); Claudius's four-bar settings are not ported. S5.1 item 4 (arm slew)
+   is unaffected -- it is about the arms, and still in the 🔗 chain.
 2. **S6: decision 0002 landed** (`72d02fb`; deploy `siwei` @ `17009cc`). `make test` 159
    passed. The scripted gate first failed on it (2/10); the cause was the *script* (every
    cube 26-41 mm off at release on either jaw, the old 9/10 was drift), fixed in `0fc65d9`

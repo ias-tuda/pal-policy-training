@@ -13,15 +13,19 @@ a run named `R-C-strict` would be worse than a job that failed.
 import pytest
 from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import (
   DEFAULT_DR,
+  DEFAULT_PPO,
   DEFAULT_REWARD,
   DR_ENV_VAR,
+  PPO_ENV_VAR,
   REWARD_ENV_VAR,
   kangaroo_pick_place_env_cfg,
+  kangaroo_pick_place_rl_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   REQUIRE_LIFTED,
   REWARD_VARIANTS,
 )
+from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES, manipulation_ppo_runner_cfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DR_LEVELS
 
 
@@ -53,13 +57,15 @@ def test_every_registered_rung_can_be_selected(rung, monkeypatch):
 
 
 @pytest.mark.parametrize(
-  ("var", "value"), [(REWARD_ENV_VAR, "R-Q"), (DR_ENV_VAR, "DR-nope")]
+  ("var", "value"),
+  [(REWARD_ENV_VAR, "R-Q"), (DR_ENV_VAR, "DR-nope"), (PPO_ENV_VAR, "PPO-Z")],
 )
 def test_an_unknown_name_is_loud(var, value, monkeypatch):
   """Silently training R-A under a name that claims otherwise is the failure mode."""
   monkeypatch.setenv(var, value)
   with pytest.raises(ValueError, match=value):
     kangaroo_pick_place_env_cfg()
+    kangaroo_pick_place_rl_cfg()
 
 
 def test_the_error_names_the_valid_options(monkeypatch):
@@ -69,3 +75,39 @@ def test_the_error_names_the_valid_options(monkeypatch):
     kangaroo_pick_place_env_cfg()
   for arm in REWARD_VARIANTS:
     assert arm in str(excinfo.value)
+
+
+def test_the_default_ppo_is_c1r_c2rs_recipe(monkeypatch):
+  """S5.1 item 9: Claudius's exploration settings, and nothing else changed."""
+  monkeypatch.delenv(PPO_ENV_VAR, raising=False)
+  cfg = kangaroo_pick_place_rl_cfg()
+  assert DEFAULT_PPO == "PPO-stack"
+  assert cfg.actor.distribution_cfg == {
+    "class_name": "GaussianDistribution",
+    "init_std": 0.35,
+    "std_type": "log",
+    "std_range": (1.0e-3, 0.5),
+  }
+  assert cfg.algorithm.entropy_coef == 0.001
+  assert cfg.algorithm.learning_rate == 3.0e-4
+  assert cfg.num_steps_per_env == 32
+  # The rest is PPO-A's: same networks, same PPO, same checkpointing.
+  base = manipulation_ppo_runner_cfg("kangaroo_pick_place")
+  assert cfg.actor.hidden_dims == base.actor.hidden_dims
+  assert cfg.critic == base.critic
+  assert cfg.algorithm.schedule == base.algorithm.schedule == "adaptive"
+  assert cfg.algorithm.gamma == base.algorithm.gamma
+  assert cfg.save_interval == base.save_interval
+
+
+def test_ppo_a_gives_back_what_c0_to_c2_ran(monkeypatch):
+  monkeypatch.setenv(PPO_ENV_VAR, "PPO-A")
+  assert kangaroo_pick_place_rl_cfg() == manipulation_ppo_runner_cfg(
+    "kangaroo_pick_place"
+  )
+
+
+def test_the_recipe_does_not_leak_into_the_shared_base():
+  """`stack_ppo_runner_cfg` edits a fresh base cfg; lift and stack must not see it."""
+  PPO_RECIPES["PPO-stack"]("x")
+  assert manipulation_ppo_runner_cfg("x").actor.distribution_cfg["init_std"] == 1.0
