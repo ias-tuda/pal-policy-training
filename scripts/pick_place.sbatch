@@ -53,7 +53,11 @@ DR="${DR:-DR0}"
 # The PPO recipe, the same way (S5.1 item 9, `rl_cfg.PPO_RECIPES`). Its default is C1r/C2r's
 # recipe, not C1's; PPO=PPO-A gives back what C0-C2 ran.
 PPO="${PPO:-PPO-stack}"
-export REWARD DR PPO
+# The arm's speed bound, the same way (plan S7): a factor in (0, 1] on the URDF slew limit.
+# 0.5 is speed bound A (FA); 1.0 is every run before S7. It goes into the run name and the
+# tags, so an FA curve can never be mistaken for an F one.
+SLEW="${SLEW:-1.0}"
+export REWARD DR PPO SLEW
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -76,7 +80,7 @@ fi
 if ! uv run --extra cu128 python -c \
      "from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import kangaroo_pick_place_env_cfg as f, kangaroo_pick_place_rl_cfg as g; f(); g()" \
      >/dev/null 2>"$REPO/.reward_check.$$"; then
-  echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO did not validate." >&2
+  echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -91,6 +95,7 @@ echo "num_envs    $NUM_ENVS"
 echo "iterations  $MAX_ITERATIONS"
 echo "reward/DR   $REWARD / $DR"
 echo "ppo         $PPO"
+echo "slew        $SLEW"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
 uv pip list 2>/dev/null | grep -E '^(mjlab|mujoco|mujoco-warp|warp-lang|torch) ' || true
@@ -114,5 +119,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\")"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\")"

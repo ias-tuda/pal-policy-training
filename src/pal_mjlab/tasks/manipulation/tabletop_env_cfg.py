@@ -153,6 +153,7 @@ def make_tabletop_env_cfg(
   dr_level: str | None = None,
   guard_divergence: bool = True,
   trunk_clearance_penalty: float = 1.0,
+  action_slew_rate_scale: float = 1.0,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -178,6 +179,10 @@ def make_tabletop_env_cfg(
       reproduces the pre-guard behaviour, in which the first divergence kills the run.
     trunk_clearance_penalty: weight of ``trunk_clearance`` (see `trunk_clearance_rewards`),
       for a robot with a ``trunk_keepout``; 0 turns it off.
+    action_slew_rate_scale: a factor on the robot's `joint_velocity_limits` slew: 1.0 is the
+      URDF rate, 0.5 halves every limited joint's top speed (plan S7, speed bound A). Must be
+      in (0, 1] -- the limits are hardware ceilings, so a factor above one would train
+      against an actuator that does not exist -- and 1.0 on a robot without limits.
   """
   gripper = robot.gripper(gripper_name)
   if objects is None:
@@ -244,13 +249,25 @@ def make_tabletop_env_cfg(
     clip=robot.action_clip,
     use_default_offset=True,
   )
+  # `action_slew_rate_scale` scales that limit (plan S7, speed bound A). It is a property of
+  # the action term, so a deployment must apply the same per-step clamp to reproduce it.
+  if not 0.0 < action_slew_rate_scale <= 1.0:
+    raise ValueError(
+      f"action_slew_rate_scale={action_slew_rate_scale} is outside (0, 1]: the velocity "
+      "limits are hardware ceilings and can only be tightened"
+    )
+  if robot.joint_velocity_limits is None and action_slew_rate_scale != 1.0:
+    raise ValueError(
+      f"action_slew_rate_scale={action_slew_rate_scale}, but the robot has no "
+      "joint_velocity_limits for it to scale"
+    )
   actions: dict[str, ActionTermCfg] = {
     "joint_pos": JointPositionActionCfg(**joint_pos_kwargs)
     if robot.joint_velocity_limits is None
     else mdp.RateLimitedJointPositionActionCfg(
       **joint_pos_kwargs,
       rate_limit={
-        pattern: limit * CONTROL_DT
+        pattern: limit * CONTROL_DT * action_slew_rate_scale
         for pattern, limit in robot.joint_velocity_limits.items()
       },
     )

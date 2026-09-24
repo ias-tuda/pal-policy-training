@@ -21,6 +21,14 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **New: a speed bound for the arm in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``.**
+  ``SLEW=`` sets a factor between 0 and 1 on the arm's slew limit, which is
+  its top joint speed from the URDF, applied per control step in the action
+  term. ``SLEW=0.5`` halves every arm joint's top speed. Unset, it is 1.0, the
+  same as before. The value appears in the training run's name and wandb tags,
+  and a value outside the range stops the run at startup. A deployed policy
+  must apply the same per-step limit to behave as it did in training.
+
 - **New: reward arms for placing in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``.**
   Earlier arms learned to pick the cube but not to place it. They either held
   it just above the target or hovered a few centimetres over it, because both

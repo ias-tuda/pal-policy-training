@@ -126,6 +126,7 @@ def make_pick_place_env_cfg(
   dr: str = "DR0",
   reward: str = "R-A",
   play: bool = False,
+  action_slew_rate_scale: float = 1.0,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a fixed target.
 
@@ -138,6 +139,8 @@ def make_pick_place_env_cfg(
     reward: reward variant, by name. See ``rewards.REWARD_VARIANTS``. R-A is the framework's
       own reward and the baseline every other arm is measured against.
     play: apply the play overrides (no observation noise, no timeout).
+    action_slew_rate_scale: factor on the arm's URDF slew limit; 0.5 is plan S7's speed
+      bound A. See `make_tabletop_env_cfg`.
   """
   cfg = make_tabletop_env_cfg(
     robot,
@@ -146,6 +149,7 @@ def make_pick_place_env_cfg(
     object_pose_range=_object_pose_range(spawn_xy),
     dr_level=dr,
     episode_length_s=EPISODE_LENGTH_S.get(reward, DEFAULT_EPISODE_LENGTH_S),
+    action_slew_rate_scale=action_slew_rate_scale,
   )
 
   gripper = robot.gripper(gripper_name)
