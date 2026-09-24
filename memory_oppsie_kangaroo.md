@@ -38,7 +38,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.0** (make the grasp possible) | ✅ **done 2026-09-23** @ `a566363`: gate 1 scripted pick-and-place 9/10 (10/10 grasped + lifted, now a test); gate 2 reach 43.5 cm; **gate 3 NaN 0.011 %** (IAS job 157575, gate 0.1 %) — `../docs/reports/pick-place-v0/s5-0-report.md` |
 | Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **merged into `siwei` @ `d9ea988`** (fast-forward 2026-09-24, `make test` 182 passed, ruff clean; branch `siwei-s5.1-chain`, code head `b0f8b85`; worktrees removed, their artifacts moved to `artifacts/s5.1-bench`, `artifacts/s5.1-chain`) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
-| Pick-and-place v0 **c1a screen** | 🛑 10 jobs 157648–157657 on IAS (`-align`, `b0f8b85`), **cancelled 2026-09-24 10:36 at 12.3–15.2 k** (superseded by S5.2); latest checkpoints + full curves in `artifacts/s5.1-c1a/`. **3–4 k: 9/10 grasp+lift 100 %; placing unsolved** (R-A holds at goal, R-C family carries over the goal and hovers 5-8 cm above it); first placements at 4 k: R-A PPO-A 2/32, R-C s1 1/32. `s5-1-report.md` §4 |
+| Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -265,6 +265,9 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      solutions are contact-free. `scripted_pick_place._solve` now demands contact-free
      waypoints *and* segments. The home pose (gripper looking forward) makes every top-down
      grasp turn the wrist ~1.5 rad: wrist scale 2.35.
+   - **`Metrics/goal_pose/position_error` is 3-D.** For c1a's R-C family it read 5–7 cm while
+     the horizontal error was 0.6–1.3 cm: the rest was the hover height. Use `eval_pick_place.py`'s
+     transport block (`af35bb2`), which is horizontal and taken while held.
    - **Per env-step the aligned config costs the same on GPU** as the 0002 config (0.101 s,
      ~20 200 env-steps/s on a 3090); PPO-stack's 32 steps/env is the whole iteration increase.
    - **`Metrics/goal_pose/episode_success` is NOT the placed rate and overstates it.** It is
