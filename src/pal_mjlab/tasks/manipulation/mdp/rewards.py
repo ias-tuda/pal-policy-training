@@ -206,6 +206,25 @@ def bring_object_after_lift(
   return torch.exp(-torch.square(distance / std)) * lifted
 
 
+def held_object_speed_hinge(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  grasp_sensor_name: str,
+  threshold: float = 0.4,
+) -> torch.Tensor:
+  """Squared excess of a held object's linear speed over ``threshold`` (m/s); 0 if not held.
+
+  Plan S7's speed bound B, the control for the slew bound A: rather than limiting how fast
+  the arm *can* move, it prices how fast the cube *is* moved while in the jaw. Only while
+  held, so a cube knocked over or settling after release is not the policy's speed. The
+  instantaneous velocity is read, as a reward term can only see this step's state.
+  """
+  obj: Entity = env.scene[object_name]
+  speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
+  held = _grasped_bool(env, grasp_sensor_name)
+  return torch.square(torch.clamp(speed - threshold, min=0.0)) * held.float()
+
+
 def lift_height_faded(
   env: ManagerBasedRlEnv,
   grasp_sensor_name: str,
