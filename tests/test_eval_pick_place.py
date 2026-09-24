@@ -181,3 +181,75 @@ def test_the_summary_reports_transport_quality():
   )  # a fraction of all episodes
   assert abs(out["held_dxy_mean_m"] - 0.05) < 1e-6
   assert abs(out["hover_dz_mean_m"] - 0.06) < 1e-6
+
+
+# -- Speed while held (plan S7's speed-bound read) ------------------------------------------
+
+DT = 0.02
+
+
+def _speed(tally, held, obj, tcp):
+  tally.measure_speed(torch.tensor(held), torch.tensor(obj), torch.tensor(tcp), DT)
+
+
+def _end(tally, env_ids):
+  n = tally.num_envs
+  tally.observe(**{k: torch.zeros(n, dtype=torch.bool) for k in Tally.FIELDS})
+  tally.finish(torch.tensor(env_ids))
+
+
+def test_peak_speed_counts_only_steps_held_at_both_ends():
+  """The jaw closing and the release are not transport: a step counts only if the cube was
+  held when it started and when it ended."""
+  tally = Tally(1, "cpu")
+  _speed(tally, [False], [[0.00, 0.0, 0.0]], [[0.00, 0.0, 0.1]])  # approach
+  _speed(
+    tally, [True], [[0.05, 0.0, 0.0]], [[0.05, 0.0, 0.1]]
+  )  # grasp closes: not counted
+  _speed(tally, [True], [[0.06, 0.0, 0.0]], [[0.07, 0.0, 0.1]])  # carry: 0.5 / 1.0 m/s
+  _speed(tally, [True], [[0.07, 0.0, 0.0]], [[0.08, 0.0, 0.1]])  # carry: 0.5 / 0.5 m/s
+  _speed(
+    tally, [False], [[0.20, 0.0, 0.0]], [[0.20, 0.0, 0.1]]
+  )  # released: not counted
+  _end(tally, [0])
+  row = tally.done[0]
+  assert abs(row["peak_obj_speed_held"] - 0.5) < 1e-5
+  assert abs(row["peak_tcp_speed_held"] - 1.0) < 1e-5
+
+
+def test_the_jump_across_a_reset_is_not_a_speed():
+  """The first observation after a reset is a teleport from the last one before it."""
+  tally = Tally(1, "cpu")
+  _speed(tally, [True], [[0.00, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
+  _speed(tally, [True], [[0.01, 0.0, 0.0]], [[0.0, 0.0, 0.0]])  # 0.5 m/s
+  _end(tally, [0])
+  _speed(
+    tally, [True], [[0.40, 0.3, 0.0]], [[0.4, 0.3, 0.0]]
+  )  # new episode, held at once
+  _speed(tally, [True], [[0.40, 0.3, 0.0]], [[0.4, 0.3, 0.0]])  # still
+  _end(tally, [0])
+  first, second = tally.done
+  assert abs(first["peak_obj_speed_held"] - 0.5) < 1e-5
+  assert second["peak_obj_speed_held"] == 0.0 and second["peak_tcp_speed_held"] == 0.0
+
+
+def test_an_episode_never_held_for_a_full_step_has_no_peak_speed():
+  tally = Tally(2, "cpu")
+  _speed(tally, [True, False], [[0.0, 0.0, 0.0]] * 2, [[0.0, 0.0, 0.0]] * 2)
+  _speed(tally, [False, False], [[0.3, 0.0, 0.0]] * 2, [[0.3, 0.0, 0.0]] * 2)
+  _end(tally, [0, 1])
+  assert all(r["peak_obj_speed_held"] is None for r in tally.done)
+  assert all(r["peak_tcp_speed_held"] is None for r in tally.done)
+
+
+def test_the_summary_reports_peak_speeds_over_the_episodes_that_moved_a_held_cube():
+  tally = Tally(1, "cpu")
+  for step in (0.010, 0.024, None):  # 0.5 and 1.2 m/s peaks, then an episode never held
+    held = step is not None
+    _speed(tally, [held], [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
+    _speed(tally, [held], [[step or 0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
+    _end(tally, [0])
+  out = eval_pick_place.summarise(tally, DT, 3)
+  assert abs(out["peak_obj_speed_held_mean_mps"] - 0.85) < 1e-5
+  assert abs(out["peak_obj_speed_held_max_mps"] - 1.2) < 1e-5
+  assert out["peak_tcp_speed_held_max_mps"] == 0.0
