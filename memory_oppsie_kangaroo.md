@@ -39,7 +39,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **merged into `siwei` @ `d9ea988`** (fast-forward 2026-09-24, `make test` 182 passed, ruff clean; branch `siwei-s5.1-chain`, code head `b0f8b85`; worktrees removed, their artifacts moved to `artifacts/s5.1-bench`, `artifacts/s5.1-chain`) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
 | Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
-| Pick-and-place v0 **S5.2** (reward arms for *placing*) | ⏳ **implemented on `siwei-s5.2` @ `dad44f1`** (not merged): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch 157927–157936** launched 2026-09-24 12:26: 7 running (config verified from each run's `params/env.yaml`), **157934–157936 held by Slurm** after a gn04 start failure, awaiting `scontrol release`. `../docs/reports/pick-place-v0/s5-2-report.md` |
+| Pick-and-place v0 **S5.2** (reward arms for *placing*) | ⏳ **implemented on `siwei-s5.2` @ `dad44f1`** (not merged): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -310,6 +310,9 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      requeued **held** (Priority 0, `Reason=user_env_retrieval_failed_requeued_held`) and
      never runs until `scontrol release`. Watch for it; squeue shows it only as PENDING.
      157934–157936 hit this on gn04 at 12:25:25.
+   - *Releasing a held job:* this session's permission guard refused `scontrol release`/`update`
+     as a shared-cluster mutation. The user chose cancel and resubmit instead: same exports,
+     plus `--exclude=gn04`, via `slurm_logs/resubmit_s52.sh`.
    - *Checking the config:* the resolved config is in the run's `params/env.yaml`; verify a
      new arm from it, not from stdout.
 
@@ -363,7 +366,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | **S5.1 NaN gate, 2026-09-23** | R-A/DR0 s1, 2048 envs, 200 iters, PPO-stack, job **157646** @ `b0f8b85` | IAS gn02 3090 | 3 `non_finite_state` / ~16 300 episodes = 0.021 % (CI 0.004-0.054); 3.24 s/iter | wandb `k3ylpaa1`; `s5-1-report.md` §3 |
 | **c1a screen, 2026-09-23** | 10 jobs 157648-157657 @ `b0f8b85` (R-A x2, R-C x2, R-C-strict x3, lift30, 2x PPO-A) | IAS | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k. Final 64-episode eval: grasped/lifted 100 % on 10/10, placing ≈ 0 (R-C s2 1/64, lift30 5/64); R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm | `run_log.md`, `s5-1-report.md` §6, `artifacts/s5.1-c1a/` |
 | **S5.2 ordering, 2026-09-24** | `tests/test_pick_place_s52_ordering.py`, scripted episode, carry 7 cm, CPU @ `dad44f1` | local Mac | full fix: reach 1.00 < carry 4.67 < over 9.32 < held on target 11.96 < released 14.95 < placed 22.93; the arms without M2 keep the cliff (held on target < over) by design; M2 weight 4 dips at ~5 cm, 7 is monotone (+0.001 minimum step) | `s5-2-report.md` §2–3 |
-| **S5.2 batch, 2026-09-24** | 10 jobs 157927-157936 @ `dad44f1`: control, +M1 x2, +M1+M3 x2, +M1+M2+M3 x3, +M3+M4 x2; DR0, PPO-stack, 2048 envs, 20 k | IAS gn01/gn02 3090 | ⏳ 7 running at 3.0–3.5 s/it (wandb `vj54i7b7` `ux98sm8b` `2ss2aikm` `225pqag0` `zs79myfk` `agip67ks` `urkljqie`); 157934–157936 held (gn04 start failure). Read at 3–4 k ≈ 15:00–16:30 | `run_log.md`, `s5-2-report.md` §4 |
+| **S5.2 batch, 2026-09-24** | 10 jobs 157927-157936 @ `dad44f1`: control, +M1 x2, +M1+M3 x2, +M1+M2+M3 x3, +M3+M4 x2; DR0, PPO-stack, 2048 envs, 20 k | IAS gn01/gn02/gn05 3090 | ⏳ running at ~3.0 s/it (wandb `vj54i7b7` `ux98sm8b` `2ss2aikm` `225pqag0` `zs79myfk` `agip67ks` `urkljqie`; resubmitted 157968 `ymw6jrv8`, 157969 `qiwv3laq`, 157970 `t280ohu9` for 157934–157936, which Slurm held). Read at 3–4 k ≈ 15:00–16:30 | `run_log.md`, `s5-2-report.md` §4 |
+| **S5.2 1 k early read, 2026-09-24** | full fix 157932/157933 `model_1000.pt`, `eval_pick_place.py` 64 eps + `transport_probe.py` 8 envs + 2-episode video @ `dad44f1` | local Mac, CPU | **placed∧was_lifted 63/64 on both seeds**, 0 slid, time to place 0.69 / 0.79 s; carried off the table 12–16 held steps on a 3–8 cm arc, released 0.4–3.9 cm from the goal; cube peaks ~1.2 m/s (M1 rewards speed). `non_finite_state` 0.03–0.06 % vs ≈ 0.001 % for the other arms | `s5-2-report.md` §5, `artifacts/s5.2/{eval,probe,videos}` |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -386,7 +390,6 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    (`s5-1-report.md` §6). It is the input to S5.2.
 1. ~~Merge `siwei-s5.1-chain`~~ done, `d9ea988`. S5.2 implemented (`dad44f1`) and launched.
    **Next:**
-   - get 157934–157936 released;
    - read S5.2 at 3–4 k: 64-episode local CPU eval of placed ∧ was_lifted, held-at-goal,
      hover height, per-term rewards and non_finite_state;
    - write `s5-2-report.md` §5.
