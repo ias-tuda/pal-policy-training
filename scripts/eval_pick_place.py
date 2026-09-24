@@ -64,6 +64,12 @@ from pal_mjlab.tasks.manipulation.tabletop_env_cfg import COMMAND, SUPPORT_SENSO
 
 TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 
+#: "Near the target" for the transport measurements: *horizontal* distance while the cube is
+#: held. Horizontal on purpose -- `Metrics/goal_pose/position_error` is a 3-D norm, so a cube
+#: carried over the target and hovering 6 cm above it reads "6 cm off" there, which is how the
+#: c1a screen was first misread as "no transport" (2026-09-24, S5.2 base selection).
+NEAR_XY = 0.03
+
 
 def parse_args() -> argparse.Namespace:
   p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -109,7 +115,16 @@ class Tally:
     self.live = {name: z() for name in self.FIELDS}
     self.first_place = torch.full((num_envs,), -1, dtype=torch.long, device=device)
     self.age = torch.zeros(num_envs, dtype=torch.long, device=device)
-    self.done: list[dict[str, bool | int]] = []
+    # Transport accumulators (`measure`): steps held, horizontal distance to the target while
+    # held (sum for the mean, running min), and height above the target while held within
+    # NEAR_XY horizontally.
+    zf = lambda v: torch.full((num_envs,), v, device=device)  # noqa: E731
+    self.held_n = torch.zeros(num_envs, dtype=torch.long, device=device)
+    self.dxy_sum = zf(0.0)
+    self.dxy_min = zf(float("inf"))
+    self.near_n = torch.zeros(num_envs, dtype=torch.long, device=device)
+    self.dz_sum = zf(0.0)
+    self.done: list[dict[str, bool | int | float | None]] = []
 
   def observe(self, **flags: torch.Tensor) -> None:
     for name, value in flags.items():
@@ -117,6 +132,22 @@ class Tally:
     newly = flags["placed"] & (self.first_place < 0)
     self.first_place = torch.where(newly, self.age, self.first_place)
     self.age += 1
+
+  def measure(self, held: torch.Tensor, dxy: torch.Tensor, dz: torch.Tensor) -> None:
+    """Accumulate this step's transport geometry for the episodes that hold the cube.
+
+    ``dxy`` is the cube's horizontal distance to the target, ``dz`` its height above the
+    target (the target is the cube's resting pose on the table, so ``dz`` is 0 when it
+    rests there). Only held steps count; the hover height only counts held steps within
+    `NEAR_XY` horizontally. Call once per step, alongside `observe`.
+    """
+    held = held.bool()
+    near = held & (dxy < NEAR_XY)
+    self.held_n += held.long()
+    self.dxy_sum += torch.where(held, dxy, torch.zeros_like(dxy))
+    self.dxy_min = torch.where(held, torch.minimum(self.dxy_min, dxy), self.dxy_min)
+    self.near_n += near.long()
+    self.dz_sum += torch.where(near, dz, torch.zeros_like(dz))
 
   def terminal(self, success: torch.Tensor) -> None:
     """Credit the episodes a `success` termination just ended, which `observe` cannot see.
@@ -134,14 +165,27 @@ class Tally:
   def finish(self, env_ids: torch.Tensor) -> None:
     """Bank the episodes that just ended and clear their latches."""
     for i in env_ids.tolist():
-      row: dict[str, bool | int] = {n: bool(self.live[n][i]) for n in self.FIELDS}
+      row: dict[str, bool | int | float | None] = {
+        n: bool(self.live[n][i]) for n in self.FIELDS
+      }
       row["steps_to_place"] = int(self.first_place[i])
       row["length"] = int(self.age[i])
+      held, near = int(self.held_n[i]), int(self.near_n[i])
+      row["held_steps"] = held
+      row["held_dxy_mean"] = float(self.dxy_sum[i]) / held if held else None
+      row["held_dxy_min"] = float(self.dxy_min[i]) if held else None
+      row["near_xy_while_held"] = near > 0
+      row["hover_dz_mean"] = float(self.dz_sum[i]) / near if near else None
       self.done.append(row)
     for name in self.FIELDS:
       self.live[name][env_ids] = False
     self.first_place[env_ids] = -1
     self.age[env_ids] = 0
+    self.held_n[env_ids] = 0
+    self.dxy_sum[env_ids] = 0.0
+    self.dxy_min[env_ids] = float("inf")
+    self.near_n[env_ids] = 0
+    self.dz_sum[env_ids] = 0.0
 
 
 def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
@@ -190,6 +234,13 @@ def probe(env: ManagerBasedRlEnv, grasp_sensor: str) -> dict[str, torch.Tensor]:
   }
 
 
+def geometry(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
+  """The cube's horizontal distance to the target and its height above it. (B,), (B,)"""
+  pos = env.scene[OBJECT].data.root_link_pos_w
+  goal = env.command_manager.get_term(COMMAND).command
+  return torch.norm((pos - goal)[:, :2], dim=-1), pos[:, 2] - goal[:, 2]
+
+
 def success_flags(env: ManagerBasedRlEnv) -> torch.Tensor:
   """Which envs the last `step` ended through the `success` termination.
 
@@ -209,6 +260,19 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
   placed_times = [
     r["steps_to_place"] for r in rows if r["placed"] and r["steps_to_place"] >= 0
   ]
+  held = [r for r in rows if r.get("held_steps")]
+  near = [r["hover_dz_mean"] for r in rows if r.get("hover_dz_mean") is not None]
+  mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
+  median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+  transport = {
+    "episodes_held": len(held),
+    "held_dxy_mean_m": mean([r["held_dxy_mean"] for r in held]),
+    "held_dxy_min_mean_m": mean([r["held_dxy_min"] for r in held]),
+    "held_dxy_min_median_m": median([r["held_dxy_min"] for r in held]),
+    "within_3cm_xy_while_held": rate("near_xy_while_held") if n else None,
+    "hover_dz_mean_m": mean(near),
+    "hover_dz_median_m": median(near),
+  }
   return {
     "episodes": n,
     "placed": rate("placed"),
@@ -221,6 +285,7 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     "time_to_place_s": (sum(placed_times) / len(placed_times) * step_dt)
     if placed_times
     else None,
+    **transport,
   }
 
 
@@ -253,6 +318,19 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
   )
   print(f"    dropped                  {result['dropped']:6.1%}")
 
+  print("\n  TRANSPORT (horizontal, while held) -------------------------------")
+  fmt = lambda v, u="m": "n/a" if v is None else f"{v:6.3f} {u}"  # noqa: E731
+  print(f"    episodes that held it    {result['episodes_held']:6d}")
+  print(f"    mean xy dist while held  {fmt(result['held_dxy_mean_m'])}")
+  print(
+    f"    closest xy while held    {fmt(result['held_dxy_min_median_m'])}  (median)"
+  )
+  w3 = result["within_3cm_xy_while_held"]
+  print(f"    within 3 cm xy, held     {'n/a' if w3 is None else f'{w3:6.1%}'}")
+  print(
+    f"    hover height over target {fmt(result['hover_dz_mean_m'])}  (z - z_target, held within 3 cm xy)"
+  )
+
   print("\n  TIMING -----------------------------------------------------------")
   ttp = result["time_to_place_s"]
   print(f"    mean episode             {result['mean_episode_length_s']:6.2f} s")
@@ -282,7 +360,9 @@ def main() -> None:
   obs, _ = wrapped.reset()
   with torch.inference_mode():
     while len(tally.done) < args.episodes:
-      tally.observe(**probe(env, grasp_sensor))
+      flags = probe(env, grasp_sensor)
+      tally.observe(**flags)
+      tally.measure(flags["grasped"], *geometry(env))
       obs, _, dones, extras = wrapped.step(policy(obs))
       tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()
