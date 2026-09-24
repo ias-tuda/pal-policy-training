@@ -29,6 +29,11 @@ New Features & Tasks
   and a value outside the range stops the run at startup. A deployed policy
   must apply the same per-step limit to behave as it did in training.
 
+- **New: a speed-penalty reward arm, ``R-C-strict+M1+M2+M3+M5``.** It is
+  ``R-C-strict+M1+M2+M3`` plus one term that penalises the held cube's speed
+  above 0.4 m/s, squared. At 1.2 m/s the penalty outweighs one step of the
+  placed reward. It is the comparison run for the ``SLEW=`` speed bound above.
+
 - **New: reward arms for placing in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``.**
   Earlier arms learned to pick the cube but not to place it. They either held
   it just above the target or hovered a few centimetres over it, because both

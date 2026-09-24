@@ -394,7 +394,29 @@ def _m4(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
-_MODULES = {"M1": _m1, "M2": _m2, "M3": _m3, "M4": _m4}
+# -- S7: speed bound B, the control for the slew bound A ------------------------------------
+#
+# M5 prices the held cube's speed above 0.4 m/s, squared (plan S7, FB). The full fix carries
+# at up to ~1.2 m/s (S5.2 report §5-6); the weight makes that cost more per step than one
+# step of `placed` (8): 16 x (1.2 - 0.4)^2 = 10.24. At 0.6 m/s it is 0.64, so a carry at the
+# slew-bound-A speed (TCP ~0.6 m/s) is nearly free.
+M5_SPEED_THRESHOLD = 0.4  # m/s
+M5_SPEED_WEIGHT = -16.0
+
+
+def _m5(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["held_speed"] = RewardTermCfg(
+    func=mdp.held_object_speed_hinge,
+    weight=M5_SPEED_WEIGHT,
+    params={
+      "object_name": OBJECT,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "threshold": M5_SPEED_THRESHOLD,
+    },
+  )
+
+
+_MODULES = {"M1": _m1, "M2": _m2, "M3": _m3, "M4": _m4, "M5": _m5}
 
 
 def _s52_arm(modules: tuple[str, ...]):
@@ -420,16 +442,22 @@ S52_ARMS = {
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S52_ARMS.items()})
 
+#: The S7 arms: FB is the full fix plus M5 (plan S7). FA is the full fix itself, with the
+#: slew bound set through the action term (`SLEW`), not through the reward.
+S7_ARMS = {f"{S52_BASE}+M1+M2+M3+M5": ("M1", "M2", "M3", "M5")}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S7_ARMS.items()})
+_MODULE_ARMS = {**S52_ARMS, **S7_ARMS}
+
 #: Arms whose success *termination* must also require the `was_lifted` latch. The reward
 #: dict cannot carry this on its own -- the termination is built by the tabletop factory --
 #: so `make_pick_place_env_cfg` reads this set.
 REQUIRE_LIFTED = frozenset(
-  {"R-C-strict", *(n for n, m in S52_ARMS.items() if "M1" not in m)}
+  {"R-C-strict", *(n for n, m in _MODULE_ARMS.items() if "M1" not in m)}
 )
 
 #: Arms that train with no success termination at all (M1): the placed state keeps paying
 #: per step instead of ending the episode.
-NO_SUCCESS_TERMINATION = frozenset(n for n, m in S52_ARMS.items() if "M1" in m)
+NO_SUCCESS_TERMINATION = frozenset(n for n, m in _MODULE_ARMS.items() if "M1" in m)
 
 #: Episode length per variant, where it differs. R-E buys its time penalty a shorter horizon.
 EPISODE_LENGTH_S = {"R-E": 12.0}
