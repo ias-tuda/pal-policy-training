@@ -39,6 +39,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **merged into `siwei` @ `d9ea988`** (fast-forward 2026-09-24, `make test` 182 passed, ruff clean; branch `siwei-s5.1-chain`, code head `b0f8b85`; worktrees removed, their artifacts moved to `artifacts/s5.1-bench`, `artifacts/s5.1-chain`) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
 | Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
+| Pick-and-place v0 **S5.2** (reward arms for *placing*) | ⏳ **implemented on `siwei-s5.2` @ `dad44f1`** (not merged): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch 157927–157936** launched 2026-09-24 12:26: 7 running (config verified from each run's `params/env.yaml`), **157934–157936 held by Slurm** after a gn04 start failure, awaiting `scontrol release`. `../docs/reports/pick-place-v0/s5-2-report.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -301,6 +302,17 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 6. **No roadmap, decision records or status summary yet** in `../docs/`. Create them on
    the first real task.
 
+7. **IAS operations (2026-09-24).**
+   - *Where progress is:* the job's stdout is block-buffered, so `Learning iteration` lines in
+     `slurm_logs/` lag by hundreds of iterations. Read progress from the run's tfevents
+     (`~/s52_read.py` on the login node, run under the checkout's `uv run --extra cu128`).
+   - *A job that never starts:* a job that fails at start with `user env retrieval failed` is
+     requeued **held** (Priority 0, `Reason=user_env_retrieval_failed_requeued_held`) and
+     never runs until `scontrol release`. Watch for it; squeue shows it only as PENDING.
+     157934–157936 hit this on gn04 at 12:25:25.
+   - *Checking the config:* the resolved config is in the run's `params/env.yaml`; verify a
+     new arm from it, not from stdout.
+
 ## 6. Current best settings
 
 - **Cost — IAS cluster, `Mjlab-PickPlace-Pal-Kangaroo-Grippers`, measured 2026-09-22**
@@ -349,7 +361,9 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | **S5.1 four-bar bench, 2026-09-23** | `scripts/gripper_bench.py` (fixed @ `2348670`), 256 worlds x 20 s + random at 1024 worlds (10.24 M steps) + 64 x 5 s shake ablation; S5.0 model @ `f44f68a` | local Mac, CPU | divergences in 10.24 M: S5.0 42, 0002 / CK-tabletop / CK-stack / hybrid 0. Held-cube grasp: 0002 and hybrid 64/64, 0 drops (5 s); Claudius's kp-20 jaw buckles or does not hold | `s5-1-parallel-report.md` §3, `artifacts/s5.1-bench/` (worktree) |
 | **S5.1 chain gate 1, 2026-09-23** | `scripted_pick_place.py rollout --num-envs 10` @ `40ed408` | local Mac | 10/10 placed and lifted, 0 clipped, 0 over-slew | `s5-1-report.md` §2 |
 | **S5.1 NaN gate, 2026-09-23** | R-A/DR0 s1, 2048 envs, 200 iters, PPO-stack, job **157646** @ `b0f8b85` | IAS gn02 3090 | 3 `non_finite_state` / ~16 300 episodes = 0.021 % (CI 0.004-0.054); 3.24 s/iter | wandb `k3ylpaa1`; `s5-1-report.md` §3 |
-| **c1a screen, 2026-09-23** | 10 jobs 157648-157657 @ `b0f8b85` (R-A x2, R-C x2, R-C-strict x3, lift30, 2x PPO-A) | IAS | ⏳ running | `run_log.md`, `s5-1-report.md` §4 |
+| **c1a screen, 2026-09-23** | 10 jobs 157648-157657 @ `b0f8b85` (R-A x2, R-C x2, R-C-strict x3, lift30, 2x PPO-A) | IAS | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k. Final 64-episode eval: grasped/lifted 100 % on 10/10, placing ≈ 0 (R-C s2 1/64, lift30 5/64); R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm | `run_log.md`, `s5-1-report.md` §6, `artifacts/s5.1-c1a/` |
+| **S5.2 ordering, 2026-09-24** | `tests/test_pick_place_s52_ordering.py`, scripted episode, carry 7 cm, CPU @ `dad44f1` | local Mac | full fix: reach 1.00 < carry 4.67 < over 9.32 < held on target 11.96 < released 14.95 < placed 22.93; the arms without M2 keep the cliff (held on target < over) by design; M2 weight 4 dips at ~5 cm, 7 is monotone (+0.001 minimum step) | `s5-2-report.md` §2–3 |
+| **S5.2 batch, 2026-09-24** | 10 jobs 157927-157936 @ `dad44f1`: control, +M1 x2, +M1+M3 x2, +M1+M2+M3 x3, +M3+M4 x2; DR0, PPO-stack, 2048 envs, 20 k | IAS gn01/gn02 3090 | ⏳ 7 running at 3.0–3.5 s/it (wandb `vj54i7b7` `ux98sm8b` `2ss2aikm` `225pqag0` `zs79myfk` `agip67ks` `urkljqie`); 157934–157936 held (gn04 start failure). Read at 3–4 k ≈ 15:00–16:30 | `run_log.md`, `s5-2-report.md` §4 |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -362,16 +376,20 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | `limxH100` | not verified for this repo | — |
 | `limx4090` | not verified for this repo | — |
 | IAS Slurm (`mn.ias...`) | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` fast-forwarded to **`a566363`** 2026-09-23 (bundle `~/siwei_a566363.bundle`, md5-verified); `uv sync --frozen --extra cu128` current (mjlab 1.6.0, mujoco/mujoco-warp 3.11.0, warp 1.15.0, torch 2.10.0); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` exists. First deployed 2026-09-22 at `e84d270` | 2026-09-23 |
-| IAS `-align` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-align`, cloned from bundle `~/align_s51.bundle` (sha256-verified) on branch `siwei-s5.1-chain` @ `b0f8b85`; own `uv sync --frozen --extra cu128` (same pins), own `slurm_logs/`; jobs pass `REPO=` to `pick_place.sbatch`. The main checkout is not touched by S5.1 | 2026-09-23 |
+| IAS `-align` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-align`, cloned from bundle `~/align_s51.bundle` (sha256-verified) on branch `siwei-s5.1-chain` @ `b0f8b85`; own `uv sync --frozen --extra cu128` (same pins), own `slurm_logs/`; jobs pass `REPO=` to `pick_place.sbatch`. The main checkout is not touched by S5.1. Kept as c1a's record (c1a cancelled 2026-09-24) | 2026-09-24 |
+| IAS `-s52` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s52` on `siwei-s5.2` @ `dad44f1` (full 40-char sha checked by the sbatch commit guard); own `uv sync --frozen --extra cu128` (same pins), `slurm_logs/submit_s52.sh`. Readers on the login node: `~/s52_read.py` (tfevents), `~/s52_cfgcheck.py` (resolved config) | 2026-09-24 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
 
-0. ~~Read the c1a screen at 3-4 k~~ done (local CPU eval, 32 eps/run; cluster eval jobs
-   157685/157707 blocked by the group GPU quota `AssocGrpGRES`). **Next: the final read at 20 k**,
-   and an S5.2 reward decision on *placing*: R-A needs release to outpay holding, the gated arms
-   need lowering to outpay `lift`. Lift 30 made hovering higher, not placing.
-1. ~~Merge `siwei-s5.1-chain`~~ done, `d9ea988`. **Next: S5.2** (plan S5.2, revision 2026-09-24 10:27) on the base chosen from c1a.
+0. ~~Read the c1a screen~~ done: 3–4 k read, then the final read after cancelling at 12–15 k
+   (`s5-1-report.md` §6). It is the input to S5.2.
+1. ~~Merge `siwei-s5.1-chain`~~ done, `d9ea988`. S5.2 implemented (`dad44f1`) and launched.
+   **Next:**
+   - get 157934–157936 released;
+   - read S5.2 at 3–4 k: 64-episode local CPU eval of placed ∧ was_lifted, held-at-goal,
+     hover height, per-term rewards and non_finite_state;
+   - write `s5-2-report.md` §5.
 2. **The jaw misses its own 0.01 % NaN bar** on both 0002 configs (157635 0.026 %, 157646
    0.021 %); the plan's 0.1 % gate passes. Decision 0002 records it; not blocking the screen.
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
