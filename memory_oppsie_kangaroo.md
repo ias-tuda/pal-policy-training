@@ -38,7 +38,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.0** (make the grasp possible) | ✅ **done 2026-09-23** @ `a566363`: gate 1 scripted pick-and-place 9/10 (10/10 grasped + lifted, now a test); gate 2 reach 43.5 cm; **gate 3 NaN 0.011 %** (IAS job 157575, gate 0.1 %) — `../docs/reports/pick-place-v0/s5-0-report.md` |
 | Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **implemented 2026-09-23** on `siwei-s5.1-chain` @ `b0f8b85` (**merge into `siwei` pending, a check-in**) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
-| Pick-and-place v0 **c1a screen** | ⏳ 10 jobs 157648–157657 on IAS (`-align` checkout, `b0f8b85`), started 2026-09-23 ~22:25, read at 3–4 k iters; ids in `../docs/run_log.md` |
+| Pick-and-place v0 **c1a screen** | ⏳ 10 jobs 157648–157657 on IAS (`-align`, `b0f8b85`), to 20 k. **3–4 k: 9/10 grasp+lift 100 %; placing unsolved** (R-A holds at goal, R-C family lifts and hovers); first placements at 4 k: R-A PPO-A 2/32, R-C s1 1/32. `s5-1-report.md` §4 |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -364,9 +364,10 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 ## 9. Next steps
 
-0. **Read the c1a screen at 3-4 k iterations** (jobs 157648-157657): grasp/lift curves,
-   `non_finite_state`, `eval_pick_place.py` placed and placed∧was_lifted; fill
-   `s5-1-report.md` §4 and `run_log.md`. The #204 fallback (lift 30) is already one arm.
+0. ~~Read the c1a screen at 3-4 k~~ done (local CPU eval, 32 eps/run; cluster eval jobs
+   157685/157707 blocked by the group GPU quota `AssocGrpGRES`). **Next: the final read at 20 k**,
+   and an S5.2 reward decision on *placing*: R-A needs release to outpay holding, the gated arms
+   need lowering to outpay `lift`. Lift 30 made hovering higher, not placing.
 1. **Merge `siwei-s5.1-chain` into `siwei`** (a check-in; do not push). Gate 2 (reach
    envelope) result goes in the report first.
 2. **The jaw misses its own 0.01 % NaN bar** on both 0002 configs (157635 0.026 %, 157646
