@@ -23,6 +23,7 @@ from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
+  NO_SUCCESS_TERMINATION,
   REQUIRE_LIFTED,
   RewardContext,
   build_rewards,
@@ -185,9 +186,12 @@ def make_pick_place_env_cfg(
     # episode early, which is worth remaining-time to the policy even with the bonus
     # withheld. `SUPPORT_SENSOR` is what turns `_placed_bool` into `placed ∧ was_lifted`.
     success_params["support_sensor_name"] = SUPPORT_SENSOR
-  cfg.terminations["success"] = TerminationTermCfg(
-    func=mdp.object_placed, params=success_params
-  )
+  # S5.2 module M1: no success termination -- the placed state pays per step instead, so
+  # finishing never ends the income (plan S5.2, design rule 2).
+  if reward not in NO_SUCCESS_TERMINATION:
+    cfg.terminations["success"] = TerminationTermCfg(
+      func=mdp.object_placed, params=success_params
+    )
 
   if play:
     apply_play_overrides(cfg)

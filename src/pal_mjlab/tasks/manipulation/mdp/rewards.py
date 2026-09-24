@@ -182,6 +182,55 @@ def bring_object_when_lifted(
   return torch.exp(-torch.square(distance / std)) * lifted
 
 
+def bring_object_after_lift(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  std: float = 0.15,
+) -> torch.Tensor:
+  """Distance-to-goal shaping gated on the `was_lifted` latch (S5.2 module M2).
+
+  `bring_object_when_lifted` pays only while the object is off the table *now*, so on a
+  table-height goal its income stops the moment the object reaches the target. With a lift
+  term that pays for height, hovering above the target is then the per-step optimum -- what
+  every R-C-family run converged to in c1a (5-8 cm up, `s5-1-report.md` section 6). Gating on
+  the latch instead keeps the slide path closed (a slid object never sets it) while paying
+  through the lowering and after the release.
+  """
+  obj: Entity = env.scene[object_name]
+  command = env.command_manager.get_term(command_name)
+  distance = torch.norm(command.command - obj.data.root_link_pos_w, dim=-1)
+  lifted = _was_lifted_bool(env, grasp_sensor_name, support_sensor_name).float()
+  return torch.exp(-torch.square(distance / std)) * lifted
+
+
+def lift_height_faded(
+  env: ManagerBasedRlEnv,
+  grasp_sensor_name: str,
+  object_name: str,
+  surface_cfg: SceneEntityCfg,
+  command_name: str,
+  max_height: float = 0.10,
+  fade_std: float = 0.05,
+) -> torch.Tensor:
+  """`lift_height` × (1 − G_fade(d_g)): lift income fades out at the goal (S5.2 module M3).
+
+  `lift_height` pays linearly for height, so lowering the object onto a table-height goal
+  costs lift income all the way down. Fading it with the object's 3-D distance to the goal
+  removes that cost where it matters and nowhere else. Fading on the horizontal distance alone
+  would leave a dip directly over the target (plan S5.2, P2).
+  """
+  obj: Entity = env.scene[object_name]
+  command = env.command_manager.get_term(command_name)
+  distance = torch.norm(command.command - obj.data.root_link_pos_w, dim=-1)
+  fade = 1.0 - torch.exp(-torch.square(distance / fade_std))
+  return (
+    lift_height(env, grasp_sensor_name, object_name, surface_cfg, max_height) * fade
+  )
+
+
 #: Corners of a unit cube, in the object's own frame. Scaled by the object's half-size to
 #: give the eight keypoints of its oriented bounding box.
 _UNIT_CORNERS = torch.tensor(

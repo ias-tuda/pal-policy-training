@@ -52,6 +52,7 @@ from .observations import (
   object_yaw_b,
 )
 from .rewards import (
+  bring_object_after_lift,
   bring_object_when_lifted,
   contact_penalty,
   entity_lin_vel_l2,
@@ -60,6 +61,7 @@ from .rewards import (
   keepout_box_penalty,
   keypoint_distance_reward,
   lift_height,
+  lift_height_faded,
   object_lifted,
   reach_only,
   released_at_goal,
@@ -105,12 +107,14 @@ __all__ = [
   "object_position_b",
   "object_yaw_b",
   # Rewards.
+  "bring_object_after_lift",
   "bring_object_when_lifted",
   "contact_penalty",
   "entity_lin_vel_l2",
   "grasped",
   "keypoint_distance_reward",
   "lift_height",
+  "lift_height_faded",
   "time_penalty",
   "joint_pos_limits",
   "object_lifted",

@@ -481,11 +481,17 @@ def rollout(
   reward: str = "R-A",
   corners_first: bool = True,
   verbose: bool = True,
+  hook=None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
   Envs ``0..8`` get the spawn box's centre and eight corners when ``corners_first`` is
   set; the rest keep the reset event's own random jitter.
+
+  ``hook(phase, env)``, if given, is called after every control step with the name of the
+  phase that step belongs to (settle waits and place corrections count to their phase). It
+  sees the env *after* the step, so a test can read reward terms and sensors at real,
+  physically reached states -- a held cube cannot be teleported into the jaw.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -611,6 +617,8 @@ def rollout(
     tally.observe(**ev.probe(env, grasp_sensor))
     _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
     tally.terminal(ev.success_flags(env) & ~ended)
+    if hook is not None:
+      hook(phase_now[0], env)
     done = (terminated | truncated) & ~ended
     for i in torch.nonzero(done).flatten().tolist():
       why[i] = ",".join(
@@ -623,8 +631,10 @@ def rollout(
       tally.finish(torch.nonzero(done).flatten())
       ended |= done
 
+  phase_now = ["start"]
   with torch.inference_mode():
     for phase, wp, closed, steps in PHASES:
+      phase_now[0] = phase
       if bool(ended.all()):
         break
       if phase == "lower":
