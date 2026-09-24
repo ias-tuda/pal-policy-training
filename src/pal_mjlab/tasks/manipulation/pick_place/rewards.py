@@ -314,10 +314,122 @@ REWARD_VARIANTS = {
   "R-E": r_e_time_penalty,
 }
 
+# -- S5.2: release / place modules on the c1a base ---------------------------------------
+#
+# c1a (`s5-1-report.md` section 6) solved picking on every arm and placing on none, and chose
+# R-C-strict as the base: every S5.2 arm keeps its reach / grasp / lift / transport terms and
+# varies only the release / place part (plan S5.2, revision 2026-09-24 10:27). The modules:
+#
+# * M1 per-step dominance -- no success termination in training; `release` (gated) weight 4;
+#   a per-step `placed` term (gated) weight 8, so the finished state out-earns holding.
+# * M2 no-cliff goal -- `goal` gated on the `was_lifted` latch instead of "off the table right
+#   now", plus a narrow `goal_near` term for the last centimetres. The plan's weight on the
+#   broad term was 4; it is 7 because at 4 the lowering path over the target has a dip at 5 cm
+#   (6.71 there vs 6.91 at 7.5 cm) -- a hover optimum of its own. 7 is the smallest integer
+#   that makes the lowering path monotone (analytic check, s5-2 report; test
+#   `test_pick_place_s52_ordering.py`).
+# * M3 lift fade -- `lift_height` x (1 - G_0.05(d_g)).
+# * M4 terminal bonus -- keep the success termination, success weight 1000 (gated).
+#
+# Every release / placed / success term, and the success termination, requires `was_lifted`
+# (R-C-strict already gates them; the modules keep it that way).
+
+#: The c1a arm S5.2 builds on.
+S52_BASE = "R-C-strict"
+M1_RELEASE_WEIGHT = 4.0
+M1_PLACED_WEIGHT = 8.0
+M2_GOAL_WEIGHT = 7.0
+M2_NEAR_WEIGHT = 3.0
+M2_NEAR_STD = 0.03
+M3_FADE_STD = 0.05
+M4_SUCCESS_WEIGHT = 1000.0
+
+
+def _gated(ctx: RewardContext) -> dict:
+  return {**ctx.grasp_params, "support_sensor_name": SUPPORT_SENSOR}
+
+
+def _m1(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards.pop("success", None)
+  rewards["release"] = RewardTermCfg(
+    func=mdp.released_at_goal, weight=M1_RELEASE_WEIGHT, params=_gated(ctx)
+  )
+  rewards["placed"] = RewardTermCfg(
+    func=mdp.object_placed_reward, weight=M1_PLACED_WEIGHT, params=_gated(ctx)
+  )
+
+
+def _m2(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  params = {
+    "command_name": COMMAND,
+    "object_name": OBJECT,
+    "grasp_sensor_name": ctx.grasp_sensor,
+    "support_sensor_name": SUPPORT_SENSOR,
+  }
+  rewards["goal"] = RewardTermCfg(
+    func=mdp.bring_object_after_lift,
+    weight=M2_GOAL_WEIGHT,
+    params={**params, "std": BRINGING_STD},
+  )
+  rewards["goal_near"] = RewardTermCfg(
+    func=mdp.bring_object_after_lift,
+    weight=M2_NEAR_WEIGHT,
+    params={**params, "std": M2_NEAR_STD},
+  )
+
+
+def _m3(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  lift = rewards["lift"]
+  assert lift.func is mdp.lift_height, "M3 is defined on R-C's bounded lift_height"
+  rewards["lift"] = RewardTermCfg(
+    func=mdp.lift_height_faded,
+    weight=lift.weight,
+    params={**lift.params, "command_name": COMMAND, "fade_std": M3_FADE_STD},
+  )
+
+
+def _m4(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["success"] = RewardTermCfg(
+    func=mdp.object_placed_reward, weight=M4_SUCCESS_WEIGHT, params=_gated(ctx)
+  )
+
+
+_MODULES = {"M1": _m1, "M2": _m2, "M3": _m3, "M4": _m4}
+
+
+def _s52_arm(modules: tuple[str, ...]):
+  if "M1" in modules and "M4" in modules:
+    raise ValueError("M1 removes the success termination that M4 keeps; pick one")
+
+  def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
+    rewards = REWARD_VARIANTS[S52_BASE](ctx)
+    for name in modules:
+      _MODULES[name](rewards, ctx)
+    return rewards
+
+  build.__doc__ = f"S5.2: {S52_BASE} + {' + '.join(modules)}."
+  return build
+
+
+#: The S5.2 arms (plan S5.2, revision 10:27), by the modules on top of the base.
+S52_ARMS = {
+  f"{S52_BASE}+M1": ("M1",),
+  f"{S52_BASE}+M1+M3": ("M1", "M3"),
+  f"{S52_BASE}+M1+M2+M3": ("M1", "M2", "M3"),
+  f"{S52_BASE}+M3+M4": ("M3", "M4"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S52_ARMS.items()})
+
 #: Arms whose success *termination* must also require the `was_lifted` latch. The reward
 #: dict cannot carry this on its own -- the termination is built by the tabletop factory --
 #: so `make_pick_place_env_cfg` reads this set.
-REQUIRE_LIFTED = frozenset({"R-C-strict"})
+REQUIRE_LIFTED = frozenset(
+  {"R-C-strict", *(n for n, m in S52_ARMS.items() if "M1" not in m)}
+)
+
+#: Arms that train with no success termination at all (M1): the placed state keeps paying
+#: per step instead of ending the episode.
+NO_SUCCESS_TERMINATION = frozenset(n for n, m in S52_ARMS.items() if "M1" in m)
 
 #: Episode length per variant, where it differs. R-E buys its time penalty a shorter horizon.
 EPISODE_LENGTH_S = {"R-E": 12.0}

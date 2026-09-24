@@ -22,6 +22,7 @@ from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import (
   kangaroo_pick_place_rl_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  NO_SUCCESS_TERMINATION,
   REQUIRE_LIFTED,
   REWARD_VARIANTS,
 )
@@ -44,8 +45,11 @@ def test_every_registered_arm_can_be_selected(arm, monkeypatch):
   monkeypatch.setenv(REWARD_ENV_VAR, arm)
   cfg = kangaroo_pick_place_env_cfg()
   # Every arm resets the latch -- the eval reads it on all of them -- but only the strict
-  # arm gates its success termination on it.
+  # arms gate their success termination on it, and the S5.2 M1 arms have none at all.
   assert "reset_was_lifted" in cfg.events
+  if arm in NO_SUCCESS_TERMINATION:
+    assert "success" not in cfg.terminations
+    return
   strict = arm in REQUIRE_LIFTED
   assert ("support_sensor_name" in cfg.terminations["success"].params) is strict
 

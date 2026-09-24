@@ -21,6 +21,26 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **New: reward arms for placing in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``.**
+  Earlier arms learned to pick the cube but not to place it. They either held
+  it just above the target or hovered a few centimetres over it, because both
+  paid more per step than putting it down. Four new arms keep ``R-C-strict``'s
+  pick and carry terms and change only the release/place part. They are
+  selected with ``REWARD=``:
+
+  - ``R-C-strict+M1`` pays a per-step reward for the placed state instead of
+    ending the episode on success.
+  - ``R-C-strict+M1+M3`` also fades the lift reward out near the target.
+  - ``R-C-strict+M1+M2+M3`` also keeps the goal reward paying after the cube
+    touches the table, with a narrow term for the last centimetres.
+  - ``R-C-strict+M3+M4`` keeps the success termination with a large one-off
+    bonus instead.
+
+  Every release, placed and success term requires the cube to have been
+  lifted, so pushing it onto the target earns nothing. The existing arms are
+  unchanged. ``eval_pick_place.py`` now also reports how close the held cube
+  comes to the target horizontally, and its height above the target.
+
 - **Changed: the Kangaroo arm and pelvis gains, for every task.** The arms
   and pelvis now use the SysID training gains (stiffness 49.94 / 26.18 N·m/rad,
   damping 3.18 / 1.67, effort 50 / 25 N·m for shoulder / rest of the arm; both
