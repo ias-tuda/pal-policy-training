@@ -112,3 +112,72 @@ def test_time_to_place_is_none_when_nothing_was_placed():
   tally.observe(**_flags())
   tally.finish(torch.tensor([0]))
   assert eval_pick_place.summarise(tally, 0.02, 1)["time_to_place_s"] is None
+
+
+def _measure(tally, held, dxy, dz):
+  tally.measure(torch.tensor(held), torch.tensor(dxy), torch.tensor(dz))
+
+
+def test_transport_is_measured_horizontally_and_only_while_held():
+  """S5.2 base selection: the horizontal distance to the target while held, and the height
+  above it while held within 3 cm horizontally. A cube 6 cm straight above the target is 0 cm
+  off horizontally -- the 3-D `position_error` misread exactly that as "no transport"."""
+  tally = Tally(1, "cpu")
+  _measure(tally, [False], [0.30], [0.00])  # not held: ignored
+  _measure(tally, [True], [0.20], [0.05])  # carrying
+  _measure(tally, [True], [0.02], [0.06])  # over the target, 6 cm up
+  _measure(tally, [True], [0.00], [0.06])  # straight above it
+  tally.observe(**_flags())
+  tally.finish(torch.tensor([0]))
+  row = tally.done[0]
+  assert row["held_steps"] == 3
+  assert abs(row["held_dxy_mean"] - (0.20 + 0.02 + 0.00) / 3) < 1e-6
+  assert abs(row["held_dxy_min"] - 0.0) < 1e-6
+  assert row["near_xy_while_held"] is True
+  assert abs(row["hover_dz_mean"] - 0.06) < 1e-6  # the 0.05 m step was 20 cm out
+
+
+def test_an_episode_that_never_holds_has_no_transport_numbers():
+  tally = Tally(1, "cpu")
+  _measure(
+    tally, [False], [0.01], [0.0]
+  )  # the cube sits on the target, but was never held
+  tally.observe(**_flags())
+  tally.finish(torch.tensor([0]))
+  row = tally.done[0]
+  assert row["held_steps"] == 0 and row["held_dxy_mean"] is None
+  assert row["near_xy_while_held"] is False and row["hover_dz_mean"] is None
+
+
+def test_transport_accumulators_clear_between_episodes_and_stay_per_env():
+  tally = Tally(2, "cpu")
+  _measure(tally, [True, True], [0.01, 0.10], [0.07, 0.02])
+  tally.observe(**{k: torch.tensor([False, False]) for k in Tally.FIELDS})
+  tally.finish(torch.tensor([0]))
+  _measure(tally, [False, True], [0.50, 0.02], [0.0, 0.03])
+  tally.observe(**{k: torch.tensor([False, False]) for k in Tally.FIELDS})
+  tally.finish(torch.tensor([0, 1]))
+  first, second, other = tally.done
+  assert first["near_xy_while_held"] and abs(first["hover_dz_mean"] - 0.07) < 1e-6
+  assert second["held_steps"] == 0, "env 0's accumulators survived its reset"
+  assert other["held_steps"] == 2 and abs(other["held_dxy_min"] - 0.02) < 1e-6
+  assert abs(other["hover_dz_mean"] - 0.03) < 1e-6  # only its near step counts
+
+
+def test_the_summary_reports_transport_quality():
+  tally = Tally(1, "cpu")
+  for held, dxy, dz in (
+    ([True], [0.02], [0.06]),
+    ([True], [0.08], [0.06]),
+    ([False], [0.0], [0.0]),
+  ):
+    _measure(tally, held, dxy, dz)
+    tally.observe(**_flags())
+    tally.finish(torch.tensor([0]))
+  out = eval_pick_place.summarise(tally, 0.02, 3)
+  assert out["episodes_held"] == 2
+  assert (
+    abs(out["within_3cm_xy_while_held"] - 1 / 3) < 1e-9
+  )  # a fraction of all episodes
+  assert abs(out["held_dxy_mean_m"] - 0.05) < 1e-6
+  assert abs(out["hover_dz_mean_m"] - 0.06) < 1e-6
