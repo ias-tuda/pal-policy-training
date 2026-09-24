@@ -299,6 +299,18 @@ Model Updates
 Bug Fixes & Reliability
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
+- **Fixed: at DR level ``DR-scene``, pick-and-place started every episode
+  with the cube on the floor.** The goal used at that level also moved the
+  cube, after the reset had already placed it on the table, into a spawn area
+  on the floor beside the robot. The goal now leaves placement to the reset,
+  as the other goals do. No training run had used ``DR-scene``.
+
+- **Changed: two DR levels now match the reference setup.** ``DR-robot``
+  now also varies the arm's starting pose by up to 0.02 rad per joint.
+  ``DR-scene`` now shifts the table by up to 2 cm in x and y and 1 cm in
+  height (previously 2 cm in height only); the cube's spawn point and the
+  target move with the table.
+
 - **Fixed a CUDA illegal-memory-access crash on reset with mjlab 1.5.1.**
   Training would crash with a CUDA illegal memory access error when
   environments reset. Worked around by pinning a specific mjlab commit;

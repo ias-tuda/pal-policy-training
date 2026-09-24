@@ -549,22 +549,27 @@ def trunk_clearance_rewards(
 #:
 #: What each rung adds:
 #:
-#: * ``DR0`` -- nothing varies. Removes the two things the base cfg randomises.
+#: * ``DR0`` -- nothing in the model varies: removes the two things the base cfg randomises
+#:   (pad friction, reset jitter). The actor's base observation noise -- joint pos +/-0.002
+#:   rad, vel +/-0.2 rad/s, object pos +/-5 mm, yaw +/-0.02 rad -- stays on at every rung.
 #: * ``DR-object`` -- the object's physics: sliding friction and mass.
 #: * ``DR-contact`` -- the gripper side: the base cfg's pad friction, restored.
 #: * ``DR-robot`` -- actuation: PD gains, joint friction and joint damping on the driven
-#:   joints.
+#:   joints, and a +/-0.02 rad jitter on their reset pose.
 #: * ``DR-obs`` -- perception: an object-tracker error model (per-episode bias, per-step
 #:   jitter, 0-2 steps of lag) and an encoder bias.
-#: * ``DR-scene`` -- layout: table height and a wider spawn box.
+#: * ``DR-scene`` -- layout: the table's pose (x, y +/-2 cm, height +/-1 cm) and a wider
+#:   spawn box.
 #:
 #: v0 trains at DR0 and DR-object only; the rest are defined so that climbing is a change of
 #: one string. Two caveats are recorded rather than hidden:
 #:
-#: * **DR-scene moves the table, so a goal with a hardcoded z stops being right.** A 2 cm
-#:   table offset eats 2 cm of a 2.5 cm success threshold. A task that uses this rung needs a
-#:   goal that reads the surface out of physics -- `mdp.SurfaceOffsetCommand` is that goal,
-#:   and `pick_place_env_cfg._command_cfg` is one way to switch to it.
+#: * **DR-scene moves the table, so a goal with a hardcoded position stops being right.** A
+#:   2 cm table offset eats 2 cm of a 2.5 cm success threshold. A task that uses this rung
+#:   needs a goal that reads the surface out of physics -- `mdp.SurfaceOffsetCommand` is that
+#:   goal, and `pick_place_env_cfg._command_cfg` is one way to switch to it. Both it and the
+#:   spawn (`reset_objects_on_surface`) read the table's world XY as well as its height, so
+#:   the target stays fixed *relative to the table* and moves +/-2 cm relative to the robot.
 #: * **Randomising the cube's size is deliberately not here**, even though `dr.geom_size`
 #:   works: the cube's resting height is a function of its size, so it breaks a hardcoded
 #:   goal z the same way the table does. It would be safe to add for a task already using
@@ -605,6 +610,10 @@ _DR_OBJECT_ALPHA = tuple(
 #: ships with `damping="0.03"` (`kangaroo_grippers.xml`), which its range brackets, and gets
 #: three orders of magnitude less stiction than an arm, since anything larger stalls it.
 _DR_ROBOT_GAIN_SCALE = (0.8, 1.2)
+#: DR-robot's reset jitter on the driven joints, rad: Claudius's value, aligned by plan S7
+#: (decided 2026-09-24). The base cfg has the same +/-0.02; DR0 switches it off and this rung
+#: puts it back.
+_DR_ROBOT_RESET_JITTER = 0.02
 _DR_ROBOT_JOINT_FRICTION = {
   r"arm_.*_[1-7]_joint": (0.0, 1.0),
   r"gripper_.*_finger_joint": (0.0, 0.02),
@@ -629,10 +638,13 @@ _DR_OBS_OBJECT_YAW_NOISE = 0.01  # rad
 _DR_OBS_OBJECT_LAG = (0, 2)  # control steps
 _DR_OBS_ENCODER_BIAS = 0.005
 
-#: DR-scene: table height, and how much wider the spawn box gets. Additive rather than a
-#: factor, because the tasks' nominal spawn ranges differ by an order of magnitude (2 cm for
-#: pick-and-place, 15 cm for lift) and a factor would push the larger ones off the table.
-_DR_SCENE_TABLE_HEIGHT = 0.02
+#: DR-scene: the table's pose, and how much wider the spawn box gets. The pose is Claudius's
+#: (x, y +/-2 cm, z +/-1 cm), aligned by plan S7 (decided 2026-09-24); the height was +/-2 cm
+#: before. The spawn widening is additive rather than a factor, because the tasks' nominal
+#: spawn ranges differ by an order of magnitude (2 cm for pick-and-place, 15 cm for lift) and
+#: a factor would push the larger ones off the table.
+_DR_SCENE_TABLE_XY = 0.02
+_DR_SCENE_TABLE_HEIGHT = 0.01
 _DR_SCENE_EXTRA_SPAWN = 0.03
 
 
@@ -701,6 +713,10 @@ def apply_dr_level(
     )
 
   if rung >= _dr_index("DR-robot"):
+    cfg.events["reset_robot_joints"].params["position_range"] = (
+      -_DR_ROBOT_RESET_JITTER,
+      _DR_ROBOT_RESET_JITTER,
+    )
     cfg.events["actuator_gains"] = EventTermCfg(
       mode="startup",
       func=dr.pd_gains,
@@ -765,19 +781,24 @@ def apply_dr_level(
     )
 
   if rung >= _dr_index("DR-scene"):
-    cfg.events["table_height"] = EventTermCfg(
+    cfg.events["table_pose"] = EventTermCfg(
       mode="startup",
       func=dr.body_pos,
       params={
         "asset_cfg": SceneEntityCfg(TABLE, body_names=(TABLE,)),
         "operation": "add",
         "distribution": "uniform",
-        "axes": [2],
-        "ranges": (-_DR_SCENE_TABLE_HEIGHT, _DR_SCENE_TABLE_HEIGHT),
+        "axes": [0, 1, 2],
+        "ranges": {
+          0: (-_DR_SCENE_TABLE_XY, _DR_SCENE_TABLE_XY),
+          1: (-_DR_SCENE_TABLE_XY, _DR_SCENE_TABLE_XY),
+          2: (-_DR_SCENE_TABLE_HEIGHT, _DR_SCENE_TABLE_HEIGHT),
+        },
       },
     )
     # The spawn box widens about its own centre. `reset_objects_on_surface` reads the table's
-    # height out of physics, so the cube still lands on the surface wherever the table is.
+    # position and height out of physics, so the cube still lands on the surface, at the same
+    # offset from the table's centre, wherever the table is.
     pose_range = cfg.events["reset_objects"].params["pose_range"]
     for axis in ("x", "y"):
       lo, hi = pose_range[axis]

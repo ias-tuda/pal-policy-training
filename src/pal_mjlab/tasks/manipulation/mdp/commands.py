@@ -122,6 +122,14 @@ class SurfaceOffsetCommandCfg(LiftingCommandCfg):
   """XY offset from the surface geom's centre. The height is not an input -- it is the
   surface plus the object's own half-height, which is what "resting on it" means."""
 
+  # Placement belongs to a reset event, not to the command -- as for `EntityOffsetCommandCfg`.
+  # Without this the inherited default is mjlab's own spawn range (x 0.30-0.35, y +/-0.10,
+  # z 0.02-0.05 in the env frame), and `LiftingCommand._resample_command` re-placed the object
+  # there *after* the reset event had put it on the table: at DR-scene, the only pick-and-place
+  # rung that uses this command, every episode started with the cube on the floor. Found
+  # 2026-09-24 (plan S7, D5 alignment); DR-scene had never been trained.
+  object_pose_range: LiftingCommandCfg.ObjectPoseRangeCfg | None = None
+
   def build(self, env: ManagerBasedRlEnv) -> SurfaceOffsetCommand:
     return SurfaceOffsetCommand(self, env)
 

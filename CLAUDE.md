@@ -169,6 +169,16 @@ Claims that have already been wrong here:
   against an 8 mm range. Set `operation="abs"` on `bias_noise_cfg`. (Measured 2026-09-23.)
 - **A string-keyed DR `ranges` dict is not scoped by `asset_cfg.joint_names`** in mjlab:
   each key is matched against every joint of the entity. `arm_.*` randomises a parked arm too.
+- **"DR-scene places the cube on the moving table" was wrong until 2026-09-24.** Its goal,
+  `mdp.SurfaceOffsetCommandCfg`, inherited mjlab `LiftingCommandCfg`'s non-None
+  `object_pose_range`, so the command re-placed the cube on the floor (x 0.30-0.35, z 0.02-0.05)
+  *after* the reset event had put it on the table. The DR-scene tests checked the goal and the
+  table, never the cube. A command must not place objects here; check where the object is after
+  `env.reset()`, not only that the placement event ran. (Found by plan S7's D5 test.)
+- **"DR0 randomises nothing" is true of the model, not of the observations.** The actor's base
+  observation noise (joint pos +/-0.002 rad, vel +/-0.2 rad/s, object pos +/-5 mm, yaw
+  +/-0.02 rad; `tabletop_env_cfg.py`) is on at every rung in training; only `--play` turns it
+  off. (Found 2026-09-24, plan S7's D4 alignment.)
 - *(Add every further claim that turns out wrong. These lines are the most valuable in the file.)*
 
 ---
