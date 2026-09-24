@@ -482,6 +482,7 @@ def rollout(
   corners_first: bool = True,
   verbose: bool = True,
   hook=None,
+  action_slew_rate_scale: float = 1.0,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -492,6 +493,10 @@ def rollout(
   phase that step belongs to (settle waits and place corrections count to their phase). It
   sees the env *after* the step, so a test can read reward terms and sensors at real,
   physically reached states -- a held cube cannot be teleported into the jaw.
+
+  ``action_slew_rate_scale`` builds the env with a scaled arm slew limit (plan S7: 0.5 is
+  speed bound A). The script reads the limit back from the action term, so its
+  interpolation stretches to the lower limit by itself; ``over_slew_env_steps`` checks it.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -501,7 +506,10 @@ def rollout(
 
   ev = _eval_module()
   cfg = pp.make_pick_place_env_cfg(
-    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=reward
+    KANGAROO_GRIPPERS_LEFT_ARM,
+    gripper_name="left",
+    reward=reward,
+    action_slew_rate_scale=action_slew_rate_scale,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -585,6 +593,11 @@ def rollout(
   arm_q = [robot.joint_names.index(j) for j in ARM_JOINTS]
   settle_steps: dict[str, int] = {}
   place_corrections = 0
+  # Corrections the planner could not make contact-free, as (env, reason). Skipped rather than
+  # forced: the env keeps its current place pose and is scored on where the cube lands.
+  # First hit at slew 0.5 (plan S7 FA, 2026-09-24): a 7 mm shift toward the torso left only
+  # elbow-in IK solutions for one corner, and the whole rollout used to die on it.
+  skipped_corrections: list[tuple[int, str]] = []
   last_q = prev.copy()
   over_slew = (
     0  # env-steps whose commanded arm move exceeded the slew limit; should stay 0
@@ -683,16 +696,21 @@ def rollout(
             break
           shifted = nxt.copy()
           for i in fix:
-            shifted[i] = _solve(
-              kin, "place", kin.fk(nxt[i])[0] - err[i], hand_xs[i], nxt[i]
-            )
-            plans[i]["place"] = _solve(
-              kin,
-              "place",
-              kin.fk(plans[i]["place"])[0] - err[i],
-              hand_xs[i],
-              plans[i]["place"],
-            )
+            try:
+              up_i = _solve(
+                kin, "place", kin.fk(nxt[i])[0] - err[i], hand_xs[i], nxt[i]
+              )
+              down_i = _solve(
+                kin,
+                "place",
+                kin.fk(plans[i]["place"])[0] - err[i],
+                hand_xs[i],
+                plans[i]["place"],
+              )
+            except RuntimeError as e:
+              skipped_corrections.append((i, str(e)))
+              continue
+            shifted[i], plans[i]["place"] = up_i, down_i
           move_and_settle(nxt, shifted, True)
           nxt = shifted
           place_corrections += 1
@@ -730,6 +748,10 @@ def rollout(
     print(f"\n{clipped} env-steps needed an action outside [-1, 1] (clipped)")
     print(f"settle waits (control steps): {settle_steps}")
     print(f"place corrections applied: {place_corrections}")
+    for env_i, reason in skipped_corrections:
+      print(
+        f"env {env_i}: place correction skipped, not plannable contact-free: {reason}"
+      )
     print(f"phases stretched to respect the arm slew limit: {stretched}")
     print(f"env-steps commanding faster than the slew limit: {over_slew}")
     print(
@@ -750,6 +772,9 @@ def rollout(
     r["clipped_env_steps"] = clipped
     r["settle_steps"] = dict(settle_steps)
     r["place_corrections"] = place_corrections
+    r["skipped_corrections"] = [
+      reason for env_i, reason in skipped_corrections if env_i == r["env"]
+    ]
     r["slew_stretched_phases"] = dict(stretched)
     r["over_slew_env_steps"] = over_slew
     r["ended_by"] = why[i]
@@ -769,6 +794,9 @@ def parse_args() -> argparse.Namespace:
   r.add_argument("--seed", type=int, default=0)
   r.add_argument("--reward", default="R-A")
   r.add_argument("--random-only", action="store_true", help="no forced corners")
+  r.add_argument(
+    "--slew", type=float, default=1.0, help="action_slew_rate_scale (S7 FA: 0.5)"
+  )
   r.add_argument("--json", type=pathlib.Path, default=None)
   return p.parse_args()
 
@@ -784,6 +812,7 @@ def main() -> None:
     seed=args.seed,
     reward=args.reward,
     corners_first=not args.random_only,
+    action_slew_rate_scale=args.slew,
   )
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)
