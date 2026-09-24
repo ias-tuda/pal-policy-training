@@ -31,6 +31,13 @@ The four diagnostic rates (plan, "Metrics and diagnostics")
                   Text2Reward hold-at-goal failure
   placed          the number that counts
 
+Transport and speed, while held
+--------------------------------------------------------------------------------
+  transport       horizontal distance to the target while held, and the height over it
+                  while held within 3 cm -- a hover, not a miss (S5.2 base selection)
+  speed           per-episode peak cube and TCP speed while held, over one control step
+                  -- the read of plan S7's speed bound
+
 Horizon
 --------------------------------------------------------------------------------
 Not the `--play` cfg as-is: `apply_play_overrides` sets `episode_length_s` to 1e9, so
@@ -60,7 +67,8 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   GOAL_THRESHOLD,
   OBJECT,
 )
-from pal_mjlab.tasks.manipulation.tabletop_env_cfg import COMMAND, SUPPORT_SENSOR
+from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import COMMAND, ROBOT, SUPPORT_SENSOR
 
 TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 
@@ -69,6 +77,8 @@ TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 #: carried over the target and hovering 6 cm above it reads "6 cm off" there, which is how the
 #: c1a screen was first misread as "no transport" (2026-09-24, S5.2 base selection).
 NEAR_XY = 0.03
+#: The gripper's tool centre point, whose speed while holding is S7's speed-bound read.
+TCP_SITE = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,6 +134,14 @@ class Tally:
     self.dxy_min = zf(float("inf"))
     self.near_n = torch.zeros(num_envs, dtype=torch.long, device=device)
     self.dz_sum = zf(0.0)
+    # Speed accumulators (`measure_speed`): the fastest the cube and the TCP moved over one
+    # control step while the cube stayed held, per episode, and the positions they moved from.
+    self.prev_obj = torch.zeros(num_envs, 3, device=device)
+    self.prev_tcp = torch.zeros(num_envs, 3, device=device)
+    self.prev_held = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.speed_n = torch.zeros(num_envs, dtype=torch.long, device=device)
+    self.obj_v_peak = zf(0.0)
+    self.tcp_v_peak = zf(0.0)
     self.done: list[dict[str, bool | int | float | None]] = []
 
   def observe(self, **flags: torch.Tensor) -> None:
@@ -148,6 +166,37 @@ class Tally:
     self.dxy_min = torch.where(held, torch.minimum(self.dxy_min, dxy), self.dxy_min)
     self.near_n += near.long()
     self.dz_sum += torch.where(near, dz, torch.zeros_like(dz))
+
+  def measure_speed(
+    self,
+    held: torch.Tensor,
+    obj_pos: torch.Tensor,
+    tcp_pos: torch.Tensor,
+    step_dt: float,
+  ) -> None:
+    """Track the peak cube and TCP speed while the cube is held (plan S7's speed read).
+
+    A step's speed is its displacement over one control step, ``|p_t - p_(t-1)| / step_dt``,
+    counted only when the cube was held at both ends of the step: the jaw closing and the
+    release are not transport, and the jump across a reset is not motion (`finish` clears
+    `prev_held`). Displacement rather than the instantaneous velocity, which spikes on
+    contact transients and is not what a rate limit bounds. Call once per step, alongside
+    `measure`.
+    """
+    held = held.bool()
+    both = held & self.prev_held
+    v_obj = torch.norm(obj_pos - self.prev_obj, dim=-1) / step_dt
+    v_tcp = torch.norm(tcp_pos - self.prev_tcp, dim=-1) / step_dt
+    self.obj_v_peak = torch.where(
+      both, torch.maximum(self.obj_v_peak, v_obj), self.obj_v_peak
+    )
+    self.tcp_v_peak = torch.where(
+      both, torch.maximum(self.tcp_v_peak, v_tcp), self.tcp_v_peak
+    )
+    self.speed_n += both.long()
+    self.prev_obj = obj_pos.clone()
+    self.prev_tcp = tcp_pos.clone()
+    self.prev_held = held.clone()
 
   def terminal(self, success: torch.Tensor) -> None:
     """Credit the episodes a `success` termination just ended, which `observe` cannot see.
@@ -176,6 +225,9 @@ class Tally:
       row["held_dxy_min"] = float(self.dxy_min[i]) if held else None
       row["near_xy_while_held"] = near > 0
       row["hover_dz_mean"] = float(self.dz_sum[i]) / near if near else None
+      moved = int(self.speed_n[i]) > 0
+      row["peak_obj_speed_held"] = float(self.obj_v_peak[i]) if moved else None
+      row["peak_tcp_speed_held"] = float(self.tcp_v_peak[i]) if moved else None
       self.done.append(row)
     for name in self.FIELDS:
       self.live[name][env_ids] = False
@@ -186,6 +238,10 @@ class Tally:
     self.dxy_min[env_ids] = float("inf")
     self.near_n[env_ids] = 0
     self.dz_sum[env_ids] = 0.0
+    self.prev_held[env_ids] = False
+    self.speed_n[env_ids] = 0
+    self.obj_v_peak[env_ids] = 0.0
+    self.tcp_v_peak[env_ids] = 0.0
 
 
 def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
@@ -241,6 +297,13 @@ def geometry(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
   return torch.norm((pos - goal)[:, :2], dim=-1), pos[:, 2] - goal[:, 2]
 
 
+def positions(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
+  """The cube's and the TCP's world positions, for `Tally.measure_speed`. (B, 3), (B, 3)"""
+  robot = env.scene[ROBOT]
+  tcp = robot.data.site_pos_w[:, robot.site_names.index(TCP_SITE)]
+  return env.scene[OBJECT].data.root_link_pos_w, tcp
+
+
 def success_flags(env: ManagerBasedRlEnv) -> torch.Tensor:
   """Which envs the last `step` ended through the `success` termination.
 
@@ -273,6 +336,12 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     "hover_dz_mean_m": mean(near),
     "hover_dz_median_m": median(near),
   }
+  speed = {}
+  for key, name in (("peak_obj_speed_held", "obj"), ("peak_tcp_speed_held", "tcp")):
+    peaks = [r[key] for r in rows if r.get(key) is not None]
+    speed[f"peak_{name}_speed_held_mean_mps"] = mean(peaks)
+    speed[f"peak_{name}_speed_held_median_mps"] = median(peaks)
+    speed[f"peak_{name}_speed_held_max_mps"] = max(peaks) if peaks else None
   return {
     "episodes": n,
     "placed": rate("placed"),
@@ -286,6 +355,7 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     if placed_times
     else None,
     **transport,
+    **speed,
   }
 
 
@@ -331,6 +401,18 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
     f"    hover height over target {fmt(result['hover_dz_mean_m'])}  (z - z_target, held within 3 cm xy)"
   )
 
+  print("\n  SPEED WHILE HELD (per-episode peak, over one control step) -------")
+  for name, label in (("obj", "cube"), ("tcp", "TCP")):
+    m = result[f"peak_{name}_speed_held_mean_mps"]
+    if m is None:
+      print(f"    peak {label:4s} speed          n/a")
+      continue
+    med = result[f"peak_{name}_speed_held_median_mps"]
+    top = result[f"peak_{name}_speed_held_max_mps"]
+    print(
+      f"    peak {label:4s} speed         {m:6.2f} m/s  (median {med:.2f}, max {top:.2f})"
+    )
+
   print("\n  TIMING -----------------------------------------------------------")
   ttp = result["time_to_place_s"]
   print(f"    mean episode             {result['mean_episode_length_s']:6.2f} s")
@@ -363,6 +445,7 @@ def main() -> None:
       flags = probe(env, grasp_sensor)
       tally.observe(**flags)
       tally.measure(flags["grasped"], *geometry(env))
+      tally.measure_speed(flags["grasped"], *positions(env), env.step_dt)
       obs, _, dones, extras = wrapped.step(policy(obs))
       tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()
