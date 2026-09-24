@@ -33,9 +33,14 @@ ADDS = {
   "DR0": (),
   "DR-object": ("object friction", "object mass"),
   "DR-contact": ("pad friction",),
-  "DR-robot": ("actuator gains", "joint friction", "joint damping"),
+  "DR-robot": (
+    "actuator gains",
+    "joint friction",
+    "joint damping",
+    "reset joint jitter",
+  ),
   "DR-obs": ("encoder bias",),
-  "DR-scene": ("table height",),
+  "DR-scene": ("table height", "table x", "table y"),
 }
 
 
@@ -78,7 +83,11 @@ def _measure(env: ManagerBasedRlEnv) -> dict[str, float]:
     "joint friction": _spread_across_envs(model.dof_frictionloss),
     "joint damping": _spread_across_envs(model.dof_damping),
     "encoder bias": _spread_across_envs(env.scene["robot"].data.encoder_bias),
+    # Read right after `env.reset()`: the reset pose itself, before any action moves it.
+    "reset joint jitter": _spread_across_envs(env.scene["robot"].data.joint_pos),
     "table height": _spread_across_envs(model.body_pos[:, body("table/table"), 2]),
+    "table x": _spread_across_envs(model.body_pos[:, body("table/table"), 0]),
+    "table y": _spread_across_envs(model.body_pos[:, body("table/table"), 1]),
   }
 
 
@@ -178,7 +187,7 @@ def test_dr_scene_goal_matches_the_fixed_goal():
   """Swapping the command at DR-scene must not move the goal when the table does not move."""
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as cfg_mod
 
-  env = _pick_place_env("DR-scene", num_envs=2, drop_events=("table_height",))
+  env = _pick_place_env("DR-scene", num_envs=2, drop_events=("table_pose",))
   goal = env.command_manager.get_term("goal_pose").command.numpy()
   env.close()
 
@@ -186,23 +195,95 @@ def test_dr_scene_goal_matches_the_fixed_goal():
   assert goal == pytest.approx(np.tile(expected, (2, 1)), abs=1e-6)
 
 
+def _table_shift(env: ManagerBasedRlEnv) -> np.ndarray:
+  """Each env's table offset from the nominal, (B, 3). The host `mj_model` keeps the
+  pre-randomisation `body_pos`; the batched model carries the randomised one."""
+  body = mujoco.mj_name2id(env.sim.mj_model, mujoco.mjtObj.mjOBJ_BODY, "table/table")
+  return env.sim.model.body_pos[:, body].numpy() - env.sim.mj_model.body_pos[body]
+
+
 def test_dr_scene_goal_tracks_the_table():
   """With the table moving, the goal has to move with it or the task becomes unwinnable.
 
-  A 2 cm table offset against a 2.5 cm success threshold leaves nothing for the xy error,
-  which is why this rung uses a goal derived from the surface rather than a constant z.
+  A 2 cm table offset against a 2.5 cm success threshold leaves nothing for the placement
+  error, which is why this rung uses a goal derived from the surface. Since plan S7 the
+  table moves in x and y too (Claudius's +/-2 cm), and the goal keeps its offset from the
+  table: fixed relative to the table, +/-2 cm relative to the robot.
   """
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as cfg_mod
 
   env = _pick_place_env("DR-scene", num_envs=8)
   goal = env.command_manager.get_term("goal_pose").command.numpy()
   top_z = _table_top_z(env)
+  shift = _table_shift(env)
   env.close()
 
-  assert top_z.max() - top_z.min() > 0.0, "the table did not move; nothing was tested"
-  assert goal[:, 0] == pytest.approx(cfg_mod.TARGET_XY[0], abs=1e-6)
-  assert goal[:, 1] == pytest.approx(cfg_mod.TARGET_XY[1], abs=1e-6)
+  for axis in (0, 1):
+    assert np.ptp(shift[:, axis]) > 0.0, f"the table did not move in axis {axis}"
+  assert top_z.max() - top_z.min() > 0.0, "the table did not move in z"
+  assert goal[:, :2] == pytest.approx(
+    np.asarray(cfg_mod.TARGET_XY) + shift[:, :2], abs=1e-6
+  )
   assert goal[:, 2] == pytest.approx(top_z + 0.025, abs=1e-6)
+
+
+def test_dr_scene_spawn_moves_with_the_table():
+  """The spawn is sampled relative to the table's measured centre, so a table shifted in x
+  and y carries the spawn with it. Collapsed to the spawn box's centre so the check is exact:
+  with the box's own width in play, a 2 cm shift could hide inside it."""
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as cfg_mod
+
+  torch.manual_seed(0)
+  cfg = make_pick_place_env_cfg(
+    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", dr="DR-scene"
+  )
+  cfg.scene.num_envs = 8
+  pose_range = cfg.events["reset_objects"].params["pose_range"]
+  for axis in ("x", "y", "yaw"):
+    lo, hi = pose_range[axis]
+    pose_range[axis] = ((lo + hi) / 2, (lo + hi) / 2)
+  env = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
+  env.reset()
+  cube = env.scene["object"].data.root_link_pos_w.numpy()
+  shift = _table_shift(env)
+  env.close()
+
+  assert np.ptp(shift[:, 0]) > 0.0 and np.ptp(shift[:, 1]) > 0.0
+  assert cube[:, :2] == pytest.approx(
+    np.asarray(cfg_mod.SPAWN_XY) + shift[:, :2], abs=1e-5
+  )
+
+
+def test_the_aligned_scene_and_robot_ranges_land_where_the_config_says():
+  """Plan S7's three aligned rows (decided 2026-09-24): table x, y +/-2 cm and z +/-1 cm at
+  DR-scene; +/-0.02 rad reset jitter on the driven joints from DR-robot up."""
+  from pal_mjlab.tasks.manipulation import tabletop_env_cfg as base
+
+  env = _pick_place_env("DR-scene", num_envs=32)
+  shift = _table_shift(env)
+  robot = env.scene["robot"]
+  # The jitter is on the driven joints. On the arm it shows as-is; the jaw's default (0.0)
+  # sits below its soft lower limit (0.0475, 95 % of [0, 0.95]), so every reset clamps it
+  # there, identically in every env and at every rung.
+  names = robot.joint_names
+  arm = [i for i, n in enumerate(names) if re.fullmatch(r"arm_left_[1-7]_joint", n)]
+  jaw = names.index("gripper_left_finger_joint")
+  assert len(arm) == 7, names
+  delta = robot.data.joint_pos - robot.data.default_joint_pos
+  offset, jaw_offset = delta[:, arm].numpy(), delta[:, jaw].numpy()
+  env.close()
+
+  xy, z = base._DR_SCENE_TABLE_XY, base._DR_SCENE_TABLE_HEIGHT
+  assert (xy, z) == (0.02, 0.01)
+  assert (
+    np.abs(shift[:, :2]).max() <= xy + 1e-9 and np.abs(shift[:, 2]).max() <= z + 1e-9
+  )
+  assert (
+    np.abs(shift[:, 2]).max() > 0.5 * z
+  )  # the range is used, not a tiny corner of it
+  jitter = base._DR_ROBOT_RESET_JITTER
+  assert np.abs(offset).max() <= jitter + 1e-6 and np.abs(offset).max() > 0.5 * jitter
+  assert np.ptp(jaw_offset) == 0.0
 
 
 def _dofs(env: ManagerBasedRlEnv, pattern: str) -> list[int]:
