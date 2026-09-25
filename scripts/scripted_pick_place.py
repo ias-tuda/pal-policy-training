@@ -488,6 +488,7 @@ def rollout(
   spawns: list[tuple[tuple[float, float], float]] | None = None,
   release_offsets: list[tuple[float, float]] | None = None,
   phases: tuple[tuple[str, str, bool, int], ...] | None = None,
+  robot=None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -514,6 +515,10 @@ def rollout(
   all aim there, so the cube is set down that far from the target (plan S7, M6's "release
   6 cm short"). ``phases`` replaces `PHASES`; names it shares with `PHASES` keep their special
   handling (`lower` re-plans, `hold` corrects, `SETTLE_AFTER` waits).
+
+  ``robot`` replaces `KANGAROO_GRIPPERS_LEFT_ARM`, e.g. with other action scales (plan S7 P2's
+  scales for a wider spawn). The script reads scales and offsets back from the action term,
+  so it drives whatever the robot cfg defines.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -521,9 +526,11 @@ def rollout(
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
   from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 
+  robot_cfg = KANGAROO_GRIPPERS_LEFT_ARM if robot is None else robot
+
   ev = _eval_module()
   cfg = pp.make_pick_place_env_cfg(
-    KANGAROO_GRIPPERS_LEFT_ARM,
+    robot_cfg,
     gripper_name="left",
     reward=reward,
     action_slew_rate_scale=action_slew_rate_scale,
@@ -531,7 +538,7 @@ def rollout(
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
   env = ManagerBasedRlEnv(cfg=cfg, device=device)
-  grasp_sensor = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").contact_sensor_name
+  grasp_sensor = robot_cfg.gripper("left").contact_sensor_name
 
   term = env.action_manager.get_term("joint_pos")
   names = [n.split("/", 1)[-1] for n in term.target_names]
@@ -543,7 +550,7 @@ def rollout(
     else torch.full((num_envs, len(names)), float(term.scale), device=env.device)
   )
   offset = term.offset
-  jaw_closed = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").closed_pos
+  jaw_closed = robot_cfg.gripper("left").closed_pos
   # The arm's slew limit, rad per control step (S5.1 item 4; inf where there is none). Every
   # interpolation below is stretched so no step asks for more than this: the action term
   # would enforce it anyway, but a script that outruns it drifts from its own schedule and
@@ -621,7 +628,7 @@ def rollout(
   why = [""] * num_envs
   order: list[int] = []  # env id of each row of tally.done, which is in finish order
   robot = env.scene["robot"]
-  tcp_idx = robot.site_names.index(KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site)
+  tcp_idx = robot.site_names.index(robot_cfg.gripper("left").tcp_site)
   goal_w = env.command_manager.get_term("goal_pose").command
   diag: dict[str, np.ndarray] = {}
   clipped = 0
