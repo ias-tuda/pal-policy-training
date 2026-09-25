@@ -16,6 +16,7 @@ this repo in `oppsie-data/`).
 | how faithful the virtual cube is | `virtual_cube_check.py` | this repo's venv |
 | what stops the arm in MuJoCo | `contact_probe.py` | this repo's venv |
 | figures | `plot_sim2sim.py` | this repo's venv |
+| videos: logged episodes replayed through RViz, one frame per 40 ms of simulated time | `render_session.sh`, `render_episode.py` in pal-policy-deployment, then `compose_videos.sh` | `devbox` (render), any ffmpeg with drawtext and xstack (compose) |
 
 Two conventions of checkpoints trained before `fda9492` are written into every exported
 `pick_place_profile.yaml` and applied by the node: `joint_signs` (arm 5 and 7 turn the other way
