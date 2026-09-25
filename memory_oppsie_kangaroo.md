@@ -4,8 +4,8 @@
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
 *Last updated: 2026-09-25 (pick-and-place v0: `siwei-s5.2` merged into `siwei` (fast-forward to
-`3323747`); **S7-1 launched** — FA ×2, FB, D1–D5 (jobs 158540–158547) from the IAS `-s7` checkout
-@ `b50efcb`; FR ×2 (M6, 158572–158573) from `-s7m6` @ `87b50d6`; sbatch `RESUME=` @ `34ddbee`.
+`3323747`); **S7-1 read**: FA ×2, FB, D1–D5 (158540–158547, `b50efcb`) and FR ×2 (M6, 158572–158573,
+`87b50d6`); **FR is the base for S7-2 and X**; sbatch `RESUME=` @ `34ddbee`; P2 boxes proposed.
 Reports in `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
@@ -41,7 +41,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **merged into `siwei` @ `d9ea988`** (fast-forward 2026-09-24, `make test` 182 passed, ruff clean; branch `siwei-s5.1-chain`, code head `b0f8b85`; worktrees removed, their artifacts moved to `artifacts/s5.1-bench`, `artifacts/s5.1-chain`) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
 | Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
 | Pick-and-place v0 **S5.2** (reward arms for *placing*) | ✅ **read at 3–4 k** (`siwei-s5.2` @ `dad44f1`, eval @ `3323747`; **merged into `siwei` 2026-09-25**, fast-forward `cba928c` → `3323747`, `make test` 256 passed, ruff clean): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md`. **4 k (64 eps each): full fix 64/64 on all 3 seeds, 0.61–0.67 s; seed 1 sets it down, seeds 2–3 mostly let go short and the cube slides in (1.2–1.5 m/s). +M1/+M1+M3 place by dropping from 3–8 cm, 3–7 k later; +M3+M4 and the control 0/64.** Base for S7 |
-| Pick-and-place v0 **S7-1** (speed bound, DR ladder; plan S7) | ⏳ **launched 2026-09-25 09:11** from the IAS `-s7` checkout @ `b50efcb` (`siwei-s7`: **FA** `af47875` = `SLEW` in (0, 1], 0.5 → arm ≤ 0.975 / 1.175 rad/s; **FB** `f6753b4` = module M5, held-cube speed hinge above 0.4 m/s ×−16; **DR** `ce1599f` = D3 reset jitter ±0.02 rad, D5 table x/y ±2 cm, z ±1 cm, + fix: DR-scene put the cube on the floor). Jobs 158540/158541 FA s1/s2, 158542 FB, 158543–158547 D1–D5; 2048 envs, PPO-stack, 5 k iterations (D4/D5 8 k), checkpoints every 500; config verified from each run's `params/*.yaml`, wandb `running`. Reads at 1/2/3/5(/8) k, 64-episode local CPU eval with the release point (`3524fdc`). **FR** = FA + **M6 release quality** (`siwei-s7-m6` @ `87b50d6`: M1's `release`/`placed` × q of the latest release after `was_lifted`, q = 0.25 + 0.75·G_0.02(d_xy)·G_0.01(max(h − 0.01, 0)); 38 tests: scripted set-down q 0.91 vs release 6 cm short q 0.25, 21.6 vs 13.7 per step, break-even 124 saved steps; `make test` 327 passed): 158572 `2wql7zqk`, 158573 `erdsdo0b` from the new `-s7m6` checkout, 10:11. `run_log.md`; S7 report; `artifacts/s7/` |
+| Pick-and-place v0 **S7-1** (speed bound, release quality, DR ladder; plan S7) | ✅ **read 2026-09-25** (`../docs/reports/pick-place-v0/s7-report.md` §5.5, §7; 64-episode evals at 1/2/3/5(/8) k with the release point, `artifacts/s7/eval/`): **FA** (slew 0.5) places like the S5.2 full fix (62–64/64 from 2 k) but 0.1–0.3 s slower, held-cube peak 15–30 % lower (0.9 vs 1.0–1.3 m/s; halving joint slew does not halve tool speed), and **still drifts to letting go before arrival by 3 k** (held at goal 0.83 → 0.16, 0.84 → 0.00). **FB** (M5 penalty) same peak speed, releases worst. **FR = FA + M6** (`87b50d6`) **sets the cube down on both seeds at every read** (held at goal 0.95–1.00, released 0.3–0.7 cm out, q 0.91–0.98; to 3.5 k / 5 k) at FA's rate and time → **by the plan's rule S7-2 and X build on FR**; watch its release speed (0.10 → 0.44 m/s). **DR:** placing holds to D4; D5 first to drop (60/64 at 5 k, 61/64 at 8 k). `non_finite_state` ≤ 0.073 %. Early stops (plan rule): D4 158546, FR s1 158572 (13:55); D2/FA s2/D1 met it while the session was paused. Video `artifacts/s7m6/videos/fa_vs_fr_slowmo_x4.mp4` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -406,15 +406,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 0. ~~Read the c1a screen~~ done: 3–4 k read, then the final read after cancelling at 12–15 k
    (`s5-1-report.md` §6). It is the input to S5.2.
 1. ~~Merge `siwei-s5.1-chain`~~ done, `d9ea988`. ~~S5.2~~ read: the full fix is S7's base (`s5-2-report.md` §6).
-   ~~Merge `siwei-s5.2`~~ done (fast-forward, `3323747`, 2026-09-25). **Now (plan S7):** S7-1 is running
-   (158540–158547) and FR ×2 (158572–158573); reads at 1/2/3/5 k with the early-stop rule.
-   **P2 (interim, 2026-09-25):** the action-space map (`artifacts/s7/map/`, FA slew 0.5, current
-   scales) reaches all three yaws (−45/0/+45°) on 64 of 432 points; W1 (±5 cm, ±45°) on 9/30
-   cells, though all 30 are IK-plannable; the wrist lacks range: the S5.0 rule over W1's
-   corners gives arm 1/2/4/5/7 = 0.90/0.85/0.80/**1.55**/**1.15** (now 0.75/0.60/0.70/0.75/0.65).
-   Strict W2 on the IK-plannable region: 4 × 14 cm (grid edge + isolated IK misses).
-   `artifacts/s7/p2/`. Next: a flag-gated scale variant, re-map, scripted ≥ 9/10 — W1/W2
-   to the user before anything uses them.
+   ~~Merge `siwei-s5.2`~~ done (fast-forward, `3323747`, 2026-09-25). ~~S7-1~~ read: S7-2 and X build on FR.
+   **Next: P2's boxes, for the user's OK** (S7 report §6): W1 (plan's ±5 cm, ±45°) and **W2 = x
+   0.34–0.46 × y 0.20–0.34, ±45°** (IK-plannable sweep, 4 cm margin, ≥ 10 cm from the target);
+   today's scales reach ±45° on only 9/30 W1 cells; the S5.0 rule over W1 ∪ W2 gives arm 1–7 =
+   0.90/0.85/0.65/0.80/1.55/2.40/1.20; scripted 10/10 on W1 and W2 with them *and* a settle wait
+   after `approach` (W1 8/10 without: a fingertip lands on the cube). `artifacts/s7/p2/`,
+   `artifacts/s7m6/p2_*`. With the OK: flag-gated scales + spawn selection, the settle wait,
+   a corners test, then S7-2 on FR. Nothing uses W1/W2 yet.
 2. **The jaw misses its own 0.01 % NaN bar** on both 0002 configs (157635 0.026 %, 157646
    0.021 %); the plan's 0.1 % gate passes. Decision 0002 records it; not blocking the screen.
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
