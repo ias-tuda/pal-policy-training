@@ -3,9 +3,9 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-23 (pick-and-place v0: C1/C2 cancelled and invalidated; **S5.0
-implemented — scripted pick-and-place 9/10 through the policy's action space**; all three S5.0 gates
-passed (gate 3: IAS job 157575, NaN 0.011 %). Reports in `../docs/reports/pick-place-v0/`).*
+*Last updated: 2026-09-25 (pick-and-place v0: `siwei-s5.2` merged into `siwei` (fast-forward to
+`3323747`); **S7-1 launched** — FA ×2, FB, D1–D5 (jobs 158540–158547) from the IAS `-s7` checkout
+@ `b50efcb`; FR (M6) on `siwei-s7-m6`. Reports in `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
 
@@ -39,8 +39,8 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.1 parallel items** (5, 9, +) | ✅ **done 2026-09-23** on branch `siwei-s5.1-parallel` (`50fed23`, `bbe1cca`, `2348670`), merged into `siwei` — `../docs/reports/pick-place-v0/s5-1-parallel-report.md`. Item 5 **decided (user, 2026-09-23): decision 0002 is the jaw**; Claudius's jaw and his damping/slew add-on not adopted |
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **merged into `siwei` @ `d9ea988`** (fast-forward 2026-09-24, `make test` 182 passed, ruff clean; branch `siwei-s5.1-chain`, code head `b0f8b85`; worktrees removed, their artifacts moved to `artifacts/s5.1-bench`, `artifacts/s5.1-chain`) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
 | Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
-| Pick-and-place v0 **S5.2** (reward arms for *placing*) | ✅ **read at 3–4 k** (`siwei-s5.2` @ `dad44f1`, eval @ `3323747`, not merged): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md`. **4 k (64 eps each): full fix 64/64 on all 3 seeds, 0.61–0.67 s; seed 1 sets it down, seeds 2–3 mostly let go short and the cube slides in (1.2–1.5 m/s). +M1/+M1+M3 place by dropping from 3–8 cm, 3–7 k later; +M3+M4 and the control 0/64.** Base for S7 |
-| Pick-and-place v0 **S7 P1 prep** (speed bound, DR alignment) | ⏳ on `siwei-s7` (cut from `siwei-s5.2` @ `3323747`, which equals the fast-forward merge target): **FA** `af47875` (`SLEW` in (0, 1], run name/tags; scripted pick-and-place at slew 0.5 10/10, one place correction skipped as unplannable); **FB** `f6753b4` (module M5, held-cube speed hinge above 0.4 m/s, weight −16); **DR** `ce1599f` (D3 reset jitter ±0.02 rad, D5 table x/y ±2 cm, z ±1 cm; D4 unchanged pending the user, its joint obs noise is already on at every rung) + **fix: DR-scene put the cube on the floor** (`SurfaceOffsetCommandCfg` inherited a non-None `object_pose_range`). Not deployed; S7-1 waits on the merge, the scancels and free GPUs (quota 10, all used by S5.2) |
+| Pick-and-place v0 **S5.2** (reward arms for *placing*) | ✅ **read at 3–4 k** (`siwei-s5.2` @ `dad44f1`, eval @ `3323747`; **merged into `siwei` 2026-09-25**, fast-forward `cba928c` → `3323747`, `make test` 256 passed, ruff clean): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md`. **4 k (64 eps each): full fix 64/64 on all 3 seeds, 0.61–0.67 s; seed 1 sets it down, seeds 2–3 mostly let go short and the cube slides in (1.2–1.5 m/s). +M1/+M1+M3 place by dropping from 3–8 cm, 3–7 k later; +M3+M4 and the control 0/64.** Base for S7 |
+| Pick-and-place v0 **S7-1** (speed bound, DR ladder; plan S7) | ⏳ **launched 2026-09-25 09:11** from the IAS `-s7` checkout @ `b50efcb` (`siwei-s7`: **FA** `af47875` = `SLEW` in (0, 1], 0.5 → arm ≤ 0.975 / 1.175 rad/s; **FB** `f6753b4` = module M5, held-cube speed hinge above 0.4 m/s ×−16; **DR** `ce1599f` = D3 reset jitter ±0.02 rad, D5 table x/y ±2 cm, z ±1 cm, + fix: DR-scene put the cube on the floor). Jobs 158540/158541 FA s1/s2, 158542 FB, 158543–158547 D1–D5; 2048 envs, PPO-stack, 5 k iterations (D4/D5 8 k), checkpoints every 500; config verified from each run's `params/*.yaml`, wandb `running`. Reads at 1/2/3/5(/8) k, 64-episode local CPU eval with the release point (`3524fdc`). **FR** (M6 release quality) waits on M6 + tests on `siwei-s7-m6`, then a new `-s7m6` checkout. `run_log.md`; `artifacts/s7/` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -311,9 +311,17 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      requeued **held** (Priority 0, `Reason=user_env_retrieval_failed_requeued_held`) and
      never runs until `scontrol release`. Watch for it; squeue shows it only as PENDING.
      157934–157936 hit this on gn04 at 12:25:25.
-   - *Releasing a held job:* this session's permission guard refused `scontrol release`/`update`
-     as a shared-cluster mutation. The user chose cancel and resubmit instead: same exports,
-     plus `--exclude=gn04`, via `slurm_logs/resubmit_s52.sh`.
+   - *Releasing a held job:* on 2026-09-24 the permission guard refused `scontrol release`/`update`
+     and the user chose cancel and resubmit (`slurm_logs/resubmit_s52.sh`, `--exclude=gn04`). On
+     2026-09-25 S7-1's 158540 hit the same on **gn03** (1 s after dispatch);
+     `scontrol update jobid=158540 ExcNodeList=gn03,gn04` + `scontrol release 158540` worked and
+     kept the job id. Not a gn04 problem, then: any node can do it.
+   - *Login (2026-09-25):* `ssh -i ~/.ssh/id_ed25519 ju@mn.ias...` works; the `ias` alias's RSA
+     identity (`id_rsa_ju`) is **refused** by `mn` ("Permission denied (publickey)"), contrary to
+     `CLAUDE.md`'s "the same identity file works for both".
+   - *S7-1 readers on the login node:* `~/s71_read.py` (tfevents; jobs from `~/s71_jobs.txt`),
+     `~/s71_cfgcheck.py <checkout>` (resolved config: terms, gates, slew as `rate_limit`, DR
+     events, save interval), `~/s71_wandb.py` (run state by API query).
    - *Checking the config:* the resolved config is in the run's `params/env.yaml`; verify a
      new arm from it, not from stdout.
 
@@ -376,7 +384,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 | host | what is installed / checked out there | last verified |
 |---|---|---|
-| local Mac | this checkout, **`siwei` @ `a566363`** (S5.0) plus the S6 session's commits; git source of truth. Nothing pushed to `origin` — no push has been authorised | 2026-09-22 |
+| local Mac | git source of truth: `siwei` @ **`3323747`** (2026-09-25, S5.2 merged); worktrees `-s5.2` (`siwei-s5.2`), `-s7` (`siwei-s7`), `-s7m6` (`siwei-s7-m6`). Nothing pushed to `origin` — no push has been authorised | 2026-09-25 |
 | `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified | — |
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
@@ -384,6 +392,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | IAS Slurm (`mn.ias...`) | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos`, branch `siwei` fast-forwarded to **`a566363`** 2026-09-23 (bundle `~/siwei_a566363.bundle`, md5-verified); `uv sync --frozen --extra cu128` current (mjlab 1.6.0, mujoco/mujoco-warp 3.11.0, warp 1.15.0, torch 2.10.0); `mujoco_warp_io.patch` NOT applied; `slurm_logs/` exists. First deployed 2026-09-22 at `e84d270` | 2026-09-23 |
 | IAS `-align` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-align`, cloned from bundle `~/align_s51.bundle` (sha256-verified) on branch `siwei-s5.1-chain` @ `b0f8b85`; own `uv sync --frozen --extra cu128` (same pins), own `slurm_logs/`; jobs pass `REPO=` to `pick_place.sbatch`. The main checkout is not touched by S5.1. Kept as c1a's record (c1a cancelled 2026-09-24) | 2026-09-24 |
 | IAS `-s52` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s52` on `siwei-s5.2` @ `dad44f1` (full 40-char sha checked by the sbatch commit guard); own `uv sync --frozen --extra cu128` (same pins), `slurm_logs/submit_s52.sh`. Readers on the login node: `~/s52_read.py` (tfevents), `~/s52_cfgcheck.py` (resolved config) | 2026-09-24 |
+| IAS `-s7` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s7` on `siwei-s7` @ `b50efcb`, deployed 2026-09-25 04:18 (full bundle, sha256-checked, own `uv sync --frozen --extra cu128`, same pins); `slurm_logs/submit_s71.sh`. **Runs S7-1 (158540–158547): do not fast-forward it while they run** | 2026-09-25 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
@@ -391,9 +400,9 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 0. ~~Read the c1a screen~~ done: 3–4 k read, then the final read after cancelling at 12–15 k
    (`s5-1-report.md` §6). It is the input to S5.2.
 1. ~~Merge `siwei-s5.1-chain`~~ done, `d9ea988`. ~~S5.2~~ read: the full fix is S7's base (`s5-2-report.md` §6).
-   **Next (plan S7):** on the user's OK, merge `siwei-s5.2` → `siwei` (fast-forward) and cancel the losing arms
-   (the control and +M3+M4 at least). Then deploy `siwei-s7` to a new `-s7` checkout and submit S7-1
-   (FA first; `artifacts/s7/submit_s71.sh`), and do P2 (the action-space reach map, W1/W2).
+   ~~Merge `siwei-s5.2`~~ done (fast-forward, `3323747`, 2026-09-25). **Now (plan S7):** S7-1 is running
+   (158540–158547); M6 + tests on `siwei-s7-m6`, then FR ×2 from a new `-s7m6` checkout; reads at
+   1/2/3/5 k with the early-stop rule; P2 (the action-space reach map, W1/W2 for the user's OK).
 2. **The jaw misses its own 0.01 % NaN bar** on both 0002 configs (157635 0.026 %, 157646
    0.021 %); the plan's 0.1 % gate passes. Decision 0002 records it; not blocking the screen.
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its
