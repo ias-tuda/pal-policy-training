@@ -169,6 +169,10 @@ Claims that have already been wrong here:
   against an 8 mm range. Set `operation="abs"` on `bias_noise_cfg`. (Measured 2026-09-23.)
 - **A string-keyed DR `ranges` dict is not scoped by `asset_cfg.joint_names`** in mjlab:
   each key is matched against every joint of the entity. `arm_.*` randomises a parked arm too.
+- **Nor is `dr.pd_gains`.** It selects actuators by `asset_cfg.actuator_ids`, which a
+  `SceneEntityCfg(joint_names=...)` leaves at `slice(None)`, so the tabletop DR-robot rung
+  randomises the gains of all 30 Kangaroo actuators -- legs, pelvis, the parked arm, both
+  jaws -- although its comment says "the driven joints". (Measured 2026-09-25, plan S8.0.)
 - **"DR-scene places the cube on the moving table" was wrong until 2026-09-24.** Its goal,
   `mdp.SurfaceOffsetCommandCfg`, inherited mjlab `LiftingCommandCfg`'s non-None
   `object_pose_range`, so the command re-placed the cube on the floor (x 0.30-0.35, z 0.02-0.05)
