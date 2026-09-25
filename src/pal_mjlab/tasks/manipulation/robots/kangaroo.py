@@ -8,8 +8,11 @@ Everything else -- tasks, rewards, observations -- goes through
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
+  DEFAULT_TABLETOP_GAINS,
+  TABLETOP_GAINS,
   get_kangaroo_grippers_tabletop_robot_cfg,
 )
 from pal_mjlab.tasks.manipulation.robot_cfg import (
@@ -150,3 +153,25 @@ KANGAROO_GRIPPERS_LEFT_ARM = dataclasses.replace(
   },
   action_clip={r"gripper_left_finger_joint": (_JAW_OPEN, _JAW_CLOSED)},
 )
+
+
+def kangaroo_grippers_left_arm(
+  gains: str = DEFAULT_TABLETOP_GAINS,
+) -> ManipulationRobotCfg:
+  """`KANGAROO_GRIPPERS_LEFT_ARM` on the plant of plan-S8 gain code ``gains``.
+
+  Only the entity changes: the pelvis and arm K/D, and whether gravity is compensated
+  (`kangaroo_constants.TABLETOP_GAINS`). The action space, its scales, clip and slew limit
+  are the same for every code, so two runs that differ in the code differ in the plant alone.
+  G0 builds exactly `KANGAROO_GRIPPERS_LEFT_ARM`'s robot.
+  """
+  if gains not in TABLETOP_GAINS:
+    raise ValueError(
+      f"unknown tabletop gain code {gains!r}; have {tuple(TABLETOP_GAINS)}"
+    )
+  return dataclasses.replace(
+    KANGAROO_GRIPPERS_LEFT_ARM,
+    entity_cfg_fn=functools.partial(
+      get_kangaroo_grippers_tabletop_robot_cfg, gains=gains
+    ),
+  )

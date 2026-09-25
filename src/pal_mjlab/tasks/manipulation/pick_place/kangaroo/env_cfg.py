@@ -22,6 +22,11 @@ default is not C1's: C1r/C2r run `PPO-stack`, and `PPO=PPO-A` gives back what C0
 So is the arm's speed bound, by `SLEW` (plan S7, speed bound A): a factor in (0, 1] on the
 URDF slew limit, `action_slew_rate_scale`. `SLEW=0.5` is FA; unset is 1.0, every run before
 S7. A value that is not a number in that range raises, for the same reason as a bad name.
+
+And so is the plant, by `GAINS` (plan S8): a gain code from `kangaroo_constants.TABLETOP_GAINS`.
+`G0`, the default, is the robot every run before S8 trained on (SysID gains, gravity
+compensation on); `G15`, `G20` and `G20s` are stiff pelvis/arm gains with no gravity
+compensation anywhere. Each code fixes both, so there is no invalid pairing to spell.
 """
 
 from __future__ import annotations
@@ -30,12 +35,16 @@ import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 
+from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
+  DEFAULT_TABLETOP_GAINS,
+  TABLETOP_GAINS,
+)
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   make_pick_place_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
-from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
 from pal_mjlab.tasks.manipulation.runner import ManipulationRunnerCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DR_LEVELS
 
@@ -44,12 +53,14 @@ REWARD_ENV_VAR = "REWARD"
 DR_ENV_VAR = "DR"
 PPO_ENV_VAR = "PPO"
 SLEW_ENV_VAR = "SLEW"
+GAINS_ENV_VAR = "GAINS"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
 DEFAULT_DR = "DR0"
 DEFAULT_PPO = "PPO-stack"
 DEFAULT_SLEW = 1.0
+DEFAULT_GAINS = DEFAULT_TABLETOP_GAINS
 
 
 def _select(var: str, default: str, valid) -> str:
@@ -83,10 +94,11 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   `KANGAROO_GRIPPERS_LEFT_ARM`, not `KANGAROO_GRIPPERS`: the right arm is held at its
   nominal pose by its own actuators and is neither driven nor observed, which is what makes
-  the action space 8 rather than 16.
+  the action space 8 rather than 16. Its plant is the `GAINS` code's; G0 is exactly
+  `KANGAROO_GRIPPERS_LEFT_ARM`'s robot.
   """
   return make_pick_place_env_cfg(
-    KANGAROO_GRIPPERS_LEFT_ARM,
+    kangaroo_grippers_left_arm(_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS)),
     gripper_name="left",
     reward=_select(REWARD_ENV_VAR, DEFAULT_REWARD, REWARD_VARIANTS),
     dr=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),

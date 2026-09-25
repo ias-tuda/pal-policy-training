@@ -48,6 +48,7 @@ import concurrent.futures
 import dataclasses
 import json
 import math
+import os
 import pathlib
 import re
 import subprocess
@@ -109,6 +110,12 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--workers", type=int, default=8)
   p.add_argument("--out", type=pathlib.Path, default=pathlib.Path("artifacts/s6"))
+  p.add_argument(
+    "--gains",
+    default=None,
+    help="plan-S8 gain code (G0 | G15 | G20 | G20s) the task's robot is built on; sets "
+    "$GAINS for the registry. Default: $GAINS as it is, else G0",
+  )
   for f in dataclasses.fields(Levers):
     p.add_argument(f"--{f.name.replace('_', '-')}", type=float, default=None)
   p.add_argument(
@@ -794,6 +801,10 @@ def main() -> None:
     report(args.report)
     return
   lv = Levers(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Levers)})
+  if args.gains is not None:
+    # `build_model` imports the registry lazily, here and in every worker process, and the
+    # pick-place cfg reads $GAINS at import (plan S8) -- so setting it now selects the plant.
+    os.environ["GAINS"] = args.gains
   stimuli = STIMULI if args.stimulus == "all" else (args.stimulus,)
   args.out.mkdir(parents=True, exist_ok=True)
   path = args.out / f"{args.name}.json"
@@ -806,6 +817,7 @@ def main() -> None:
     seconds=args.seconds,
     shake_amp=args.shake_amp,
     seed=args.seed,
+    gains=os.environ.get("GAINS", "G0"),
     provenance=provenance(),
   )
   for s in stimuli:
