@@ -21,6 +21,16 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **New: a release-quality reward arm, ``R-C-strict+M1+M2+M3+M6``.** It is
+  ``R-C-strict+M1+M2+M3`` with its release and placed rewards scaled by how
+  well the cube was last let go: 1 for a cube set down on the target, falling
+  with the horizontal distance to the target and with the height above the
+  table at the moment the jaw opened, down to 0.25. A cube let go 6 cm short
+  that slides onto the target now earns about a quarter of what a set-down
+  earns per step, instead of the same. The goal rewards are unchanged, and so
+  are the existing arms. ``eval_pick_place.py`` reports where the cube was let
+  go: its horizontal distance to the target, its height and its speed.
+
 - **New: a speed bound for the arm in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``.**
   ``SLEW=`` sets a factor between 0 and 1 on the arm's slew limit, which is
   its top joint speed from the URDF, applied per control step in the action

@@ -20,7 +20,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
 
-from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
+from pal_mjlab.tasks.manipulation.mdp.observations import _RELEASE, _WAS_LIFTED
 
 #: Same module-level singleton the observation terms use: a SceneEntityCfg built in an
 #: argument default is evaluated once at import and shared, which ruff flags as B008.
@@ -161,3 +161,20 @@ def reset_was_lifted(
   latch = getattr(env, _WAS_LIFTED, None)
   if latch is not None:
     latch[env_ids] = False
+
+
+def reset_release_latch(
+  env: ManagerBasedRlEnv, env_ids: Sequence[int] | torch.Tensor
+) -> None:
+  """Clear the release latch (plan S7, module M6) for the environments being reset.
+
+  Without this the last episode's release would grade the next one's. The remembered grasp
+  state is cleared too: an episode that ended with the object in the jaw would otherwise see
+  the grasp "open" on the next one's first step.
+  """
+  latch = getattr(env, _RELEASE, None)
+  if latch is not None:
+    latch.grasped[env_ids] = False
+    latch.released[env_ids] = False
+    latch.dxy[env_ids] = 0.0
+    latch.height[env_ids] = 0.0

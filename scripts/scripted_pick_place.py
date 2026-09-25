@@ -486,6 +486,8 @@ def rollout(
   hook=None,
   action_slew_rate_scale: float = 1.0,
   spawns: list[tuple[tuple[float, float], float]] | None = None,
+  release_offsets: list[tuple[float, float]] | None = None,
+  phases: tuple[tuple[str, str, bool, int], ...] | None = None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -506,6 +508,12 @@ def rollout(
   have no contact-free IK is reported in ``plan_error`` and its arm stays home, rather than
   failing the whole batch; so are closed-loop re-plans that fail (``skipped_corrections``).
   ``clipped_steps`` counts the env's own clipped control steps.
+
+  ``release_offsets`` moves env ``i``'s release point to the goal + ``release_offsets[i]``
+  (x, y in m): the carry, place and retreat waypoints and the closed-loop place corrections
+  all aim there, so the cube is set down that far from the target (plan S7, M6's "release
+  6 cm short"). ``phases`` replaces `PHASES`; names it shares with `PHASES` keep their special
+  handling (`lower` re-plans, `hold` corrects, `SETTLE_AFTER` waits).
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -555,6 +563,12 @@ def rollout(
   origins = env.scene.env_origins
   if spawns is not None and len(spawns) != num_envs:
     raise ValueError(f"{len(spawns)} spawns for {num_envs} envs")
+  if release_offsets is not None and len(release_offsets) != num_envs:
+    raise ValueError(f"{len(release_offsets)} release offsets for {num_envs} envs")
+  # Each env's release point relative to the goal, (x, y, 0) in m.
+  release_off = np.zeros((num_envs, 3))
+  if release_offsets is not None:
+    release_off[:, :2] = np.asarray(release_offsets, dtype=float)
   forced = (
     spawns
     if spawns is not None
@@ -591,7 +605,7 @@ def rollout(
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
     try:
-      plans.append(waypoints(kin, pos[i, :2], yaw, target))
+      plans.append(waypoints(kin, pos[i, :2], yaw, target + release_off[i, :2]))
     except RuntimeError as e:
       # Unreachable for the planner: the arm stays home and the env is scored as it ends.
       plan_error[i] = str(e)
@@ -671,7 +685,7 @@ def rollout(
 
   phase_now = ["start"]
   with torch.inference_mode():
-    for phase, wp, closed, steps in PHASES:
+    for phase, wp, closed, steps in phases if phases is not None else PHASES:
       phase_now[0] = phase
       if bool(ended.all()):
         break
@@ -683,7 +697,9 @@ def rollout(
           if i in plan_error:
             continue
           try:
-            replan_place(kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i])
+            replan_place(
+              kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i] + release_off[i]
+            )
           except RuntimeError as e:  # keep the open-loop place; scored as it lands
             skipped_corrections.append((i, f"replan: {e}"))
       nxt = np.stack([p[wp] for p in plans])
@@ -719,7 +735,7 @@ def rollout(
         move_and_settle(nxt, up, True)
         nxt = up
         for _ in range(PLACE_CORRECTIONS):
-          err = (obj.data.root_link_pos_w - goal_w).cpu().numpy()
+          err = (obj.data.root_link_pos_w - goal_w).cpu().numpy() - release_off
           err[:, 2] = 0.0
           fix = [
             i
