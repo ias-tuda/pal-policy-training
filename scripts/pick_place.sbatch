@@ -67,6 +67,14 @@ EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 # plain configuration says so in its own provenance.
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+# Resume (plan S7, "5 k plus a resume if still rising"): RESUME=<path of a model_<iter>.pt>
+# continues that run -- policy, optimiser, learning rate, iteration count and the reward
+# curriculum's clock -- for MAX_ITERATIONS *more* iterations, in a new run directory and a new
+# wandb run tagged "resumed". The checkpoint may belong to another checkout (the one the run
+# started from); `pick_place_resume.sh` links its run directory into this one's log root.
+# Resume on the code the run started on, or say in its record what changed.
+RESUME="${RESUME:-}"
+
 cd "$REPO"
 actual_commit="$(git rev-parse HEAD)"
 if [ "$actual_commit" != "$EXPECTED_COMMIT" ]; then
@@ -87,6 +95,14 @@ if ! uv run --extra cu128 python -c \
 fi
 rm -f "$REPO/.reward_check.$$"
 
+RESUME_ARGS=()
+RESUME_TAG=""
+if [ -n "$RESUME" ]; then
+  # shellcheck source=pick_place_resume.sh
+  source "$REPO/scripts/pick_place_resume.sh"
+  RESUME_TAG=',"resumed"'
+fi
+
 echo "=== provenance ==="
 echo "commit      $actual_commit"
 echo "task        $TASK"
@@ -97,6 +113,7 @@ echo "reward/DR   $REWARD / $DR"
 echo "ppo         $PPO"
 echo "slew        $SLEW"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
+echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
 uv pip list 2>/dev/null | grep -E '^(mjlab|mujoco|mujoco-warp|warp-lang|torch) ' || true
 # Whether mujoco_warp_io.patch is applied is part of a result's provenance: the patch
@@ -112,6 +129,7 @@ echo "=================="
 # shellcheck disable=SC2086  # EXTRA_ARGS is meant to word-split.
 exec uv run --extra cu128 train "$TASK" \
   $EXTRA_ARGS \
+  ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"} \
   --env.scene.num-envs "$NUM_ENVS" \
   --env.seed "$SEED" \
   --agent.seed "$SEED" \
@@ -120,4 +138,4 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
   --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\")"
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\"$RESUME_TAG)"
