@@ -253,3 +253,51 @@ def test_the_summary_reports_peak_speeds_over_the_episodes_that_moved_a_held_cub
   assert abs(out["peak_obj_speed_held_mean_mps"] - 0.85) < 1e-5
   assert abs(out["peak_obj_speed_held_max_mps"] - 1.2) < 1e-5
   assert out["peak_tcp_speed_held_max_mps"] == 0.0
+
+
+# -- The release point (S5.2 report section 6: set down vs let go short) --------------------
+
+GOAL = [[0.42, 0.07, 0.785]]
+
+
+def _rel(tally, held, obj):
+  tally.measure_speed(
+    torch.tensor(held),
+    torch.tensor(obj),
+    torch.zeros(len(held), 3),
+    DT,
+    torch.tensor(GOAL * len(held)),
+  )
+
+
+def test_the_last_release_is_recorded_with_distance_height_and_speed():
+  tally = Tally(1, "cpu")
+  _rel(tally, [True], [[0.42, 0.20, 0.83]])  # carrying
+  _rel(tally, [False], [[0.42, 0.18, 0.82]])  # a first, early let-go: 11 cm short
+  _rel(tally, [True], [[0.42, 0.10, 0.80]])  # re-grasped, carried on
+  _rel(tally, [True], [[0.42, 0.08, 0.79]])
+  _rel(tally, [False], [[0.42, 0.07, 0.788]])  # the last let-go, on the target
+  _end(tally, [0])
+  row = tally.done[0]
+  assert abs(row["release_dxy"] - 0.0) < 1e-6
+  assert abs(row["release_dz"] - 0.003) < 1e-6
+  assert abs(row["release_speed"] - 0.0102 / DT) < 1e-4  # |(0, -0.01, -0.002)| / dt
+
+
+def test_an_episode_that_never_lets_go_has_no_release():
+  tally = Tally(2, "cpu")
+  _rel(tally, [True, False], [[0.4, 0.2, 0.8]] * 2)
+  _rel(tally, [True, False], [[0.4, 0.2, 0.8]] * 2)
+  _end(tally, [0, 1])
+  assert all(r["release_dxy"] is None for r in tally.done)
+
+
+def test_the_summary_reports_where_the_cube_was_let_go():
+  tally = Tally(1, "cpu")
+  for y in (0.07, 0.12):  # on the target, then 5 cm short
+    _rel(tally, [True], [[0.42, y + 0.01, 0.80]])
+    _rel(tally, [False], [[0.42, y, 0.79]])
+    _end(tally, [0])
+  out = eval_pick_place.summarise(tally, DT, 2)
+  assert out["episodes_released"] == 2
+  assert abs(out["release_within_3cm_xy"] - 0.5) < 1e-9

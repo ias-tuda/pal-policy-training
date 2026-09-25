@@ -37,6 +37,8 @@ Transport and speed, while held
                   while held within 3 cm -- a hover, not a miss (S5.2 base selection)
   speed           per-episode peak cube and TCP speed while held, over one control step
                   -- the read of plan S7's speed bound
+  release         the episode's last let-go: the cube's xy distance to the target, its
+                  height above it, and its speed -- a set-down vs a cube let go short
 
 Horizon
 --------------------------------------------------------------------------------
@@ -142,6 +144,12 @@ class Tally:
     self.speed_n = torch.zeros(num_envs, dtype=torch.long, device=device)
     self.obj_v_peak = zf(0.0)
     self.tcp_v_peak = zf(0.0)
+    # The last release of the episode (`measure_speed` with a goal): the cube's horizontal
+    # distance to the target, its height above it, and its speed, the step the jaw let go.
+    self.released = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.rel_dxy = zf(0.0)
+    self.rel_dz = zf(0.0)
+    self.rel_v = zf(0.0)
     self.done: list[dict[str, bool | int | float | None]] = []
 
   def observe(self, **flags: torch.Tensor) -> None:
@@ -173,6 +181,7 @@ class Tally:
     obj_pos: torch.Tensor,
     tcp_pos: torch.Tensor,
     step_dt: float,
+    goal_pos: torch.Tensor | None = None,
   ) -> None:
     """Track the peak cube and TCP speed while the cube is held (plan S7's speed read).
 
@@ -182,9 +191,22 @@ class Tally:
     `prev_held`). Displacement rather than the instantaneous velocity, which spikes on
     contact transients and is not what a rate limit bounds. Call once per step, alongside
     `measure`.
+
+    With ``goal_pos``, also records the episode's last release -- the step the cube goes from
+    held to not held -- as the cube's horizontal distance to the target, its height above it,
+    and its speed over that step. A cube let go 5 cm short at 1 m/s and one set down on the
+    target both count as placed; this is what tells them apart (S5.2 report section 6).
     """
     held = held.bool()
     both = held & self.prev_held
+    if goal_pos is not None:
+      let_go = self.prev_held & ~held
+      dxy = torch.norm((obj_pos - goal_pos)[:, :2], dim=-1)
+      v = torch.norm(obj_pos - self.prev_obj, dim=-1) / step_dt
+      self.released |= let_go
+      self.rel_dxy = torch.where(let_go, dxy, self.rel_dxy)
+      self.rel_dz = torch.where(let_go, obj_pos[:, 2] - goal_pos[:, 2], self.rel_dz)
+      self.rel_v = torch.where(let_go, v, self.rel_v)
     v_obj = torch.norm(obj_pos - self.prev_obj, dim=-1) / step_dt
     v_tcp = torch.norm(tcp_pos - self.prev_tcp, dim=-1) / step_dt
     self.obj_v_peak = torch.where(
@@ -228,6 +250,10 @@ class Tally:
       moved = int(self.speed_n[i]) > 0
       row["peak_obj_speed_held"] = float(self.obj_v_peak[i]) if moved else None
       row["peak_tcp_speed_held"] = float(self.tcp_v_peak[i]) if moved else None
+      rel = bool(self.released[i])
+      row["release_dxy"] = float(self.rel_dxy[i]) if rel else None
+      row["release_dz"] = float(self.rel_dz[i]) if rel else None
+      row["release_speed"] = float(self.rel_v[i]) if rel else None
       self.done.append(row)
     for name in self.FIELDS:
       self.live[name][env_ids] = False
@@ -242,6 +268,7 @@ class Tally:
     self.speed_n[env_ids] = 0
     self.obj_v_peak[env_ids] = 0.0
     self.tcp_v_peak[env_ids] = 0.0
+    self.released[env_ids] = False
 
 
 def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
@@ -342,6 +369,16 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     speed[f"peak_{name}_speed_held_mean_mps"] = mean(peaks)
     speed[f"peak_{name}_speed_held_median_mps"] = median(peaks)
     speed[f"peak_{name}_speed_held_max_mps"] = max(peaks) if peaks else None
+  rel = [r for r in rows if r.get("release_dxy") is not None]
+  release = {
+    "episodes_released": len(rel),
+    "release_dxy_median_m": median([r["release_dxy"] for r in rel]),
+    "release_within_3cm_xy": sum(r["release_dxy"] < NEAR_XY for r in rel) / len(rel)
+    if rel
+    else None,
+    "release_dz_median_m": median([r["release_dz"] for r in rel]),
+    "release_speed_median_mps": median([r["release_speed"] for r in rel]),
+  }
   return {
     "episodes": n,
     "placed": rate("placed"),
@@ -356,6 +393,7 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     else None,
     **transport,
     **speed,
+    **release,
   }
 
 
@@ -413,6 +451,22 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"    peak {label:4s} speed         {m:6.2f} m/s  (median {med:.2f}, max {top:.2f})"
     )
 
+  print("\n  RELEASE (the episode's last let-go) ------------------------------")
+  if result.get("episodes_released"):
+    print(f"    episodes that let go      {result['episodes_released']:6d}")
+    print(
+      f"    xy to target at release  {fmt(result['release_dxy_median_m'])}  (median)"
+    )
+    print(f"    within 3 cm xy           {result['release_within_3cm_xy']:6.1%}")
+    print(
+      f"    height over target       {fmt(result['release_dz_median_m'])}  (median)"
+    )
+    print(
+      f"    cube speed at release    {fmt(result['release_speed_median_mps'], 'm/s')}  (median)"
+    )
+  else:
+    print("    no release observed")
+
   print("\n  TIMING -----------------------------------------------------------")
   ttp = result["time_to_place_s"]
   print(f"    mean episode             {result['mean_episode_length_s']:6.2f} s")
@@ -445,7 +499,12 @@ def main() -> None:
       flags = probe(env, grasp_sensor)
       tally.observe(**flags)
       tally.measure(flags["grasped"], *geometry(env))
-      tally.measure_speed(flags["grasped"], *positions(env), env.step_dt)
+      tally.measure_speed(
+        flags["grasped"],
+        *positions(env),
+        env.step_dt,
+        env.command_manager.get_term(COMMAND).command,
+      )
       obs, _, dones, extras = wrapped.step(policy(obs))
       tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()
