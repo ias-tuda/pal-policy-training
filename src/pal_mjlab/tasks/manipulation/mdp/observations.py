@@ -23,11 +23,22 @@ from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply, quat_inv, 
 
 _ROBOT = SceneEntityCfg("robot")
 
+#: The body every observation is expressed in: the frame PAL's stack publishes the robot and
+#: the tracked objects in. Not the entity's root link: with `fixed_base` the root is the mocap
+#: anchor at the world origin, 0.9 m below `base_link`, and until plan S7-2 (Claudius's
+#: fda9492) every position the policy saw was in that frame -- which the robot does not have.
+BASE_BODY = "base_link"
+
+
+def _base_pose(robot: Entity) -> tuple[torch.Tensor, torch.Tensor]:
+  """World pose (pos, quat) of `BASE_BODY`. (B, 3), (B, 4)"""
+  i = robot.body_names.index(BASE_BODY)
+  return robot.data.body_link_pos_w[:, i], robot.data.body_link_quat_w[:, i]
+
 
 def _to_base_frame(robot: Entity, pos_w: torch.Tensor) -> torch.Tensor:
-  return quat_apply(
-    quat_inv(robot.data.root_link_quat_w), pos_w - robot.data.root_link_pos_w
-  )
+  base_pos, base_quat = _base_pose(robot)
+  return quat_apply(quat_inv(base_quat), pos_w - base_pos)
 
 
 def ee_position_b(
@@ -58,7 +69,7 @@ def object_yaw_b(
   """
   robot: Entity = env.scene[asset_cfg.name]
   obj: Entity = env.scene[object_name]
-  quat_b = quat_mul(quat_inv(robot.data.root_link_quat_w), obj.data.root_link_quat_w)
+  quat_b = quat_mul(quat_inv(_base_pose(robot)[1]), obj.data.root_link_quat_w)
   _, _, yaw = euler_xyz_from_quat(quat_b)
   return torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
 

@@ -467,21 +467,26 @@ KANGAROO_LOWER_BODY_ACTUATORS = KANGAROO_LEG_ACTUATORS + (
 #: no script for it was committed. Adopted by S5.1 item 2 (2026-09-23), replacing S1's
 #: left-arm-only pose (elbow at pi/2, jaw straight down, right arm left at its locomotion
 #: pose). It is also the action origin (`use_default_offset=True`).
+#:
+#: Arm 5 and 7 are signed for their axes about +z, PAL's URDF convention (plan S7-2 prep 1,
+#: Claudius's fda9492 "fix kang arm kinematics!"): `kangaroo_grippers.xml` had them about -z,
+#: so a policy's joint 5/7 commands were sign-flipped against PAL's controllers. The pose is
+#: physically the same one; only the sign of those four angles changed with the axes.
 _MANIPULATION_ARM_HOME_POSE = {
   "arm_left_1_joint": 0.102,
   "arm_left_2_joint": 1.452,
   "arm_left_3_joint": 1.777,
   "arm_left_4_joint": 1.670,
-  "arm_left_5_joint": -0.458,
+  "arm_left_5_joint": 0.458,
   "arm_left_6_joint": 0.404,
-  "arm_left_7_joint": 0.009,
+  "arm_left_7_joint": -0.009,
   "arm_right_1_joint": -0.139,
   "arm_right_2_joint": 1.480,
   "arm_right_3_joint": -1.717,
   "arm_right_4_joint": 1.691,
-  "arm_right_5_joint": 0.382,
+  "arm_right_5_joint": -0.382,
   "arm_right_6_joint": 0.368,
-  "arm_right_7_joint": -0.005,
+  "arm_right_7_joint": 0.005,
 }
 
 INIT_STATE = EntityCfg.InitialStateCfg(
