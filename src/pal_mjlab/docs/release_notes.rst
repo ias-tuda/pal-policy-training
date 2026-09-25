@@ -31,6 +31,15 @@ New Features & Tasks
   are the existing arms. ``eval_pick_place.py`` reports where the cube was let
   go: its horizontal distance to the target, its height and its speed.
 
+- **Fixed: a resumed manipulation run restarted its reward curriculum.** The
+  curriculum that raises the joint-velocity penalty is timed by the
+  environment's step counter, which starts at zero in every new process, so a
+  run resumed from a checkpoint trained its next ~750 iterations with the
+  penalty back at its first-stage weight. A resumed run now continues the
+  counter from the checkpoint. Fresh runs are unchanged. The IAS training
+  script takes ``RESUME=<checkpoint>`` to continue a run, including one started
+  from another checkout.
+
 - **New: a speed bound for the arm in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``.**
   ``SLEW=`` sets a factor between 0 and 1 on the arm's slew limit, which is
   its top joint speed from the URDF, applied per control step in the action

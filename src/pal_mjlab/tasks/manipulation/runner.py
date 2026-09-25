@@ -10,6 +10,10 @@ that nothing will ever read.
 lost with the filename: `OnPolicyRunner.save` stores it in the checkpoint as `iter`, and
 `load` reads it back from there, so resuming works the same either way.
 
+Resuming (`--agent.resume True`, or `RESUME=` in `scripts/pick_place.sbatch`) also restarts
+the env-step clock the reward curriculum reads where the checkpoint left it, which a new
+process would otherwise start at 0 (plan S7, "5 k plus a resume").
+
 Both pieces live here rather than as edits to mjlab or rsl_rl, which are read-mostly
 dependencies (CLAUDE.md, *External Dependencies*): a cfg subclass that adds the field and a
 runner subclass that acts on it, in the one place the manipulation tasks already share.
@@ -44,11 +48,27 @@ class ManipulationRunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 class ManipulationRunner(ManipulationOnPolicyRunner):
-  """`ManipulationOnPolicyRunner` that honours `save_only_last`.
+  """`ManipulationOnPolicyRunner` that honours `save_only_last`, and resumes a run's reward
+  curriculum along with its policy.
 
   Overriding `save` rather than `learn` covers both of rsl_rl's call sites -- the periodic
   save inside the loop and the final one after it -- without reimplementing the loop.
   """
+
+  def learn(
+    self, num_learning_iterations: int, init_at_random_ep_len: bool = False
+  ) -> None:
+    # A resumed run (`load` has set the iteration) must continue the env-step clock too.
+    # mjlab's curricula read `common_step_counter` (`reward_curriculum`,
+    # `mjlab/envs/mdp/curriculums.py`), which a new process starts at 0: resuming from
+    # iteration 4999 would otherwise put the joint-velocity hinge back to its first stage
+    # (-0.01 instead of -1) for the next ~750 iterations. Each iteration is
+    # `num_steps_per_env` env steps; the checkpoint at iteration i was saved after i + 1.
+    if self.current_learning_iteration > 0:
+      env = self.env.unwrapped
+      steps = (self.current_learning_iteration + 1) * self.cfg["num_steps_per_env"]
+      env.common_step_counter = max(env.common_step_counter, steps)
+    super().learn(num_learning_iterations, init_at_random_ep_len)
 
   def save(self, path: str, infos: dict | None = None) -> None:
     # `self.cfg` is the agent cfg as a plain dict (`asdict`, in mjlab's train script), so a
