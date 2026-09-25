@@ -90,6 +90,8 @@ PHASES = (
   ("retreat", "retreat", False, 40),
   ("settle", "retreat", False, 20),
 )
+#: Every waypoint `waypoints` plans, in order.
+WAYPOINT_NAMES = ("pregrasp", "grasp", "lift", "carry", "place", "retreat")
 #: Phases after which the arm is held at its waypoint until it has actually stopped: before
 #: the jaw closes (a still-swinging arm shoves the cube across the table as the pads meet
 #: it), before `replan_place` measures the tracking bias (a snapshot of a swinging arm is
@@ -483,6 +485,7 @@ def rollout(
   verbose: bool = True,
   hook=None,
   action_slew_rate_scale: float = 1.0,
+  spawns: list[tuple[tuple[float, float], float]] | None = None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -497,6 +500,12 @@ def rollout(
   ``action_slew_rate_scale`` builds the env with a scaled arm slew limit (plan S7: 0.5 is
   speed bound A). The script reads the limit back from the action term, so its
   interpolation stretches to the lower limit by itself; ``over_slew_env_steps`` checks it.
+
+  ``spawns`` puts env ``i`` at ``spawns[i]`` = ((x, y), yaw) in the env frame instead of
+  the spawn box's corners (plan S7 P2's action-space reach map). A spawn whose waypoints
+  have no contact-free IK is reported in ``plan_error`` and its arm stays home, rather than
+  failing the whole batch; so are closed-loop re-plans that fail (``skipped_corrections``).
+  ``clipped_steps`` counts the env's own clipped control steps.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -544,11 +553,18 @@ def rollout(
   env.reset()
   obj = env.scene[pp.OBJECT]
   origins = env.scene.env_origins
-  if corners_first:
+  if spawns is not None and len(spawns) != num_envs:
+    raise ValueError(f"{len(spawns)} spawns for {num_envs} envs")
+  forced = (
+    spawns
+    if spawns is not None
+    else spawn_corners(pp.SPAWN_XY, pp.SPAWN_JITTER_XY, pp.SPAWN_JITTER_YAW)[:num_envs]
+    if corners_first
+    else None
+  )
+  if forced is not None:
     pose = obj.data.root_link_pose_w.clone()
-    for i, (xy, yaw) in enumerate(
-      spawn_corners(pp.SPAWN_XY, pp.SPAWN_JITTER_XY, pp.SPAWN_JITTER_YAW)[:num_envs]
-    ):
+    for i, (xy, yaw) in enumerate(forced):
       pose[i, 0] = origins[i, 0] + float(xy[0])
       pose[i, 1] = origins[i, 1] + float(xy[1])
       pose[i, 3:7] = torch.tensor(
@@ -570,10 +586,16 @@ def rollout(
   target = np.asarray(pp.TARGET_XY)
   plans = []
   hand_xs = []
+  plan_error: dict[int, str] = {}
   for i in range(num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-    plans.append(waypoints(kin, pos[i, :2], yaw, target))
+    try:
+      plans.append(waypoints(kin, pos[i, :2], yaw, target))
+    except RuntimeError as e:
+      # Unreachable for the planner: the arm stays home and the env is scored as it ends.
+      plan_error[i] = str(e)
+      plans.append({name: kin.q_default.copy() for name in WAYPOINT_NAMES})
     hand_xs.append(hand_x_for(kin, yaw))
     if verbose:
       print(
@@ -589,6 +611,7 @@ def rollout(
   goal_w = env.command_manager.get_term("goal_pose").command
   diag: dict[str, np.ndarray] = {}
   clipped = 0
+  clipped_env = np.zeros(num_envs, dtype=int)
   prev = np.stack([kin.q_default] * num_envs)
   arm_q = [robot.joint_names.index(j) for j in ARM_JOINTS]
   settle_steps: dict[str, int] = {}
@@ -619,14 +642,16 @@ def rollout(
 
   def step_to(q: np.ndarray, closed: bool) -> None:
     """One control step toward arm pose ``q`` with the jaw open or closed."""
-    nonlocal clipped, ended, order, last_q, over_slew
+    nonlocal clipped, clipped_env, ended, order, last_q, over_slew
     over_slew += int((np.abs(q - last_q) > slew + 1e-6).any(axis=-1).sum())
     last_q = np.array(q, copy=True)
     target_q = offset.clone()
     target_q[:, arm_idx] = torch.as_tensor(q, dtype=torch.float32, device=env.device)
     target_q[:, jaw_idx] = jaw_closed if closed else 0.0
     raw = (target_q - offset) / scale
-    clipped += int((raw.abs() > 1.0 + 1e-6).any(dim=-1).sum())
+    over = (raw.abs() > 1.0 + 1e-6).any(dim=-1)
+    clipped += int(over.sum())
+    clipped_env += over.cpu().numpy().astype(int)
     tally.observe(**ev.probe(env, grasp_sensor))
     _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
     tally.terminal(ev.success_flags(env) & ~ended)
@@ -655,7 +680,12 @@ def rollout(
         cube_a = (obj.data.root_link_pos_w - origins).cpu().numpy()
         goal = (goal_w - origins).cpu().numpy()
         for i in torch.nonzero(~ended).flatten().tolist():
-          replan_place(kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i])
+          if i in plan_error:
+            continue
+          try:
+            replan_place(kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i])
+          except RuntimeError as e:  # keep the open-loop place; scored as it lands
+            skipped_corrections.append((i, f"replan: {e}"))
       nxt = np.stack([p[wp] for p in plans])
       n = n_steps(prev, nxt, steps)
       if n > steps:
@@ -676,12 +706,16 @@ def rollout(
         # cube's friction holds the hand against a centimetre-scale move (measured: a
         # correction at release height left the error unchanged).
         lift = np.array([0.0, 0.0, PLACE_CORRECTION_LIFT])
-        up = np.stack(
-          [
-            _solve(kin, "place", kin.fk(pl["place"])[0] + lift, hx, pl["place"])
-            for pl, hx in zip(plans, hand_xs, strict=True)
-          ]
-        )
+        ups = []
+        for i, (pl, hx) in enumerate(zip(plans, hand_xs, strict=True)):
+          try:
+            ups.append(
+              _solve(kin, "place", kin.fk(pl["place"])[0] + lift, hx, pl["place"])
+            )
+          except RuntimeError as e:  # no lifted correction pose: hold where it is
+            skipped_corrections.append((i, f"lift: {e}"))
+            ups.append(pl["place"])
+        up = np.stack(ups)
         move_and_settle(nxt, up, True)
         nxt = up
         for _ in range(PLACE_CORRECTIONS):
@@ -778,9 +812,71 @@ def rollout(
     r["slew_stretched_phases"] = dict(stretched)
     r["over_slew_env_steps"] = over_slew
     r["ended_by"] = why[i]
+    r["clipped_steps"] = int(clipped_env[i])
+    r["plan_error"] = plan_error.get(r["env"])
     for key, v in diag.items():
       r[key] = float(v[i])
   return rows
+
+
+def reach_map(args: argparse.Namespace) -> list[dict]:
+  """Plan S7 P2: which spawn points the scripted pick-and-place reaches *through the action
+  term* -- the env's own scales, clip and slew limit -- rather than by IK alone (S5.0's lesson:
+  C1/C2 trained on a task the action space could not do).
+
+  A grid over x, y and a few cube yaws, each point one env of a batched rollout to the fixed
+  target. A point counts when it is placed and lifted with no clipped control step; the
+  plan error, skipped re-plans and final cube-to-goal distance are kept so a failure can be
+  told apart from a near-miss. Written after every batch, and resumed from what is already in
+  ``--json``, so a long map survives an interruption. ``--shard``/``--shards`` split the grid
+  across processes.
+  """
+  xs = np.arange(args.x[0], args.x[1] + 1e-9, args.step)
+  ys = np.arange(args.y[0], args.y[1] + 1e-9, args.step)
+  grid = [
+    ((round(float(x), 4), round(float(y), 4)), float(d))
+    for x in xs
+    for y in ys
+    for d in args.yaws
+  ][args.shard :: args.shards]
+  out: list[dict] = []
+  if args.json.exists():
+    out = json.loads(args.json.read_text())
+  done = {(r["x"], r["y"], r["yaw_deg"]) for r in out}
+  todo = [p for p in grid if (p[0][0], p[0][1], p[1]) not in done]
+  print(f"{len(grid)} points in this shard, {len(todo)} to do")
+  for b in range(0, len(todo), args.batch):
+    chunk = todo[b : b + args.batch]
+    rows = rollout(
+      num_envs=len(chunk),
+      device=args.device,
+      seed=args.seed,
+      reward=args.reward,
+      verbose=False,
+      action_slew_rate_scale=args.slew,
+      spawns=[(xy, math.radians(d)) for xy, d in chunk],
+    )
+    for (xy, d), r in zip(chunk, rows, strict=True):
+      out.append(
+        {
+          "x": xy[0],
+          "y": xy[1],
+          "yaw_deg": d,
+          "reached": bool(r["placed_and_lifted"]) and r["clipped_steps"] == 0,
+          "placed_and_lifted": bool(r["placed_and_lifted"]),
+          "grasped": bool(r["grasped"]),
+          "lifted": bool(r["lifted"]),
+          "clipped_steps": r["clipped_steps"],
+          "plan_error": r["plan_error"],
+          "skipped_corrections": r["skipped_corrections"],
+          "final_cube_to_goal_mm": r["final_cube_to_goal_mm"],
+        }
+      )
+    args.json.parent.mkdir(parents=True, exist_ok=True)
+    args.json.write_text(json.dumps(out, indent=1))
+    ok = sum(r["reached"] for r in out)
+    print(f"batch {b // args.batch + 1}: {len(out)} / {len(grid)} done, {ok} reached")
+  return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -798,6 +894,25 @@ def parse_args() -> argparse.Namespace:
     "--slew", type=float, default=1.0, help="action_slew_rate_scale (S7 FA: 0.5)"
   )
   r.add_argument("--json", type=pathlib.Path, default=None)
+  m = sub.add_parser(
+    "map", help="action-space reach map over a spawn grid (plan S7 P2)"
+  )
+  m.add_argument("--x", type=float, nargs=2, default=(0.26, 0.62), metavar=("LO", "HI"))
+  m.add_argument(
+    "--y", type=float, nargs=2, default=(-0.06, 0.44), metavar=("LO", "HI")
+  )
+  m.add_argument("--step", type=float, default=0.02, help="grid spacing, m")
+  m.add_argument(
+    "--yaws", type=float, nargs="+", default=(-45.0, 0.0, 45.0), help="deg"
+  )
+  m.add_argument("--slew", type=float, default=0.5, help="action_slew_rate_scale")
+  m.add_argument("--reward", default="R-A")
+  m.add_argument("--batch", type=int, default=32, help="spawn points per rollout")
+  m.add_argument("--shard", type=int, default=0)
+  m.add_argument("--shards", type=int, default=1)
+  m.add_argument("--device", default="cpu")
+  m.add_argument("--seed", type=int, default=0)
+  m.add_argument("--json", type=pathlib.Path, required=True)
   return p.parse_args()
 
 
@@ -805,6 +920,9 @@ def main() -> None:
   args = parse_args()
   if args.cmd == "derive":
     derive(args)
+    return
+  if args.cmd == "map":
+    reach_map(args)
     return
   rows = rollout(
     num_envs=args.num_envs,
