@@ -40,6 +40,7 @@ from .commands import (
 from .events import (
   hold_nominal_targets,
   reset_objects_on_surface,
+  reset_release_latch,
   reset_was_lifted,
   surface_top_z,
 )
@@ -64,8 +65,11 @@ from .rewards import (
   lift_height,
   lift_height_faded,
   object_lifted,
+  object_placed_graded,
   reach_only,
+  release_quality,
   released_at_goal,
+  released_at_goal_graded,
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
@@ -120,12 +124,16 @@ __all__ = [
   "time_penalty",
   "joint_pos_limits",
   "object_lifted",
+  "object_placed_graded",
   "object_placed_reward",
+  "release_quality",
   "released_at_goal",
+  "released_at_goal_graded",
   # Terminations.
   "entity_below_height",
   "non_finite_state",
   "reach_only",
+  "reset_release_latch",
   "reset_was_lifted",
   "object_placed",
 ]

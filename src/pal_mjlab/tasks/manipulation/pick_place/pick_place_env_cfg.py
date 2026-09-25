@@ -185,6 +185,12 @@ def make_pick_place_env_cfg(
   # of the run. The term is a no-op when nothing ever reads the latch, which is the case
   # during training on every arm outside `REQUIRE_LIFTED`.
   cfg.events["reset_was_lifted"] = EventTermCfg(func=mdp.reset_was_lifted, mode="reset")
+  # The same for M6's release latch (plan S7), for the same reason: registered on every arm,
+  # a no-op where nothing reads the latch, so an eval or a test that reads it on any arm is
+  # never graded by the previous episode's release.
+  cfg.events["reset_release_latch"] = EventTermCfg(
+    func=mdp.reset_release_latch, mode="reset"
+  )
   if reward in REQUIRE_LIFTED:
     # Gating the reward without gating the termination would still let a slid cube end the
     # episode early, which is worth remaining-time to the policy even with the bonus

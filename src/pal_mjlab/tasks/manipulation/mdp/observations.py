@@ -12,6 +12,8 @@ they return is not.
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
@@ -139,6 +141,76 @@ def _was_lifted_bool(
     env, support_sensor_name
   )
   latch |= lifted
+  return latch
+
+
+#: Attribute on the env holding the release latch (plan S7, module M6).
+_RELEASE = "_pp_release"
+
+
+@dataclasses.dataclass
+class ReleaseLatch:
+  """Where the object was let go the last time, per env (plan S7, module M6).
+
+  ``released`` is set once a release after `was_lifted` has been seen this episode; ``dxy`` is
+  the object's horizontal distance to the goal and ``height`` its height above its resting
+  height on the surface, both at the step the grasp opened. ``grasped`` is the grasp state at
+  the last update: the next update compares against it to see the grasp open.
+  """
+
+  grasped: torch.Tensor
+  released: torch.Tensor
+  dxy: torch.Tensor
+  height: torch.Tensor
+
+
+def _release_latch(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+) -> ReleaseLatch:
+  """Episode latch of the latest release after `was_lifted`. Cleared on reset by
+  `events.reset_release_latch`.
+
+  A release is the step the grasp opens -- held at the last update, not held now -- while the
+  `was_lifted` latch is set, so letting go of a cube that was only ever pushed is not one.
+  Each release overwrites the last: the record is of where the object was *finally* let go,
+  and a second grasp and release cannot bank a better one.
+
+  Updated lazily, on read, like `_was_lifted_bool`, and idempotent within a step: the update
+  stores the current grasp state, so a second read in the same step sees no opening. It sees
+  an opening on the step it happens only if something reads it every step; the M6 reward
+  terms do, at a nonzero weight (mjlab skips a zero-weight term entirely).
+
+  The resting height is the surface's top plus the object's half-height, read out of physics
+  the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table.
+  """
+  from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+
+  latch = getattr(env, _RELEASE, None)
+  if latch is None or latch.released.shape[0] != env.num_envs:
+    no = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    zero = torch.zeros(env.num_envs, device=env.device)
+    latch = ReleaseLatch(no.clone(), no.clone(), zero.clone(), zero.clone())
+    setattr(env, _RELEASE, latch)
+  grasped = _grasped_bool(env, grasp_sensor_name)
+  opened = (
+    latch.grasped
+    & ~grasped
+    & _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  )
+  obj: Entity = env.scene[object_name]
+  goal = env.command_manager.get_term(command_name).command
+  pos = obj.data.root_link_pos_w
+  half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+  rest_z = surface_top_z(env, surface_cfg) + half_z
+  latch.dxy = torch.where(opened, torch.norm((pos - goal)[:, :2], dim=-1), latch.dxy)
+  latch.height = torch.where(opened, pos[:, 2] - rest_z, latch.height)
+  latch.released |= opened
+  latch.grasped = grasped
   return latch
 
 

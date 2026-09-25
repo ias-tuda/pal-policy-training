@@ -21,6 +21,7 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
   _grasped_bool,
   _on_surface_bool,
   _placed_bool,
+  _release_latch,
   _was_lifted_bool,
 )
 
@@ -223,6 +224,128 @@ def held_object_speed_hinge(
   speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
   held = _grasped_bool(env, grasp_sensor_name)
   return torch.square(torch.clamp(speed - threshold, min=0.0)) * held.float()
+
+
+def release_quality_of(
+  dxy: torch.Tensor,
+  height: torch.Tensor,
+  dist_std: float,
+  height_free: float,
+  height_std: float,
+  floor: float,
+) -> torch.Tensor:
+  """q = floor + (1 - floor) * G_dist_std(dxy) * G_height_std(max(height - height_free, 0)).
+
+  Plan S7's M6 grade of one release: 1 for a set-down on the target, falling with the
+  horizontal distance it was let go at and with the height above ``height_free`` it was
+  dropped from, down to ``floor`` -- which keeps placing worth something even when the
+  release was poor.
+  """
+  near = torch.exp(-torch.square(dxy / dist_std))
+  low = torch.exp(-torch.square((height - height_free).clamp_min(0.0) / height_std))
+  return floor + (1.0 - floor) * near * low
+
+
+def release_quality(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  dist_std: float = 0.02,
+  height_free: float = 0.01,
+  height_std: float = 0.01,
+  floor: float = 0.25,
+) -> torch.Tensor:
+  """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
+  there has been none this episode.
+
+  See `release_quality_of` for the grade and `observations._release_latch` for what counts
+  as the release and where it is measured.
+  """
+  latch = _release_latch(
+    env, command_name, object_name, grasp_sensor_name, support_sensor_name, surface_cfg
+  )
+  q = release_quality_of(
+    latch.dxy, latch.height, dist_std, height_free, height_std, floor
+  )
+  return torch.where(latch.released, q, torch.full_like(q, floor))
+
+
+def released_at_goal_graded(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  threshold: float = 0.05,
+  dist_std: float = 0.02,
+  height_free: float = 0.01,
+  height_std: float = 0.01,
+  floor: float = 0.25,
+) -> torch.Tensor:
+  """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
+
+  M1 pays ``release`` and ``placed`` every step, so a cube let go short that slides onto the
+  target earns the same as one set down on it, sooner -- the late release two of three S5.2
+  full-fix seeds converged to. Grading both by where the cube was let go makes the set-down
+  pay more for the rest of the episode.
+  """
+  released = released_at_goal(
+    env, command_name, object_name, grasp_sensor_name, threshold, support_sensor_name
+  )
+  return released * release_quality(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    dist_std,
+    height_free,
+    height_std,
+    floor,
+  )
+
+
+def object_placed_graded(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  threshold: float = 0.05,
+  velocity_threshold: float = 0.05,
+  dist_std: float = 0.02,
+  height_free: float = 0.01,
+  height_std: float = 0.01,
+  floor: float = 0.25,
+) -> torch.Tensor:
+  """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6)."""
+  placed = object_placed(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    velocity_threshold,
+    support_sensor_name,
+  )
+  return placed * release_quality(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    dist_std,
+    height_free,
+    height_std,
+    floor,
+  )
 
 
 def lift_height_faded(

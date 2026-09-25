@@ -416,12 +416,49 @@ def _m5(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
-_MODULES = {"M1": _m1, "M2": _m2, "M3": _m3, "M4": _m4, "M5": _m5}
+# -- S7: M6, release quality (plan S7, added 2026-09-25) ----------------------------------
+#
+# Under M1 a cube let go 5-6 cm short that slides or flies onto the target counts as placed
+# and starts earning `placed` a few steps sooner than one set down on it -- the per-step
+# optimum two of three S5.2 full-fix seeds converged to (S5.2 report section 6). M6 grades
+# M1's `release` and `placed` by where the latest release after `was_lifted` happened:
+# q = 0.25 + 0.75 * G_0.02(d_xy) * G_0.01(max(h - 0.01, 0)), d_xy the cube's horizontal
+# distance to the target and h its height above rest, at the step the grasp opened. A set-down
+# like seed 1's (0.8 cm off, 0.4 cm up) gives q ~ 0.89, one 6 cm short ~ 0.25; `goal` and
+# `goal_near` are not graded. The floor keeps placing worth something early in training.
+M6_FLOOR = 0.25
+M6_DIST_STD = 0.02  # m
+M6_HEIGHT_FREE = 0.01  # m
+M6_HEIGHT_STD = 0.01  # m
+
+
+def _m6(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  quality = {
+    "surface_cfg": SceneEntityCfg(TABLE),
+    "dist_std": M6_DIST_STD,
+    "height_free": M6_HEIGHT_FREE,
+    "height_std": M6_HEIGHT_STD,
+    "floor": M6_FLOOR,
+  }
+  graded = {"release": mdp.released_at_goal_graded, "placed": mdp.object_placed_graded}
+  for name, func in graded.items():
+    term = rewards.get(name)
+    assert term is not None and "support_sensor_name" in term.params, (
+      "M6 grades M1's gated release and placed terms; apply M1 first"
+    )
+    rewards[name] = RewardTermCfg(
+      func=func, weight=term.weight, params={**term.params, **quality}
+    )
+
+
+_MODULES = {"M1": _m1, "M2": _m2, "M3": _m3, "M4": _m4, "M5": _m5, "M6": _m6}
 
 
 def _s52_arm(modules: tuple[str, ...]):
   if "M1" in modules and "M4" in modules:
     raise ValueError("M1 removes the success termination that M4 keeps; pick one")
+  if "M6" in modules and "M1" not in modules[: modules.index("M6")]:
+    raise ValueError("M6 grades M1's release and placed terms; it needs M1 before it")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -442,9 +479,13 @@ S52_ARMS = {
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S52_ARMS.items()})
 
-#: The S7 arms: FB is the full fix plus M5 (plan S7). FA is the full fix itself, with the
-#: slew bound set through the action term (`SLEW`), not through the reward.
-S7_ARMS = {f"{S52_BASE}+M1+M2+M3+M5": ("M1", "M2", "M3", "M5")}
+#: The S7 arms: FB is the full fix plus M5, FR the full fix plus M6 (plan S7). FA is the full
+#: fix itself, with the slew bound set through the action term (`SLEW`), not through the
+#: reward -- and so is FR's.
+S7_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M5": ("M1", "M2", "M3", "M5"),
+  f"{S52_BASE}+M1+M2+M3+M6": ("M1", "M2", "M3", "M6"),
+}
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S7_ARMS.items()})
 _MODULE_ARMS = {**S52_ARMS, **S7_ARMS}
 
