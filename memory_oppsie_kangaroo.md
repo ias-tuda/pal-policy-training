@@ -40,6 +40,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.1 chain** (8, 2, 3, 1, 4, 6) | ✅ **merged into `siwei` @ `d9ea988`** (fast-forward 2026-09-24, `make test` 182 passed, ruff clean; branch `siwei-s5.1-chain`, code head `b0f8b85`; worktrees removed, their artifacts moved to `artifacts/s5.1-bench`, `artifacts/s5.1-chain`) — `../docs/reports/pick-place-v0/s5-1-report.md`. Gate 1 10/10, `make test` 182, NaN gate 157646 0.021 % |
 | Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
 | Pick-and-place v0 **S5.2** (reward arms for *placing*) | ⏳ **implemented on `siwei-s5.2` @ `dad44f1`** (not merged): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md` |
+| Pick-and-place v0 **PAL sim2sim** (S5.2 policies in PAL's physics simulator) | 🟡 **done 2026-09-25 on `Geoffery`** with pal-policy-deployment @ `8e7024a` + branch `siwei/pick-place-sim2sim` (joint-position node, virtual cube; not pushed) and `scripts/sim2sim/` (`siwei-sim2sim`). Full fix @ 20 k, table + static stand-in cube: **placed 8/9, 9/9, 5/9** (seeds 1–3; MuJoCo 9/9 ×3), grasp 0.18–0.24 s, place 0.60/0.64 s; open-loop replay: joints within 0.015 rad (arm 1–4) / 0.045 rad (wrist) of MuJoCo. No cube stop: seed 1 0/9. `../docs/reports/pick-place-v0/sim2sim-pal-report.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -188,6 +189,22 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 - **The arm's real meshes come within 1 mm of the torso**, and within 9.2 mm for arm 5 vs
   arm 7 — those self-collisions are real. Arm 2 vs arm 4 (82.8 mm) and arm 4 vs arm 6
   (71.7 mm) cannot touch; their proxies only overlap at the joint, and they are excluded.
+
+- **Checkpoints trained on the pre-`fda9492` MJCF do not match PAL's robot** (every `siwei`,
+  `siwei-s5.2`, `siwei-s7` policy as of 2026-09-25): `arm_*_5_joint` and `arm_*_7_joint` turn
+  about −z here and +z in PAL's URDF — FK `base_link → arm_left_7_link` is 148 mm / 180° apart,
+  0.001 mm / 0.0001° with those two signs flipped — and observations are in the fixed-base root
+  link, 0.9 m below `base_link` (`_to_base_frame` uses the root link; `fda9492` moves them to
+  `base_link`). A deployment needs both mappings; the sim2sim profile carries them
+  (`joint_signs`, `base_in_obs_frame_*`).
+- **PAL's physics simulator has no free bodies** (static Bullet world objects only), so a cube
+  cannot be simulated there. Its gripper settles 0.0387 rad more closed than commanded, and its
+  jaw velocity chatters at ±2 rad/s at 1 kHz (0.1 N·m URDF effort limit in a limit cycle) —
+  the S5.2 policies' jaw command flips with it. PAL's `DirectImpedanceControl` has no torque
+  clamp at the training effort limits.
+- **The S5.2 full fix grasps by collision**: the fingertips reach the cube at ~1.4 m/s and the
+  cube, pinned on the table, stops the arm (MuJoCo contact probe, no hand–table contact); seed 1
+  runs arm 6 9–18 % above its rated 2.35 rad/s in both simulators.
 
 ## 5. What doesn't work / open problems
 
@@ -368,6 +385,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | **S5.2 ordering, 2026-09-24** | `tests/test_pick_place_s52_ordering.py`, scripted episode, carry 7 cm, CPU @ `dad44f1` | local Mac | full fix: reach 1.00 < carry 4.67 < over 9.32 < held on target 11.96 < released 14.95 < placed 22.93; the arms without M2 keep the cliff (held on target < over) by design; M2 weight 4 dips at ~5 cm, 7 is monotone (+0.001 minimum step) | `s5-2-report.md` §2–3 |
 | **S5.2 batch, 2026-09-24** | 10 jobs 157927-157936 @ `dad44f1`: control, +M1 x2, +M1+M3 x2, +M1+M2+M3 x3, +M3+M4 x2; DR0, PPO-stack, 2048 envs, 20 k | IAS gn01/gn02/gn05 3090 | ⏳ running at ~3.0 s/it (wandb `vj54i7b7` `ux98sm8b` `2ss2aikm` `225pqag0` `zs79myfk` `agip67ks` `urkljqie`; resubmitted 157968 `ymw6jrv8`, 157969 `qiwv3laq`, 157970 `t280ohu9` for 157934–157936, which Slurm held). Read at 3–4 k ≈ 15:00–16:30 | `run_log.md`, `s5-2-report.md` §4 |
 | **S5.2 1 k early read, 2026-09-24** | full fix 157932/157933 `model_1000.pt`, `eval_pick_place.py` 64 eps + `transport_probe.py` 8 envs + 2-episode video @ `dad44f1` | local Mac, CPU | **placed∧was_lifted 63/64 on both seeds**, 0 slid, time to place 0.69 / 0.79 s; carried off the table 12–16 held steps on a 3–8 cm arc, released 0.4–3.9 cm from the goal; cube peaks ~1.2 m/s (M1 rewards speed). `non_finite_state` 0.03–0.06 % vs ≈ 0.001 % for the other arms | `s5-2-report.md` §5, `artifacts/s5.2/{eval,probe,videos}` |
+| **PAL sim2sim, 2026-09-25** | full fix s1–s3 `model_19999` (+ s1 `model_8000`, `+M1+M3` s1, `+M1` s2), 9 episode specs × 8 s, conditions TC/T/F/TCraw + open-loop replay; matched MuJoCo reference per checkpoint | `Geoffery`, kangaroo:5-dev-ias `sha256:5348a188…`, 3 containers | TC placed 8/9, 9/9, 5/9 (virtual-cube ceiling 9, 9, 2); seed 1 by world: none 0/9, table 3/9, table + stand-in 8/9; `+M1+M3` 9/9, `+M1` 7/9; replay within 0.015/0.045 rad; sustained torque ≤ 0.94 of the training limits, impact impulses up to 1.5× | `../docs/reports/pick-place-v0/sim2sim-pal-report.md`, `Geoffery:~/pal_sim2sim/runs/pick_place/` |
 | Pre-guard failures, 2026-09-22 | same task, jobs 157122-157179 | IAS | 157122 `uv: not found` (non-login shell); 157123 NaN @ iter 180; 157124 completed; 157176/7 **OOM at 4096**; 157178 NaN @ 10; 157179 NaN @ 15 | same |
 
 ## 8. Compute state
@@ -375,7 +393,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | host | what is installed / checked out there | last verified |
 |---|---|---|
 | local Mac | this checkout, **`siwei` @ `a566363`** (S5.0) plus the S6 session's commits; git source of truth. Nothing pushed to `origin` — no push has been authorised | 2026-09-22 |
-| `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified | — |
+| `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified. **PAL sim2sim**: `~/pal_sim2sim/` (catkin `src/` = pal-policy-deployment `siwei/pick-place-sim2sim` + `models/` + `worlds/`; `runs/pick_place/<tag>/`), containers `pal_sim2sim`, `_2`, `_3` from `kangaroo:5-dev-ias` (unprivileged; `sim2sim_container.sh`). Registry login in `~/.docker-ias` (token); the default Docker Desktop store is GPG-locked over SSH | 2026-09-25 |
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
 | `limx4090` | not verified for this repo | — |
