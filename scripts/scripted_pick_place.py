@@ -30,6 +30,9 @@ and it is two things:
     uv run --extra cpu python scripts/scripted_pick_place.py derive
     uv run --extra cpu python scripts/scripted_pick_place.py rollout --num-envs 10
 
+``rollout --gains G20`` runs it on a plan-S8 gain code's plant (stiff gains, no gravity
+compensation) with the same scales, clip and slew limit.
+
 ``tests/test_pick_place_scripted_feasibility.py`` runs the rollout, so a scale or pose
 change that makes the task impossible again fails the suite instead of a training run.
 
@@ -916,6 +919,12 @@ def parse_args() -> argparse.Namespace:
   r.add_argument(
     "--slew", type=float, default=1.0, help="action_slew_rate_scale (S7 FA: 0.5)"
   )
+  r.add_argument(
+    "--gains",
+    default=None,
+    help="plan-S8 gain code the robot is built on (G0 | G15 | G20 | G20s); default: "
+    "KANGAROO_GRIPPERS_LEFT_ARM, i.e. G0",
+  )
   r.add_argument("--json", type=pathlib.Path, default=None)
   m = sub.add_parser(
     "map", help="action-space reach map over a spawn grid (plan S7 P2)"
@@ -947,6 +956,12 @@ def main() -> None:
   if args.cmd == "map":
     reach_map(args)
     return
+  robot = None
+  if args.gains is not None:
+    import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
+    from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
+
+    robot = kangaroo_grippers_left_arm(args.gains)
   rows = rollout(
     num_envs=args.num_envs,
     device=args.device,
@@ -954,6 +969,7 @@ def main() -> None:
     reward=args.reward,
     corners_first=not args.random_only,
     action_slew_rate_scale=args.slew,
+    robot=robot,
   )
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)

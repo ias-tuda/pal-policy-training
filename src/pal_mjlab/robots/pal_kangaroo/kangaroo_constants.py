@@ -1,6 +1,7 @@
 """Pal Robotics KANGAROO constants."""
 
 import dataclasses
+import math
 import re
 from pathlib import Path
 
@@ -189,6 +190,101 @@ XS = _pal_impedance_params(26.177, 1.666, 25, _ARMATURE_S_MINUS)  # arm_*_6,7
 PELVIS_1 = _pal_impedance_params(49.940, 3.179, 50, _ARMATURE_S_PLUS)
 PELVIS_2 = _pal_impedance_params(49.940, 3.179, 50, _ARMATURE_S_PLUS)
 
+# Plan S8 (2026-09-25): stiff pelvis and arm gains *instead of* gravity compensation, for the
+# tabletop robot only (`get_kangaroo_grippers_tabletop_robot_cfg(gains=...)`); the SysID
+# blocks above stay what every other task runs. A position actuator holding a gravity load
+# tau_g sits tau_g / K below its target whether or not anything compensates, and one following
+# a target at speed v trails it by a further (D / K) * v: K sets the droop, D / K the lag.
+# Effort and armature are the SysID blocks' own in every code; only K and D change.
+#
+# The drivetrain gains before `_calc_actuator_params` rounds them to 3 decimals -- S_PLUS and
+# S_MINUS are these, rounded: K 49.9395 / 26.1768, D 3.17925 / 1.66646, D / K 0.064 s.
+_SYSID_K_S_PLUS = _ARMATURE_S_PLUS * NATURAL_FREQ**2
+_SYSID_D_S_PLUS = 2.0 * DAMPING_RATIO * _ARMATURE_S_PLUS * NATURAL_FREQ
+_SYSID_K_S_MINUS = _ARMATURE_S_MINUS * NATURAL_FREQ**2
+_SYSID_D_S_MINUS = 2.0 * DAMPING_RATIO * _ARMATURE_S_MINUS * NATURAL_FREQ
+
+
+def _kd_4k_over_omega(stiffness: float) -> float:
+  """S4's damping rule for its x15 hold set: `_calc_leg_params`' D = 4 K / omega_n."""
+  return round(2.0 * DAMPING_RATIO * stiffness / NATURAL_FREQ, 3)
+
+
+# G15: S4's x15 set, decision 0001's rejected alternative -- arm 1-2 600, arm 3-7 300,
+# pelvis_1 750, pelvis_2 300 (`../docs/reports/pick-place-v0/s4-report.md` section 4).
+G15_S_PLUS = _pal_impedance_params(
+  600.0, _kd_4k_over_omega(600.0), 50, _ARMATURE_S_PLUS
+)
+G15_S_MINUS = _pal_impedance_params(
+  300.0, _kd_4k_over_omega(300.0), 25, _ARMATURE_S_MINUS
+)
+G15_XS = G15_S_MINUS
+G15_PELVIS_1 = _pal_impedance_params(
+  750.0, _kd_4k_over_omega(750.0), 50, _ARMATURE_S_PLUS
+)
+G15_PELVIS_2 = _pal_impedance_params(
+  300.0, _kd_4k_over_omega(300.0), 50, _ARMATURE_S_PLUS
+)
+
+# G20: the SysID gains x20, K and D alike, so D / K stays 0.064 s. These are the values
+# `impedance_control_v37` carries for pelvis_1/2 and arm 1-4 (pal-policy-deployment,
+# `pal_policy_deployer/config/impedance_control_v37/`, 2025-11-18); it has no arm 5-7 files.
+G20_S_PLUS = _pal_impedance_params(
+  20 * _SYSID_K_S_PLUS, 20 * _SYSID_D_S_PLUS, 50, _ARMATURE_S_PLUS
+)
+G20_S_MINUS = _pal_impedance_params(
+  20 * _SYSID_K_S_MINUS, 20 * _SYSID_D_S_MINUS, 25, _ARMATURE_S_MINUS
+)
+G20_XS = G20_S_MINUS
+G20_PELVIS_1 = G20_S_PLUS
+G20_PELVIS_2 = G20_S_PLUS
+
+# G20s: G20's K with D x sqrt(20) rather than x20. The damping ratio stays the SysID one and
+# D / K -- the lag behind a moving target -- drops to 0.014 s.
+G20S_S_PLUS = _pal_impedance_params(
+  20 * _SYSID_K_S_PLUS, math.sqrt(20) * _SYSID_D_S_PLUS, 50, _ARMATURE_S_PLUS
+)
+G20S_S_MINUS = _pal_impedance_params(
+  20 * _SYSID_K_S_MINUS, math.sqrt(20) * _SYSID_D_S_MINUS, 25, _ARMATURE_S_MINUS
+)
+G20S_XS = G20S_S_MINUS
+G20S_PELVIS_1 = G20S_S_PLUS
+G20S_PELVIS_2 = G20S_S_PLUS
+
+
+@dataclasses.dataclass(frozen=True)
+class TabletopGains:
+  """One plan-S8 gain code: the pelvis/arm actuator blocks, and whether gravity is compensated.
+
+  A code fixes both, so no invalid pairing of the two can be named. Right arm = left arm.
+  """
+
+  s_plus: dict  # arm_*_1, arm_*_2
+  s_minus: dict  # arm_*_3, 4, 5
+  xs: dict  # arm_*_6, 7
+  pelvis_1: dict
+  pelvis_2: dict
+  gravcomp: bool
+
+
+#: The plan-S8 gain codes. G0 is the plant every run before S8 trained on: the SysID gains and
+#: MuJoCo gravity compensation on the torso, arms and grippers (decision 0001). The others turn
+#: the compensation off everywhere -- bodies and `actgravcomp` routing -- and hold the arms up
+#: with K instead. The jaw (decision 0002) and the legs are the same in every code.
+TABLETOP_GAINS: dict[str, TabletopGains] = {
+  "G0": TabletopGains(S_PLUS, S_MINUS, XS, PELVIS_1, PELVIS_2, gravcomp=True),
+  "G15": TabletopGains(
+    G15_S_PLUS, G15_S_MINUS, G15_XS, G15_PELVIS_1, G15_PELVIS_2, gravcomp=False
+  ),
+  "G20": TabletopGains(
+    G20_S_PLUS, G20_S_MINUS, G20_XS, G20_PELVIS_1, G20_PELVIS_2, gravcomp=False
+  ),
+  "G20s": TabletopGains(
+    G20S_S_PLUS, G20S_S_MINUS, G20S_XS, G20S_PELVIS_1, G20S_PELVIS_2, gravcomp=False
+  ),
+}
+DEFAULT_TABLETOP_GAINS = "G0"
+
 # The gripper is driven by gripper_controller (a JointTrajectoryController), not by the
 # impedance path, so it has no impedance_control entry. PAL's nominal is pids.yaml
 # {p: 500, d: 0.5, i: 2, torque_clamp: 50} -- but p=500 on a ~5e-6 kg.m^2 finger inside an
@@ -352,8 +448,9 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   It also switches on gravity compensation for the torso, the arms and the grippers -- see
   `_TABLETOP_GRAVCOMP_BODIES`, which is a decision, not a detail -- and routes it through
   the pelvis/arm actuators so it counts against their effort limits
-  (`_route_gravcomp_through_actuators`). `gravcomp=False` is there
-  to measure against, not to train with: without it the arm droops half a radian.
+  (`_route_gravcomp_through_actuators`). `gravcomp=False` is what the plan-S8 stiff-gain
+  codes train on (`TABLETOP_GAINS`); under the SysID gains it is there to measure against,
+  not to train with: without it the arm droops half a radian.
   """
   spec = _load_spec(KANGAROO_GRIPPERS_XML)
 
@@ -637,6 +734,27 @@ KANGAROO_GRIPPERS_TABLETOP_ARTICULATION = EntityArticulationInfoCfg(
 )
 
 
+def _tabletop_articulation(gains: TabletopGains) -> EntityArticulationInfoCfg:
+  """`KANGAROO_GRIPPERS_TABLETOP_ARTICULATION` with the pelvis/arm blocks of ``gains``.
+
+  The same actuators in the same order, each rebuilt from its G0 cfg with only its block
+  swapped, so the legs, the jaw and every actuator index stay those of G0.
+  """
+  replace = dataclasses.replace
+  return replace(
+    KANGAROO_GRIPPERS_TABLETOP_ARTICULATION,
+    actuators=KANGAROO_LEG_ACTUATORS
+    + (
+      replace(KANGAROO_S_PLUS_ACTUATOR_CFG, **gains.s_plus),
+      replace(KANGAROO_PELVIS_1_ACTUATOR_CFG, **gains.pelvis_1),
+      replace(KANGAROO_PELVIS_2_ACTUATOR_CFG, **gains.pelvis_2),
+      replace(KANGAROO_S_MINUS_ACTUATOR_CFG, **gains.s_minus),
+      replace(KANGAROO_XS_ACTUATOR_CFG, **gains.xs),
+      KANGAROO_GRIPPER_TABLETOP_ACTUATOR_CFG,
+    ),
+  )
+
+
 _ROBOT_CONFIGS = {
   "kangaroo": (get_kangaroo_spec, KANGAROO_ARTICULATION, FULL_COLLISION),
   "lower_body": (
@@ -693,7 +811,9 @@ def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
   return _make_robot_cfg("grippers")
 
 
-def get_kangaroo_grippers_tabletop_robot_cfg(gravcomp: bool = True) -> EntityCfg:
+def get_kangaroo_grippers_tabletop_robot_cfg(
+  gravcomp: bool | None = None, gains: str = DEFAULT_TABLETOP_GAINS
+) -> EntityCfg:
   """The grippers variant for tabletop manipulation.
 
   Full arm and torso colliders, an arm-up start pose, and a gravity-compensated torso and
@@ -701,9 +821,21 @@ def get_kangaroo_grippers_tabletop_robot_cfg(gravcomp: bool = True) -> EntityCfg
   `Mjlab-Velocity-*-Pal-Kangaroo-Grippers` and `Mjlab-Reaching-Flat-Pal-Kangaroo-Grippers`
   instantiate, and none of the three changes belongs under those tasks.
 
-  `gravcomp=False` reproduces the plant before S4, for measuring against.
+  ``gains`` names a plan-S8 gain code (`TABLETOP_GAINS`). G0, the default, is the robot as
+  it was before S8; G15 / G20 / G20s carry stiff pelvis and arm gains and no gravity
+  compensation. ``gravcomp`` defaults to the code's own; `gravcomp=False` on G0 reproduces
+  the plant before S4, for measuring against.
   """
+  if gains not in TABLETOP_GAINS:
+    raise ValueError(
+      f"unknown tabletop gain code {gains!r}; have {tuple(TABLETOP_GAINS)}"
+    )
+  code = TABLETOP_GAINS[gains]
+  if gravcomp is None:
+    gravcomp = code.gravcomp
   cfg = _make_robot_cfg("grippers_tabletop", MANIPULATION_INIT_STATE)
+  if gains != DEFAULT_TABLETOP_GAINS:
+    cfg = dataclasses.replace(cfg, articulation=_tabletop_articulation(code))
   if not gravcomp:
     cfg = dataclasses.replace(
       cfg, spec_fn=lambda: get_kangaroo_grippers_tabletop_spec(gravcomp=False)
