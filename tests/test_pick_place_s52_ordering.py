@@ -78,6 +78,23 @@ def _task_terms(env, arm: str) -> dict:
   return {name: cfg for name, cfg in rewards.items() if name in TASK_TERMS}
 
 
+#: The script's phases with `lower` split in two: `lower` re-plans the place and moves the held
+#: cube over it at carry height (to `retreat`, which the re-plan puts straight above the place
+#: pose), then `lower_down` descends onto it. Since the fda9492 model (plan S7-2 prep 1) the
+#: one-phase `lower` also moves the cube ~0.5 mm a step sideways, ~3 cm from the target, while
+#: it descends -- the re-plan's correction, interpolated in joint space -- and the goal terms
+#: fall with that drift; the design rule is about a descent over the target.
+VERTICAL_LOWERING = tuple(
+  step
+  for phase in scripted.PHASES
+  for step in (
+    (("lower", "retreat", True, 30), ("lower_down", "place", True, 40))
+    if phase[0] == "lower"
+    else (phase,)
+  )
+)
+
+
 @pytest.fixture(scope="module")
 def episode():
   """One scripted episode under the full arm (no success termination, so it runs through
@@ -107,7 +124,12 @@ def episode():
   scripted.CLEAR_HEIGHT = CARRY_HEIGHT
   try:
     rows = scripted.rollout(
-      num_envs=1, device=get_test_device(), reward=FULL, verbose=False, hook=hook
+      num_envs=1,
+      device=get_test_device(),
+      reward=FULL,
+      verbose=False,
+      hook=hook,
+      phases=VERTICAL_LOWERING,
     )
   finally:
     scripted.CLEAR_HEIGHT = saved
@@ -159,9 +181,10 @@ def test_the_full_fix_is_strictly_increasing(episode):
 def test_the_full_fix_pays_more_all_the_way_down(episode):
   """No dip on the lowering path over the target (design rule 2). At M2's planned goal weight
   of 4 the reward dips at ~5 cm below its 7.5 cm value; the weight is 7 for this."""
-  # The `lower` phase only: `hold` includes the script's place corrections, which lift the
-  # cube 2 cm and put it back down -- motion the script makes, not the path a policy lowers on.
-  path = [_total(s, FULL) for s in episode["lower"]]
+  # The `lower_down` phase only: a straight descent onto the re-planned place pose (see
+  # `VERTICAL_LOWERING`). `hold` includes the script's place corrections, which lift the cube
+  # 2 cm and put it back down -- motion the script makes, not the path a policy lowers on.
+  path = [_total(s, FULL) for s in episode["lower_down"]]
   worst = min(b - a for a, b in zip(path, path[1:], strict=False))
   assert worst > -0.01, f"the lowering path dips by {worst:.3f}"
   assert path[-1] > path[0] + 2.0
