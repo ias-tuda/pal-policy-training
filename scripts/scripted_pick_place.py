@@ -671,7 +671,12 @@ def rollout(
   env = ManagerBasedRlEnv(cfg=cfg, device=device)
   grasp_sensor = robot_cfg.gripper("left").contact_sensor_name
   table = env.scene[pp.TABLE]
-  table_body = table.indexing.body_ids[0]
+  # The table body itself, not the entity's first body: that is the mocap anchor
+  # (`table/mocap_base`) the fixed table hangs from. DR-scene's `dr.body_pos` moves the
+  # `table` body's local offset from it, and so does this -- overwriting the startup draw,
+  # where writing the anchor's `body_pos` moved the table only at the next reset and on top
+  # of the draw (found by the corners check's positive control, 2026-09-26).
+  table_body = table.indexing.body_ids[table.body_names.index(pp.TABLE)]
   if table_offsets is not None:
     if len(table_offsets) != num_envs:
       raise ValueError(f"{len(table_offsets)} table offsets for {num_envs} envs")
@@ -680,9 +685,11 @@ def rollout(
       raise ValueError(
         "table_offsets needs a per-world table: build the env at DR-scene"
       )
-    nominal = torch.tensor(pp.scene.table_pos(baseline.table_top_z), device=env.device)
+    local0 = torch.tensor(
+      env.sim.mj_model.body_pos[int(table_body)], dtype=torch.float32, device=env.device
+    )
     for i, off in enumerate(table_offsets):
-      body_pos[i, table_body] = nominal + torch.tensor(off, device=env.device)
+      body_pos[i, table_body] = local0 + torch.tensor(off, device=env.device)
     # The reset event reads the table's geom pose out of `data`, which only a forward pass
     # brings up to date with `model`.
     env.sim.forward()
