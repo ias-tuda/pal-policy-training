@@ -39,6 +39,16 @@ Transport and speed, while held
                   -- the read of plan S7's speed bound
   release         the episode's last let-go: the cube's xy distance to the target, its
                   height above it, and its speed -- a set-down vs a cube let go short
+  set-down        at that let-go: table contact, the dwell held still on the table since
+                  a touchdown near the target, the cube's vertical and horizontal speed,
+                  and plan S7-2's M7 grade of it (`SET_DOWN_*`, mirrored from the reward's
+                  latch so the eval also runs on code without M7)
+
+Per-episode records
+--------------------------------------------------------------------------------
+Every episode's spawn pose, table offset from its nominal pose, target, release point
+and final cube position go into the JSON (``episodes_detail``): what plan S7-2's D5
+diagnosis and the W runs' placed rate by spawn distance are read from.
 
 Horizon
 --------------------------------------------------------------------------------
@@ -52,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 from dataclasses import asdict
 
@@ -70,7 +81,12 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   OBJECT,
 )
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
-from pal_mjlab.tasks.manipulation.tabletop_env_cfg import COMMAND, ROBOT, SUPPORT_SENSOR
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
+  COMMAND,
+  ROBOT,
+  SUPPORT_SENSOR,
+  TABLE,
+)
 
 TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 
@@ -81,6 +97,32 @@ TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 NEAR_XY = 0.03
 #: The gripper's tool centre point, whose speed while holding is S7's speed-bound read.
 TCP_SITE = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site
+
+#: Plan S7-2's M7 set-down, restated from `mdp.observations` / `pick_place.rewards` rather
+#: than imported, so this eval runs on checkouts that predate M7 (the D5 diagnosis reads an
+#: S7-1 checkpoint on S7-1's code): a let-go is a set-down when the cube rests on the table,
+#: moves slower than `SET_DOWN_STILL`, and was held there, still and within
+#: `SET_DOWN_RADIUS` of the target, for `SET_DOWN_STEPS` steps since a touchdown within it.
+#: `test_eval_pick_place.py` checks them against the reward's.
+SET_DOWN_RADIUS = 0.015
+SET_DOWN_STILL = 0.05
+SET_DOWN_STEPS = 3
+SET_DOWN_CLEARANCE = 0.005
+#: M6's grade (`mdp.rewards.release_quality_of`), for the per-release numbers.
+M6_GRADE = {"dist_std": 0.02, "height_free": 0.01, "height_std": 0.01, "floor": 0.25}
+
+
+def release_grades(dxy: float, dz: float, passed: bool) -> tuple[float, float]:
+  """(M6, M7) grade of one release at ``dxy`` from the target and ``dz`` above it. M7 is M6
+  without the free centimetre, paid for a set-down only (plan S7-2)."""
+  g = M6_GRADE
+
+  def q(height_free: float) -> float:
+    near = math.exp(-((dxy / g["dist_std"]) ** 2))
+    low = math.exp(-((max(dz - height_free, 0.0) / g["height_std"]) ** 2))
+    return g["floor"] + (1.0 - g["floor"]) * near * low
+
+  return q(g["height_free"]), (q(0.0) if passed else g["floor"])
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +192,23 @@ class Tally:
     self.rel_dxy = zf(0.0)
     self.rel_dz = zf(0.0)
     self.rel_v = zf(0.0)
+    # The set-down at the last let-go (`measure_set_down`), and the state it is built from.
+    zb = lambda: torch.zeros(num_envs, dtype=torch.bool, device=device)  # noqa: E731
+    zl = lambda: torch.zeros(num_envs, dtype=torch.long, device=device)  # noqa: E731
+    self.sd_prev_held, self.sd_clear, self.sd_touch_ok = zb(), zb(), zb()
+    self.sd_dwell = zl()
+    self.sd_released, self.rel_on_table = zb(), zb()
+    self.rel_dwell = zl()
+    self.rel_vz, self.rel_vxy, self.rel_x, self.rel_y = (
+      zf(0.0),
+      zf(0.0),
+      zf(0.0),
+      zf(0.0),
+    )
+    # Per-episode records (`record`): the first step's spawn, table and target, the last
+    # step's cube position.
+    self.first = torch.zeros(num_envs, 9, device=device)
+    self.last_pos = torch.zeros(num_envs, 3, device=device)
     self.done: list[dict[str, bool | int | float | None]] = []
 
   def observe(self, **flags: torch.Tensor) -> None:
@@ -220,6 +279,63 @@ class Tally:
     self.prev_tcp = tcp_pos.clone()
     self.prev_held = held.clone()
 
+  def measure_set_down(
+    self,
+    held: torch.Tensor,
+    on_table: torch.Tensor,
+    obj_pos: torch.Tensor,
+    obj_vel: torch.Tensor,
+    goal_pos: torch.Tensor,
+  ) -> None:
+    """Plan S7-2's M7 read of the episode's last let-go, the way the reward's latch builds it
+    (`mdp.observations._release_latch`): a touchdown is the first step held on the table
+    after the cube was held `SET_DOWN_CLEARANCE` clear of it (above the target's height, which
+    is the resting height); the dwell counts steps held on the table, slower than
+    `SET_DOWN_STILL` and within `SET_DOWN_RADIUS` of the target, since a touchdown within that
+    radius; at a let-go the table contact, the cube's velocity (instantaneous, from physics)
+    and the dwell up to the step before are recorded. Call once per step, alongside
+    `measure_speed`."""
+    held, on_table = held.bool(), on_table.bool()
+    dxy = torch.norm((obj_pos - goal_pos)[:, :2], dim=-1)
+    speed = torch.norm(obj_vel, dim=-1)
+    height = obj_pos[:, 2] - goal_pos[:, 2]
+    let_go = self.sd_prev_held & ~held
+    self.sd_released |= let_go
+    self.rel_on_table = torch.where(let_go, on_table, self.rel_on_table)
+    self.rel_dwell = torch.where(let_go, self.sd_dwell, self.rel_dwell)
+    self.rel_vz = torch.where(let_go, obj_vel[:, 2], self.rel_vz)
+    self.rel_vxy = torch.where(let_go, torch.norm(obj_vel[:, :2], dim=-1), self.rel_vxy)
+    self.rel_x = torch.where(let_go, obj_pos[:, 0], self.rel_x)
+    self.rel_y = torch.where(let_go, obj_pos[:, 1], self.rel_y)
+    down = held & on_table
+    self.sd_clear = held & (self.sd_clear | (height > SET_DOWN_CLEARANCE))
+    touchdown = down & self.sd_clear
+    near = dxy < SET_DOWN_RADIUS
+    self.sd_touch_ok = torch.where(touchdown, near, self.sd_touch_ok)
+    self.sd_clear = self.sd_clear & ~touchdown
+    still = down & self.sd_touch_ok & near & (speed < SET_DOWN_STILL)
+    self.sd_dwell = torch.where(
+      still, self.sd_dwell + 1, torch.zeros_like(self.sd_dwell)
+    )
+    self.sd_prev_held = held.clone()
+
+  def record(
+    self,
+    obj_pos: torch.Tensor,
+    obj_yaw: torch.Tensor,
+    table_offset: torch.Tensor,
+    goal_pos: torch.Tensor,
+  ) -> None:
+    """Keep each episode's spawn (cube x, y, yaw), table offset from its nominal pose and
+    target from its first step, and the cube's position from its latest. Call once per step,
+    *before* `observe` (which advances the step count)."""
+    first = self.age == 0
+    now = torch.cat(
+      [obj_pos[:, :2], obj_yaw.unsqueeze(-1), table_offset, goal_pos], dim=-1
+    )
+    self.first = torch.where(first.unsqueeze(-1), now, self.first)
+    self.last_pos = obj_pos.clone()
+
   def terminal(self, success: torch.Tensor) -> None:
     """Credit the episodes a `success` termination just ended, which `observe` cannot see.
 
@@ -254,6 +370,31 @@ class Tally:
       row["release_dxy"] = float(self.rel_dxy[i]) if rel else None
       row["release_dz"] = float(self.rel_dz[i]) if rel else None
       row["release_speed"] = float(self.rel_v[i]) if rel else None
+      sd = bool(self.sd_released[i])
+      row["release_on_table"] = bool(self.rel_on_table[i]) if sd else None
+      row["release_dwell"] = int(self.rel_dwell[i]) if sd else None
+      row["release_vz"] = float(self.rel_vz[i]) if sd else None
+      row["release_vxy"] = float(self.rel_vxy[i]) if sd else None
+      row["release_x"] = float(self.rel_x[i]) if sd else None
+      row["release_y"] = float(self.rel_y[i]) if sd else None
+      passed = (
+        sd
+        and bool(self.rel_on_table[i])
+        and math.hypot(float(self.rel_vz[i]), float(self.rel_vxy[i])) < SET_DOWN_STILL
+        and int(self.rel_dwell[i]) >= SET_DOWN_STEPS
+      )
+      row["release_set_down"] = passed if sd else None
+      if rel:
+        q6, q7 = release_grades(float(self.rel_dxy[i]), float(self.rel_dz[i]), passed)
+        row["release_q_m6"], row["release_q_m7"] = q6, q7
+      else:
+        row["release_q_m6"] = row["release_q_m7"] = None
+      first = self.first[i].tolist()
+      keys = ("spawn_x", "spawn_y", "spawn_yaw", "table_dx", "table_dy", "table_dz")
+      row.update(dict(zip(keys, first[:6], strict=True)))
+      row.update(target_x=first[6], target_y=first[7], target_z=first[8])
+      final = self.last_pos[i].tolist()
+      row.update(zip(("final_x", "final_y", "final_z"), final, strict=True))
       self.done.append(row)
     for name in self.FIELDS:
       self.live[name][env_ids] = False
@@ -269,6 +410,11 @@ class Tally:
     self.obj_v_peak[env_ids] = 0.0
     self.tcp_v_peak[env_ids] = 0.0
     self.released[env_ids] = False
+    self.sd_prev_held[env_ids] = False
+    self.sd_clear[env_ids] = False
+    self.sd_touch_ok[env_ids] = False
+    self.sd_dwell[env_ids] = 0
+    self.sd_released[env_ids] = False
 
 
 def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
@@ -331,6 +477,24 @@ def positions(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
   return env.scene[OBJECT].data.root_link_pos_w, tcp
 
 
+def scene_state(
+  env: ManagerBasedRlEnv,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """The cube's position, yaw and linear velocity, and the table's offset from its nominal
+  pose (DR-scene moves it), for `Tally.record` and `Tally.measure_set_down`."""
+  obj = env.scene[OBJECT]
+  q = obj.data.root_link_quat_w
+  yaw = torch.atan2(
+    2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+  )
+  table = env.scene[TABLE]
+  nominal = torch.tensor(
+    env.cfg.scene.entities[TABLE].init_state.pos, device=env.device
+  )
+  offset = env.sim.data.geom_xpos[:, table.indexing.geom_ids[0]] - nominal
+  return obj.data.root_link_pos_w, yaw, offset, obj.data.root_link_lin_vel_w
+
+
 def success_flags(env: ManagerBasedRlEnv) -> torch.Tensor:
   """Which envs the last `step` ended through the `success` termination.
 
@@ -379,6 +543,20 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     "release_dz_median_m": median([r["release_dz"] for r in rel]),
     "release_speed_median_mps": median([r["release_speed"] for r in rel]),
   }
+  sd = [r for r in rows if r.get("release_set_down") is not None]
+  set_down = {
+    "release_on_table": sum(r["release_on_table"] for r in sd) / len(sd)
+    if sd
+    else None,
+    "release_set_down": sum(r["release_set_down"] for r in sd) / len(sd)
+    if sd
+    else None,
+    "release_dwell_median": median([r["release_dwell"] for r in sd]),
+    "release_vz_median_mps": median([r["release_vz"] for r in sd]),
+    "release_vxy_median_mps": median([r["release_vxy"] for r in sd]),
+    "release_q_m6_median": median([r["release_q_m6"] for r in rel]),
+    "release_q_m7_median": median([r["release_q_m7"] for r in rel]),
+  }
   return {
     "episodes": n,
     "placed": rate("placed"),
@@ -394,6 +572,7 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     **transport,
     **speed,
     **release,
+    **set_down,
   }
 
 
@@ -467,6 +646,27 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
   else:
     print("    no release observed")
 
+  print("\n  SET-DOWN (plan S7-2's M7, at the last let-go) ---------------------")
+  if result.get("release_set_down") is not None:
+    print(f"    on the table             {result['release_on_table']:6.1%}")
+    print(
+      f"    a set-down (M7 passes)   {result['release_set_down']:6.1%}   "
+      f"on the table, < {SET_DOWN_STILL} m/s, held still >= {SET_DOWN_STEPS} steps"
+    )
+    print(
+      f"    dwell before letting go  {result['release_dwell_median']:6d} steps (median)"
+    )
+    print(
+      f"    cube v_z / v_xy          {fmt(result['release_vz_median_mps'], 'm/s')} / "
+      f"{fmt(result['release_vxy_median_mps'], 'm/s')}  (median)"
+    )
+    print(
+      f"    grade M6 / M7            {result['release_q_m6_median']:.2f} / "
+      f"{result['release_q_m7_median']:.2f}  (median)"
+    )
+  else:
+    print("    no release observed")
+
   print("\n  TIMING -----------------------------------------------------------")
   ttp = result["time_to_place_s"]
   print(f"    mean episode             {result['mean_episode_length_s']:6.2f} s")
@@ -496,14 +696,19 @@ def main() -> None:
   obs, _ = wrapped.reset()
   with torch.inference_mode():
     while len(tally.done) < args.episodes:
+      goal = env.command_manager.get_term(COMMAND).command
+      obj_pos, obj_yaw, table_offset, obj_vel = scene_state(env)
+      tally.record(obj_pos, obj_yaw, table_offset, goal)
       flags = probe(env, grasp_sensor)
       tally.observe(**flags)
       tally.measure(flags["grasped"], *geometry(env))
-      tally.measure_speed(
+      tally.measure_speed(flags["grasped"], *positions(env), env.step_dt, goal)
+      tally.measure_set_down(
         flags["grasped"],
-        *positions(env),
-        env.step_dt,
-        env.command_manager.get_term(COMMAND).command,
+        _on_surface_bool(env, SUPPORT_SENSOR),
+        obj_pos,
+        obj_vel,
+        goal,
       )
       obs, _, dones, extras = wrapped.step(policy(obs))
       tally.terminal(success_flags(env))
@@ -531,6 +736,7 @@ def main() -> None:
           "seed": args.seed,
           **result,
           "reward_terms": rewards,
+          "episodes_detail": tally.done[: args.episodes],
         },
         indent=2,
       )

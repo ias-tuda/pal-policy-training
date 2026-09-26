@@ -75,6 +75,8 @@ MARGIN = 1.5
 ROUND = 0.05
 
 #: Phases of the scripted episode: (name, waypoint to move to, jaw closed?, control steps).
+#: "Closed" may also be a fraction of the full close, for a jaw that holds lightly and so opens
+#: within a step or two under a jaw slew (plan S7-2, M7's release while lowering).
 #: Joint-space linear interpolation from the previous waypoint over that many 20 ms steps.
 #: `place` and `retreat` are re-planned at the end of `steady`, from where the cube actually
 #: sits in the hand -- see `replan_place`.
@@ -94,7 +96,8 @@ PHASES = (
 #: Every waypoint `waypoints` plans, in order.
 WAYPOINT_NAMES = ("pregrasp", "grasp", "lift", "carry", "place", "retreat")
 #: The place pose at the goal itself, for a cube set down at a release offset and then dragged
-#: there while held (plan S7-2, M7's drag test). Planned by `replan_place` when a phase uses it.
+#: there while held (plan S7-2, M7's drag test). Planned from the corrected place pose when the
+#: first phase that moves to it starts.
 DRAG_WAYPOINT = "place_goal"
 #: Phases after which the arm is held at its waypoint until it has actually stopped: before
 #: the jaw closes (a still-swinging arm shoves the cube across the table as the pads meet
@@ -177,6 +180,20 @@ class Kin:
     return self.data.site_xpos[self.tcp].copy(), self.data.xmat[self.hand].reshape(
       3, 3
     ).copy()
+
+  def lever_arms(self, q: np.ndarray) -> np.ndarray:
+    """Distance from each arm joint's axis to the grasp point at pose ``q``: what plan S7-2's
+    tool speed bound V multiplies each joint's step by (`mdp.ToolSpeedCappedJointPositionAction`).
+    """
+    if not hasattr(self, "_jids"):
+      self._jids = [
+        mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{j}")
+        for j in ARM_JOINTS
+      ]
+    tcp, _ = self.fk(q)
+    anchor = self.data.xanchor[self._jids]
+    axis = self.data.xaxis[self._jids]
+    return np.linalg.norm(np.cross(tcp - anchor, axis), axis=-1)
 
   def move_table(self, offset: np.ndarray) -> None:
     """Put the table at its compiled pose + ``offset`` (x, y, z) for the collision checks:
@@ -367,7 +384,6 @@ def replan_place(
   tcp_actual: np.ndarray,
   cube_actual: np.ndarray,
   goal: np.ndarray,
-  drag_to: np.ndarray | None = None,
 ) -> None:
   """Re-plan `place` and `retreat` from the cube's measured position in the hand.
 
@@ -389,11 +405,6 @@ def replan_place(
     hand_x,
     plan["place"],
   )
-  if drag_to is not None:
-    # The same place pose, moved along the table to put the cube on ``drag_to`` instead.
-    plan[DRAG_WAYPOINT] = _solve(
-      kin, "place", want - bias + (drag_to - goal), hand_x, plan["place"]
-    )
 
 
 def _surface_top(env, name: str) -> np.ndarray:
@@ -444,7 +455,9 @@ TABLE_SHIFT_Z = 0.01
 
 def corner_cases(
   box, target_xy: tuple[float, float], target_half_xy: float
-) -> list[tuple[tuple[np.ndarray, float], tuple[float, float], tuple[float, float, float]]]:
+) -> list[
+  tuple[tuple[np.ndarray, float], tuple[float, float], tuple[float, float, float]]
+]:
   """Plan S7-2's corners check: ten (spawn, target, table shift) triples for one spawn box.
 
   The spawns are `box_corners` (the centre at yaw 0, the four xy corners at -/+ the largest
@@ -457,7 +470,9 @@ def corner_cases(
   tx, ty, h = target_xy[0], target_xy[1], target_half_xy
   signs = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
   xy, dz = TABLE_SHIFT_XY, TABLE_SHIFT_Z
-  targets = [(tx, ty)] + [(tx + sx * h, ty + sy * h) for sx, sy in signs] * 2 + [(tx, ty)]
+  targets = (
+    [(tx, ty)] + [(tx + sx * h, ty + sy * h) for sx, sy in signs] * 2 + [(tx, ty)]
+  )
   shifts = (
     [(0.0, 0.0, 0.0)]
     + [(sx * xy, sy * xy, dz if k % 2 else -dz) for k, (sx, sy) in enumerate(signs)]
@@ -693,8 +708,24 @@ def rollout(
     else np.full(len(arm_idx), np.inf)
   )
 
-  def n_steps(a: np.ndarray, b: np.ndarray, base: int) -> int:
+  # Plan S7-2's tool speed bound V, when the action term carries one: a move is stretched so
+  # its bound on the tool's travel per step, sum_i |dq_i| r_i, stays under the cap -- the slow
+  # one whenever the jaw is closed (V slows a held cube only near the table or the goal, so
+  # this is the conservative side), with lever arms at the move's midpoint and 20 % margin.
+  # Same reason as the slew: the term enforces it anyway, and a script that outruns it measures
+  # its own lag at every settle check and re-plans the place from it.
+  tool_cap = getattr(term.cfg, "speed_limit", None)
+  tool_cap_slow = getattr(term.cfg, "slow_speed_limit", None)
+
+  def n_steps(a: np.ndarray, b: np.ndarray, base: int, closed: bool = False) -> int:
     need = int(np.ceil((np.abs(b - a) / slew).max() - 1e-9))
+    if tool_cap is not None:
+      v = tool_cap_slow if closed else tool_cap
+      travel = max(
+        float(np.abs(b[e] - a[e]) @ kin.lever_arms(0.5 * (a[e] + b[e])))
+        for e in range(len(a))
+      )
+      need = max(need, int(np.ceil(1.2 * travel / (v * env.step_dt) - 1e-9)))
     return max(base, need)
 
   env.reset()
@@ -810,7 +841,7 @@ def rollout(
 
   def move_and_settle(a: np.ndarray, b: np.ndarray, closed: bool) -> None:
     """Interpolate the arm from pose ``a`` to ``b``, then hold ``b`` until it settles."""
-    n = n_steps(a, b, PLACE_CORRECTION_STEPS)
+    n = n_steps(a, b, PLACE_CORRECTION_STEPS, closed)
     for s in range(1, n + 1):
       step_to(a + (b - a) * (s / n), closed)
     for _ in range(SETTLE_MAX_STEPS):
@@ -821,14 +852,14 @@ def rollout(
         return
       step_to(b, closed)
 
-  def step_to(q: np.ndarray, closed: bool) -> None:
+  def step_to(q: np.ndarray, closed: bool | float) -> None:
     """One control step toward arm pose ``q`` with the jaw open or closed."""
     nonlocal clipped, clipped_env, ended, order, last_q, over_slew
     over_slew += int((np.abs(q - last_q) > slew + 1e-6).any(axis=-1).sum())
     last_q = np.array(q, copy=True)
     target_q = offset.clone()
     target_q[:, arm_idx] = torch.as_tensor(q, dtype=torch.float32, device=env.device)
-    target_q[:, jaw_idx] = jaw_closed if closed else 0.0
+    target_q[:, jaw_idx] = jaw_closed * float(closed)
     raw = (target_q - offset) / scale
     over = (raw.abs() > 1.0 + 1e-6).any(dim=-1)
     clipped += int(over.sum())
@@ -851,9 +882,6 @@ def rollout(
       ended |= done
 
   phase_list = phases if phases is not None else PHASES
-  # A phase that moves to `DRAG_WAYPOINT` drags the cube, still held, from its release point
-  # to the goal (plan S7-2, M7's drag test): `lower` then also plans that pose.
-  drags = any(wp == DRAG_WAYPOINT for _, wp, _, _ in phase_list)
   phase_now = ["start"]
   with torch.inference_mode():
     for phase, wp, closed, steps in phase_list:
@@ -870,19 +898,28 @@ def rollout(
           kin.move_table(shift[i])
           try:
             replan_place(
-              kin,
-              plans[i],
-              hand_xs[i],
-              tcp_a[i],
-              cube_a[i],
-              goal[i] + release_off[i],
-              drag_to=goal[i] if drags else None,
+              kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i] + release_off[i]
             )
           except RuntimeError as e:  # keep the open-loop place; scored as it lands
             skipped_corrections.append((i, f"replan: {e}"))
-          plans[i].setdefault(DRAG_WAYPOINT, plans[i]["place"])
+      if wp == DRAG_WAYPOINT and DRAG_WAYPOINT not in plans[0]:
+        # The (corrected) place pose, moved along the table by -release offset: the held cube
+        # is dragged from where it was set down onto the goal.
+        for i, pl in enumerate(plans):
+          kin.move_table(shift[i])
+          try:
+            pl[DRAG_WAYPOINT] = _solve(
+              kin,
+              "place",
+              kin.fk(pl["place"])[0] - release_off[i],
+              hand_xs[i],
+              pl["place"],
+            )
+          except RuntimeError as e:
+            skipped_corrections.append((i, f"drag: {e}"))
+            pl[DRAG_WAYPOINT] = pl["place"]
       nxt = np.stack([p[wp] for p in plans])
-      n = n_steps(prev, nxt, steps)
+      n = n_steps(prev, nxt, steps, closed)
       if n > steps:
         stretched[phase] = n
       for s in range(1, n + 1):

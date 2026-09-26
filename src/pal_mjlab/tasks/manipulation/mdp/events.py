@@ -179,7 +179,7 @@ def reset_release_latch(
     latch.released[env_ids] = False
     latch.dxy[env_ids] = 0.0
     latch.height[env_ids] = 0.0
-    latch.held_on_table[env_ids] = False
+    latch.clear[env_ids] = False
     latch.touchdown_ok[env_ids] = False
     latch.dwell[env_ids] = 0
     latch.rel_on_table[env_ids] = False

@@ -178,6 +178,10 @@ _RELEASE = "_pp_release"
 SET_DOWN_RADIUS = 0.015
 #: ...and moving slower than this (m/s). The same speed bounds the release itself.
 STILL_SPEED = 0.05
+#: A touchdown counts only after the held object was lifted this far clear of its resting
+#: height (m), and held since. Without it, the contact flicker of a cube dragged along the table
+#: re-arms the touchdown wherever the drag happens to be (found by the drag test).
+SET_DOWN_CLEARANCE = 0.005
 
 
 @dataclasses.dataclass
@@ -189,8 +193,9 @@ class ReleaseLatch:
   height on the surface, both at the step the grasp opened. ``grasped`` is the grasp state at
   the last update: the next update compares against it to see the grasp open.
 
-  M7's set-down state, kept alongside: ``held_on_table`` is "held and resting on the surface"
-  at the last update; ``touchdown_ok`` whether the current held-on-surface contact began
+  M7's set-down state, kept alongside: ``clear`` is "held, and lifted more than
+  `SET_DOWN_CLEARANCE` clear of the surface since the last touchdown"; ``touchdown_ok``
+  whether the latest touchdown -- the first held-on-surface update after being clear -- was
   within `SET_DOWN_RADIUS` of the goal; ``dwell`` how many consecutive updates, up to the last,
   the object was held on the surface, still and within the radius, since such a touchdown.
   ``rel_on_table``, ``rel_speed`` and ``rel_dwell`` are the surface contact, the object's
@@ -201,7 +206,7 @@ class ReleaseLatch:
   released: torch.Tensor
   dxy: torch.Tensor
   height: torch.Tensor
-  held_on_table: torch.Tensor
+  clear: torch.Tensor
   touchdown_ok: torch.Tensor
   dwell: torch.Tensor
   rel_on_table: torch.Tensor
@@ -236,10 +241,11 @@ def _release_latch(
   The resting height is the surface's top plus the object's half-height, read out of physics
   the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table.
 
-  M7's set-down (plan S7-2): a *touchdown* is the first update of a held-on-surface contact.
-  The dwell counts only after a touchdown within `SET_DOWN_RADIUS` of the goal, so a cube put
-  down short and dragged along the table to the goal never builds one -- it has to be lifted
-  and set down again. The dwell at a release is the count up to the update before it.
+  M7's set-down (plan S7-2): a *touchdown* is the first held-on-surface update after the held
+  object was lifted `SET_DOWN_CLEARANCE` clear. The dwell counts only after a touchdown within
+  `SET_DOWN_RADIUS` of the goal, so a cube put down short and dragged along the table to the
+  goal never builds one -- it has to be lifted and set down again. The dwell at a release is
+  the count up to the update before it.
   """
   from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
 
@@ -253,7 +259,7 @@ def _release_latch(
       released=no.clone(),
       dxy=zero.clone(),
       height=zero.clone(),
-      held_on_table=no.clone(),
+      clear=no.clone(),
       touchdown_ok=no.clone(),
       dwell=count.clone(),
       rel_on_table=no.clone(),
@@ -287,12 +293,13 @@ def _release_latch(
   latch.grasped = grasped
   # M7's dwell, after the release has been recorded with the count up to the last update.
   held_on_table = grasped & on_table
-  touchdown = held_on_table & ~latch.held_on_table
+  latch.clear = grasped & (latch.clear | (pos[:, 2] - rest_z > SET_DOWN_CLEARANCE))
+  touchdown = held_on_table & latch.clear
   near = dxy < SET_DOWN_RADIUS
   latch.touchdown_ok = torch.where(touchdown, near, latch.touchdown_ok)
+  latch.clear = latch.clear & ~touchdown
   still = held_on_table & latch.touchdown_ok & near & (speed < STILL_SPEED)
   latch.dwell = torch.where(still, latch.dwell + 1, torch.zeros_like(latch.dwell))
-  latch.held_on_table = held_on_table
   return latch
 
 
