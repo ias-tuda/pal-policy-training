@@ -343,10 +343,14 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      (`user_env_retrieval_failed_requeued_held`) within 3 s; released in place with
      `ExcNodeList=gn03,gn04`. **Submit with `--exclude=gn03,gn04` by default.**
    - *S7-2 readers:* `~/s72_cfgcheck.py <checkout>` (plain python3 over `params/*.yaml`),
-     `~/s72_wandb.py` (under the checkout's `uv run --extra cu128`); reads locally with
+     `~/s72_wandb.py` (under the checkout's `~/.local/bin/uv run --extra cu128`: `uv` is not on a
+     non-interactive ssh's `PATH`); reads locally with
      `artifacts/s7-2/eval_one.sh <code> <seed> <it>` + `read_table.py` (amended early-stop rule).
    - *Checking the config:* the resolved config is in the run's `params/env.yaml`; verify a
      new arm from it, not from stdout.
+   - *Silent logs (2026-09-26):* S7-2's gn05/gn09 jobs (159038–159041) print nothing after wandb's
+     setup lines while training normally (tfevents and wandb advance); gn11's print every iteration.
+     Judge progress by wandb `_step` or tfevents, never by the Slurm log. Cause not established.
 
 ## 6. Current best settings
 
