@@ -3,10 +3,11 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-25 (pick-and-place v0: `siwei-s5.2` merged into `siwei` (fast-forward to
-`3323747`); **S7-1 read**: FA ×2, FB, D1–D5 (158540–158547, `b50efcb`) and FR ×2 (M6, 158572–158573,
-`87b50d6`); **FR is the base for S7-2 and X**; sbatch `RESUME=` @ `34ddbee`; P2 boxes proposed.
-Reports in `../docs/reports/pick-place-v0/`).*
+*Last updated: 2026-09-26 (pick-and-place v0: **S7-2 launched** on baseline B — jobs 159038–159047 from IAS
+`-s72` @ `f3bcfd0` (branch `siwei-s7-2`: fda9492 port, `BASELINE`/`SPAWN`/`TOOL_SPEED`, M7, V); `siwei`
+fast-forwarded to `4bf8a69` (= `siwei-s7-m6`) 2026-09-25; S8 ran in parallel on `siwei-s8`. Before:
+**S7-1 read** (158540–158547, FR 158572–158573): **FR is the base for S7-2 and X**. Reports in
+`../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
 
@@ -42,6 +43,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **c1a screen** | 🛑 cancelled 2026-09-24 10:36 at 12.3–15.2 k (superseded by S5.2). **Final 64-episode eval: grasped/lifted 100 % on 10/10 runs; within 3 cm *horizontally* while held 100 %; placing ≈ 0.** R-A holds ~1 cm above the target, the R-C family hovers 5–8 cm above it; both are per-step optima. **S5.2 base = R-C-strict + PPO-stack** (runner-up R-C). `s5-1-report.md` §6; data in `artifacts/s5.1-c1a/` |
 | Pick-and-place v0 **S5.2** (reward arms for *placing*) | ✅ **read at 3–4 k** (`siwei-s5.2` @ `dad44f1`, eval @ `3323747`; **merged into `siwei` 2026-09-25**, fast-forward `cba928c` → `3323747`, `make test` 256 passed, ruff clean): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md`. **4 k (64 eps each): full fix 64/64 on all 3 seeds, 0.61–0.67 s; seed 1 sets it down, seeds 2–3 mostly let go short and the cube slides in (1.2–1.5 m/s). +M1/+M1+M3 place by dropping from 3–8 cm, 3–7 k later; +M3+M4 and the control 0/64.** Base for S7 |
 | Pick-and-place v0 **S7-1** (speed bound, release quality, DR ladder; plan S7) | ✅ **read 2026-09-25** (`../docs/reports/pick-place-v0/s7-report.md` §5.5, §7; 64-episode evals at 1/2/3/5(/8) k with the release point, `artifacts/s7/eval/`): **FA** (slew 0.5) places like the S5.2 full fix (62–64/64 from 2 k) but 0.1–0.3 s slower, held-cube peak 15–30 % lower (0.9 vs 1.0–1.3 m/s; halving joint slew does not halve tool speed), and **still drifts to letting go before arrival by 3 k** (held at goal 0.83 → 0.16, 0.84 → 0.00). **FB** (M5 penalty) same peak speed, releases worst. **FR = FA + M6** (`87b50d6`) **sets the cube down on both seeds at every read** (held at goal 0.95–1.00, released 0.3–0.7 cm out, q 0.91–0.98; to 3.5 k / 5 k) at FA's rate and time → **by the plan's rule S7-2 and X build on FR**; watch its release speed (0.10 → 0.44 m/s). **DR:** placing holds to D4; D5 first to drop (60/64 at 5 k, 61/64 at 8 k). `non_finite_state` ≤ 0.073 %. Early stops (plan rule): D4 158546, FR s1 158572 (13:55); D2/FA s2/D1 met it while the session was paused. Video `artifacts/s7m6/videos/fa_vs_fr_slowmo_x4.mp4` |
+| Pick-and-place v0 **S7-2** (baseline B, M7, V, W1/W2; plan S7-2) | ⏳ **launched 2026-09-26 19:00**, jobs 159038–159047 from IAS `-s72` @ `f3bcfd0` (`siwei-s7-2`), all `running` (wandb `mjnoc503` `gn0hc5he` B; `x7kg0zwt` `jtwy6ojh` B-S; `rzi0paxg` `mhx93lbx` B-SV; `4r5td7kk` `w2ubleym` W1-B; `czuojwnd` `c3ak7nor` W2-B); 5 k, reads at 1/2/3/5 k. **Baseline B** = FR on the fda9492 model (arm 5/7 about +z, obs in `base_link`) + table 0.815 m + 10 s + target (0.46, 0.08) ±2 cm table-relative + 38-D actor (`grasped` critic-only) + jaw slew 0.04, at DR-scene. **The plan's target box (0.42, 0.07) ±3 cm failed the corners check** (near the torso the arm cannot place at 0.815 m) — moved by Siwei's decision 2026-09-26. Gates: corners S71 9/10, W1 9/10, W2 10/10; V gate 10/10; jaw-slew bench 64/64, 0 drops; M7 tests; `make test` green on the launched code. `../docs/reports/pick-place-v0/s7-2-report.md` |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -254,6 +256,16 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      `bias = cfg.apply(bias)` and the default op is "add" (15 mm after 1 episode, 65 mm after
      20, bound 8 mm). Use `operation="abs"` on `bias_noise_cfg`. Claudius's branch is
      affected. Draft issue `../docs/upstream/mjlab-additive-bias-random-walk.md`.
+   - **mjlab's `dr.encoder_bias` offsets the actuator target, not the observation**
+     (`JointPositionAction.apply_actions` subtracts it; only `joint_pos_rel(biased=True)` reports it, and
+     our `joint_pos` term is not `biased`). D4/D5's ±5 mrad was a tracking offset the policy saw through.
+     Baseline B adds an observation-side bias (±0.01, `abs`) and keeps the event. (S7-2, 2026-09-25.)
+   - **A fixed entity's first body is its mocap anchor** (`table/mocap_base`), not `table/table`:
+     writing the anchor's `model.body_pos` moves the table only at the next reset and on top of DR-scene's
+     draw, which lives on `table/table`'s local offset. Index bodies by name. (S7-2 corners check.)
+   - **At the 0.815 m table the arm cannot place near the torso** (script IK, hand straight down): the
+     plan's target (0.42, 0.07) ±3 cm was 11–18 % unplannable with the table shift (66 % for a cube at
+     +10°). B's target is (0.46, 0.08) ±2 cm (0–2 %). `artifacts/s7-2/ikmap/`.
    - **mjlab string-keyed DR `ranges` ignore `asset_cfg.joint_names`** — the keys match every
      joint of the entity. `tabletop_env_cfg._on_joints` restricts them to the action joints.
    - **`actgravcomp` alone is unbounded under mjlab position actuators.** mjlab puts the
@@ -327,6 +339,12 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    - *S7-1 readers on the login node:* `~/s71_read.py` (tfevents; jobs from `~/s71_jobs.txt`),
      `~/s71_cfgcheck.py <checkout>` (resolved config: terms, gates, slew as `rate_limit`, DR
      events, save interval), `~/s71_wandb.py` (run state by API query).
+   - *gn03 again (2026-09-26):* S7-2's 159038–159040 were dispatched to gn03 and held
+     (`user_env_retrieval_failed_requeued_held`) within 3 s; released in place with
+     `ExcNodeList=gn03,gn04`. **Submit with `--exclude=gn03,gn04` by default.**
+   - *S7-2 readers:* `~/s72_cfgcheck.py <checkout>` (plain python3 over `params/*.yaml`),
+     `~/s72_wandb.py` (under the checkout's `uv run --extra cu128`); reads locally with
+     `artifacts/s7-2/eval_one.sh <code> <seed> <it>` + `read_table.py` (amended early-stop rule).
    - *Checking the config:* the resolved config is in the run's `params/env.yaml`; verify a
      new arm from it, not from stdout.
 
@@ -389,7 +407,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 | host | what is installed / checked out there | last verified |
 |---|---|---|
-| local Mac | git source of truth: `siwei` @ **`3323747`** (2026-09-25, S5.2 merged); worktrees `-s5.2` (`siwei-s5.2`), `-s7` (`siwei-s7`), `-s7m6` (`siwei-s7-m6`). Nothing pushed to `origin` — no push has been authorised | 2026-09-25 |
+| local Mac | git source of truth: `siwei` @ **`4bf8a69`** (2026-09-26: fast-forwarded to `siwei-s7-m6`); worktrees `-s5.2`, `-s7`, `-s7m6`, **`-s72` (`siwei-s7-2`, S7-2)**, and S8's `-s8` (`siwei-s8`). Nothing pushed to `origin` — no push has been authorised | 2026-09-26 |
 | `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified | — |
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
@@ -399,6 +417,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | IAS `-s52` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s52` on `siwei-s5.2` @ `dad44f1` (full 40-char sha checked by the sbatch commit guard); own `uv sync --frozen --extra cu128` (same pins), `slurm_logs/submit_s52.sh`. Readers on the login node: `~/s52_read.py` (tfevents), `~/s52_cfgcheck.py` (resolved config) | 2026-09-24 |
 | IAS `-s7` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s7` on `siwei-s7` @ `b50efcb`, deployed 2026-09-25 04:18 (full bundle, sha256-checked, own `uv sync --frozen --extra cu128`, same pins); `slurm_logs/submit_s71.sh`. **Runs S7-1 (158540–158547): do not fast-forward it while they run** | 2026-09-25 |
 | IAS `-s7m6` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s7m6` on `siwei-s7-m6` @ `87b50d6` (M6), deployed 2026-09-25 10:09 (full bundle, sha256-checked, own uv sync, same pins); `slurm_logs/submit_s71_fr.sh`. **Runs FR (158572–158573): do not fast-forward it while they run** | 2026-09-25 |
+| IAS `-s72` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s72` on `siwei-s7-2` @ `f3bcfd0`, deployed 2026-09-26 11:10 at `2d727b8` (full bundle, sha256-checked, own `uv sync --frozen --extra cu128`, same pins), fast-forwarded 18:59 (incremental bundle, sha256-checked); `slurm_logs/submit_s72.sh`, `s72_cfgcheck_0926*.txt`. **Runs S7-2 (159038–159047): do not fast-forward it while they run** | 2026-09-26 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
@@ -407,13 +426,10 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
    (`s5-1-report.md` §6). It is the input to S5.2.
 1. ~~Merge `siwei-s5.1-chain`~~ done, `d9ea988`. ~~S5.2~~ read: the full fix is S7's base (`s5-2-report.md` §6).
    ~~Merge `siwei-s5.2`~~ done (fast-forward, `3323747`, 2026-09-25). ~~S7-1~~ read: S7-2 and X build on FR.
-   **Next: P2's boxes, for the user's OK** (S7 report §6): W1 (plan's ±5 cm, ±45°) and **W2 = x
-   0.34–0.46 × y 0.20–0.34, ±45°** (IK-plannable sweep, 4 cm margin, ≥ 10 cm from the target);
-   today's scales reach ±45° on only 9/30 W1 cells; the S5.0 rule over W1 ∪ W2 gives arm 1–7 =
-   0.90/0.85/0.65/0.80/1.55/2.40/1.20; scripted 10/10 on W1 and W2 with them *and* a settle wait
-   after `approach` (W1 8/10 without: a fingertip lands on the cube). `artifacts/s7/p2/`,
-   `artifacts/s7m6/p2_*`. With the OK: flag-gated scales + spawn selection, the settle wait,
-   a corners test, then S7-2 on FR. Nothing uses W1/W2 yet.
+   ~~P2 / S7-2 implementation~~ done and launched 2026-09-26 (S7-2 report). **Next: read S7-2 at 1 / 2 / 3 /
+   5 k** (`artifacts/s7-2/eval_one.sh`, `read_table.py`, the amended early-stop rule; W runs also
+   `--by-spawn`); the D5 per-episode diagnosis (`artifacts/s7-2/d5/`); prep 7 (grip force vs cube size) and
+   asking PAL for the gripper's force; merging `siwei-s7-2` and `siwei-s8` into `siwei` (the user's call).
 2. **The jaw misses its own 0.01 % NaN bar** on both 0002 configs (157635 0.026 %, 157646
    0.021 %); the plan's 0.1 % gate passes. Decision 0002 records it; not blocking the screen.
 3. Write down **what Oppsie is** (§1 here and `CLAUDE.md`'s header gap note), and its

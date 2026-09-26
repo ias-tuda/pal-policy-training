@@ -179,6 +179,17 @@ Claims that have already been wrong here:
   observation noise (joint pos +/-0.002 rad, vel +/-0.2 rad/s, object pos +/-5 mm, yaw
   +/-0.02 rad; `tabletop_env_cfg.py`) is on at every rung in training; only `--play` turns it
   off. (Found 2026-09-24, plan S7's D4 alignment.)
+- **"mjlab's `dr.encoder_bias` is an observation error" is wrong.** It offsets the actuator
+  target instead. `JointPositionAction.apply_actions` subtracts it from the joint target, and
+  only `joint_pos_rel(biased=True)` reports it. Our `joint_pos` term is not `biased`. So under
+  D4/D5 the arm tracked up to 5 mrad off its command while the policy observed the true angle.
+  For an encoder offset the policy observes, put a bias on the observation term (baseline B,
+  `operation="abs"`). (Found 2026-09-25, plan S7-2.)
+- **A fixed entity's first body is not its main body.** `entity.indexing.body_ids[0]` is the
+  mocap anchor it hangs from (`table/mocap_base`), not `table/table`. DR-scene draws the table
+  pose into `table/table`'s local offset. Writing the anchor's `model.body_pos` instead moved
+  the table only at the next reset, and added the move to the DR draw. Look bodies up by name.
+  (Found by the S7-2 corners check's positive control, 2026-09-26, `f3bcfd0`.)
 - *(Add every further claim that turns out wrong. These lines are the most valuable in the file.)*
 
 ---
@@ -620,7 +631,10 @@ other projects use it. **This project uses `uv`** — `make sync` (`uv sync --al
 **The `ias` alias is a trap.** `~/.ssh/config`'s `ias` points at
 `kay.ias.informatik.tu-darmstadt.de` and exists **only** as the `ProxyJump` for `Geoffery` and
 `blackwell`. The Slurm login node is a different machine, `mn.ias...`, reached by its full
-hostname with user `ju`. The same identity file works for both. (Verified 2026-08-05.)
+hostname with user `ju`. (Verified 2026-08-05.) **The same identity file does not work for
+both:** on 2026-09-25 `mn` refused the `ias` alias's RSA key ("Permission denied
+(publickey)"); `ssh -i ~/.ssh/id_ed25519 ju@mn.ias.informatik.tu-darmstadt.de` works
+(verified again 2026-09-26).
 
 Note that `origin` for this repo is on the same IAS GitLab host family — a host that can reach
 `git.ias.informatik.tu-darmstadt.de` over SSH can clone and push; a host that cannot needs the
@@ -895,6 +909,11 @@ tail -f /home/ju/repo/humanoids/<repo>/slurm_logs/<name>_<jobid>.log
    and do not read the first iteration's timing as steady-state throughput.
 8. **Record the job id** alongside the commit, task id and config. Once the scrollback is gone,
    scheduler accounting is the only record.
+9. **Jobs dispatched to gn03 or gn04 can come back held** with the reason
+   `user_env_retrieval_failed_requeued_held`, within seconds of dispatch. This happened on gn04
+   on 2026-09-24, and on gn03 on 2026-09-25 and 2026-09-26. Fix without losing the job id:
+   `scontrol update jobid=<id> ExcNodeList=gn03,gn04`, then `scontrol release <id>`. Check
+   `squeue -u ju` a minute after every submission.
 
 ---
 
