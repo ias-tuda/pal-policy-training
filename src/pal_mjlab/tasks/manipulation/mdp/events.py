@@ -166,11 +166,12 @@ def reset_was_lifted(
 def reset_release_latch(
   env: ManagerBasedRlEnv, env_ids: Sequence[int] | torch.Tensor
 ) -> None:
-  """Clear the release latch (plan S7, module M6) for the environments being reset.
+  """Clear the release latch (plan S7 M6, S7-2 M7) for the environments being reset.
 
   Without this the last episode's release would grade the next one's. The remembered grasp
   state is cleared too: an episode that ended with the object in the jaw would otherwise see
-  the grasp "open" on the next one's first step.
+  the grasp "open" on the next one's first step. So is M7's set-down state, or a dwell built
+  at the end of one episode would count towards the first release of the next.
   """
   latch = getattr(env, _RELEASE, None)
   if latch is not None:
@@ -178,3 +179,9 @@ def reset_release_latch(
     latch.released[env_ids] = False
     latch.dxy[env_ids] = 0.0
     latch.height[env_ids] = 0.0
+    latch.held_on_table[env_ids] = False
+    latch.touchdown_ok[env_ids] = False
+    latch.dwell[env_ids] = 0
+    latch.rel_on_table[env_ids] = False
+    latch.rel_speed[env_ids] = 0.0
+    latch.rel_dwell[env_ids] = 0

@@ -50,6 +50,21 @@ def ee_position_b(
   return _to_base_frame(robot, ee_pos_w)
 
 
+def ee_orientation_b(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _ROBOT
+) -> torch.Tensor:
+  """Grasp-point orientation in the robot base frame, as a (w, x, y, z) quaternion. (B, 4)
+
+  Plan S7-2's baseline B observes it (Claudius's `ee_orientation_b`): without it the policy
+  reads the hand's orientation only through the seven joint angles. The sign is fixed to
+  w >= 0, so the same orientation always gives the same four numbers.
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  ee_quat_w = robot.data.site_quat_w[:, asset_cfg.site_ids].squeeze(1)
+  quat_b = quat_mul(quat_inv(_base_pose(robot)[1]), ee_quat_w)
+  return torch.where(quat_b[:, :1] < 0.0, -quat_b, quat_b)
+
+
 def object_position_b(
   env: ManagerBasedRlEnv, object_name: str, asset_cfg: SceneEntityCfg = _ROBOT
 ) -> torch.Tensor:
@@ -158,21 +173,41 @@ def _was_lifted_bool(
 #: Attribute on the env holding the release latch (plan S7, module M6).
 _RELEASE = "_pp_release"
 
+#: Plan S7-2, module M7 (the set-down): a held step counts towards the on-table dwell only
+#: while the object is within this horizontal distance of the goal (m)...
+SET_DOWN_RADIUS = 0.015
+#: ...and moving slower than this (m/s). The same speed bounds the release itself.
+STILL_SPEED = 0.05
+
 
 @dataclasses.dataclass
 class ReleaseLatch:
-  """Where the object was let go the last time, per env (plan S7, module M6).
+  """Where and how the object was let go the last time, per env (plan S7 M6, S7-2 M7).
 
   ``released`` is set once a release after `was_lifted` has been seen this episode; ``dxy`` is
   the object's horizontal distance to the goal and ``height`` its height above its resting
   height on the surface, both at the step the grasp opened. ``grasped`` is the grasp state at
   the last update: the next update compares against it to see the grasp open.
+
+  M7's set-down state, kept alongside: ``held_on_table`` is "held and resting on the surface"
+  at the last update; ``touchdown_ok`` whether the current held-on-surface contact began
+  within `SET_DOWN_RADIUS` of the goal; ``dwell`` how many consecutive updates, up to the last,
+  the object was held on the surface, still and within the radius, since such a touchdown.
+  ``rel_on_table``, ``rel_speed`` and ``rel_dwell`` are the surface contact, the object's
+  speed and that dwell at the latest release. ``step`` is the env step of the last update.
   """
 
   grasped: torch.Tensor
   released: torch.Tensor
   dxy: torch.Tensor
   height: torch.Tensor
+  held_on_table: torch.Tensor
+  touchdown_ok: torch.Tensor
+  dwell: torch.Tensor
+  rel_on_table: torch.Tensor
+  rel_speed: torch.Tensor
+  rel_dwell: torch.Tensor
+  step: int = -1
 
 
 def _release_latch(
@@ -191,13 +226,20 @@ def _release_latch(
   Each release overwrites the last: the record is of where the object was *finally* let go,
   and a second grasp and release cannot bank a better one.
 
-  Updated lazily, on read, like `_was_lifted_bool`, and idempotent within a step: the update
-  stores the current grasp state, so a second read in the same step sees no opening. It sees
-  an opening on the step it happens only if something reads it every step; the M6 reward
-  terms do, at a nonzero weight (mjlab skips a zero-weight term entirely).
+  Updated lazily, on read, like `_was_lifted_bool`, and at most once per env step (``step``
+  against `env.common_step_counter`): a second read in the same step returns the latch as it
+  is, so the dwell counter cannot count one step twice. It sees an opening on the step it
+  happens only if something reads it every step; the M6/M7 reward terms do, at a nonzero
+  weight (mjlab skips a zero-weight term entirely), and `scripts/eval_pick_place.py` reads it
+  after every step for the arms that have none.
 
   The resting height is the surface's top plus the object's half-height, read out of physics
   the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table.
+
+  M7's set-down (plan S7-2): a *touchdown* is the first update of a held-on-surface contact.
+  The dwell counts only after a touchdown within `SET_DOWN_RADIUS` of the goal, so a cube put
+  down short and dragged along the table to the goal never builds one -- it has to be lifted
+  and set down again. The dwell at a release is the count up to the update before it.
   """
   from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
 
@@ -205,8 +247,23 @@ def _release_latch(
   if latch is None or latch.released.shape[0] != env.num_envs:
     no = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     zero = torch.zeros(env.num_envs, device=env.device)
-    latch = ReleaseLatch(no.clone(), no.clone(), zero.clone(), zero.clone())
+    count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    latch = ReleaseLatch(
+      grasped=no.clone(),
+      released=no.clone(),
+      dxy=zero.clone(),
+      height=zero.clone(),
+      held_on_table=no.clone(),
+      touchdown_ok=no.clone(),
+      dwell=count.clone(),
+      rel_on_table=no.clone(),
+      rel_speed=zero.clone(),
+      rel_dwell=count.clone(),
+    )
     setattr(env, _RELEASE, latch)
+  if latch.step == env.common_step_counter:
+    return latch
+  latch.step = env.common_step_counter
   grasped = _grasped_bool(env, grasp_sensor_name)
   opened = (
     latch.grasped
@@ -218,10 +275,24 @@ def _release_latch(
   pos = obj.data.root_link_pos_w
   half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
   rest_z = surface_top_z(env, surface_cfg) + half_z
-  latch.dxy = torch.where(opened, torch.norm((pos - goal)[:, :2], dim=-1), latch.dxy)
+  dxy = torch.norm((pos - goal)[:, :2], dim=-1)
+  speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
+  on_table = _on_surface_bool(env, support_sensor_name)
+  latch.dxy = torch.where(opened, dxy, latch.dxy)
   latch.height = torch.where(opened, pos[:, 2] - rest_z, latch.height)
+  latch.rel_on_table = torch.where(opened, on_table, latch.rel_on_table)
+  latch.rel_speed = torch.where(opened, speed, latch.rel_speed)
+  latch.rel_dwell = torch.where(opened, latch.dwell, latch.rel_dwell)
   latch.released |= opened
   latch.grasped = grasped
+  # M7's dwell, after the release has been recorded with the count up to the last update.
+  held_on_table = grasped & on_table
+  touchdown = held_on_table & ~latch.held_on_table
+  near = dxy < SET_DOWN_RADIUS
+  latch.touchdown_ok = torch.where(touchdown, near, latch.touchdown_ok)
+  still = held_on_table & latch.touchdown_ok & near & (speed < STILL_SPEED)
+  latch.dwell = torch.where(still, latch.dwell + 1, torch.zeros_like(latch.dwell))
+  latch.held_on_table = held_on_table
   return latch
 
 
