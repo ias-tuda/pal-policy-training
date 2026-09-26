@@ -60,6 +60,7 @@ ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 JAW_JOINT = "gripper_left_finger_joint"
 TCP_SITE = "robot/tcp_left"
 HAND_BODY = "robot/arm_left_7_link"
+TABLE_BODY = "table/table"
 PAD_SITES = (
   "robot/gripper_left_fingertip_left_site",
   "robot/gripper_left_fingertip_right_site",
@@ -92,13 +93,19 @@ PHASES = (
 )
 #: Every waypoint `waypoints` plans, in order.
 WAYPOINT_NAMES = ("pregrasp", "grasp", "lift", "carry", "place", "retreat")
+#: The place pose at the goal itself, for a cube set down at a release offset and then dragged
+#: there while held (plan S7-2, M7's drag test). Planned by `replan_place` when a phase uses it.
+DRAG_WAYPOINT = "place_goal"
 #: Phases after which the arm is held at its waypoint until it has actually stopped: before
 #: the jaw closes (a still-swinging arm shoves the cube across the table as the pads meet
 #: it), before `replan_place` measures the tracking bias (a snapshot of a swinging arm is
 #: not a bias), and before release. Fixed durations were tuned to one jaw model: with the
 #: S6 gripper (decision 0002) the same timings left the arm moving and placed 2/10, and
 #: shortening `approach` broke the old model too (0/10). Measured 2026-09-23.
-SETTLE_AFTER = ("descend", "steady", "hold")
+#: `approach` added by plan S7-2 (prep 2): at P2's W1 corner (0.37, 0.22) the -45 deg IK takes
+#: another elbow branch, and descending before the arm had caught up with `approach` landed a
+#: fingertip on the cube's top (W1 8/10 without the wait, 10/10 with it; S7 report section 6).
+SETTLE_AFTER = ("approach", "descend", "steady", "hold")
 #: "Stopped": every active env's arm joints under this speed (rad/s)...
 SETTLE_SPEED = 0.05
 #: ...or this many extra control steps, whichever comes first.
@@ -171,6 +178,16 @@ class Kin:
       3, 3
     ).copy()
 
+  def move_table(self, offset: np.ndarray) -> None:
+    """Put the table at its compiled pose + ``offset`` (x, y, z) for the collision checks:
+    the env's per-world table (DR-scene) is not in this single-world model."""
+    bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, TABLE_BODY)
+    if bid < 0:
+      raise KeyError(f"no body {TABLE_BODY!r} in the model")
+    if not hasattr(self, "_table_pos0"):
+      self._table_pos0 = self.model.body_pos[bid].copy()
+    self.model.body_pos[bid] = self._table_pos0 + np.asarray(offset, dtype=float)
+
   def pad_offset(self) -> float:
     """How far the pads reach past the grasp point along the approach axis (S1.3)."""
     tcp, rot = self.fk(self.q_default)
@@ -242,14 +259,20 @@ def hand_x_for(kin: Kin, cube_yaw: float) -> np.ndarray:
 
 
 def waypoints(
-  kin: Kin, cube_xy: np.ndarray, cube_yaw: float, target_xy: np.ndarray
+  kin: Kin,
+  cube_xy: np.ndarray,
+  cube_yaw: float,
+  target_xy: np.ndarray,
+  table_z: float | None = None,
 ) -> dict[str, np.ndarray]:
   """Joint configurations for every phase, each IK seeded from the previous one so the
   sequence stays on one solution branch. Raises if any waypoint has no solution or puts
-  the arm in contact."""
+  the arm in contact. ``table_z`` is the table's top face (m); `scene.TABLE_TOP_Z` if None."""
   from pal_mjlab.tasks.manipulation import scene
 
-  z_grasp = scene.TABLE_TOP_Z + kin.pad_offset() + PAD_CLEARANCE
+  if table_z is None:
+    table_z = scene.TABLE_TOP_Z
+  z_grasp = table_z + kin.pad_offset() + PAD_CLEARANCE
   z_high = z_grasp + CLEAR_HEIGHT
   hand_x = hand_x_for(kin, cube_yaw)
   goals = {
@@ -344,6 +367,7 @@ def replan_place(
   tcp_actual: np.ndarray,
   cube_actual: np.ndarray,
   goal: np.ndarray,
+  drag_to: np.ndarray | None = None,
 ) -> None:
   """Re-plan `place` and `retreat` from the cube's measured position in the hand.
 
@@ -365,6 +389,27 @@ def replan_place(
     hand_x,
     plan["place"],
   )
+  if drag_to is not None:
+    # The same place pose, moved along the table to put the cube on ``drag_to`` instead.
+    plan[DRAG_WAYPOINT] = _solve(
+      kin, "place", want - bias + (drag_to - goal), hand_x, plan["place"]
+    )
+
+
+def _surface_top(env, name: str) -> np.ndarray:
+  """Each env's world z of the named surface entity's top face, from physics. (B,)"""
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+  from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+
+  return surface_top_z(env, SceneEntityCfg(name)).cpu().numpy()
+
+
+def _surface_xy(env, name: str) -> np.ndarray:
+  """Each env's world xy of the named surface entity's top geom centre, from physics. (B, 2)"""
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+  from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy
+
+  return _surface_centre_xy(env, SceneEntityCfg(name)).cpu().numpy()
 
 
 def spawn_corners(
@@ -377,6 +422,49 @@ def spawn_corners(
       for yaw in (-jitter_yaw, jitter_yaw):
         out.append((np.asarray(spawn_xy) + (dx, dy), yaw))
   return out
+
+
+def box_corners(box) -> list[tuple[np.ndarray, float]]:
+  """A `pick_place_env_cfg.SpawnBox`'s centre at yaw 0, then its four xy corners at -/+ its
+  largest yaw: `spawn_corners` for a box that need not be square."""
+  centre = np.array([sum(box.x) / 2, sum(box.y) / 2])
+  out = [(centre, 0.0)]
+  for x in box.x:
+    for y in box.y:
+      for yaw in (-box.yaw, box.yaw):
+        out.append((np.array([x, y]), yaw))
+  return out
+
+
+#: DR-scene's table shift, for the corners check: x, y +/-2 cm and z +/-1 cm
+#: (`tabletop_env_cfg._DR_SCENE_TABLE_XY` / `_DR_SCENE_TABLE_HEIGHT`).
+TABLE_SHIFT_XY = 0.02
+TABLE_SHIFT_Z = 0.01
+
+
+def corner_cases(
+  box, target_xy: tuple[float, float], target_half_xy: float
+) -> list[tuple[tuple[np.ndarray, float], tuple[float, float], tuple[float, float, float]]]:
+  """Plan S7-2's corners check: ten (spawn, target, table shift) triples for one spawn box.
+
+  The spawns are `box_corners` (the centre at yaw 0, the four xy corners at -/+ the largest
+  yaw) and the centre at + the largest yaw. The targets and table shifts: the target box's
+  centre; its four corners each with the table shifted +/-2 cm the same way, +/-1 cm up or
+  down -- the targets farthest out relative to the robot; the four corners without a shift;
+  and the centre with the table shifted towards the torso (-x, -y) and down.
+  """
+  spawns = box_corners(box) + [(np.array([sum(box.x) / 2, sum(box.y) / 2]), box.yaw)]
+  tx, ty, h = target_xy[0], target_xy[1], target_half_xy
+  signs = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+  xy, dz = TABLE_SHIFT_XY, TABLE_SHIFT_Z
+  targets = [(tx, ty)] + [(tx + sx * h, ty + sy * h) for sx, sy in signs] * 2 + [(tx, ty)]
+  shifts = (
+    [(0.0, 0.0, 0.0)]
+    + [(sx * xy, sy * xy, dz if k % 2 else -dz) for k, (sx, sy) in enumerate(signs)]
+    + [(0.0, 0.0, 0.0)] * 4
+    + [(-xy, -xy, -dz)]
+  )
+  return list(zip(spawns, targets, shifts, strict=True))
 
 
 # --------------------------------------------------------------------------------------
@@ -489,11 +577,31 @@ def rollout(
   release_offsets: list[tuple[float, float]] | None = None,
   phases: tuple[tuple[str, str, bool, int], ...] | None = None,
   robot=None,
+  baseline=None,
+  spawn_box=None,
+  dr: str = "DR0",
+  tool_speed_cap=None,
+  targets: list[tuple[float, float]] | None = None,
+  table_offsets: list[tuple[float, float, float]] | None = None,
+  episode_length_s: float | None = None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
   Envs ``0..8`` get the spawn box's centre and eight corners when ``corners_first`` is
   set; the rest keep the reset event's own random jitter.
+
+  Plan S7-2: ``baseline`` (`pick_place_env_cfg.BASELINES`, S71's if None), ``spawn_box``
+  (`SPAWN_BOXES`, S71's if None; its corners are the forced ones), ``dr`` and
+  ``tool_speed_cap`` build the env as a run would. Every env plans to its own goal and its
+  own table height, read from the env, so a random target box and a moving table are
+  followed. ``targets`` puts env ``i``'s goal at ``targets[i]`` (x, y in the env frame, for
+  the table at its nominal place; it moves with the table) -- a `SurfaceOffsetCommand` goal
+  only, i.e. a baseline with a target box or DR-scene. ``table_offsets`` moves env ``i``'s
+  table by ``table_offsets[i]`` (x, y, z) -- DR-scene only, whose table is per world -- and a
+  forced spawn moves with it, as the reset event would place it. ``episode_length_s``
+  overrides the env's: the script is slow and closed-loop on purpose (settle waits, place
+  corrections) and needs ~9 s where a trained policy needs ~1, so under baseline B's 10 s
+  episode it would time out mid-place. What it tests is the action space, not the clock.
 
   ``hook(phase, env)``, if given, is called after every control step with the name of the
   phase that step belongs to (settle waits and place corrections count to their phase). It
@@ -527,6 +635,8 @@ def rollout(
   from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 
   robot_cfg = KANGAROO_GRIPPERS_LEFT_ARM if robot is None else robot
+  baseline = pp.BASELINES["S71"] if baseline is None else baseline
+  spawn_box = pp.SPAWN_BOXES["S71"] if spawn_box is None else spawn_box
 
   ev = _eval_module()
   cfg = pp.make_pick_place_env_cfg(
@@ -534,11 +644,33 @@ def rollout(
     gripper_name="left",
     reward=reward,
     action_slew_rate_scale=action_slew_rate_scale,
+    spawn=spawn_box,
+    dr=dr,
+    baseline=baseline,
+    tool_speed_cap=tool_speed_cap,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
+  if episode_length_s is not None:
+    cfg.episode_length_s = episode_length_s
   env = ManagerBasedRlEnv(cfg=cfg, device=device)
   grasp_sensor = robot_cfg.gripper("left").contact_sensor_name
+  table = env.scene[pp.TABLE]
+  table_body = table.indexing.body_ids[0]
+  if table_offsets is not None:
+    if len(table_offsets) != num_envs:
+      raise ValueError(f"{len(table_offsets)} table offsets for {num_envs} envs")
+    body_pos = env.sim.model.body_pos
+    if body_pos.shape[0] != num_envs:
+      raise ValueError(
+        "table_offsets needs a per-world table: build the env at DR-scene"
+      )
+    nominal = torch.tensor(pp.scene.table_pos(baseline.table_top_z), device=env.device)
+    for i, off in enumerate(table_offsets):
+      body_pos[i, table_body] = nominal + torch.tensor(off, device=env.device)
+    # The reset event reads the table's geom pose out of `data`, which only a forward pass
+    # brings up to date with `model`.
+    env.sim.forward()
 
   term = env.action_manager.get_term("joint_pos")
   names = [n.split("/", 1)[-1] for n in term.target_names]
@@ -576,18 +708,35 @@ def rollout(
   release_off = np.zeros((num_envs, 3))
   if release_offsets is not None:
     release_off[:, :2] = np.asarray(release_offsets, dtype=float)
+  # Each env's table offset from its nominal pose, as the reset event and goal see it.
+  table_xy0 = np.asarray(pp.scene.table_pos(baseline.table_top_z)[:2])
+  shift = np.zeros((num_envs, 3))
+  shift[:, :2] = _surface_xy(env, pp.TABLE) - origins[:, :2].cpu().numpy() - table_xy0
+  shift[:, 2] = _surface_top(env, pp.TABLE) - baseline.table_top_z
+  if targets is not None:
+    if len(targets) != num_envs:
+      raise ValueError(f"{len(targets)} targets for {num_envs} envs")
+    command = env.command_manager.get_term("goal_pose")
+    if not hasattr(command, "set_offsets"):
+      raise ValueError(
+        "targets needs a SurfaceOffsetCommand goal (target box or DR-scene)"
+      )
+    command.set_offsets(
+      torch.arange(num_envs, device=env.device),
+      torch.tensor(np.asarray(targets) - table_xy0, dtype=torch.float32),
+    )
   forced = (
     spawns
     if spawns is not None
-    else spawn_corners(pp.SPAWN_XY, pp.SPAWN_JITTER_XY, pp.SPAWN_JITTER_YAW)[:num_envs]
+    else box_corners(spawn_box)[:num_envs]
     if corners_first
     else None
   )
   if forced is not None:
     pose = obj.data.root_link_pose_w.clone()
     for i, (xy, yaw) in enumerate(forced):
-      pose[i, 0] = origins[i, 0] + float(xy[0])
-      pose[i, 1] = origins[i, 1] + float(xy[1])
+      pose[i, 0] = origins[i, 0] + float(xy[0]) + float(shift[i, 0])
+      pose[i, 1] = origins[i, 1] + float(xy[1]) + float(shift[i, 1])
       pose[i, 3:7] = torch.tensor(
         [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
       )
@@ -598,21 +747,32 @@ def rollout(
     with torch.inference_mode():
       env.step(torch.zeros(env.action_space.shape, device=env.device))
 
-  # Plan every env's waypoints from where its cube actually is.
+  # Plan every env's waypoints from where its cube actually is, to where its goal is, over
+  # its own table.
   kin = Kin.from_model(env.sim.mj_model)
   if not np.allclose(kin.q_default, offset[0, arm_idx].cpu().numpy(), atol=1e-4):
     raise RuntimeError("the IK model's default pose is not the action term's offset")
   pos = (obj.data.root_link_pos_w - origins).cpu().numpy()
   quat = obj.data.root_link_quat_w.cpu().numpy()
-  target = np.asarray(pp.TARGET_XY)
+  goals = (env.command_manager.get_term("goal_pose").command - origins).cpu().numpy()
+  table_z = _surface_top(env, pp.TABLE)
   plans = []
   hand_xs = []
   plan_error: dict[int, str] = {}
   for i in range(num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    kin.move_table(shift[i])
     try:
-      plans.append(waypoints(kin, pos[i, :2], yaw, target + release_off[i, :2]))
+      plans.append(
+        waypoints(
+          kin,
+          pos[i, :2],
+          yaw,
+          goals[i, :2] + release_off[i, :2],
+          table_z=float(table_z[i]),
+        )
+      )
     except RuntimeError as e:
       # Unreachable for the planner: the arm stays home and the env is scored as it ends.
       plan_error[i] = str(e)
@@ -690,9 +850,13 @@ def rollout(
       tally.finish(torch.nonzero(done).flatten())
       ended |= done
 
+  phase_list = phases if phases is not None else PHASES
+  # A phase that moves to `DRAG_WAYPOINT` drags the cube, still held, from its release point
+  # to the goal (plan S7-2, M7's drag test): `lower` then also plans that pose.
+  drags = any(wp == DRAG_WAYPOINT for _, wp, _, _ in phase_list)
   phase_now = ["start"]
   with torch.inference_mode():
-    for phase, wp, closed, steps in phases if phases is not None else PHASES:
+    for phase, wp, closed, steps in phase_list:
       phase_now[0] = phase
       if bool(ended.all()):
         break
@@ -703,12 +867,20 @@ def rollout(
         for i in torch.nonzero(~ended).flatten().tolist():
           if i in plan_error:
             continue
+          kin.move_table(shift[i])
           try:
             replan_place(
-              kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i] + release_off[i]
+              kin,
+              plans[i],
+              hand_xs[i],
+              tcp_a[i],
+              cube_a[i],
+              goal[i] + release_off[i],
+              drag_to=goal[i] if drags else None,
             )
           except RuntimeError as e:  # keep the open-loop place; scored as it lands
             skipped_corrections.append((i, f"replan: {e}"))
+          plans[i].setdefault(DRAG_WAYPOINT, plans[i]["place"])
       nxt = np.stack([p[wp] for p in plans])
       n = n_steps(prev, nxt, steps)
       if n > steps:
@@ -731,6 +903,7 @@ def rollout(
         lift = np.array([0.0, 0.0, PLACE_CORRECTION_LIFT])
         ups = []
         for i, (pl, hx) in enumerate(zip(plans, hand_xs, strict=True)):
+          kin.move_table(shift[i])
           try:
             ups.append(
               _solve(kin, "place", kin.fk(pl["place"])[0] + lift, hx, pl["place"])
@@ -753,6 +926,7 @@ def rollout(
             break
           shifted = nxt.copy()
           for i in fix:
+            kin.move_table(shift[i])
             try:
               up_i = _solve(
                 kin, "place", kin.fk(nxt[i])[0] - err[i], hand_xs[i], nxt[i]
@@ -916,6 +1090,12 @@ def parse_args() -> argparse.Namespace:
   r.add_argument(
     "--slew", type=float, default=1.0, help="action_slew_rate_scale (S7 FA: 0.5)"
   )
+  r.add_argument("--baseline", default="S71", help="BASELINES name (S7-2: B)")
+  r.add_argument(
+    "--spawn", default="S71", help="SPAWN_BOXES name; a W box brings P2's scales"
+  )
+  r.add_argument("--dr", default="DR0")
+  r.add_argument("--tool-speed", default="none", help="TOOL_SPEED_CAPS name (V)")
   r.add_argument("--json", type=pathlib.Path, default=None)
   m = sub.add_parser(
     "map", help="action-space reach map over a spawn grid (plan S7 P2)"
@@ -947,6 +1127,9 @@ def main() -> None:
   if args.cmd == "map":
     reach_map(args)
     return
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+  from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+
   rows = rollout(
     num_envs=args.num_envs,
     device=args.device,
@@ -954,6 +1137,11 @@ def main() -> None:
     reward=args.reward,
     corners_first=not args.random_only,
     action_slew_rate_scale=args.slew,
+    robot=SPAWN_ROBOTS[args.spawn],
+    baseline=pp.BASELINES[args.baseline],
+    spawn_box=pp.SPAWN_BOXES[args.spawn],
+    dr=args.dr,
+    tool_speed_cap=pp.TOOL_SPEED_CAPS[args.tool_speed],
   )
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)

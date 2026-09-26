@@ -18,6 +18,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from pal_mjlab.tasks.manipulation.mdp.observations import (
+  STILL_SPEED,
   _grasped_bool,
   _on_surface_bool,
   _placed_bool,
@@ -246,6 +247,22 @@ def release_quality_of(
   return floor + (1.0 - floor) * near * low
 
 
+def set_down_passed(latch, set_down_steps: int) -> torch.Tensor:
+  """Whether the latest release was a set-down (plan S7-2, module M7). (B,)
+
+  At the step the grasp opened the object rested on the surface, moved slower than
+  `observations.STILL_SPEED`, and had been held there, still, within
+  `observations.SET_DOWN_RADIUS` of the goal since a touchdown inside that radius, for at
+  least ``set_down_steps`` control steps. ``latch`` is `observations._release_latch`'s.
+  """
+  return (
+    latch.released
+    & latch.rel_on_table
+    & (latch.rel_speed < STILL_SPEED)
+    & (latch.rel_dwell >= set_down_steps)
+  )
+
+
 def release_quality(
   env: ManagerBasedRlEnv,
   command_name: str,
@@ -257,12 +274,17 @@ def release_quality(
   height_free: float = 0.01,
   height_std: float = 0.01,
   floor: float = 0.25,
+  set_down_steps: int = 0,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode.
 
   See `release_quality_of` for the grade and `observations._release_latch` for what counts
   as the release and where it is measured.
+
+  With ``set_down_steps`` > 0 (plan S7-2, module M7) the grade is paid only for a set-down
+  (`set_down_passed`), and is ``floor`` for any other release -- let go above the surface,
+  while the object still moved, too soon after putting it down, or after dragging it in.
   """
   latch = _release_latch(
     env, command_name, object_name, grasp_sensor_name, support_sensor_name, surface_cfg
@@ -270,7 +292,10 @@ def release_quality(
   q = release_quality_of(
     latch.dxy, latch.height, dist_std, height_free, height_std, floor
   )
-  return torch.where(latch.released, q, torch.full_like(q, floor))
+  paid = latch.released
+  if set_down_steps > 0:
+    paid = set_down_passed(latch, set_down_steps)
+  return torch.where(paid, q, torch.full_like(q, floor))
 
 
 def released_at_goal_graded(
@@ -285,13 +310,15 @@ def released_at_goal_graded(
   height_free: float = 0.01,
   height_std: float = 0.01,
   floor: float = 0.25,
+  set_down_steps: int = 0,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
   M1 pays ``release`` and ``placed`` every step, so a cube let go short that slides onto the
   target earns the same as one set down on it, sooner -- the late release two of three S5.2
   full-fix seeds converged to. Grading both by where the cube was let go makes the set-down
-  pay more for the rest of the episode.
+  pay more for the rest of the episode. ``set_down_steps`` > 0 pays the grade for a set-down
+  only (module M7, `release_quality`).
   """
   released = released_at_goal(
     env, command_name, object_name, grasp_sensor_name, threshold, support_sensor_name
@@ -307,6 +334,7 @@ def released_at_goal_graded(
     height_free,
     height_std,
     floor,
+    set_down_steps,
   )
 
 
@@ -323,8 +351,12 @@ def object_placed_graded(
   height_free: float = 0.01,
   height_std: float = 0.01,
   floor: float = 0.25,
+  set_down_steps: int = 0,
 ) -> torch.Tensor:
-  """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6)."""
+  """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
+
+  ``set_down_steps`` > 0 pays the grade for a set-down only (module M7, `release_quality`).
+  """
   placed = object_placed(
     env,
     command_name,
@@ -345,7 +377,32 @@ def object_placed_graded(
     height_free,
     height_std,
     floor,
+    set_down_steps,
   )
+
+
+def held_object_slide_speed(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+) -> torch.Tensor:
+  """The object's horizontal speed (m/s) while it is held *and* resting on the surface, after
+  it has been lifted once this episode; 0 otherwise. Weight it negative.
+
+  Plan S7-2's guard on M7: sliding a held cube along the table is not a set-down, and
+  M7's touchdown rule already withholds the grade from a release after one. This prices the
+  slide itself. Gated on `was_lifted` so that the first grasp -- the jaw closing on a cube
+  that rests on the table, and nudging it -- is not charged.
+  """
+  obj: Entity = env.scene[object_name]
+  speed_xy = torch.norm(obj.data.root_link_lin_vel_w[:, :2], dim=-1)
+  held_down = (
+    _grasped_bool(env, grasp_sensor_name)
+    & _on_surface_bool(env, support_sensor_name)
+    & _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  )
+  return speed_xy * held_down.float()
 
 
 def lift_height_faded(

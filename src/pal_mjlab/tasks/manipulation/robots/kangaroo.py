@@ -150,3 +150,24 @@ KANGAROO_GRIPPERS_LEFT_ARM = dataclasses.replace(
   },
   action_clip={r"gripper_left_finger_joint": (_JAW_OPEN, _JAW_CLOSED)},
 )
+
+
+# The same arm with the action scales plan S7's P2 derived for the wider spawn boxes W1 and
+# W2 at every cube yaw (S5.0 rule over both boxes' corners and centres at -45/0/+45 deg, never
+# below today's; S7 report section 6, `artifacts/s7/p2/`). Approved by Siwei 2026-09-25 17:49
+# for S7-2's W runs. What +/-45 deg needs is mostly the forearm and wrist rolls, arm 5 and 7.
+# Derived on the model before fda9492; the scales are half-widths about the home pose, so the
+# sign flip of arm 5/7 leaves them valid, and the corners test re-checks them on the new model.
+KANGAROO_GRIPPERS_LEFT_ARM_WIDE = dataclasses.replace(
+  KANGAROO_GRIPPERS_LEFT_ARM,
+  action_scale={
+    r"arm_left_1_joint": 0.90,
+    r"arm_left_2_joint": 0.85,
+    r"arm_left_3_joint": 0.65,
+    r"arm_left_4_joint": 0.80,
+    r"arm_left_5_joint": 1.55,
+    r"arm_left_6_joint": 2.40,
+    r"arm_left_7_joint": 1.20,
+    r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
+  },
+)

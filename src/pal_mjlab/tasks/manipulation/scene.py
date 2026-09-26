@@ -18,17 +18,31 @@ from __future__ import annotations
 import mujoco
 from mjlab.entity import EntityCfg
 
-#: Table top height. A real table height, and inside Kangaroo's vertical reach.
+#: Table top height. A real table height, and inside Kangaroo's vertical reach. Every run up
+#: to S7-1 trained here.
 TABLE_TOP_Z = 0.76
+#: The table top of the deployment cell, relative to the robot (plan S7-2 baseline B; Claudius's
+#: f44b49d). What has to match the cell is the cube's height in `base_link`, where the policy
+#: sees it: `base_link` stands at 0.900 m in this scene and the robot measured the resting cube
+#: at z_b = -0.060, so 0.900 - 0.060 - 0.025 = 0.815. At 0.76 the sim's cube sat 5.5 cm lower
+#: (z_b = -0.115) than the real one.
+ROBOT_CELL_TABLE_TOP_Z = 0.815
 TABLE_HALF_X = 0.30
 TABLE_HALF_Y = 0.40
 TABLE_THICKNESS = 0.04
+
+
+def table_pos(top_z: float = TABLE_TOP_Z) -> tuple[float, float, float]:
+  """Table centre in the robot's frame, in front of the base, for a top face at ``top_z``."""
+  return (0.55, 0.0, top_z - TABLE_THICKNESS / 2)
+
+
 #: Table centre in the robot's frame, in front of the base.
-TABLE_POS = (0.55, 0.0, TABLE_TOP_Z - TABLE_THICKNESS / 2)
+TABLE_POS = table_pos()
 
 
-def get_table_spec() -> mujoco.MjSpec:
-  """A static table: one top slab plus four legs."""
+def get_table_spec(top_z: float = TABLE_TOP_Z) -> mujoco.MjSpec:
+  """A static table: one top slab plus four legs, its top face at ``top_z``."""
   spec = mujoco.MjSpec()
   body = spec.worldbody.add_body(name="table")
   body.add_geom(
@@ -41,7 +55,7 @@ def get_table_spec() -> mujoco.MjSpec:
     solref=(0.02, 1.0),
     solimp=(0.95, 0.99, 0.001, 0.5, 2),
   )
-  leg_half_z = (TABLE_TOP_Z - TABLE_THICKNESS) / 2
+  leg_half_z = (top_z - TABLE_THICKNESS) / 2
   for sx in (-1, 1):
     for sy in (-1, 1):
       body.add_geom(
@@ -59,10 +73,10 @@ def get_table_spec() -> mujoco.MjSpec:
   return spec
 
 
-def get_table_cfg() -> EntityCfg:
+def get_table_cfg(top_z: float = TABLE_TOP_Z) -> EntityCfg:
   return EntityCfg(
-    spec_fn=get_table_spec,
-    init_state=EntityCfg.InitialStateCfg(pos=TABLE_POS),
+    spec_fn=lambda: get_table_spec(top_z),
+    init_state=EntityCfg.InitialStateCfg(pos=table_pos(top_z)),
   )
 
 
