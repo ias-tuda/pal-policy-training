@@ -8,8 +8,11 @@ Everything else -- tasks, rewards, observations -- goes through
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
+  DEFAULT_TABLETOP_GAINS,
+  TABLETOP_GAINS,
   get_kangaroo_grippers_tabletop_robot_cfg,
 )
 from pal_mjlab.tasks.manipulation.robot_cfg import (
@@ -171,3 +174,34 @@ KANGAROO_GRIPPERS_LEFT_ARM_WIDE = dataclasses.replace(
     r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
   },
 )
+
+
+def kangaroo_grippers_left_arm(
+  gains: str = DEFAULT_TABLETOP_GAINS,
+  base: ManipulationRobotCfg = KANGAROO_GRIPPERS_LEFT_ARM,
+) -> ManipulationRobotCfg:
+  """``base`` on the plant of plan-S8 gain code ``gains``.
+
+  ``base`` is `KANGAROO_GRIPPERS_LEFT_ARM` or its wide-scale twin for plan S7-2's W boxes
+  (plan S7-3 runs both on G20). Only the entity changes: the pelvis and arm K/D, and whether
+  gravity is compensated (`kangaroo_constants.TABLETOP_GAINS`). The action space, its scales,
+  clip and slew limit are ``base``'s for every code, so two runs that differ in the code differ
+  in the plant alone. G0 builds exactly ``base``'s robot.
+  """
+  if gains not in TABLETOP_GAINS:
+    raise ValueError(
+      f"unknown tabletop gain code {gains!r}; have {tuple(TABLETOP_GAINS)}"
+    )
+  # Every gain code rebuilds the tabletop articulation; a base on any other entity would have
+  # its robot silently swapped for it.
+  if base.entity_cfg_fn is not get_kangaroo_grippers_tabletop_robot_cfg:
+    raise ValueError(
+      "gain codes apply to the tabletop robot only; base is built by "
+      f"{getattr(base.entity_cfg_fn, '__name__', base.entity_cfg_fn)!r}"
+    )
+  return dataclasses.replace(
+    base,
+    entity_cfg_fn=functools.partial(
+      get_kangaroo_grippers_tabletop_robot_cfg, gains=gains
+    ),
+  )

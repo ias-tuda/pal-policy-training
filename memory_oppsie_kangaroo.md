@@ -3,10 +3,12 @@
 *Long-term project state. Read before starting work; update when a decision, milestone or
 result lands. Not a conversation log — replace outdated entries rather than appending.
 Keep under ~500 lines.*
-*Last updated: 2026-09-26 (pick-and-place v0: **S7-2 launched** on baseline B — jobs 159038–159047 from IAS
-`-s72` @ `f3bcfd0` (branch `siwei-s7-2`: fda9492 port, `BASELINE`/`SPAWN`/`TOOL_SPEED`, M7, V); `siwei`
-fast-forwarded to `4bf8a69` (= `siwei-s7-m6`) 2026-09-25; S8 ran in parallel on `siwei-s8`. Before:
-**S7-1 read** (158540–158547, FR 158572–158573): **FR is the base for S7-2 and X**. Reports in
+*Last updated: 2026-09-27 (pick-and-place v0: **S7-3** — S7-2's ten runs on S8's G20 plant — on branch
+`siwei-s7-3` = `siwei-s7-2` + `siwei-s8` merged; see §2. Before: 2026-09-26 **S7-2 launched** on baseline B —
+jobs 159038–159047 from IAS `-s72` @ `f3bcfd0` (branch `siwei-s7-2`: fda9492 port,
+`BASELINE`/`SPAWN`/`TOOL_SPEED`, M7, V); **S8 read at 5 k** (`siwei-s8`: `GAINS`; G20 4/5 seeds place faster
+than FR, s3 collapsed); `siwei` fast-forwarded to `4bf8a69` (= `siwei-s7-m6`) 2026-09-25. Earlier: **S7-1
+read** (158540–158547, FR 158572–158573): **FR is the base for S7-2 and X**. Reports in
 `../docs/reports/pick-place-v0/`).*
 
 ## 1. What we are building
@@ -44,6 +46,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | Pick-and-place v0 **S5.2** (reward arms for *placing*) | ✅ **read at 3–4 k** (`siwei-s5.2` @ `dad44f1`, eval @ `3323747`; **merged into `siwei` 2026-09-25**, fast-forward `cba928c` → `3323747`, `make test` 256 passed, ruff clean): base R-C-strict + modules M1 (no success termination, per-step `placed` ×8, release ×4), M2 (goal on the `was_lifted` latch ×7 + `goal_near` 3·G_0.03), M3 (lift × (1 − G_0.05(d_g))), M4 (success ×1000, keep termination); all release/placed/success gated on `was_lifted`. Only the full fix (+M1+M2+M3) is strictly increasing over the task stages (1.00 → 22.93 at scripted states); `make test` 252 passed. **Batch** launched 2026-09-24 12:26: 157927–157933, plus 157968–157970, which replace 157934–157936 (held by Slurm after a gn04 start failure; cancelled and resubmitted on the user's instruction at 14:24, `--exclude=gn04`); config verified from each run's `params/env.yaml`. **1 k early read: the full fix places 63/64 on both seeds** (64-episode eval), a real, very fast carry (probe + video); the other arms still hover. `../docs/reports/pick-place-v0/s5-2-report.md`. **4 k (64 eps each): full fix 64/64 on all 3 seeds, 0.61–0.67 s; seed 1 sets it down, seeds 2–3 mostly let go short and the cube slides in (1.2–1.5 m/s). +M1/+M1+M3 place by dropping from 3–8 cm, 3–7 k later; +M3+M4 and the control 0/64.** Base for S7 |
 | Pick-and-place v0 **S7-1** (speed bound, release quality, DR ladder; plan S7) | ✅ **read 2026-09-25** (`../docs/reports/pick-place-v0/s7-report.md` §5.5, §7; 64-episode evals at 1/2/3/5(/8) k with the release point, `artifacts/s7/eval/`): **FA** (slew 0.5) places like the S5.2 full fix (62–64/64 from 2 k) but 0.1–0.3 s slower, held-cube peak 15–30 % lower (0.9 vs 1.0–1.3 m/s; halving joint slew does not halve tool speed), and **still drifts to letting go before arrival by 3 k** (held at goal 0.83 → 0.16, 0.84 → 0.00). **FB** (M5 penalty) same peak speed, releases worst. **FR = FA + M6** (`87b50d6`) **sets the cube down on both seeds at every read** (held at goal 0.95–1.00, released 0.3–0.7 cm out, q 0.91–0.98; to 3.5 k / 5 k) at FA's rate and time → **by the plan's rule S7-2 and X build on FR**; watch its release speed (0.10 → 0.44 m/s). **DR:** placing holds to D4; D5 first to drop (60/64 at 5 k, 61/64 at 8 k). `non_finite_state` ≤ 0.073 %. Early stops (plan rule): D4 158546, FR s1 158572 (13:55); D2/FA s2/D1 met it while the session was paused. Video `artifacts/s7m6/videos/fa_vs_fr_slowmo_x4.mp4` |
 | Pick-and-place v0 **S7-2** (baseline B, M7, V, W1/W2; plan S7-2) | ⏳ **launched 2026-09-26 19:00**, jobs 159038–159047 from IAS `-s72` @ `f3bcfd0` (`siwei-s7-2`), all `running` (wandb `mjnoc503` `gn0hc5he` B; `x7kg0zwt` `jtwy6ojh` B-S; `rzi0paxg` `mhx93lbx` B-SV; `4r5td7kk` `w2ubleym` W1-B; `czuojwnd` `c3ak7nor` W2-B); 5 k, reads at 1/2/3/5 k. **Baseline B** = FR on the fda9492 model (arm 5/7 about +z, obs in `base_link`) + table 0.815 m + 10 s + target (0.46, 0.08) ±2 cm table-relative + 38-D actor (`grasped` critic-only) + jaw slew 0.04, at DR-scene. **The plan's target box (0.42, 0.07) ±3 cm failed the corners check** (near the torso the arm cannot place at 0.815 m) — moved by Siwei's decision 2026-09-26. Gates: corners S71 9/10, W1 9/10, W2 10/10; V gate 10/10; jaw-slew bench 64/64, 0 drops; M7 tests; `make test` on `f3bcfd0` **420 passed** (30:37, Mac CPU, 2026-09-26). `../docs/reports/pick-place-v0/s7-2-report.md` |
+| Pick-and-place v0 **S8** (stiff pelvis/arm gains *instead of* gravity compensation; plan S8) | 🟡 **read 2026-09-26 — no code meets the plan's bar; check-in pending.** G20: 4/5 seeds place 62–64/64 in 0.52–0.57 s (FR 0.74–0.78), s3 collapsed (11/64, std 0.02); G20s: 63–64/64 ×3 but ~2 m/s carries, elbow saturated ≤ 10 %, ~50 N set-down presses; in-batch G0 reproduces FR (and misses the plan's time bar itself, 0.89 s). The same SLEW gives a ~40 % faster tool on G20 (the soft G0 arm lags its target 0.06 rad); the body holds far better on G20 (≤ 0.024 vs G0's pelvis 0.054–0.087 rad). Eval `--plant` @ `38ca8c5`. Earlier: (`siwei-s8` @ `824aadc`, from `siwei` @ `4bf8a69`; IAS `-s8`). `GAINS` = G0 (today: SysID + gravcomp) / G15 (S4's ×15) / G20 (SysID ×20 = `impedance_control_v37`) / G20s (G20's K, D ×√20); every stiff code has no gravcomp anywhere (`kangaroo_constants.TABLETOP_GAINS`); `make test` 353. **Gates (local CPU):** hold at zero action — G20 elbows **0.0208 rad** (gate 0.02; the plan's own K ≥ 545 vs v37's 523.5), G20s 0.0208 + reset overshoot 0.029, G15 0.038; random left arm — no NaN, G20 holds the pelvis 7× better than G0, G20s rings (4.7 rad/s, elbow saturated 18 %); gripper unchanged without compensation, but under a slew-limited shake G20/G20s lose held cubes over 20 s (48 % / 100 %; 0 at 5 s); scripted 10/10 on every code. **Decision (user, 19:29): G20 + G20s train, G15 dropped.** Gate 5 (IAS, 200 it): G20 0.021 %, G20s 0.000 % `non_finite_state`. **Batch 158811–158820:** G20 ×5, G20s ×3, G0 ×2 (seeds 3–4), 5 k, reads at 1/2/3/5 k |
 | D10 -- arm/rung selection | ✅ one task id; `REWARD`/`DR` env vars validated at registration (`e27a9b5`) |
 | Checkpointing | ✅ `save_interval` 1000 (was 100); `--agent.save-only-last` collapses to one rolling file (`d299961`) |
 | Velocity, tracking, reaching tasks (inherited from upstream) | ✅ registered; no result measured *in this fork* |
@@ -268,6 +271,10 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
      +10°). B's target is (0.46, 0.08) ±2 cm (0–2 %). `artifacts/s7-2/ikmap/`.
    - **mjlab string-keyed DR `ranges` ignore `asset_cfg.joint_names`** — the keys match every
      joint of the entity. `tabletop_env_cfg._on_joints` restricts them to the action joints.
+   - **DR-robot's `dr.pd_gains` randomises all 30 actuators, not the driven joints** (found
+     2026-09-25, plan S8.0): it selects by `asset_cfg.actuator_ids`, which a
+     `SceneEntityCfg(joint_names=...)` leaves at `slice(None)`. S7-1's D3–D5 ran with it; S7-2's B
+     keeps it on purpose; not fixed. Scope it (`actuator_names=`) before S8.3.
    - **`actgravcomp` alone is unbounded under mjlab position actuators.** mjlab puts the
      effort limit on the actuator `forcerange` (PD only); MuJoCo clamps an actgravcomp joint
      only by the *joint* `actuatorfrcrange`, which mjlab leaves unset (46 N·m through a 1 N·m
@@ -411,7 +418,7 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 
 | host | what is installed / checked out there | last verified |
 |---|---|---|
-| local Mac | git source of truth: `siwei` @ **`4bf8a69`** (2026-09-26: fast-forwarded to `siwei-s7-m6`); worktrees `-s5.2`, `-s7`, `-s7m6`, **`-s72` (`siwei-s7-2`, S7-2)**, and S8's `-s8` (`siwei-s8`). Nothing pushed to `origin` — no push has been authorised | 2026-09-26 |
+| local Mac | git source of truth: `siwei` @ **`4bf8a69`** (2026-09-25 ~18:50, fast-forwarded to `siwei-s7-m6`); worktrees `-s5.2`, `-s7`, `-s7m6`, `-s72` (`siwei-s7-2`, S7-2), `-s8` (`siwei-s8`, S8), **`-s73` (`siwei-s7-3`, S7-3)**. Nothing pushed to `origin` — no push has been authorised | 2026-09-27 |
 | `Geoffery` | ~20 checkouts under `~/repo/humanoids/`; this repo's presence unverified | — |
 | `blackwell` | shallow clone under `~/repo/humanoids/`; sm_120, driver-check patch likely needed | — |
 | `limxH100` | not verified for this repo | — |
@@ -420,11 +427,18 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
 | IAS `-align` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-align`, cloned from bundle `~/align_s51.bundle` (sha256-verified) on branch `siwei-s5.1-chain` @ `b0f8b85`; own `uv sync --frozen --extra cu128` (same pins), own `slurm_logs/`; jobs pass `REPO=` to `pick_place.sbatch`. The main checkout is not touched by S5.1. Kept as c1a's record (c1a cancelled 2026-09-24) | 2026-09-24 |
 | IAS `-s52` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s52` on `siwei-s5.2` @ `dad44f1` (full 40-char sha checked by the sbatch commit guard); own `uv sync --frozen --extra cu128` (same pins), `slurm_logs/submit_s52.sh`. Readers on the login node: `~/s52_read.py` (tfevents), `~/s52_cfgcheck.py` (resolved config) | 2026-09-24 |
 | IAS `-s7` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s7` on `siwei-s7` @ `b50efcb`, deployed 2026-09-25 04:18 (full bundle, sha256-checked, own `uv sync --frozen --extra cu128`, same pins); `slurm_logs/submit_s71.sh`. **Runs S7-1 (158540–158547): do not fast-forward it while they run** | 2026-09-25 |
+| IAS `-s8` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s8` on `siwei-s8` @ `824aadc` (all S8 jobs ended 2026-09-26 00:47), cloned 2026-09-25 19:23 from `~/s8_824aadc.bundle` (sha256 matched), own `uv sync --frozen --extra cu128` (same pins); `slurm_logs/submit_s8.sh` (`PHASE=nan|batch RUNS="<code>:<seed> …"`); readers `~/s8_read.py`, `~/s8_cfgcheck.py` (prints the plant's K/D and the code), `~/s8_wandb.py`; jobs in `~/s8_jobs.txt`. **Runs S8 (158806–158807 done, 158811–158820): do not redeploy while they run** | 2026-09-25 |
 | IAS `-s7m6` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s7m6` on `siwei-s7-m6` @ `87b50d6` (M6), deployed 2026-09-25 10:09 (full bundle, sha256-checked, own uv sync, same pins); `slurm_logs/submit_s71_fr.sh`. **Runs FR (158572–158573): do not fast-forward it while they run** | 2026-09-25 |
 | IAS `-s72` checkout | `/home/ju/repo/humanoids/pal_mjlab_kangaroo_talos-s72` on `siwei-s7-2` @ `f3bcfd0`, deployed 2026-09-26 11:10 at `2d727b8` (full bundle, sha256-checked, own `uv sync --frozen --extra cu128`, same pins), fast-forwarded 18:59 (incremental bundle, sha256-checked); `slurm_logs/submit_s72.sh`, `s72_cfgcheck_0926*.txt`. **Runs S7-2 (159038–159047): do not fast-forward it while they run** | 2026-09-26 |
 | Cluster42 | staging area on `Geoffery`; nothing deployed for this repo | — |
 
 ## 9. Next steps
+
+- **S8 (read, check-in pending):** no code met the plan's bar (G20: one collapsed seed of 5;
+  G20s: violent). Plan-strict: G0 stays and 0001 gets an addendum. Alternative: keep G20 as a
+  candidate — more seeds for the collapse rate, S8.3 at DR-robot (after scoping DR-robot's
+  `pd_gains`), and a slew re-derived for the stiff plant. 1/2/3 k evals not run (checkpoints in
+  `artifacts/s8/ckpt/`, `artifacts/s8/schedule.sh jobs_early.txt`).
 
 0. ~~Read the c1a screen~~ done: 3–4 k read, then the final read after cancelling at 12–15 k
    (`s5-1-report.md` §6). It is the input to S5.2.

@@ -425,3 +425,48 @@ def test_the_grades_are_m6_and_m7s():
   assert q6 == pytest.approx(1.0) and q7 == pytest.approx(0.25 + 0.75 * math.exp(-0.25))
   q6, q7 = eval_pick_place.release_grades(0.0, 0.005, passed=False)
   assert q6 == pytest.approx(1.0) and q7 == pytest.approx(0.25)
+
+
+def _plant_step(pt, parked, track, torque, force, carrying, setdown):
+  pt.measure(
+    parked_q=torch.tensor([parked]),
+    driven_q=torch.zeros(1, 7),
+    driven_target=torch.full((1, 7), track),
+    gained_torque=torch.tensor([torque]),
+    table_force=torch.tensor([force]),
+    carrying=torch.tensor([carrying]),
+    setdown=torch.tensor([setdown]),
+  )
+
+
+def test_the_plant_reads_bank_per_episode_and_clear_between_them():
+  """Plan S8's `--plant` reads: hold, tracking, saturation, set-down force, per episode."""
+  pt = eval_pick_place.PlantTally(
+    1,
+    "cpu",
+    ["a", "b"],
+    torch.zeros(1, 2),
+    ["a", "b", "c"],
+    torch.tensor([10.0, 10.0, 5.0]),
+  )
+  _plant_step(pt, [0.01, -0.03], 0.1, [10.0, 0.0, 1.0], 3.0, False, False)
+  _plant_step(pt, [0.02, 0.00], 0.2, [0.0, -10.0, 5.0], 7.0, True, True)
+  pt.finish(torch.tensor([0]))
+  row = pt.done[0]
+  assert row["parked_hold_max"] == pytest.approx(0.03)
+  assert row["parked_hold_mean"] == pytest.approx((0.02 + 0.01) / 2)
+  # Tracking and set-down force count only their own steps.
+  assert row["carry_steps"] == 1
+  assert row["track_carry_mean"] == pytest.approx(0.2)
+  assert row["track_carry_max"] == pytest.approx(0.2)
+  assert row["setdown_force_peak"] == pytest.approx(7.0)
+  # Saturation: |torque| at the joint's own limit, either sign, over all steps.
+  summary = pt.summarise(1)
+  assert summary["plant_saturation_share"] == {"a": 0.5, "b": 0.5, "c": 0.5}
+  assert summary["plant_parked_worst_joint"] == "b"
+  # The next episode starts clean.
+  _plant_step(pt, [0.0, 0.0], 0.0, [0.0, 0.0, 0.0], 9.0, False, False)
+  pt.finish(torch.tensor([0]))
+  assert pt.done[1]["parked_hold_max"] == 0.0
+  assert pt.done[1]["track_carry_mean"] is None
+  assert pt.done[1]["setdown_force_peak"] is None
