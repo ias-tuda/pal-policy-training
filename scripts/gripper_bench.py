@@ -48,6 +48,7 @@ import concurrent.futures
 import dataclasses
 import json
 import math
+import os
 import pathlib
 import re
 import subprocess
@@ -106,9 +107,22 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--worlds", type=int, default=64, help="random/shake worlds")
   p.add_argument("--seconds", type=float, default=20.0, help="random/shake duration")
   p.add_argument("--shake-amp", type=float, default=0.3, help="rad, arm target noise")
+  p.add_argument(
+    "--shake-slew",
+    type=float,
+    default=None,
+    help="rate-limit the shake's arm target like the task does: this factor x the URDF "
+    "slew (plan S7 FA: 0.5). Default: unlimited, as S6 ran it",
+  )
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--workers", type=int, default=8)
   p.add_argument("--out", type=pathlib.Path, default=pathlib.Path("artifacts/s6"))
+  p.add_argument(
+    "--gains",
+    default=None,
+    help="plan-S8 gain code (G0 | G15 | G20 | G20s) the task's robot is built on; sets "
+    "$GAINS for the registry. Default: $GAINS as it is, else G0",
+  )
   for f in dataclasses.fields(Levers):
     p.add_argument(f"--{f.name.replace('_', '-')}", type=float, default=None)
   p.add_argument(
@@ -540,6 +554,7 @@ def _shake_worker(lv: Levers, args, world_ids: list[int]) -> dict:
     model.geom_conaffinity[g] = 0
   cube_weight = model.body_subtreemass[ids.cube_body] * -model.opt.gravity[2]
   n_ctrl = round(args.seconds / CONTROL_DT)
+  slew = None if args.shake_slew is None else _arm_slew_per_step(args.shake_slew)
   worlds, grips, slips, drops, forces, tcp_speed = [], [], [], [], [], []
   for wid in world_ids:
     rng = np.random.default_rng([args.seed, 10_000 + wid])
@@ -560,10 +575,14 @@ def _shake_worker(lv: Levers, args, world_ids: list[int]) -> dict:
     tcp = _PeakSpeed(w.d, ids.tcp_site, model.opt.timestep)
 
     arm_default = ids.default_ctrl[ids.arm_act]
+    arm_target = arm_default.copy()
     for _ in range(n_ctrl if ok else 0):
-      w.d.ctrl[ids.arm_act] = arm_default + rng.uniform(
-        -args.shake_amp, args.shake_amp, size=7
-      )
+      proposal = arm_default + rng.uniform(-args.shake_amp, args.shake_amp, size=7)
+      if slew is None:
+        arm_target = proposal
+      else:
+        arm_target = arm_target + np.clip(proposal - arm_target, -slew, slew)
+      w.d.ctrl[ids.arm_act] = arm_target
       if not w.control_step(on_physics=tcp):
         break
       max_slip = max(max_slip, float(np.linalg.norm(w.cube_in_hand() - ref)))
@@ -580,6 +599,27 @@ def _shake_worker(lv: Levers, args, world_ids: list[int]) -> dict:
     "tcp_speed": tcp_speed,
   }
   return out
+
+
+def _arm_slew_per_step(factor: float) -> np.ndarray:
+  """The task's arm slew limit in rad per control step, in `Ids.arm_act` order.
+
+  The robot's URDF joint speeds (`KANGAROO_GRIPPERS.joint_velocity_limits`) x the control
+  period x ``factor`` -- what `mdp.RateLimitedJointPositionAction` allows a target to move per
+  step. Without it a shake jumps the target by up to 2 x ``--shake-amp`` per step, which a
+  stiff arm (plan S8) follows at several m/s at the tool.
+  """
+  from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS
+
+  limits = KANGAROO_GRIPPERS.joint_velocity_limits
+  return np.array(
+    [
+      next(v for rx, v in limits.items() if re.fullmatch(rx, f"arm_{SIDE}_{k}_joint"))
+      * CONTROL_DT
+      * factor
+      for k in range(1, 8)
+    ]
+  )
 
 
 class _PeakSpeed:
@@ -794,6 +834,10 @@ def main() -> None:
     report(args.report)
     return
   lv = Levers(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Levers)})
+  if args.gains is not None:
+    # `build_model` imports the registry lazily, here and in every worker process, and the
+    # pick-place cfg reads $GAINS at import (plan S8) -- so setting it now selects the plant.
+    os.environ["GAINS"] = args.gains
   stimuli = STIMULI if args.stimulus == "all" else (args.stimulus,)
   args.out.mkdir(parents=True, exist_ok=True)
   path = args.out / f"{args.name}.json"
@@ -805,7 +849,9 @@ def main() -> None:
     worlds=args.worlds,
     seconds=args.seconds,
     shake_amp=args.shake_amp,
+    shake_slew=args.shake_slew,
     seed=args.seed,
+    gains=os.environ.get("GAINS", "G0"),
     provenance=provenance(),
   )
   for s in stimuli:

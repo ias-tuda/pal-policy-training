@@ -125,6 +125,16 @@ def release_grades(dxy: float, dz: float, passed: bool) -> tuple[float, float]:
   return q(g["height_free"]), (q(0.0) if passed else g["floor"])
 
 
+#: Plan S8's plant reads (`--plant`): the joints a gain code changes that the policy does not
+#: drive -- the parked right arm and the pelvis -- the arm it does drive, and all of them.
+PARKED_JOINTS = r"(arm_right_[1-7]|pelvis_[12])_joint"
+DRIVEN_ARM_JOINTS = r"arm_left_[1-7]_joint"
+GAINED_JOINTS = r"(pelvis_[12]|arm_(left|right)_[1-7])_joint"
+#: A joint counts as at its effort limit within this fraction of it: the limit clamps the
+#: torque exactly, and the margin absorbs float32 round-off. As `hold_check.py`.
+SATURATION_FRACTION = 0.999
+
+
 def parse_args() -> argparse.Namespace:
   p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   p.add_argument("--checkpoint", type=pathlib.Path, required=True, help="model_*.pt")
@@ -135,6 +145,12 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--seed", type=int, default=0)
   p.add_argument(
     "--json", type=pathlib.Path, default=None, help="also write the result"
+  )
+  p.add_argument(
+    "--plant",
+    action="store_true",
+    help="also read the plant (plan S8): parked-arm/pelvis hold error, the driven arm's "
+    "tracking error while carrying, effort saturation, cube-table force at set-down",
   )
   return p.parse_args()
 
@@ -417,6 +433,190 @@ class Tally:
     self.sd_released[env_ids] = False
 
 
+class PlantTally:
+  """Plan S8's plant reads, per episode, kept beside `Tally` and banked with it.
+
+  * parked hold -- |q - q_default| of the parked right arm and the pelvis, which are commanded
+    to their default the whole episode: the episode's max, and its mean over steps and joints;
+  * tracking -- the driven arm's |q* - q| while the cube is carried (held and off the table),
+    q* being its position actuators' target: the episode's mean over carrying steps and the
+    seven joints, and its max over both;
+  * saturation -- how many steps each pelvis/arm joint's actuator torque sits at its effort
+    limit, over the whole rollout;
+  * set-down force -- the peak cube-table normal force while the cube is held within
+    `NEAR_XY` of the target: how hard the arm presses the cube into the table.
+
+  Tensors in, so the accounting is testable without an env; `from_env` wires one to it.
+  """
+
+  def __init__(
+    self,
+    num_envs: int,
+    device: str,
+    parked_names: list[str],
+    parked_default: torch.Tensor,
+    gained_names: list[str],
+    effort: torch.Tensor,
+  ) -> None:
+    self.parked_names = parked_names
+    self.parked_default = parked_default
+    self.gained_names = gained_names
+    self.effort = effort
+    zf = lambda: torch.zeros(num_envs, device=device)  # noqa: E731
+    self.steps = torch.zeros(num_envs, dtype=torch.long, device=device)
+    self.park_max = zf()
+    self.park_sum = zf()
+    self.carry_n = torch.zeros(num_envs, dtype=torch.long, device=device)
+    self.track_sum = zf()
+    self.track_max = zf()
+    self.setdown_n = torch.zeros(num_envs, dtype=torch.long, device=device)
+    self.force_peak = zf()
+    self.park_joint_max = torch.zeros(len(parked_names), device=device)
+    self.sat_count = torch.zeros(len(gained_names), dtype=torch.long, device=device)
+    self.sat_steps = 0
+    self.done: list[dict[str, float | int | None]] = []
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> PlantTally:
+    import re
+
+    import mujoco
+
+    robot = env.scene[ROBOT]
+    names = list(robot.joint_names)
+    pick = lambda rx: [i for i, n in enumerate(names) if re.fullmatch(rx, n)]  # noqa: E731
+    parked, driven, gained = (
+      pick(PARKED_JOINTS),
+      pick(DRIVEN_ARM_JOINTS),
+      pick(GAINED_JOINTS),
+    )
+    mj = env.sim.mj_model
+    actuator = {
+      (mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_ACTUATOR, a) or "").split("/")[-1]: a
+      for a in range(mj.nu)
+    }
+    tally = cls(
+      env.num_envs,
+      env.device,
+      [names[i] for i in parked],
+      robot.data.default_joint_pos[:, parked].clone(),
+      [names[i] for i in gained],
+      torch.tensor(
+        [float(mj.actuator_forcerange[actuator[names[i]], 1]) for i in gained],
+        device=env.device,
+      ),
+    )
+    tally._robot = robot
+    tally._sim = env.sim
+    tally._support = env.scene[SUPPORT_SENSOR]
+    tally._idx = (parked, driven, gained)
+    tally._driven_ctrl = torch.tensor(
+      [actuator[names[i]] for i in driven], device=env.device
+    )
+    return tally
+
+  def measure_env(self, carrying: torch.Tensor, setdown: torch.Tensor) -> None:
+    """`measure` from the env `from_env` was built on, at the current state."""
+    parked, driven, gained = self._idx
+    q = self._robot.data.joint_pos
+    force = self._support.data.force  # (B, slots, 3), contact frame: normal first
+    self.measure(
+      parked_q=q[:, parked],
+      driven_q=q[:, driven],
+      driven_target=self._sim.data.ctrl[:, self._driven_ctrl],
+      gained_torque=self._robot.data.qfrc_actuator[:, gained],
+      table_force=force[..., 0].abs().amax(dim=-1),
+      carrying=carrying,
+      setdown=setdown,
+    )
+
+  def measure(
+    self,
+    parked_q: torch.Tensor,
+    driven_q: torch.Tensor,
+    driven_target: torch.Tensor,
+    gained_torque: torch.Tensor,
+    table_force: torch.Tensor,
+    carrying: torch.Tensor,
+    setdown: torch.Tensor,
+  ) -> None:
+    """One step. Shapes (B, parked), (B, 7), (B, 7), (B, gained), (B,), (B,), (B,)."""
+    carrying, setdown = carrying.bool(), setdown.bool()
+    park_err = (parked_q - self.parked_default).abs()
+    self.park_max = torch.maximum(self.park_max, park_err.amax(dim=-1))
+    self.park_sum += park_err.mean(dim=-1)
+    self.park_joint_max = torch.maximum(self.park_joint_max, park_err.amax(dim=0))
+    self.steps += 1
+    track = (driven_target - driven_q).abs()
+    self.carry_n += carrying.long()
+    self.track_sum += torch.where(
+      carrying, track.mean(dim=-1), torch.zeros_like(self.track_sum)
+    )
+    self.track_max = torch.where(
+      carrying, torch.maximum(self.track_max, track.amax(dim=-1)), self.track_max
+    )
+    self.setdown_n += setdown.long()
+    self.force_peak = torch.where(
+      setdown, torch.maximum(self.force_peak, table_force), self.force_peak
+    )
+    self.sat_count += (gained_torque.abs() >= SATURATION_FRACTION * self.effort).sum(
+      dim=0
+    )
+    self.sat_steps += gained_torque.shape[0]
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    """Bank the episodes that just ended, in the order `Tally.finish` banks them."""
+    for i in env_ids.tolist():
+      steps, carry, setdown = (
+        int(self.steps[i]),
+        int(self.carry_n[i]),
+        int(self.setdown_n[i]),
+      )
+      self.done.append(
+        {
+          "parked_hold_max": float(self.park_max[i]) if steps else None,
+          "parked_hold_mean": float(self.park_sum[i]) / steps if steps else None,
+          "carry_steps": carry,
+          "track_carry_mean": float(self.track_sum[i]) / carry if carry else None,
+          "track_carry_max": float(self.track_max[i]) if carry else None,
+          "setdown_force_peak": float(self.force_peak[i]) if setdown else None,
+        }
+      )
+    for acc in (
+      self.park_max,
+      self.park_sum,
+      self.track_sum,
+      self.track_max,
+      self.force_peak,
+    ):
+      acc[env_ids] = 0.0
+    for acc in (self.steps, self.carry_n, self.setdown_n):
+      acc[env_ids] = 0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    vals = lambda k: [r[k] for r in rows if r[k] is not None]  # noqa: E731
+    mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
+    median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+    share = (self.sat_count.float() / max(self.sat_steps, 1)).tolist()
+    worst = int(torch.argmax(self.park_joint_max))
+    return {
+      "plant_parked_hold_max_median_rad": median(vals("parked_hold_max")),
+      "plant_parked_hold_max_rad": max(vals("parked_hold_max"), default=None),
+      "plant_parked_hold_mean_rad": mean(vals("parked_hold_mean")),
+      "plant_parked_worst_joint": self.parked_names[worst],
+      "plant_parked_max_by_joint_rad": dict(
+        zip(self.parked_names, self.park_joint_max.tolist(), strict=True)
+      ),
+      "plant_track_carry_mean_rad": mean(vals("track_carry_mean")),
+      "plant_track_carry_max_median_rad": median(vals("track_carry_max")),
+      "plant_saturation_share": dict(zip(self.gained_names, share, strict=True)),
+      "plant_saturation_share_max": max(share, default=None),
+      "plant_setdown_force_peak_median_n": median(vals("setdown_force_peak")),
+      "plant_setdown_force_peak_max_n": max(vals("setdown_force_peak"), default=None),
+    }
+
+
 def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
   cfg = load_env_cfg(args.task, play=True)
   # `play=True` removes observation corruption and the curriculum, both of which we want
@@ -425,6 +625,18 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
   cfg.episode_length_s = load_env_cfg(args.task, play=False).episode_length_s
   cfg.scene.num_envs = args.num_envs
   cfg.seed = args.seed
+  if getattr(args, "plant", False):
+    # The support sensor records contact only (`found`); the set-down read needs its force
+    # too. A sensor field is read-only on the physics, and `found` -- what every other read
+    # here uses -- is unchanged.
+    import dataclasses
+
+    cfg.scene.sensors = tuple(
+      dataclasses.replace(s, fields=(*s.fields, "force"))
+      if s.name == SUPPORT_SENSOR and "force" not in s.fields
+      else s
+      for s in cfg.scene.sensors
+    )
   return ManagerBasedRlEnv(cfg=cfg, device=args.device)
 
 
@@ -672,6 +884,30 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
   print(f"    mean episode             {result['mean_episode_length_s']:6.2f} s")
   print(f"    time to place            {'n/a' if ttp is None else f'{ttp:6.2f} s'}")
 
+  if "plant_parked_hold_mean_rad" in result:
+    fmt3 = lambda v, u="rad": "n/a" if v is None else f"{v:7.4f} {u}"  # noqa: E731
+    print("\n  PLANT (plan S8) --------------------------------------------------")
+    print(
+      f"    parked arm + pelvis hold {fmt3(result['plant_parked_hold_max_median_rad'])}"
+      f"  (episode max, median; worst {result['plant_parked_worst_joint']})"
+    )
+    print(f"      max over episodes      {fmt3(result['plant_parked_hold_max_rad'])}")
+    print(f"      mean                   {fmt3(result['plant_parked_hold_mean_rad'])}")
+    print(
+      f"    driven arm |q*-q| carry  {fmt3(result['plant_track_carry_mean_rad'])}"
+      f"  (mean; episode max, median {fmt3(result['plant_track_carry_max_median_rad'])})"
+    )
+    sat = result["plant_saturation_share"]
+    top = sorted(sat.items(), key=lambda kv: -kv[1])[:3]
+    print(
+      "    at effort limit          "
+      + ", ".join(f"{n.removesuffix('_joint')} {v:.1%}" for n, v in top)
+    )
+    print(
+      f"    set-down force, peak     {fmt3(result['plant_setdown_force_peak_median_n'], 'N')}"
+      f"  (median; max {fmt3(result['plant_setdown_force_peak_max_n'], 'N')})"
+    )
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -691,6 +927,7 @@ def main() -> None:
   )
 
   tally = Tally(args.num_envs, args.device)
+  plant = PlantTally.from_env(env) if args.plant else None
   reward_sums: dict[str, list[float]] = {}
 
   obs, _ = wrapped.reset()
@@ -701,7 +938,12 @@ def main() -> None:
       tally.record(obj_pos, obj_yaw, table_offset, goal)
       flags = probe(env, grasp_sensor)
       tally.observe(**flags)
-      tally.measure(flags["grasped"], *geometry(env))
+      dxy, dz = geometry(env)
+      tally.measure(flags["grasped"], dxy, dz)
+      if plant is not None:
+        plant.measure_env(
+          carrying=flags["lifted"], setdown=flags["grasped"] & (dxy < NEAR_XY)
+        )
       tally.measure_speed(flags["grasped"], *positions(env), env.step_dt, goal)
       tally.measure_set_down(
         flags["grasped"],
@@ -715,6 +957,8 @@ def main() -> None:
       finished = torch.nonzero(dones, as_tuple=False).flatten()
       if finished.numel():
         tally.finish(finished)
+        if plant is not None:
+          plant.finish(finished)
         for key, value in extras.get("log", {}).items():
           if key.startswith("Episode_Reward/"):
             reward_sums.setdefault(key.removeprefix("Episode_Reward/"), []).append(
@@ -722,6 +966,8 @@ def main() -> None:
             )
 
   result = summarise(tally, env.step_dt, args.episodes)
+  if plant is not None:
+    result.update(plant.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
