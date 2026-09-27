@@ -20,9 +20,15 @@ arcs anyway. Its episode is 30 s: the script is slow and closed-loop on purpose,
 checked here is the action space, not the clock (`rollout(episode_length_s=...)`).
 
 Measured 2026-09-26 (Mac, CPU): 9/10 on each of S71, W1 and W2.
+
+Plan S7-3 (S7-2 on S8's G20 plant) runs the same check as its gate 4, on its own plant and, for
+B-SV, under V: ``GAINS=G20`` builds each box's arm on that gain code, ``TOOL_SPEED=V`` adds the
+tool speed cap. They are read from the variables the task reads, so unset they give S7-2's
+check.
 """
 
 import importlib.util
+import os
 import pathlib
 import sys
 
@@ -31,6 +37,7 @@ import pytest
 from conftest import get_test_device
 from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
 from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
 
 _SCRIPT = pathlib.Path(__file__).parent.parent / "scripts/scripted_pick_place.py"
 _SPEC = importlib.util.spec_from_file_location("scripted_pick_place_s72", _SCRIPT)
@@ -43,6 +50,12 @@ REQUIRED = 9
 #: The script's carry height over the grasp pose, m (see the module docstring).
 CARRY_HEIGHT = 0.05
 B = pp.BASELINES["B"]
+#: The plant and the tool speed cap (plan S7-3, see the module docstring).
+GAINS = os.environ.get("GAINS", "G0")
+TOOL_SPEED = os.environ.get("TOOL_SPEED", "none")
+#: Under V the script stretches every move to V's bound; the V gate gives it 40 s
+#: (`test_pick_place_tool_speed.py`).
+EPISODE_S = 40.0 if TOOL_SPEED == "V" else 30.0
 
 
 @pytest.fixture(scope="module", params=sorted(pp.SPAWN_BOXES))
@@ -65,14 +78,15 @@ def corners(request):
       reward="R-C-strict+M1+M2+M3+M6",
       verbose=False,
       action_slew_rate_scale=0.5,
-      robot=SPAWN_ROBOTS[name],
+      robot=kangaroo_grippers_left_arm(GAINS, SPAWN_ROBOTS[name]),
       baseline=B,
       spawn_box=pp.SPAWN_BOXES[name],
       dr="DR-scene",
+      tool_speed_cap=pp.TOOL_SPEED_CAPS[TOOL_SPEED],
       spawns=[c[0] for c in cases],
       targets=[c[1] for c in cases],
       table_offsets=[c[2] for c in cases],
-      episode_length_s=30.0,
+      episode_length_s=EPISODE_S,
       hook=hook,
     )
   finally:
