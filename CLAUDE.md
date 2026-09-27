@@ -194,6 +194,11 @@ Claims that have already been wrong here:
   pose into `table/table`'s local offset. Writing the anchor's `model.body_pos` instead moved
   the table only at the next reset, and added the move to the DR draw. Look bodies up by name.
   (Found by the S7-2 corners check's positive control, 2026-09-26, `f3bcfd0`.)
+- **"The corners check fails under V" (0/10) was a time-out, not a failure.** At 40 s every case ran out of
+  episode mid-place, on G0 as on G20, and the "final cube distance" it reported (~19 cm, the spawn-target
+  distance) was the respawned cube's. Read a scripted rollout's `ended_by` and `length` before reading its
+  misses, and run the control plant before blaming the new one. (Found 2026-09-27, plan S7-3 gate 4; the
+  check runs 120 s under V since `e4cd58a`.)
 - *(Add every further claim that turns out wrong. These lines are the most valuable in the file.)*
 
 ---
