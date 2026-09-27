@@ -88,6 +88,18 @@ New Features & Tasks
   ``TOOL_SPEED`` through and adds them to the run name and wandb tags.
   (``346840a``, ``2d727b8``, ``f3bcfd0``.)
 
+- **New: stiff arm gains instead of gravity compensation,** selected with
+  ``GAINS`` in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. ``GAINS=G20`` gives
+  the pelvis and both arms 20 times the identified stiffness and damping, the
+  gains of PAL's ``impedance_control_v37`` configuration, and turns the
+  simulator's gravity compensation off, so the arms hold themselves up by
+  stiffness alone. ``G15`` (15 times the stiffness) and ``G20s`` (``G20``'s
+  stiffness with less damping) are variants of it. ``GAINS`` defaults to
+  ``G0``: the identified gains with gravity compensation, as in every earlier
+  run. It combines with every ``SPAWN`` box. The IAS training script passes it
+  through and adds it to the run name and wandb tags. (``1b750eb``,
+  ``ca6d490``.)
+
 - **New: a release-quality reward arm, ``R-C-strict+M1+M2+M3+M6``.** It is
   ``R-C-strict+M1+M2+M3`` with its release and placed rewards scaled by how
   well the cube was last let go: 1 for a cube set down on the target, falling
