@@ -53,9 +53,12 @@ B = pp.BASELINES["B"]
 #: The plant and the tool speed cap (plan S7-3, see the module docstring).
 GAINS = os.environ.get("GAINS", "G0")
 TOOL_SPEED = os.environ.get("TOOL_SPEED", "none")
-#: Under V the script stretches every move to V's bound; the V gate gives it 40 s
-#: (`test_pick_place_tool_speed.py`).
-EPISODE_S = 40.0 if TOOL_SPEED == "V" else 30.0
+#: Under V the script stretches every move to V's bound, and the 5 cm carry keeps the held cube
+#: inside V's 0.1 m/s slow zone all the way: at 40 s (the V gate's episode,
+#: `test_pick_place_tool_speed.py`) every case timed out mid-place, on G0 and G20 alike (approach
+#: 223 and carry 374 control steps; 2026-09-27). The rollout stops when its schedule ends, so a
+#: long episode costs nothing.
+EPISODE_S = 120.0 if TOOL_SPEED == "V" else 30.0
 
 
 @pytest.fixture(scope="module", params=sorted(pp.SPAWN_BOXES))
