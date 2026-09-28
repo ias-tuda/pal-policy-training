@@ -54,6 +54,103 @@ class RateLimitedJointPositionAction(JointPositionAction):
     # The last target actually commanded, which the next one is measured against. Seeded
     # with the default pose, which is what `_offset` holds under `use_default_offset`.
     self._last_target = self._default_target()
+    self._range_idx, self._range = self._resolve_range_clip(cfg, env)
+    self._band_idx, self._band = self._resolve_effort_band(cfg, env)
+    #: Per env, whether T's band / C's range clip moved the target at the last step. For the
+    #: plan's check that neither binds during a scripted carry, and for the eval.
+    self.band_hit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    self.range_hit = torch.zeros_like(self.band_hit)
+
+  def _indices(self, patterns: tuple[str, ...], what: str) -> torch.Tensor:
+    index_list, _ = resolve_matching_names(patterns, self._target_names)
+    if not index_list:
+      raise ValueError(
+        f"{what} matched no actuator; patterns={list(patterns)}, "
+        f"targets={self._target_names}"
+      )
+    return torch.tensor(index_list, device=self.device, dtype=torch.long)
+
+  def _resolve_range_clip(self, cfg, env):
+    """Plan S7-4's C: the named joints' targets are clipped to their joint range. (idx, (B, n, 2))"""
+    if not cfg.range_clip_joints:
+      return None, None
+    idx = self._indices(cfg.range_clip_joints, "range_clip_joints")
+    limits = self._entity.data.joint_pos_limits[:, self._target_ids[idx]].clone()
+    if not torch.isfinite(limits).all():
+      raise ValueError("range_clip_joints names a joint without a finite range")
+    return idx, limits
+
+  def _resolve_effort_band(self, cfg, env):
+    """Plan S7-4's T: the band the named joints' targets are kept in, as (idx, (n, 3)) rows of
+    (tau_cmd / K, D / K, K).
+
+    The target q* is kept where the position actuator's own PD output stays within the cap,
+
+        |K (q* - q) - D qdot| <= tau_cmd,   i.e.   q* in q + (D / K) qdot +/- tau_cmd / K,
+
+    so the PD can never command more than tau_cmd and a target cannot run away past what the
+    capped actuator can deliver (S7-3's press). The plan wrote the band as q +/- tau_cmd / K,
+    the K term alone; on G20 that is not the PD's output while the arm moves -- a joint moving
+    at qdot needs K (q* - q) = tau_g + D qdot, D qdot of which the D term takes back -- and it
+    capped every move at (tau_cmd - tau_g) / D, ~0.2 rad/s on the elbow: it bound on every step
+    of the scripted approach (S7-4 prep 3, 2026-09-28). Centred on (D / K) qdot it binds only
+    where the capped actuator would saturate anyway.
+
+    tau_cmd is the joint's effort limit as the compiled model carries it -- the joint's
+    ``actuatorfrcrange`` where it is limited (the lowered cap, `_cap_left_arm_effort`), else
+    its actuator's ``forcerange`` -- and K, D the actuator's nominal gains: what a deployer
+    knows, not a DR draw.
+    """
+    if not cfg.effort_band_joints:
+      return None, None
+    idx = self._indices(cfg.effort_band_joints, "effort_band_joints")
+    mj = env.sim.mj_model
+    ctrl_of = {}
+    for actuator in self._entity.actuators:
+      for name, ctrl in zip(
+        actuator.target_names, actuator.global_ctrl_ids.tolist(), strict=True
+      ):
+        ctrl_of[name.split("/")[-1]] = ctrl
+    joint_ids = self._entity.indexing.joint_ids[self._target_ids[idx]].tolist()
+    half = []
+    for i, jid in zip(idx.tolist(), joint_ids, strict=True):
+      name = self._target_names[i].split("/")[-1]
+      ctrl = ctrl_of[name]
+      if mj.jnt_actfrclimited[jid]:
+        tau = float(mj.jnt_actfrcrange[jid, 1])
+      elif mj.actuator_forcelimited[ctrl]:
+        tau = float(mj.actuator_forcerange[ctrl, 1])
+      else:
+        raise ValueError(f"effort_band_joints: {name} has no effort limit")
+      k = float(mj.actuator_gainprm[ctrl, 0])
+      d = -float(mj.actuator_biasprm[ctrl, 2])
+      half.append((tau / k, d / k, k))
+    return idx, torch.tensor(half, device=self.device)
+
+  def _bound(self) -> None:
+    """Plan S7-4's bounds on the final target, after the slew and any tool cap: T's band
+    about the measured position, then C's joint range."""
+    target = self._processed_actions
+    if self._band_idx is not None:
+      joints = self._target_ids[self._band_idx]
+      centre = (
+        self._entity.data.joint_pos[:, joints]
+        + self._band[:, 1] * self._entity.data.joint_vel[:, joints]
+      )
+      half = self._band[:, 0]
+      before = target[:, self._band_idx]
+      after = torch.clamp(before, centre - half, centre + half)
+      self.band_hit = (after != before).any(dim=-1)
+      target[:, self._band_idx] = after
+    if self._range_idx is not None:
+      before = target[:, self._range_idx]
+      after = torch.clamp(before, self._range[..., 0], self._range[..., 1])
+      self.range_hit = (after != before).any(dim=-1)
+      target[:, self._range_idx] = after
+    self._processed_actions = target
+
+  def _shape_step(self, previous: torch.Tensor) -> None:
+    """Hook between the slew and the bounds, on `_processed_actions`. None here."""
 
   def _default_target(self) -> torch.Tensor:
     if isinstance(self._offset, torch.Tensor):
@@ -63,9 +160,12 @@ class RateLimitedJointPositionAction(JointPositionAction):
     )
 
   def process_actions(self, actions: torch.Tensor) -> None:
+    previous = self._last_target.clone()
     super().process_actions(actions)  # scale, offset, then clip
-    delta = (self._processed_actions - self._last_target).clamp(-self._rate, self._rate)
-    self._processed_actions = self._last_target + delta
+    delta = (self._processed_actions - previous).clamp(-self._rate, self._rate)
+    self._processed_actions = previous + delta
+    self._shape_step(previous)
+    self._bound()
     self._last_target = self._processed_actions.clone()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
@@ -87,6 +187,17 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
   a tuning knob: a target the real servo cannot reach within one control period is a target
   that only ever existed in the solver.
   """
+
+  range_clip_joints: tuple[str, ...] | None = None
+  """Plan S7-4's C: actuator regexes whose target is clipped to the joint's range, after the
+  slew. mjlab's position actuators are ``ctrllimited=False``, so a target past a limit pushes
+  the joint into its stop at up to full effort (S7-3's elbow run-away). None for none."""
+
+  effort_band_joints: tuple[str, ...] | None = None
+  """Plan S7-4's T: actuator regexes whose target is kept where the actuator's PD output
+  stays within the effort cap, q* in q + (D / K) qdot +/- tau_cmd / K, after the slew
+  (`RateLimitedJointPositionAction._resolve_effort_band`). None for none. Like the slew, a
+  deployer must apply both bounds to reproduce training."""
 
   def build(self, env: ManagerBasedRlEnv) -> RateLimitedJointPositionAction:
     return RateLimitedJointPositionAction(self, env)
@@ -168,9 +279,8 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
       torch.full_like(height, cfg.speed_limit),
     )
 
-  def process_actions(self, actions: torch.Tensor) -> None:
-    previous = self._last_target.clone()
-    super().process_actions(actions)  # scale, offset, clip, then the per-joint slew
+  def _shape_step(self, previous: torch.Tensor) -> None:
+    # After scale, offset, clip and the per-joint slew; before plan S7-4's bounds.
     target = self._processed_actions
     dq = target[:, self._capped] - previous[:, self._capped]
     travel = (dq.abs() * self._lever_arms()).sum(dim=-1)  # bound on the tool's move, m
@@ -179,7 +289,6 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
     shrink = (allowed / travel.clamp_min(1e-9)).clamp(max=1.0)
     target[:, self._capped] = previous[:, self._capped] + dq * shrink.unsqueeze(-1)
     self._processed_actions = target
-    self._last_target = target.clone()
 
 
 @dataclass(kw_only=True)

@@ -25,6 +25,10 @@ Plan S7-3 (S7-2 on S8's G20 plant) runs the same check as its gate 4, on its own
 B-SV, under V: ``GAINS=G20`` builds each box's arm on that gain code, ``TOOL_SPEED=V`` adds the
 tool speed cap. They are read from the variables the task reads, so unset they give S7-2's
 check.
+
+Plan S7-4 (prep 3) runs it on G20 under its effort bound: ``EFFORT=CTP`` (or ``C``) builds the
+arm with T's lowered limit and the action term with C's clip and T's band, and the check adds
+that neither binds while the script carries (``TOOL_SPEED=V0.5`` for R-CTPV).
 """
 
 import importlib.util
@@ -53,12 +57,16 @@ B = pp.BASELINES["B"]
 #: The plant and the tool speed cap (plan S7-3, see the module docstring).
 GAINS = os.environ.get("GAINS", "G0")
 TOOL_SPEED = os.environ.get("TOOL_SPEED", "none")
+EFFORT = os.environ.get("EFFORT", "none")
+#: Phases in which plan S7-4's bounds must not bind: the script moving the arm through free
+#: space, and carrying (holding the cube down on the table is not in them).
+FREE_PHASES = ("approach", "descend", "lift", "carry", "steady", "retreat")
 #: Under V the script stretches every move to V's bound, and the 5 cm carry keeps the held cube
 #: inside V's 0.1 m/s slow zone all the way: at 40 s (the V gate's episode,
 #: `test_pick_place_tool_speed.py`) every case timed out mid-place, on G0 and G20 alike (approach
 #: 223 and carry 374 control steps; 2026-09-27). The rollout stops when its schedule ends, so a
 #: long episode costs nothing.
-EPISODE_S = 120.0 if TOOL_SPEED == "V" else 30.0
+EPISODE_S = 120.0 if TOOL_SPEED.startswith("V") else 30.0
 
 
 @pytest.fixture(scope="module", params=sorted(pp.SPAWN_BOXES))
@@ -81,7 +89,12 @@ def corners(request):
       reward="R-C-strict+M1+M2+M3+M6",
       verbose=False,
       action_slew_rate_scale=0.5,
-      robot=kangaroo_grippers_left_arm(GAINS, SPAWN_ROBOTS[name]),
+      robot=kangaroo_grippers_left_arm(
+        GAINS,
+        SPAWN_ROBOTS[name],
+        arm_effort_scale=pp.EFFORT_BOUNDS[EFFORT].effort_scale,
+      ),
+      effort=pp.EFFORT_BOUNDS[EFFORT],
       baseline=B,
       spawn_box=pp.SPAWN_BOXES[name],
       dr="DR-scene",
@@ -106,6 +119,19 @@ def test_the_corners_are_placed(corners):
     if not r["placed_and_lifted"]
   ]
   assert len(placed) >= REQUIRED, f"{name}: {len(placed)}/{len(rows)}; failed {failed}"
+
+
+def test_the_effort_bounds_never_bind_in_free_space(corners):
+  """Plan S7-4 prep 3: C and T must not bind while the script moves the arm and carries."""
+  name, _, rows, _ = corners
+  hits = {
+    (r["env"], key, ph): n
+    for r in rows
+    for key in ("band", "range")
+    for ph, n in r[f"{key}_hit_steps"].items()
+    if ph in FREE_PHASES
+  }
+  assert not hits, f"{name}: {hits}"
 
 
 def test_the_script_never_outran_the_slew(corners):

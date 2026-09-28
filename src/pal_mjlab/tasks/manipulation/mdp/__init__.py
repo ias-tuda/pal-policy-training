@@ -56,6 +56,7 @@ from .observations import (
   object_yaw_b,
 )
 from .rewards import (
+  arm_effort_hinge,
   bring_object_after_lift,
   bring_object_when_lifted,
   contact_penalty,
@@ -70,10 +71,13 @@ from .rewards import (
   lift_height_faded,
   object_lifted,
   object_placed_graded,
+  pad_contact_after_release,
   reach_only,
   release_quality,
   released_at_goal,
   released_at_goal_graded,
+  retreat_height,
+  set_down_placed,
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
@@ -119,6 +123,7 @@ __all__ = [
   "object_position_b",
   "object_yaw_b",
   # Rewards.
+  "arm_effort_hinge",
   "bring_object_after_lift",
   "bring_object_when_lifted",
   "contact_penalty",
@@ -137,6 +142,9 @@ __all__ = [
   "release_quality",
   "released_at_goal",
   "released_at_goal_graded",
+  "pad_contact_after_release",
+  "retreat_height",
+  "set_down_placed",
   # Terminations.
   "entity_below_height",
   "non_finite_state",

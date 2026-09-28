@@ -20,7 +20,9 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 from pal_mjlab.tasks.manipulation.mdp.observations import (
   STILL_SPEED,
   _grasped_bool,
+  _jaw_open_bool,
   _on_surface_bool,
+  _pad_contact_any,
   _placed_bool,
   _release_latch,
   _was_lifted_bool,
@@ -76,6 +78,8 @@ def released_at_goal(
   grasp_sensor_name: str,
   threshold: float = 0.05,
   support_sensor_name: str | None = None,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> torch.Tensor:
   """1.0 when the object is at the goal and no longer held.
 
@@ -85,7 +89,8 @@ def released_at_goal(
 
   `¬grasped` is also true of an object that was never grasped, so on a table-height goal
   this pays a slide. Passing `support_sensor_name` additionally requires the `was_lifted`
-  latch; leaving it None is the pre-C2 behaviour.
+  latch; leaving it None is the pre-C2 behaviour. ``jaw_cfg`` / ``jaw_open`` (plan S7-4's J)
+  also require the jaw open (`observations._jaw_open_bool`).
   """
   obj: Entity = env.scene[object_name]
   command = env.command_manager.get_term(command_name)
@@ -93,6 +98,9 @@ def released_at_goal(
   released = at_goal & ~_grasped_bool(env, grasp_sensor_name)
   if support_sensor_name is not None:
     released &= _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  if jaw_cfg is not None:
+    assert jaw_open is not None
+    released &= _jaw_open_bool(env, jaw_cfg, jaw_open)
   return released.float()
 
 
@@ -104,11 +112,13 @@ def object_placed(
   threshold: float = 0.05,
   velocity_threshold: float = 0.05,
   support_sensor_name: str | None = None,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> torch.Tensor:
   """1.0 on full success: at the goal, released, and come to rest.
 
   With `support_sensor_name`, additionally requires that the object was lifted at some
-  point in the episode -- see `_placed_bool`.
+  point in the episode; with ``jaw_cfg`` / ``jaw_open``, the jaw open -- see `_placed_bool`.
   """
   return _placed_bool(
     env,
@@ -118,6 +128,8 @@ def object_placed(
     threshold,
     velocity_threshold,
     support_sensor_name,
+    jaw_cfg,
+    jaw_open,
   ).float()
 
 
@@ -275,9 +287,12 @@ def release_quality(
   height_std: float = 0.01,
   floor: float = 0.25,
   set_down_steps: int = 0,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
-  there has been none this episode.
+  there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
+  (plan S7-4's J, `observations._release_latch`).
 
   See `release_quality_of` for the grade and `observations._release_latch` for what counts
   as the release and where it is measured.
@@ -287,7 +302,14 @@ def release_quality(
   while the object still moved, too soon after putting it down, or after dragging it in.
   """
   latch = _release_latch(
-    env, command_name, object_name, grasp_sensor_name, support_sensor_name, surface_cfg
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
   )
   q = release_quality_of(
     latch.dxy, latch.height, dist_std, height_free, height_std, floor
@@ -311,6 +333,8 @@ def released_at_goal_graded(
   height_std: float = 0.01,
   floor: float = 0.25,
   set_down_steps: int = 0,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -321,7 +345,14 @@ def released_at_goal_graded(
   only (module M7, `release_quality`).
   """
   released = released_at_goal(
-    env, command_name, object_name, grasp_sensor_name, threshold, support_sensor_name
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    support_sensor_name,
+    jaw_cfg,
+    jaw_open,
   )
   return released * release_quality(
     env,
@@ -335,6 +366,8 @@ def released_at_goal_graded(
     height_std,
     floor,
     set_down_steps,
+    jaw_cfg,
+    jaw_open,
   )
 
 
@@ -352,6 +385,8 @@ def object_placed_graded(
   height_std: float = 0.01,
   floor: float = 0.25,
   set_down_steps: int = 0,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -365,6 +400,8 @@ def object_placed_graded(
     threshold,
     velocity_threshold,
     support_sensor_name,
+    jaw_cfg,
+    jaw_open,
   )
   return placed * release_quality(
     env,
@@ -378,6 +415,8 @@ def object_placed_graded(
     height_std,
     floor,
     set_down_steps,
+    jaw_cfg,
+    jaw_open,
   )
 
 
@@ -403,6 +442,162 @@ def held_object_slide_speed(
     & _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
   )
   return speed_xy * held_down.float()
+
+
+def set_down_placed(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float,
+  set_down_steps: int,
+  threshold: float = 0.05,
+  velocity_threshold: float = 0.05,
+) -> torch.Tensor:
+  """1.0 while the object is placed (plan S7-4's J) and its latest release was a set-down
+  (`set_down_passed` with ``set_down_steps``); 0 otherwise. Plan S7-4's revised M7 (`S`): a
+  bonus on top of M6's grade, which every release keeps -- M7 as run floored every other
+  release, and was not learned."""
+  placed = object_placed(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    velocity_threshold,
+    support_sensor_name,
+    jaw_cfg,
+    jaw_open,
+  )
+  latch = _release_latch(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
+  return placed * set_down_passed(latch, set_down_steps).float()
+
+
+def _tcp_above_object_top(
+  env: ManagerBasedRlEnv, object_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+  """Height of the tool point above the object's top face, m (upright object). (B,)"""
+  robot: Entity = env.scene[asset_cfg.name]
+  obj: Entity = env.scene[object_name]
+  tcp_z = robot.data.site_pos_w[:, asset_cfg.site_ids].squeeze(1)[:, 2]
+  half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+  return tcp_z - (obj.data.root_link_pos_w[:, 2] + half_z)
+
+
+def retreat_height(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float,
+  asset_cfg: SceneEntityCfg,
+  clear_height: float = 0.05,
+  threshold: float = 0.05,
+  velocity_threshold: float = 0.05,
+) -> torch.Tensor:
+  """Plan S7-4's M8, the retreat: the tool point's height above the object's top as a
+  fraction of ``clear_height``, capped at 1, paid only while the object is placed -- after a
+  J-release: at the goal, at rest, the jaw open, lifted this episode -- and neither pad
+  touches it. (B,)
+
+  Nothing is paid before the release, so the term cannot pull the hand up while it carries;
+  and `placed` keeps paying through the retreat, so a retreat that knocks the object off the
+  goal loses both. A hand left resting around the placed object earns nothing here -- what
+  S7-3's G20 policies did, pressing the elbow at full effort (S7-3 report section 8.4).
+  """
+  placed = _placed_bool(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    velocity_threshold,
+    support_sensor_name,
+    jaw_cfg,
+    jaw_open,
+  )
+  armed = placed & ~_pad_contact_any(env, grasp_sensor_name)
+  above = _tcp_above_object_top(env, object_name, asset_cfg)
+  return (above / clear_height).clamp(0.0, 1.0) * armed.float()
+
+
+def pad_contact_after_release(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float,
+) -> torch.Tensor:
+  """1.0 while either pad touches the object after this episode's J-release; weight it
+  negative (plan S7-4's M8: the nudging after the set-down in S7-2's videos). (B,)"""
+  latch = _release_latch(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
+  return (latch.released & _pad_contact_any(env, grasp_sensor_name)).float()
+
+
+#: Attribute on the env caching `_joint_effort_caps`, keyed by the joints' global ids.
+_EFFORT_CAPS = "_pp_effort_caps"
+
+
+def _joint_effort_caps(env: ManagerBasedRlEnv, robot: Entity, ids) -> torch.Tensor:
+  """The joints' ``actuatorfrcrange`` upper bound off the compiled model, cached. (n,)"""
+  global_ids = tuple(robot.indexing.joint_ids[ids].tolist())
+  cache = getattr(env, _EFFORT_CAPS, None)
+  if cache is None:
+    cache = {}
+    setattr(env, _EFFORT_CAPS, cache)
+  if global_ids not in cache:
+    mj = env.sim.mj_model
+    if not all(bool(mj.jnt_actfrclimited[j]) for j in global_ids):
+      raise ValueError(
+        "arm_effort_hinge needs a joint-level effort limit (actuatorfrcrange) on every "
+        "joint it reads; build the robot with an arm effort scale (plan S7-4's T)"
+      )
+    cache[global_ids] = torch.tensor(
+      [float(mj.jnt_actfrcrange[j, 1]) for j in global_ids], device=env.device
+    )
+  return cache[global_ids]
+
+
+def arm_effort_hinge(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, threshold: float = 0.8
+) -> torch.Tensor:
+  """Plan S7-4's P: sum over the named joints of max(|tau| / tau_cmd - threshold, 0)^2, with
+  tau the joint's actuator force (`qfrc_actuator`) and tau_cmd its effort limit as the model
+  carries it -- the joint's ``actuatorfrcrange``, which plan S7-4's T lowers. Positive; weight
+  it negative. Below ``threshold`` of the limit, where gravity and carrying live, it is 0. (B,)
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  ids = asset_cfg.joint_ids
+  tau_cmd = _joint_effort_caps(env, robot, ids)
+  tau = robot.data.qfrc_actuator[:, ids]
+  excess = (tau.abs() / tau_cmd - threshold).clamp_min(0.0)
+  return torch.sum(torch.square(excess), dim=-1)
 
 
 def lift_height_faded(

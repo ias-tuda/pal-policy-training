@@ -265,6 +265,8 @@ def make_tabletop_env_cfg(
   jaw_slew_rate: float | None = None,
   tool_speed_cap: ToolSpeedCapCfg | None = None,
   dr_spawn_widening: bool = True,
+  arm_range_clip: bool = False,
+  arm_effort_band: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -304,6 +306,11 @@ def make_tabletop_env_cfg(
     dr_spawn_widening: whether `DR-scene` widens ``object_pose_range`` (it does for the
       +/-2 cm box every run up to S7-1 used). Off for a spawn box that is already the whole
       region to train on (plan S7-2's W boxes).
+    arm_range_clip: plan S7-4's C -- the arm's (not the jaw's) targets clipped to the joint
+      range in the action term, after the slew and any tool cap.
+    arm_effort_band: plan S7-4's T in the action term -- the arm's targets kept within
+      q +/- tau_cmd / K, tau_cmd the effort limit the robot's model carries (lowered by the
+      robot cfg, `robots.kangaroo_grippers_left_arm(arm_effort_scale=...)`).
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
@@ -404,14 +411,27 @@ def make_tabletop_env_cfg(
   }
   if jaw_slew_rate is not None:
     rate_limit[re.escape(gripper.finger_joint)] = jaw_slew_rate
+  # Plan S7-4's bounds on the arm's final target (C, T); `mdp.RateLimitedJointPositionAction`.
+  bounds = {}
+  if arm_range_clip:
+    bounds["range_clip_joints"] = arm_regex
+  if arm_effort_band:
+    bounds["effort_band_joints"] = arm_regex
+  if bounds and not rate_limit:
+    raise ValueError(
+      "the arm bounds live in the rate-limited action term; no slew limit"
+    )
   joint_pos_action: ActionTermCfg = (
-    mdp.RateLimitedJointPositionActionCfg(**joint_pos_kwargs, rate_limit=rate_limit)
+    mdp.RateLimitedJointPositionActionCfg(
+      **joint_pos_kwargs, rate_limit=rate_limit, **bounds
+    )
     if rate_limit
     else JointPositionActionCfg(**joint_pos_kwargs)
   )
   if tool_speed_cap is not None:
     joint_pos_action = mdp.ToolSpeedCappedJointPositionActionCfg(
       **joint_pos_kwargs,
+      **bounds,
       rate_limit=rate_limit,
       capped_joints=arm_regex,
       tool_site=gripper.tcp_site,

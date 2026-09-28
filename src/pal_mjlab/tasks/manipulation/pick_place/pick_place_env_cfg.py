@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.event_manager import EventTermCfg
@@ -30,6 +31,7 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   REQUIRE_LIFTED,
   RewardContext,
   build_rewards,
+  effort_hinge_reward,
   reward_curriculum_cfg,
 )
 from pal_mjlab.tasks.manipulation.robot_cfg import ManipulationRobotCfg
@@ -170,6 +172,34 @@ BASELINES = {
 TOOL_SPEED_CAPS: dict[str, ToolSpeedCapCfg | None] = {
   "none": None,
   "V": ToolSpeedCapCfg(speed=0.3, slow_speed=0.1, slow_zone=0.05),
+  # Plan S7-4 (revision 5): V back at 0.5 m/s for R-CTPV; 0.3 took 3.0-3.6 s per place.
+  "V0.5": ToolSpeedCapCfg(speed=0.5, slow_speed=0.1, slow_zone=0.05),
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class EffortBound:
+  """Plan S7-4's bound on the driven arm's effort: what stops S7-3's press after the release."""
+
+  range_clip: bool
+  """C: the arm's targets clipped to the joint range in the action term."""
+
+  effort_scale: float | None
+  """T: the arm's effort limit lowered to this fraction of its effort, on the plant and as the
+  target band q +/- tau_cmd / K in the action term; None for none. The robot has to be built
+  with it (`robots.kangaroo_grippers_left_arm(arm_effort_scale=...)`), which
+  `kangaroo/env_cfg.py` does from the same code."""
+
+  hinge: bool
+  """P: the effort hinge above 80 % of the (lowered) limit, `rewards.effort_hinge_reward`."""
+
+
+#: The effort bounds by name (`EFFORT`; plan S7-4, revised 2026-09-28 21:33: T and P always go
+#: together, as TP, at 0.7 x effort -- 35 N.m on arm 1-2, 17.5 on arm 3-7).
+EFFORT_BOUNDS = {
+  "none": EffortBound(range_clip=False, effort_scale=None, hinge=False),
+  "C": EffortBound(range_clip=True, effort_scale=None, hinge=False),
+  "CTP": EffortBound(range_clip=True, effort_scale=0.7, hinge=True),
 }
 
 
@@ -247,6 +277,7 @@ def make_pick_place_env_cfg(
   action_slew_rate_scale: float = 1.0,
   baseline: Baseline = BASELINES["S71"],
   tool_speed_cap: ToolSpeedCapCfg | None = None,
+  effort: EffortBound = EFFORT_BOUNDS["none"],
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -265,6 +296,8 @@ def make_pick_place_env_cfg(
     baseline: table height, episode length, target box, observations and jaw slew. See
       `BASELINES`; ``S71`` is every run up to S7-1.
     tool_speed_cap: plan S7-2's module V, or None. See `tabletop_env_cfg.ToolSpeedCapCfg`.
+    effort: plan S7-4's effort bound (C, TP). See `EFFORT_BOUNDS`; T's plant half comes with
+      ``robot``.
   """
   if target_xy is None:
     target_xy = baseline.target_xy
@@ -284,10 +317,15 @@ def make_pick_place_env_cfg(
     jaw_slew_rate=baseline.jaw_slew_rate,
     tool_speed_cap=tool_speed_cap,
     dr_spawn_widening=spawn.widen_at_dr_scene,
+    arm_range_clip=effort.range_clip,
+    arm_effort_band=effort.effort_scale is not None,
   )
 
   gripper = robot.gripper(gripper_name)
   grasp_sensor = gripper.contact_sensor_name
+  arm_regex = tuple(
+    p for p in robot.action_joint_regex if not re.fullmatch(p, gripper.finger_joint)
+  )
 
   # The whole reward dict comes from the named variant, replacing the base cfg's. Replacing
   # rather than patching is what makes the arms of the comparison comparable: two variants
@@ -300,8 +338,13 @@ def make_pick_place_env_cfg(
       grasp_sensor=grasp_sensor,
       surface_sensor=gripper.surface_sensor_name,
       threshold=GOAL_THRESHOLD,
+      jaw=SceneEntityCfg(ROBOT, joint_names=(re.escape(gripper.finger_joint),)),
     ),
   )
+  if effort.hinge:
+    cfg.rewards["arm_effort"] = effort_hinge_reward(
+      SceneEntityCfg(ROBOT, joint_names=arm_regex)
+    )
   # Not part of any arm's comparison: every variant carries the same trunk penalty.
   cfg.rewards.update(trunk_clearance_rewards(robot))
   cfg.curriculum = reward_curriculum_cfg()
