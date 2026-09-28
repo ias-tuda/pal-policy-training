@@ -1,0 +1,15 @@
+{
+  "description": "Episode specs shared by the MuJoCo reference and the PAL sim2sim runs. Offsets are from the training spawn centre SPAWN_XY = (0.42, 0.27) (env frame) and inside the training spawn box (+/-2 cm, +/-10 deg). Robot starts exactly at its default pose (no reset jitter).",
+  "spawn_center_env_xy": [0.42, 0.27],
+  "episodes": [
+    {"id": 0, "dx": 0.000, "dy": 0.000, "dyaw": 0.000},
+    {"id": 1, "dx": 0.015, "dy": 0.015, "dyaw": 0.100},
+    {"id": 2, "dx": 0.015, "dy": -0.015, "dyaw": -0.100},
+    {"id": 3, "dx": -0.015, "dy": 0.015, "dyaw": -0.100},
+    {"id": 4, "dx": -0.015, "dy": -0.015, "dyaw": 0.100},
+    {"id": 5, "dx": 0.020, "dy": 0.000, "dyaw": 0.170},
+    {"id": 6, "dx": -0.020, "dy": 0.000, "dyaw": -0.170},
+    {"id": 7, "dx": 0.000, "dy": 0.020, "dyaw": 0.000},
+    {"id": 8, "dx": 0.000, "dy": -0.020, "dyaw": 0.000}
+  ]
+}
