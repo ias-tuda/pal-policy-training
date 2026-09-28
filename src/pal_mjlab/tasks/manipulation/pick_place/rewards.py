@@ -451,7 +451,56 @@ def _m6(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
     )
 
 
-_MODULES = {"M1": _m1, "M2": _m2, "M3": _m3, "M4": _m4, "M5": _m5, "M6": _m6}
+# -- S7-2: M7, the set-down (plan S7-2, decided by Siwei 2026-09-25) ------------------------
+#
+# FR (M6) lets go at the target, but increasingly while the cube still moves: 0.10 -> 0.44
+# m/s at release over training (S7 report section 5.5). M6 grades where and how high the
+# release is and gives the first centimetre of height free. M7 pays M6's grade only for a
+# set-down: at the step the grasp opens the cube rests on the table, moves slower than
+# 0.05 m/s, and has been held there, still and within 1.5 cm of the target, for
+# `M7_DWELL_STEPS` control steps since a touchdown within that radius (`mdp.set_down_passed`,
+# `observations._release_latch`); any other release is graded at the floor. The table contact
+# replaces M6's free centimetre of height, so `height_free` goes to 0. The touchdown rule is
+# the guard against dragging the cube along the table into the target and letting go of it at
+# rest; `held_slide` prices the drag itself (`M7_SLIDE_WEIGHT` per m/s of the held cube's
+# horizontal speed on the table, after the first lift).
+#
+# The plan leaves the dwell at 2-3 steps; 3 (60 ms) is taken, the stricter end.
+M7_DWELL_STEPS = 3
+M7_SLIDE_WEIGHT = -10.0
+
+
+def _m7(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in ("release", "placed"):
+    term = rewards.get(name)
+    assert term is not None and "floor" in term.params, (
+      "M7 pays M6's grade for a set-down only; apply M6 first"
+    )
+    rewards[name] = RewardTermCfg(
+      func=term.func,
+      weight=term.weight,
+      params={**term.params, "height_free": 0.0, "set_down_steps": M7_DWELL_STEPS},
+    )
+  rewards["held_slide"] = RewardTermCfg(
+    func=mdp.held_object_slide_speed,
+    weight=M7_SLIDE_WEIGHT,
+    params={
+      "object_name": OBJECT,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "support_sensor_name": SUPPORT_SENSOR,
+    },
+  )
+
+
+_MODULES = {
+  "M1": _m1,
+  "M2": _m2,
+  "M3": _m3,
+  "M4": _m4,
+  "M5": _m5,
+  "M6": _m6,
+  "M7": _m7,
+}
 
 
 def _s52_arm(modules: tuple[str, ...]):
@@ -459,6 +508,8 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("M1 removes the success termination that M4 keeps; pick one")
   if "M6" in modules and "M1" not in modules[: modules.index("M6")]:
     raise ValueError("M6 grades M1's release and placed terms; it needs M1 before it")
+  if "M7" in modules and "M6" not in modules[: modules.index("M7")]:
+    raise ValueError("M7 pays M6's grade for a set-down only; it needs M6 before it")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -487,7 +538,12 @@ S7_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6": ("M1", "M2", "M3", "M6"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S7_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS}
+#: The S7-2 arm: FR plus M7, for the B-S and B-SV runs (plan S7-2).
+S72_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+M7": ("M1", "M2", "M3", "M6", "M7"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S72_ARMS.items()})
+_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS}
 
 #: Arms whose success *termination* must also require the `was_lifted` latch. The reward
 #: dict cannot carry this on its own -- the termination is built by the tabletop factory --

@@ -6,8 +6,10 @@ Neither needs a GPU or a checkpoint to test, so neither should wait for one.
 """
 
 import importlib.util
+import math
 import pathlib
 
+import pytest
 import torch
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -301,3 +303,170 @@ def test_the_summary_reports_where_the_cube_was_let_go():
   out = eval_pick_place.summarise(tally, DT, 2)
   assert out["episodes_released"] == 2
   assert abs(out["release_within_3cm_xy"] - 0.5) < 1e-9
+
+
+# -- The set-down at the last let-go (plan S7-2, M7) ----------------------------------------
+
+STILL = [0.0, 0.0, 0.0]
+
+
+def _sd(tally, held, on_table, obj, vel=STILL):
+  n = len(held)
+  tally.measure_set_down(
+    torch.tensor(held),
+    torch.tensor(on_table),
+    torch.tensor(obj),
+    torch.tensor([vel] * n),
+    torch.tensor(GOAL * n),
+  )
+
+
+def test_the_eval_restates_the_rewards_set_down_rule():
+  """The eval's constants must be the reward's: it restates them only so it runs on code
+  that predates M7."""
+  from pal_mjlab.tasks.manipulation.mdp.observations import (
+    SET_DOWN_CLEARANCE,
+    SET_DOWN_RADIUS,
+    STILL_SPEED,
+  )
+  from pal_mjlab.tasks.manipulation.pick_place import rewards
+
+  assert eval_pick_place.SET_DOWN_RADIUS == SET_DOWN_RADIUS
+  assert eval_pick_place.SET_DOWN_CLEARANCE == SET_DOWN_CLEARANCE
+  assert eval_pick_place.SET_DOWN_STILL == STILL_SPEED
+  assert eval_pick_place.SET_DOWN_STEPS == rewards.M7_DWELL_STEPS
+  assert eval_pick_place.M6_GRADE == {
+    "dist_std": rewards.M6_DIST_STD,
+    "height_free": rewards.M6_HEIGHT_FREE,
+    "height_std": rewards.M6_HEIGHT_STD,
+    "floor": rewards.M6_FLOOR,
+  }
+
+
+def test_a_set_down_is_recognised():
+  tally = Tally(1, "cpu")
+  _sd(tally, [True], [False], [[0.42, 0.07, 0.80]])  # carried over the target
+  for _ in range(4):
+    _sd(tally, [True], [True], [[0.42, 0.075, 0.785]])  # touched down 5 mm out, still
+  _sd(tally, [False], [True], [[0.42, 0.075, 0.785]])  # let go
+  _end(tally, [0])
+  row = tally.done[0]
+  assert row["release_on_table"] and row["release_dwell"] == 4
+  assert row["release_set_down"] is True
+
+
+def test_a_drag_does_not_build_a_dwell():
+  """Touched down 5 cm out and dragged in: held on the table all the way -- bar a step of
+  contact flicker, the way a dragged cube's contact flickers in the sim -- but the touchdown
+  was outside the radius, and a flicker at table height is not a new one, so the dwell never
+  starts. As in the reward's latch; the M7 drag test found the flicker."""
+  tally = Tally(1, "cpu")
+  _sd(tally, [True], [False], [[0.42, 0.12, 0.80]])
+  for y, down in (
+    (0.12, True),
+    (0.10, True),
+    (0.08, False),
+    (0.07, True),
+    (0.07, True),
+  ):
+    _sd(tally, [True], [down], [[0.42, y, 0.785]])
+  for _ in range(4):
+    _sd(tally, [True], [True], [[0.42, 0.07, 0.785]])
+  _sd(tally, [False], [True], [[0.42, 0.07, 0.785]])
+  _end(tally, [0])
+  row = tally.done[0]
+  assert row["release_dwell"] == 0 and row["release_set_down"] is False
+
+
+def test_a_release_in_the_air_or_moving_is_not_a_set_down():
+  tally = Tally(2, "cpu")
+  for _ in range(4):
+    _sd(tally, [True, True], [True, True], [[0.42, 0.07, 0.785]] * 2)
+  # env 0 lets go moving at 0.3 m/s; env 1 lifts and lets go 2 cm up.
+  tally.measure_set_down(
+    torch.tensor([False, True]),
+    torch.tensor([True, False]),
+    torch.tensor([[0.42, 0.07, 0.785], [0.42, 0.07, 0.805]]),
+    torch.tensor([[0.0, 0.0, -0.3], [0.0, 0.0, 0.0]]),
+    torch.tensor(GOAL * 2),
+  )
+  _sd(tally, [False, False], [True, False], [[0.42, 0.07, 0.785], [0.42, 0.07, 0.805]])
+  _end(tally, [0, 1])
+  moving, high = tally.done
+  assert moving["release_set_down"] is False
+  assert moving["release_vz"] == pytest.approx(-0.3)
+  assert high["release_on_table"] is False and high["release_set_down"] is False
+
+
+def test_the_record_keeps_each_episodes_first_and_last_state():
+  tally = Tally(1, "cpu")
+  for k in range(3):
+    obj = torch.tensor([[0.40 + 0.01 * k, 0.27, 0.84]])
+    tally.record(
+      obj,
+      torch.tensor([0.1 * (k + 1)]),
+      torch.tensor([[0.01, -0.02, 0.005]]),
+      torch.tensor([[0.46, 0.08, 0.84]]),
+    )
+    tally.observe(**_flags())
+  tally.finish(torch.tensor([0]))
+  row = tally.done[0]
+  assert (row["spawn_x"], row["spawn_y"]) == pytest.approx((0.40, 0.27))
+  assert row["spawn_yaw"] == pytest.approx(0.1)
+  assert (row["table_dx"], row["table_dy"], row["table_dz"]) == pytest.approx(
+    (0.01, -0.02, 0.005)
+  )
+  assert (row["target_x"], row["target_y"]) == pytest.approx((0.46, 0.08))
+  assert row["final_x"] == pytest.approx(0.42)
+
+
+def test_the_grades_are_m6_and_m7s():
+  q6, q7 = eval_pick_place.release_grades(0.0, 0.005, passed=True)
+  assert q6 == pytest.approx(1.0) and q7 == pytest.approx(0.25 + 0.75 * math.exp(-0.25))
+  q6, q7 = eval_pick_place.release_grades(0.0, 0.005, passed=False)
+  assert q6 == pytest.approx(1.0) and q7 == pytest.approx(0.25)
+
+
+def _plant_step(pt, parked, track, torque, force, carrying, setdown):
+  pt.measure(
+    parked_q=torch.tensor([parked]),
+    driven_q=torch.zeros(1, 7),
+    driven_target=torch.full((1, 7), track),
+    gained_torque=torch.tensor([torque]),
+    table_force=torch.tensor([force]),
+    carrying=torch.tensor([carrying]),
+    setdown=torch.tensor([setdown]),
+  )
+
+
+def test_the_plant_reads_bank_per_episode_and_clear_between_them():
+  """Plan S8's `--plant` reads: hold, tracking, saturation, set-down force, per episode."""
+  pt = eval_pick_place.PlantTally(
+    1,
+    "cpu",
+    ["a", "b"],
+    torch.zeros(1, 2),
+    ["a", "b", "c"],
+    torch.tensor([10.0, 10.0, 5.0]),
+  )
+  _plant_step(pt, [0.01, -0.03], 0.1, [10.0, 0.0, 1.0], 3.0, False, False)
+  _plant_step(pt, [0.02, 0.00], 0.2, [0.0, -10.0, 5.0], 7.0, True, True)
+  pt.finish(torch.tensor([0]))
+  row = pt.done[0]
+  assert row["parked_hold_max"] == pytest.approx(0.03)
+  assert row["parked_hold_mean"] == pytest.approx((0.02 + 0.01) / 2)
+  # Tracking and set-down force count only their own steps.
+  assert row["carry_steps"] == 1
+  assert row["track_carry_mean"] == pytest.approx(0.2)
+  assert row["track_carry_max"] == pytest.approx(0.2)
+  assert row["setdown_force_peak"] == pytest.approx(7.0)
+  # Saturation: |torque| at the joint's own limit, either sign, over all steps.
+  summary = pt.summarise(1)
+  assert summary["plant_saturation_share"] == {"a": 0.5, "b": 0.5, "c": 0.5}
+  assert summary["plant_parked_worst_joint"] == "b"
+  # The next episode starts clean.
+  _plant_step(pt, [0.0, 0.0], 0.0, [0.0, 0.0, 0.0], 9.0, False, False)
+  pt.finish(torch.tensor([0]))
+  assert pt.done[1]["parked_hold_max"] == 0.0
+  assert pt.done[1]["track_carry_mean"] is None
+  assert pt.done[1]["setdown_force_peak"] is None

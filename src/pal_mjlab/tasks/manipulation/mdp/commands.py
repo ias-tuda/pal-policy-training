@@ -84,6 +84,10 @@ class SurfaceOffsetCommand(LiftingCommand):
   This reads the same two quantities ``mdp.events.reset_objects_on_surface`` does -- the
   surface geom's world XY and the height of its top face -- so the goal and the cube's
   spawn agree about where the table is by construction.
+
+  With a nonzero ``offset_range`` the offset is drawn per env from a box around ``offset``
+  each time the command resamples -- once per episode for a pick-and-place goal -- so the goal
+  is a random point on the surface that stays fixed relative to it (plan S7-2 baseline B).
   """
 
   cfg: SurfaceOffsetCommandCfg
@@ -92,6 +96,11 @@ class SurfaceOffsetCommand(LiftingCommand):
     super().__init__(cfg, env)
     self._surface_cfg = SceneEntityCfg(cfg.surface_name)
     self._offset = torch.tensor(cfg.offset, device=self.device, dtype=torch.float32)
+    self._half_range = torch.tensor(
+      cfg.offset_range, device=self.device, dtype=torch.float32
+    )
+    #: This episode's offset from the surface centre, per env. (B, 2)
+    self.offsets = self._offset.repeat(self.num_envs, 1)
 
   def _goal_on_surface(self) -> torch.Tensor:
     from pal_mjlab.tasks.manipulation.mdp.events import (
@@ -102,10 +111,20 @@ class SurfaceOffsetCommand(LiftingCommand):
     centre_xy = _surface_centre_xy(self._env, self._surface_cfg)
     top_z = surface_top_z(self._env, self._surface_cfg)
     half_z = self._env.sim.model.geom_size[:, self.object.indexing.geom_ids[0], 2]
-    return torch.cat([centre_xy + self._offset, (top_z + half_z).unsqueeze(-1)], dim=-1)
+    return torch.cat([centre_xy + self.offsets, (top_z + half_z).unsqueeze(-1)], dim=-1)
+
+  def set_offsets(self, env_ids: torch.Tensor, offsets: torch.Tensor) -> None:
+    """Put the goal of ``env_ids`` at ``offsets`` (N, 2) from the surface centre, for the rest
+    of their episode. For scripted tests that need a goal at a chosen point of the box."""
+    self.offsets[env_ids] = offsets.to(self.offsets)
+    self.target_pos[env_ids] = self._goal_on_surface()[env_ids]
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     super()._resample_command(env_ids)
+    noise = (2.0 * torch.rand(len(env_ids), 2, device=self.device) - 1.0) * (
+      self._half_range
+    )
+    self.offsets[env_ids] = self._offset + noise
     self.target_pos[env_ids] = self._goal_on_surface()[env_ids]
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
@@ -121,6 +140,10 @@ class SurfaceOffsetCommandCfg(LiftingCommandCfg):
   offset: tuple[float, float] = (0.0, 0.0)
   """XY offset from the surface geom's centre. The height is not an input -- it is the
   surface plus the object's own half-height, which is what "resting on it" means."""
+
+  offset_range: tuple[float, float] = (0.0, 0.0)
+  """Half-widths in x and y of the box the offset is drawn from at each resample, centred on
+  ``offset``. Zero, the default, is a fixed point."""
 
   # Placement belongs to a reset event, not to the command -- as for `EntityOffsetCommandCfg`.
   # Without this the inherited default is mjlab's own spawn range (x 0.30-0.35, y +/-0.10,

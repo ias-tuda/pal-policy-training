@@ -21,6 +21,85 @@ The changes below have landed on ``main`` since the ``v1.0.0`` tag
 New Features & Tasks
 ^^^^^^^^^^^^^^^^^^^^^
 
+- **Changed: arm joints 5 and 7 of the Kangaroo grippers model turn the other
+  way.** In ``kangaroo_grippers.xml``, ``arm_{left,right}_5_joint`` and
+  ``arm_{left,right}_7_joint`` now rotate about +z, as on PAL's robot, instead
+  of -z. Arm 5's range is now PAL's ±2.618 rad on both arms. This affects every
+  task on the grippers variant: velocity, reaching, lift, stack and
+  pick-and-place. The manipulation start pose flips the sign of those joints
+  with their axes, so the robot starts in the same physical pose. The velocity
+  and reaching tasks start those joints at 0, which is unchanged. A policy
+  trained before this change moves these four joints the wrong way, so it has
+  to be retrained. (Ported from ``fda9492`` in ``5e09c30``.)
+
+- **Changed: manipulation observations are in the robot's base frame,**
+  ``base_link``. The lift, stack and pick-and-place tasks report the gripper,
+  cube and target positions and the cube's yaw relative to ``base_link``.
+  Before, they were relative to the fixed-base robot's root, a point on the
+  floor 0.9 m below ``base_link``. ``base_link`` is the frame PAL's software reports
+  the robot and tracked objects in. Policies trained before this change see
+  different numbers and have to be retrained. (``5e09c30``.)
+
+- **New: a deployment-matched pick-and-place setup,** selected with
+  ``BASELINE=B`` in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. It changes five
+  things:
+
+  - the table top is at 0.815 m, the height of the real robot cell;
+  - episodes are 10 s long;
+  - the target is drawn anew every episode from a ±2 cm box around
+    (0.46, 0.08) m on the table, instead of being fixed;
+  - the policy sees only what the real robot measures: joint positions, arm
+    joint velocities, its last action, the gripper's position and orientation,
+    the cube's position and yaw, and the target. Joint positions carry an
+    offset of up to 0.01 rad that stays fixed for the episode, and joint
+    readings arrive up to one control step late. The cube's position and yaw
+    get the object tracker's error at every domain-randomisation level. Whether
+    the cube is grasped, a simulator contact reading the robot does not have,
+    goes to the critic only;
+  - the gripper jaw moves no faster than 2 rad/s.
+
+  ``BASELINE`` defaults to ``S71``, which gives the setup of every earlier run.
+  (``346840a``, ``2d727b8``.)
+
+- **New: wider cube start regions,** selected with ``SPAWN=W1`` or
+  ``SPAWN=W2``. The cube starts anywhere in a 10 × 10 cm (``W1``) or
+  12 × 14 cm (``W2``) box, rotated up to ±45°. Before, it started within 2 cm
+  of a fixed point, rotated up to ±10°. Both boxes widen the arm's action range
+  so the gripper can reach those rotations. ``SPAWN`` defaults to ``S71``, the
+  old start region. (``346840a``.)
+
+- **New: a gripper speed limit,** selected with ``TOOL_SPEED=V``. The action
+  term scales the arm's joint steps so that the gripper moves no faster than
+  0.3 m/s. While it holds the cube less than 5 cm above the table, or less
+  than 5 cm from the target horizontally, the limit is 0.1 m/s. A deployed
+  policy must apply the same limit to behave as it did in training.
+  ``TOOL_SPEED`` defaults to ``none``, no limit. (``346840a``.)
+
+- **New: a set-down reward arm,** ``R-C-strict+M1+M2+M3+M6+M7``. It is
+  ``R-C-strict+M1+M2+M3+M6`` with the release grade paid only for a set-down.
+  A release is a set-down when, as the gripper opens, the cube rests on the
+  table within 1.5 cm of the target, moves slower than 0.05 m/s, and has been
+  held still there for three control steps since it was put down. Every other
+  release gets the lowest grade. A new penalty also charges for sliding the
+  held cube along the table.
+  ``eval_pick_place.py`` now reports whether each release was a set-down, the
+  cube's vertical and horizontal speed when the gripper opened, and both
+  grades. The IAS training script passes ``BASELINE``, ``SPAWN`` and
+  ``TOOL_SPEED`` through and adds them to the run name and wandb tags.
+  (``346840a``, ``2d727b8``, ``f3bcfd0``.)
+
+- **New: stiff arm gains instead of gravity compensation,** selected with
+  ``GAINS`` in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. ``GAINS=G20`` gives
+  the pelvis and both arms 20 times the identified stiffness and damping, the
+  gains of PAL's ``impedance_control_v37`` configuration, and turns the
+  simulator's gravity compensation off, so the arms hold themselves up by
+  stiffness alone. ``G15`` (15 times the stiffness) and ``G20s`` (``G20``'s
+  stiffness with less damping) are variants of it. ``GAINS`` defaults to
+  ``G0``: the identified gains with gravity compensation, as in every earlier
+  run. It combines with every ``SPAWN`` box. The IAS training script passes it
+  through and adds it to the run name and wandb tags. (``1b750eb``,
+  ``ca6d490``.)
+
 - **New: a release-quality reward arm, ``R-C-strict+M1+M2+M3+M6``.** It is
   ``R-C-strict+M1+M2+M3`` with its release and placed rewards scaled by how
   well the cube was last let go: 1 for a cube set down on the target, falling

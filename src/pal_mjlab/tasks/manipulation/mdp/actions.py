@@ -17,7 +17,10 @@ from dataclasses import dataclass
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
-from mjlab.utils.lab_api.string import resolve_matching_names_values
+from mjlab.utils.lab_api.string import (
+  resolve_matching_names,
+  resolve_matching_names_values,
+)
 
 
 class RateLimitedJointPositionAction(JointPositionAction):
@@ -87,3 +90,123 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> RateLimitedJointPositionAction:
     return RateLimitedJointPositionAction(self, env)
+
+
+class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
+  """`RateLimitedJointPositionAction` with a bound on the tool's speed (plan S7-2, module V).
+
+  Halving every joint's slew (S7 speed bound A) cut the held cube's peak speed by only 15-30 %:
+  several joints add up at the tool. This bounds the tool itself. After the per-joint slew,
+  the capped joints' step in commanded target, dq, is scaled down uniformly -- its direction
+  kept -- until
+
+      sum_i |dq_i| * r_i <= v_max * control_dt,
+
+  with r_i the distance from joint i's axis to the tool point. A revolute joint turning by
+  dq_i moves the tool by |dq_i| * r_i, so the sum bounds how far one control step's command
+  moves the tool, from the joint anchors and axes alone -- no Jacobian solve.
+
+  v_max is ``speed_limit``, and ``slow_speed_limit`` while the object is held and either
+  within ``slow_zone`` of its resting height on the surface (lifting off, setting down) or
+  within ``slow_zone`` of the goal horizontally (arriving over it).
+
+  Like the slew, this lives in the action term: a deployment must apply the same bound to
+  reproduce what was trained. The bound uses the robot's own kinematics (anchors, axes, tool
+  point) plus "held", the object's pose and the goal; on hardware "held" has no sensor and
+  needs a proxy (the jaw-angle rule of the sim2sim adapter).
+  """
+
+  cfg: ToolSpeedCappedJointPositionActionCfg
+
+  def __init__(
+    self, cfg: ToolSpeedCappedJointPositionActionCfg, env: ManagerBasedRlEnv
+  ):
+    super().__init__(cfg=cfg, env=env)
+    index_list, _ = resolve_matching_names(cfg.capped_joints, self._target_names)
+    if not index_list:
+      raise ValueError(
+        f"capped_joints matched no actuator; patterns={list(cfg.capped_joints)}, "
+        f"targets={self._target_names}"
+      )
+    self._capped = torch.tensor(index_list, device=self.device, dtype=torch.long)
+    # Global joint ids, for the anchors and axes MuJoCo computes per joint.
+    self._capped_joints = self._entity.indexing.joint_ids[
+      self._target_ids[self._capped]
+    ]
+    self._tool = self._entity.site_names.index(cfg.tool_site)
+    #: The tool speed bound applied at the last step, per env (m/s).
+    self.speed_limit = torch.full((self.num_envs,), cfg.speed_limit, device=self.device)
+
+  def _lever_arms(self) -> torch.Tensor:
+    """Distance from each capped joint's axis to the tool point. (B, n)"""
+    data = self._env.sim.data
+    anchor = data.xanchor[:, self._capped_joints]
+    axis = data.xaxis[:, self._capped_joints]
+    tool = self._entity.data.site_pos_w[:, self._tool].unsqueeze(1)
+    return torch.norm(torch.linalg.cross(tool - anchor, axis, dim=-1), dim=-1)
+
+  def _speed_limits(self) -> torch.Tensor:
+    """``slow_speed_limit`` in the slow zone, ``speed_limit`` elsewhere. (B,)"""
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+    from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+    from pal_mjlab.tasks.manipulation.mdp.observations import _grasped_bool
+
+    env, cfg = self._env, self.cfg
+    obj = env.scene[cfg.object_name]
+    pos = obj.data.root_link_pos_w
+    half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+    height = pos[:, 2] - surface_top_z(env, SceneEntityCfg(cfg.surface_name)) - half_z
+    goal = env.command_manager.get_term(cfg.command_name).command
+    near = (height < cfg.slow_zone) | (
+      torch.norm((pos - goal)[:, :2], dim=-1) < cfg.slow_zone
+    )
+    slow = _grasped_bool(env, cfg.grasp_sensor_name) & near
+    return torch.where(
+      slow,
+      torch.full_like(height, cfg.slow_speed_limit),
+      torch.full_like(height, cfg.speed_limit),
+    )
+
+  def process_actions(self, actions: torch.Tensor) -> None:
+    previous = self._last_target.clone()
+    super().process_actions(actions)  # scale, offset, clip, then the per-joint slew
+    target = self._processed_actions
+    dq = target[:, self._capped] - previous[:, self._capped]
+    travel = (dq.abs() * self._lever_arms()).sum(dim=-1)  # bound on the tool's move, m
+    self.speed_limit = self._speed_limits()
+    allowed = self.speed_limit * self.cfg.control_dt
+    shrink = (allowed / travel.clamp_min(1e-9)).clamp(max=1.0)
+    target[:, self._capped] = previous[:, self._capped] + dq * shrink.unsqueeze(-1)
+    self._processed_actions = target
+    self._last_target = target.clone()
+
+
+@dataclass(kw_only=True)
+class ToolSpeedCappedJointPositionActionCfg(RateLimitedJointPositionActionCfg):
+  capped_joints: tuple[str, ...]
+  """Actuator regexes of the joints whose step the tool bound scales: the arm, not the jaw."""
+
+  tool_site: str
+  """The tool point whose speed is bounded (the grasp point)."""
+
+  speed_limit: float
+  """Tool speed bound outside the slow zone, m/s."""
+
+  slow_speed_limit: float
+  """Tool speed bound in the slow zone, m/s."""
+
+  slow_zone: float
+  """Distance (m) to the object's resting height, or horizontally to the goal, inside which a
+  held object gets ``slow_speed_limit``."""
+
+  control_dt: float
+  """Control period, s: the bound is a speed times this."""
+
+  object_name: str
+  grasp_sensor_name: str
+  surface_name: str
+  command_name: str
+
+  def build(self, env: ManagerBasedRlEnv) -> ToolSpeedCappedJointPositionAction:
+    return ToolSpeedCappedJointPositionAction(self, env)

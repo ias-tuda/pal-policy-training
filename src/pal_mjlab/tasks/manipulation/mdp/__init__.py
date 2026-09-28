@@ -30,6 +30,8 @@ from mjlab.tasks.manipulation.mdp import (
 from .actions import (
   RateLimitedJointPositionAction,
   RateLimitedJointPositionActionCfg,
+  ToolSpeedCappedJointPositionAction,
+  ToolSpeedCappedJointPositionActionCfg,
 )
 from .commands import (
   EntityOffsetCommand,
@@ -45,6 +47,7 @@ from .events import (
   surface_top_z,
 )
 from .observations import (
+  ee_orientation_b,
   ee_position_b,
   goal_position_b,
   is_grasped,
@@ -58,6 +61,7 @@ from .rewards import (
   contact_penalty,
   entity_lin_vel_l2,
   grasped,
+  held_object_slide_speed,
   held_object_speed_hinge,
   joint_pos_limits,
   keepout_box_penalty,
@@ -83,6 +87,8 @@ from .terminations import (
 __all__ = [
   "RateLimitedJointPositionAction",
   "RateLimitedJointPositionActionCfg",
+  "ToolSpeedCappedJointPositionAction",
+  "ToolSpeedCappedJointPositionActionCfg",
   "entity_out_of_reach",
   "keepout_box_penalty",
   # mjlab manipulation terms, re-exported so a task needs one namespace.
@@ -105,6 +111,7 @@ __all__ = [
   "reset_objects_on_surface",
   "surface_top_z",
   # Observations.
+  "ee_orientation_b",
   "ee_position_b",
   "goal_position_b",
   "is_grasped",
@@ -119,6 +126,7 @@ __all__ = [
   "grasped",
   "keypoint_distance_reward",
   "lift_height",
+  "held_object_slide_speed",
   "held_object_speed_hinge",
   "lift_height_faded",
   "time_penalty",
