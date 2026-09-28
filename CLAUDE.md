@@ -169,6 +169,10 @@ Claims that have already been wrong here:
   against an 8 mm range. Set `operation="abs"` on `bias_noise_cfg`. (Measured 2026-09-23.)
 - **A string-keyed DR `ranges` dict is not scoped by `asset_cfg.joint_names`** in mjlab:
   each key is matched against every joint of the entity. `arm_.*` randomises a parked arm too.
+- **Nor is `dr.pd_gains`.** It selects actuators by `asset_cfg.actuator_ids`, which a
+  `SceneEntityCfg(joint_names=...)` leaves at `slice(None)`, so the tabletop DR-robot rung
+  randomises the gains of all 30 Kangaroo actuators -- legs, pelvis, the parked arm, both
+  jaws -- although its comment says "the driven joints". (Measured 2026-09-25, plan S8.0.)
 - **"DR-scene places the cube on the moving table" was wrong until 2026-09-24.** Its goal,
   `mdp.SurfaceOffsetCommandCfg`, inherited mjlab `LiftingCommandCfg`'s non-None
   `object_pose_range`, so the command re-placed the cube on the floor (x 0.30-0.35, z 0.02-0.05)
@@ -179,6 +183,22 @@ Claims that have already been wrong here:
   observation noise (joint pos +/-0.002 rad, vel +/-0.2 rad/s, object pos +/-5 mm, yaw
   +/-0.02 rad; `tabletop_env_cfg.py`) is on at every rung in training; only `--play` turns it
   off. (Found 2026-09-24, plan S7's D4 alignment.)
+- **"mjlab's `dr.encoder_bias` is an observation error" is wrong.** It offsets the actuator
+  target instead. `JointPositionAction.apply_actions` subtracts it from the joint target, and
+  only `joint_pos_rel(biased=True)` reports it. Our `joint_pos` term is not `biased`. So under
+  D4/D5 the arm tracked up to 5 mrad off its command while the policy observed the true angle.
+  For an encoder offset the policy observes, put a bias on the observation term (baseline B,
+  `operation="abs"`). (Found 2026-09-25, plan S7-2.)
+- **A fixed entity's first body is not its main body.** `entity.indexing.body_ids[0]` is the
+  mocap anchor it hangs from (`table/mocap_base`), not `table/table`. DR-scene draws the table
+  pose into `table/table`'s local offset. Writing the anchor's `model.body_pos` instead moved
+  the table only at the next reset, and added the move to the DR draw. Look bodies up by name.
+  (Found by the S7-2 corners check's positive control, 2026-09-26, `f3bcfd0`.)
+- **"The corners check fails under V" (0/10) was a time-out, not a failure.** At 40 s every case ran out of
+  episode mid-place, on G0 as on G20, and the "final cube distance" it reported (~19 cm, the spawn-target
+  distance) was the respawned cube's. Read a scripted rollout's `ended_by` and `length` before reading its
+  misses, and run the control plant before blaming the new one. (Found 2026-09-27, plan S7-3 gate 4; the
+  check runs 120 s under V since `e4cd58a`.)
 - *(Add every further claim that turns out wrong. These lines are the most valuable in the file.)*
 
 ---
@@ -620,7 +640,10 @@ other projects use it. **This project uses `uv`** — `make sync` (`uv sync --al
 **The `ias` alias is a trap.** `~/.ssh/config`'s `ias` points at
 `kay.ias.informatik.tu-darmstadt.de` and exists **only** as the `ProxyJump` for `Geoffery` and
 `blackwell`. The Slurm login node is a different machine, `mn.ias...`, reached by its full
-hostname with user `ju`. The same identity file works for both. (Verified 2026-08-05.)
+hostname with user `ju`. (Verified 2026-08-05.) **The same identity file does not work for
+both:** on 2026-09-25 `mn` refused the `ias` alias's RSA key ("Permission denied
+(publickey)"); `ssh -i ~/.ssh/id_ed25519 ju@mn.ias.informatik.tu-darmstadt.de` works
+(verified again 2026-09-26).
 
 Note that `origin` for this repo is on the same IAS GitLab host family — a host that can reach
 `git.ias.informatik.tu-darmstadt.de` over SSH can clone and push; a host that cannot needs the
@@ -895,6 +918,11 @@ tail -f /home/ju/repo/humanoids/<repo>/slurm_logs/<name>_<jobid>.log
    and do not read the first iteration's timing as steady-state throughput.
 8. **Record the job id** alongside the commit, task id and config. Once the scrollback is gone,
    scheduler accounting is the only record.
+9. **Jobs dispatched to gn03 or gn04 can come back held** with the reason
+   `user_env_retrieval_failed_requeued_held`, within seconds of dispatch. This happened on gn04
+   on 2026-09-24, and on gn03 on 2026-09-25 and 2026-09-26. Fix without losing the job id:
+   `scontrol update jobid=<id> ExcNodeList=gn03,gn04`, then `scontrol release <id>`. Check
+   `squeue -u ju` a minute after every submission.
 
 ---
 
