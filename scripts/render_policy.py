@@ -260,6 +260,8 @@ def main() -> None:
   ep_step = args.settle_steps if pinned else 0
   ended_by: list[str] = []
   first_placed: list[float | None] = [None]
+  # Per episode, the steps after its first placing: [steps, placed and lifted, grasped].
+  after: list[list[int]] = [[0, 0, 0]]
   with torch.inference_mode():
     writer.append_data(caption(env.render(), ep_step))
     while done_episodes < args.episodes and (
@@ -279,17 +281,30 @@ def main() -> None:
           break
         ep_step = 0
         first_placed.append(None)
-      elif first_placed[-1] is None and bool(
-        ev.probe(env, grasp_sensor)["placed_and_lifted"][0]
-      ):
-        first_placed[-1] = ep_step * env.step_dt
+        after.append([0, 0, 0])
+      else:
+        state = ev.probe(env, grasp_sensor)
+        placed_now = bool(state["placed_and_lifted"][0])
+        if first_placed[-1] is None:
+          if placed_now:
+            first_placed[-1] = ep_step * env.step_dt
+        else:
+          after[-1][0] += 1
+          after[-1][1] += placed_now
+          after[-1][2] += bool(state["grasped"][0])
       writer.append_data(caption(env.render(), ep_step))
   writer.close()
   env.close()
-  placed = ", ".join("never" if t is None else f"{t:.2f} s" for t in first_placed)
+  per_episode = [
+    "never placed"
+    if t is None
+    else f"first placed and lifted at {t:.2f} s, then placed on {a[1]}/{a[0]} and "
+    f"grasped on {a[2]}/{a[0]} steps"
+    for t, a in zip(first_placed, after, strict=True)
+  ]
   print(
     f"wrote {args.out}: {steps} steps ({steps / fps:.1f} s at {fps} fps), "
-    f"episodes ended by: {ended_by}; first placed and lifted at: {placed}"
+    f"episodes ended by: {ended_by}; " + "; ".join(per_episode)
   )
 
 
