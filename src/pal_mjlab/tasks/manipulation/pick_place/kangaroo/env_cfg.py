@@ -33,6 +33,13 @@ And the plant, by `GAINS` (plan S8): a gain code from `kangaroo_constants.TABLET
 `G0`, the default, is the robot every run before S8 trained on (SysID gains, gravity
 compensation on); `G15`, `G20` and `G20s` are stiff pelvis/arm gains with no gravity
 compensation anywhere. Each code fixes both, so there is no invalid pairing to spell.
+
+Plan S7-4 adds `EFFORT` (`none` | `C` | `CTP`, `pick_place_env_cfg.EFFORT_BOUNDS`): the bound on
+the driven arm's effort. `C` clips the arm's targets to the joint range; `CTP` adds T -- the arm's
+effort limit lowered to 0.7 x effort on the plant, mirrored as a target band in the action term
+-- and P, the effort hinge. The plant half of T is built into the robot here, from the same code.
+`TOOL_SPEED=V0.5` is S7-4's V at 0.5 m/s. The release-by-jaw (J) and the retreat (M8) are reward
+modules, named in `REWARD`.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 )
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
+  EFFORT_BOUNDS,
   SPAWN_BOXES,
   TOOL_SPEED_CAPS,
   make_pick_place_env_cfg,
@@ -70,6 +78,7 @@ BASELINE_ENV_VAR = "BASELINE"
 SPAWN_ENV_VAR = "SPAWN"
 TOOL_SPEED_ENV_VAR = "TOOL_SPEED"
 GAINS_ENV_VAR = "GAINS"
+EFFORT_ENV_VAR = "EFFORT"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -80,6 +89,7 @@ DEFAULT_BASELINE = "S71"
 DEFAULT_SPAWN = "S71"
 DEFAULT_TOOL_SPEED = "none"
 DEFAULT_GAINS = DEFAULT_TABLETOP_GAINS
+DEFAULT_EFFORT = "none"
 
 #: The arm each spawn box trains with: the W boxes need P2's wider action scales (plan S7 P2).
 SPAWN_ROBOTS = {
@@ -121,14 +131,18 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   `KANGAROO_GRIPPERS_LEFT_ARM` (or its wide-scale twin for a W spawn box), not
   `KANGAROO_GRIPPERS`: the right arm is held at its nominal pose by its own actuators and is
   neither driven nor observed, which is what makes the action space 8 rather than 16. Its
-  plant is the `GAINS` code's; G0 is exactly the spawn box's arm.
+  plant is the `GAINS` code's, with the `EFFORT` code's arm effort limit; G0 with no effort
+  bound is exactly the spawn box's arm.
   """
   spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
   tool_speed = _select(TOOL_SPEED_ENV_VAR, DEFAULT_TOOL_SPEED, TOOL_SPEED_CAPS)
+  effort = EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)]
   return make_pick_place_env_cfg(
     kangaroo_grippers_left_arm(
-      _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS), SPAWN_ROBOTS[spawn]
+      _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
+      SPAWN_ROBOTS[spawn],
+      arm_effort_scale=effort.effort_scale,
     ),
     gripper_name="left",
     spawn=SPAWN_BOXES[spawn],
@@ -138,6 +152,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     action_slew_rate_scale=_select_slew(),
     baseline=BASELINES[baseline],
     tool_speed_cap=TOOL_SPEED_CAPS[tool_speed],
+    effort=effort,
   )
 
 

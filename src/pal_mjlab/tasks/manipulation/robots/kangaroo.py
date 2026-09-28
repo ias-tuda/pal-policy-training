@@ -179,6 +179,7 @@ KANGAROO_GRIPPERS_LEFT_ARM_WIDE = dataclasses.replace(
 def kangaroo_grippers_left_arm(
   gains: str = DEFAULT_TABLETOP_GAINS,
   base: ManipulationRobotCfg = KANGAROO_GRIPPERS_LEFT_ARM,
+  arm_effort_scale: float | None = None,
 ) -> ManipulationRobotCfg:
   """``base`` on the plant of plan-S8 gain code ``gains``.
 
@@ -187,6 +188,9 @@ def kangaroo_grippers_left_arm(
   gravity is compensated (`kangaroo_constants.TABLETOP_GAINS`). The action space, its scales,
   clip and slew limit are ``base``'s for every code, so two runs that differ in the code differ
   in the plant alone. G0 builds exactly ``base``'s robot.
+
+  ``arm_effort_scale`` lowers the driven (left) arm's effort limit to that fraction of its
+  effort -- plan S7-4's module T, 0.7: 35 N.m on arm 1-2, 17.5 on arm 3-7. None keeps it.
   """
   if gains not in TABLETOP_GAINS:
     raise ValueError(
@@ -202,6 +206,8 @@ def kangaroo_grippers_left_arm(
   return dataclasses.replace(
     base,
     entity_cfg_fn=functools.partial(
-      get_kangaroo_grippers_tabletop_robot_cfg, gains=gains
+      get_kangaroo_grippers_tabletop_robot_cfg,
+      gains=gains,
+      left_arm_effort_scale=arm_effort_scale,
     ),
   )

@@ -50,6 +50,20 @@ Every episode's spawn pose, table offset from its nominal pose, target, release 
 and final cube position go into the JSON (``episodes_detail``): what plan S7-2's D5
 diagnosis and the W runs' placed rate by spawn distance are read from.
 
+Plan S7-4: the release is the jaw opening, and the retreat (``RetreatTally``)
+--------------------------------------------------------------------------------
+Every read above keeps its old definition (a let-go = the pads losing the cube), so a number
+stays comparable with the S7-2 / S7-3 reports. Beside them, the J reads: whether the jaw really
+opens -- its measured angle falls below `JAW_OPEN` (0.15 rad) after the first lift -- its angle
+at the pads' let-go, and `placed` / `placed & lifted` with the jaw open. With ``--handoff`` a
+position controller takes over, as it will on the robot: once the jaw has opened after the lift
+and the TCP has stayed `HANDOFF_CLEAR` above the cube's top for `HANDOFF_STEPS` steps, or at
+`HANDOFF_TIMEOUT_S`, the env gets action 0 -- the home pose and the open jaw, reached through the
+action term's own slew (and V, C, T where the run has them). Read: the lift height before the
+hand-off, the time from placed to it, the cube's displacement during the lift and the return,
+whether it is still placed at the end, the time to home, and S7-4's success -- placed & lifted &
+J-released & lifted clear (>= `HANDOFF_CLEAR`) & still placed after the return.
+
 Horizon
 --------------------------------------------------------------------------------
 Not the `--play` cfg as-is: `apply_play_overrides` sets `episode_length_s` to 1e9, so
@@ -111,6 +125,18 @@ SET_DOWN_CLEARANCE = 0.005
 #: M6's grade (`mdp.rewards.release_quality_of`), for the per-release numbers.
 M6_GRADE = {"dist_std": 0.02, "height_free": 0.01, "height_std": 0.01, "floor": 0.25}
 
+#: Plan S7-4. `JAW_OPEN`: the jaw counts as open below this measured angle (rad), module J's
+#: `mdp.observations.JAW_OPEN_BELOW`. The hand-off to the position controller: the jaw open
+#: after the lift and the TCP at least `HANDOFF_CLEAR` (m) above the cube's top for
+#: `HANDOFF_STEPS` consecutive steps, or at `HANDOFF_TIMEOUT_S`. "Home": every driven-arm joint
+#: within `HOME_TOL` (rad) of its default. Restated like `SET_DOWN_*`; the test checks them.
+JAW_OPEN = 0.15
+JAW_JOINT = "gripper_left_finger_joint"
+HANDOFF_CLEAR = 0.03
+HANDOFF_STEPS = 5
+HANDOFF_TIMEOUT_S = 8.0
+HOME_TOL = 0.05
+
 
 def release_grades(dxy: float, dz: float, passed: bool) -> tuple[float, float]:
   """(M6, M7) grade of one release at ``dxy`` from the target and ``dz`` above it. M7 is M6
@@ -135,7 +161,7 @@ GAINED_JOINTS = r"(pelvis_[12]|arm_(left|right)_[1-7])_joint"
 SATURATION_FRACTION = 0.999
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   p.add_argument("--checkpoint", type=pathlib.Path, required=True, help="model_*.pt")
   p.add_argument("--task", default=TASK)
@@ -152,7 +178,13 @@ def parse_args() -> argparse.Namespace:
     help="also read the plant (plan S8): parked-arm/pelvis hold error, the driven arm's "
     "tracking error while carrying, effort saturation, cube-table force at set-down",
   )
-  return p.parse_args()
+  p.add_argument(
+    "--handoff",
+    action="store_true",
+    help="plan S7-4: hand the arm to a position controller (action 0: home, jaw open) once "
+    "the jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
+  )
+  return p.parse_args(argv)
 
 
 class Tally:
@@ -444,7 +476,12 @@ class PlantTally:
   * saturation -- how many steps each pelvis/arm joint's actuator torque sits at its effort
     limit, over the whole rollout;
   * set-down force -- the peak cube-table normal force while the cube is held within
-    `NEAR_XY` of the target: how hard the arm presses the cube into the table.
+    `NEAR_XY` of the target: how hard the arm presses the cube into the table;
+  * plan S7-4 -- the effort limit a joint's saturation is read against is the one the model
+    carries: its ``actuatorfrcrange`` where that is set and lower (T's cap), else its actuator's
+    ``forcerange``. Also the driven arm's peak |tau| / limit per joint, its saturation over the
+    steps after the episode's first let-go (the press), and the share of its targets outside
+    the joint range (what C prevents).
 
   Tensors in, so the accounting is testable without an env; `from_env` wires one to it.
   """
@@ -474,7 +511,41 @@ class PlantTally:
     self.park_joint_max = torch.zeros(len(parked_names), device=device)
     self.sat_count = torch.zeros(len(gained_names), dtype=torch.long, device=device)
     self.sat_steps = 0
+    self.driven_names: list[str] = []
+    self.driven_effort: torch.Tensor | None = None
+    self.driven_range: torch.Tensor | None = None
+    self.peak_ratio: torch.Tensor | None = None
+    self.after_sat = self.after_steps = self.out_of_range = self.target_steps = None
     self.done: list[dict[str, float | int | None]] = []
+
+  def set_driven(
+    self, names: list[str], effort: torch.Tensor, joint_range: torch.Tensor
+  ) -> None:
+    """Plan S7-4's driven-arm reads: its joints, effort limits (n,) and ranges (n, 2)."""
+    n, device = len(names), effort.device
+    self.driven_names = names
+    self.driven_effort, self.driven_range = effort, joint_range
+    self.peak_ratio = torch.zeros(n, device=device)
+    self.after_sat = torch.zeros(n, dtype=torch.long, device=device)
+    self.out_of_range = torch.zeros(n, dtype=torch.long, device=device)
+    self.after_steps = 0
+    self.target_steps = 0
+
+  def measure_driven(
+    self, torque: torch.Tensor, target: torch.Tensor, after: torch.Tensor
+  ) -> None:
+    """One step of the driven arm: torque and target (B, n), ``after`` the envs past their
+    episode's first let-go (B,)."""
+    assert self.driven_effort is not None and self.driven_range is not None
+    ratio = torque.abs() / self.driven_effort
+    self.peak_ratio = torch.maximum(self.peak_ratio, ratio.amax(dim=0))
+    sat = ratio >= SATURATION_FRACTION
+    after = after.bool()
+    self.after_sat += (sat & after.unsqueeze(-1)).sum(dim=0)
+    self.after_steps += int(after.sum())
+    lo, hi = self.driven_range[:, 0], self.driven_range[:, 1]
+    self.out_of_range += ((target < lo) | (target > hi)).sum(dim=0)
+    self.target_steps += target.shape[0]
 
   @classmethod
   def from_env(cls, env: ManagerBasedRlEnv) -> PlantTally:
@@ -495,15 +566,30 @@ class PlantTally:
       (mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_ACTUATOR, a) or "").split("/")[-1]: a
       for a in range(mj.nu)
     }
+    joint_ids = robot.indexing.joint_ids.tolist()
+
+    def effort(i: int) -> float:
+      # The limit that binds: the actuator's forcerange, or the joint's actuatorfrcrange
+      # where it is set lower (plan S7-4's T; with G0's routed gravcomp it is the same).
+      e = float(mj.actuator_forcerange[actuator[names[i]], 1])
+      j = joint_ids[i]
+      if mj.jnt_actfrclimited[j]:
+        e = min(e, float(mj.jnt_actfrcrange[j, 1]))
+      return e
+
     tally = cls(
       env.num_envs,
       env.device,
       [names[i] for i in parked],
       robot.data.default_joint_pos[:, parked].clone(),
       [names[i] for i in gained],
+      torch.tensor([effort(i) for i in gained], device=env.device),
+    )
+    tally.set_driven(
+      [names[i] for i in driven],
+      torch.tensor([effort(i) for i in driven], device=env.device),
       torch.tensor(
-        [float(mj.actuator_forcerange[actuator[names[i]], 1]) for i in gained],
-        device=env.device,
+        [mj.jnt_range[joint_ids[i]].tolist() for i in driven], device=env.device
       ),
     )
     tally._robot = robot
@@ -515,11 +601,22 @@ class PlantTally:
     )
     return tally
 
-  def measure_env(self, carrying: torch.Tensor, setdown: torch.Tensor) -> None:
+  def measure_env(
+    self,
+    carrying: torch.Tensor,
+    setdown: torch.Tensor,
+    after_let_go: torch.Tensor | None = None,
+  ) -> None:
     """`measure` from the env `from_env` was built on, at the current state."""
     parked, driven, gained = self._idx
     q = self._robot.data.joint_pos
     force = self._support.data.force  # (B, slots, 3), contact frame: normal first
+    if after_let_go is not None:
+      self.measure_driven(
+        self._robot.data.qfrc_actuator[:, driven],
+        self._sim.data.ctrl[:, self._driven_ctrl],
+        after_let_go,
+      )
     self.measure(
       parked_q=q[:, parked],
       driven_q=q[:, driven],
@@ -614,7 +711,213 @@ class PlantTally:
       "plant_saturation_share_max": max(share, default=None),
       "plant_setdown_force_peak_median_n": median(vals("setdown_force_peak")),
       "plant_setdown_force_peak_max_n": max(vals("setdown_force_peak"), default=None),
+      **self._summarise_driven(),
     }
+
+  def _summarise_driven(self) -> dict:
+    if self.peak_ratio is None or not self.target_steps:
+      return {}
+    names = self.driven_names
+    after = (self.after_sat.float() / max(self.after_steps, 1)).tolist()
+    out = (self.out_of_range.float() / self.target_steps).tolist()
+    return {
+      "plant_driven_effort_limit_nm": dict(
+        zip(names, self.driven_effort.tolist(), strict=True)
+      ),
+      "plant_driven_peak_effort_ratio": dict(
+        zip(names, self.peak_ratio.tolist(), strict=True)
+      ),
+      "plant_driven_saturation_after_let_go": dict(zip(names, after, strict=True)),
+      "plant_driven_saturation_after_let_go_max": max(after, default=None),
+      "plant_driven_target_out_of_range": dict(zip(names, out, strict=True)),
+      "plant_driven_target_out_of_range_max": max(out, default=None),
+    }
+
+
+class RetreatTally:
+  """Plan S7-4's reads, per episode, kept beside `Tally` and banked with it: the jaw release
+  (module J), the retreat and the hand-off to the position controller. Tensors in, like
+  `PlantTally`; call `step` once per control step, at the top of the step, and apply the
+  hand-off mask it returns to that step's action."""
+
+  def __init__(
+    self, num_envs: int, device: str, step_dt: float, handoff: bool = False
+  ) -> None:
+    self.step_dt = step_dt
+    self.handoff = handoff
+    self.timeout_steps = round(HANDOFF_TIMEOUT_S / step_dt)
+    zb = lambda: torch.zeros(num_envs, dtype=torch.bool, device=device)  # noqa: E731
+    zl = lambda v=0: torch.full((num_envs,), v, dtype=torch.long, device=device)  # noqa: E731
+    zf = lambda v=0.0: torch.full((num_envs,), v, device=device)  # noqa: E731
+    self.age = zl()
+    self.prev_grasped, self.prev_jaw_closed, self.lifted = zb(), zb(), zb()
+    self.let_go, self.jaw_at_let_go = zb(), zf()
+    self.released, self.rel_step = zb(), zl(-1)
+    self.rel_xy = torch.zeros(num_envs, 2, device=device)
+    self.placed_j, self.placed_j_step = zb(), zl(-1)
+    self.clear_max = zf(float("-inf"))
+    self.clear_run = zl()
+    self.handed, self.hand_step, self.hand_by = zb(), zl(-1), zl()
+    self.hand_xy = torch.zeros(num_envs, 2, device=device)
+    self.hand_height = zf()
+    self.home_step = zl(-1)
+    self.final_placed_j, self.final_dxy = zb(), zf()
+    self.final_xy = torch.zeros(num_envs, 2, device=device)
+    self.done: list[dict[str, float | int | bool | str | None]] = []
+
+  def step(
+    self,
+    jaw_q: torch.Tensor,
+    grasped: torch.Tensor,
+    lifted: torch.Tensor,
+    placed_j: torch.Tensor,
+    tcp_above: torch.Tensor,
+    obj_xy: torch.Tensor,
+    goal_dxy: torch.Tensor,
+    arm_home_err: torch.Tensor,
+  ) -> torch.Tensor:
+    """One step's state -> the envs the position controller drives this step. (B,)
+
+    ``tcp_above`` is the TCP's height above the cube's top, ``goal_dxy`` the cube's horizontal
+    distance to the target, ``arm_home_err`` the driven arm's max |q - q_default|."""
+    grasped, lifted, placed_j = grasped.bool(), lifted.bool(), placed_j.bool()
+    jaw_open = jaw_q < JAW_OPEN
+    self.lifted |= lifted
+    let_go = self.prev_grasped & ~grasped & self.lifted
+    self.jaw_at_let_go = torch.where(let_go, jaw_q, self.jaw_at_let_go)
+    self.let_go |= let_go
+    opened = self.prev_jaw_closed & jaw_open & self.lifted & ~self.released
+    self.released |= opened
+    self.rel_step = torch.where(opened, self.age, self.rel_step)
+    self.rel_xy = torch.where(opened.unsqueeze(-1), obj_xy, self.rel_xy)
+    newly = placed_j & (self.placed_j_step < 0)
+    self.placed_j_step = torch.where(newly, self.age, self.placed_j_step)
+    self.placed_j |= placed_j
+    # The lift: after the J-release and before the hand-off, how high the TCP gets.
+    lifting = self.released & ~self.handed
+    self.clear_max = torch.where(
+      lifting, torch.maximum(self.clear_max, tcp_above), self.clear_max
+    )
+    clear = lifting & jaw_open & (tcp_above >= HANDOFF_CLEAR)
+    self.clear_run = torch.where(
+      clear, self.clear_run + 1, torch.zeros_like(self.clear_run)
+    )
+    if self.handoff:
+      by_lift = ~self.handed & (self.clear_run >= HANDOFF_STEPS)
+      by_time = ~self.handed & ~by_lift & (self.age >= self.timeout_steps)
+      start = by_lift | by_time
+      self.hand_by = torch.where(by_lift, 1, torch.where(by_time, 2, self.hand_by))
+      self.hand_step = torch.where(start, self.age, self.hand_step)
+      self.hand_xy = torch.where(start.unsqueeze(-1), obj_xy, self.hand_xy)
+      self.hand_height = torch.where(start, tcp_above, self.hand_height)
+      self.handed |= start
+      home = self.handed & (self.home_step < 0) & (arm_home_err < HOME_TOL)
+      self.home_step = torch.where(home, self.age, self.home_step)
+    self.final_placed_j = placed_j
+    self.final_dxy = goal_dxy
+    self.final_xy = obj_xy.clone()
+    self.prev_grasped = grasped.clone()
+    self.prev_jaw_closed = ~jaw_open
+    self.age += 1
+    return self.handed.clone()
+
+  def finish(self, env_ids: torch.Tensor, placed_and_lifted: list[bool]) -> None:
+    """Bank the episodes that just ended, in `Tally.finish`'s order; ``placed_and_lifted`` is
+    `Tally`'s flag for each of them (the J version is this tally's own)."""
+    dt = self.step_dt
+    for k, i in enumerate(env_ids.tolist()):
+      rel, hand = bool(self.released[i]), int(self.hand_step[i])
+      handed = hand >= 0
+      clear = rel and float(self.clear_max[i]) >= HANDOFF_CLEAR
+      row = {
+        "jaw_released": rel,
+        "jaw_at_let_go": float(self.jaw_at_let_go[i]) if bool(self.let_go[i]) else None,
+        "placed_j": bool(self.placed_j[i]),
+        "placed_and_lifted_j": bool(self.placed_j[i]) and bool(self.lifted[i]),
+        "lift_clear_max": float(self.clear_max[i]) if rel else None,
+        "lifted_clear": clear,
+        "handoff_by": ("lift", "timeout")[int(self.hand_by[i]) - 1] if handed else None,
+        "handoff_height": float(self.hand_height[i]) if handed else None,
+        "placed_to_handoff_s": (hand - int(self.placed_j_step[i])) * dt
+        if handed and int(self.placed_j_step[i]) >= 0
+        else None,
+        "cube_moved_lift": float(torch.norm(self.hand_xy[i] - self.rel_xy[i]))
+        if handed and rel
+        else None,
+        "cube_moved_return": float(torch.norm(self.final_xy[i] - self.hand_xy[i]))
+        if handed
+        else None,
+        "final_placed_j": bool(self.final_placed_j[i]),
+        "final_dxy": float(self.final_dxy[i]),
+        "time_to_home_s": (int(self.home_step[i]) - hand) * dt
+        if handed and int(self.home_step[i]) >= 0
+        else None,
+      }
+      row["success_retreat"] = (
+        bool(placed_and_lifted[k])
+        and rel
+        and clear
+        and bool(self.final_placed_j[i])
+        and bool(self.placed_j[i])
+      )
+      self.done.append(row)
+    for acc in (
+      self.prev_grasped,
+      self.prev_jaw_closed,
+      self.lifted,
+      self.let_go,
+      self.released,
+      self.placed_j,
+      self.handed,
+    ):
+      acc[env_ids] = False
+    for acc in (self.age, self.clear_run, self.hand_by):
+      acc[env_ids] = 0
+    for acc in (self.rel_step, self.placed_j_step, self.hand_step, self.home_step):
+      acc[env_ids] = -1
+    self.clear_max[env_ids] = float("-inf")
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    vals = lambda k: [r[k] for r in rows if r[k] is not None]  # noqa: E731
+    median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+    share = lambda k: sum(bool(r[k]) for r in rows) / n  # noqa: E731
+    by = [r["handoff_by"] for r in rows]
+    return {
+      "jaw_released": share("jaw_released"),
+      "jaw_at_let_go_median_rad": median(vals("jaw_at_let_go")),
+      "placed_j": share("placed_j"),
+      "placed_and_lifted_j": share("placed_and_lifted_j"),
+      "lifted_clear": share("lifted_clear"),
+      "lift_clear_max_median_m": median(vals("lift_clear_max")),
+      "handoff_by_lift": by.count("lift") / n,
+      "handoff_by_timeout": by.count("timeout") / n,
+      "handoff_height_median_m": median(vals("handoff_height")),
+      "placed_to_handoff_median_s": median(vals("placed_to_handoff_s")),
+      "cube_moved_lift_median_m": median(vals("cube_moved_lift")),
+      "cube_moved_lift_max_m": max(vals("cube_moved_lift"), default=None),
+      "cube_moved_return_median_m": median(vals("cube_moved_return")),
+      "cube_moved_return_max_m": max(vals("cube_moved_return"), default=None),
+      "final_placed_j": share("final_placed_j"),
+      "final_within_goal": sum(r["final_dxy"] < GOAL_THRESHOLD for r in rows) / n,
+      "time_to_home_median_s": median(vals("time_to_home_s")),
+      "success_retreat": share("success_retreat"),
+    }
+
+
+def retreat_state(
+  env: ManagerBasedRlEnv, arm_ids: list[int], jaw_id: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """The jaw's measured angle, the TCP's height above the cube's top, and the driven arm's
+  max |q - q_default|, for `RetreatTally.step`. (B,) each"""
+  robot, obj = env.scene[ROBOT], env.scene[OBJECT]
+  q = robot.data.joint_pos
+  half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+  _, tcp = positions(env)
+  above = tcp[:, 2] - (obj.data.root_link_pos_w[:, 2] + half_z)
+  home_err = (q[:, arm_ids] - robot.data.default_joint_pos[:, arm_ids]).abs().amax(-1)
+  return q[:, jaw_id], above, home_err
 
 
 def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
@@ -908,6 +1211,58 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"  (median; max {fmt3(result['plant_setdown_force_peak_max_n'], 'N')})"
     )
 
+  if "plant_driven_peak_effort_ratio" in result:
+    print("\n  DRIVEN ARM (plan S7-4) -------------------------------------------")
+    peak = result["plant_driven_peak_effort_ratio"]
+    after = result["plant_driven_saturation_after_let_go"]
+    out = result["plant_driven_target_out_of_range"]
+    for n, lim in result["plant_driven_effort_limit_nm"].items():
+      print(
+        f"    {n.removesuffix('_joint'):14s} limit {lim:5.1f} N.m  peak |tau|/limit "
+        f"{peak[n]:5.2f}  at limit after let-go {after[n]:6.1%}  target out of range "
+        f"{out[n]:6.1%}"
+      )
+
+  if "jaw_released" in result:
+    fmt = lambda v, u="m": "n/a" if v is None else f"{v:6.3f} {u}"  # noqa: E731
+    print("\n  RELEASE BY THE JAW, RETREAT, HAND-OFF (plan S7-4) ------------------")
+    print(
+      f"    jaw opened (< {JAW_OPEN} rad)   {result['jaw_released']:6.1%}   after the lift"
+    )
+    print(
+      f"    jaw at the pads' let-go  {fmt(result['jaw_at_let_go_median_rad'], 'rad')}  (median)"
+    )
+    print(f"    placed, jaw open         {result['placed_j']:6.1%}")
+    print(f"    placed & lifted, jaw open{result['placed_and_lifted_j']:6.1%}")
+    print(
+      f"    lifted clear (>= {HANDOFF_CLEAR} m) {result['lifted_clear']:6.1%}   "
+      f"max TCP over cube top {fmt(result['lift_clear_max_median_m'])} (median)"
+    )
+    print(
+      f"    hand-off by lift / time  {result['handoff_by_lift']:6.1%} / "
+      f"{result['handoff_by_timeout']:6.1%}"
+    )
+    print(
+      f"    placed -> hand-off       {fmt(result['placed_to_handoff_median_s'], 's')}  (median)"
+    )
+    print(
+      f"    cube moved, lift         {fmt(result['cube_moved_lift_median_m'])}  "
+      f"(median; max {fmt(result['cube_moved_lift_max_m'])})"
+    )
+    print(
+      f"    cube moved, return       {fmt(result['cube_moved_return_median_m'])}  "
+      f"(median; max {fmt(result['cube_moved_return_max_m'])})"
+    )
+    print(
+      f"    still placed at the end  {result['final_placed_j']:6.1%}   within "
+      f"{GOAL_THRESHOLD} m: {result['final_within_goal']:6.1%}"
+    )
+    print(f"    time to home             {fmt(result['time_to_home_median_s'], 's')}")
+    print(
+      f"    SUCCESS (S7-4)           {result['success_retreat']:6.1%}   placed & lifted & "
+      "jaw-released & lifted clear & still placed"
+    )
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -928,6 +1283,11 @@ def main() -> None:
 
   tally = Tally(args.num_envs, args.device)
   plant = PlantTally.from_env(env) if args.plant else None
+  retreat = RetreatTally(args.num_envs, args.device, env.step_dt, args.handoff)
+  robot = env.scene[ROBOT]
+  arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
+  arm_ids = [i for i in arm_ids if robot.joint_names[i].startswith("arm_left_")]
+  jaw_id = robot.joint_names.index(JAW_JOINT)
   reward_sums: dict[str, list[float]] = {}
 
   obs, _ = wrapped.reset()
@@ -940,9 +1300,22 @@ def main() -> None:
       tally.observe(**flags)
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
+      jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
+      handed = retreat.step(
+        jaw_q,
+        flags["grasped"],
+        flags["lifted"],
+        flags["placed_and_lifted"] & (jaw_q < JAW_OPEN),
+        tcp_above,
+        obj_pos[:, :2],
+        dxy,
+        home_err,
+      )
       if plant is not None:
         plant.measure_env(
-          carrying=flags["lifted"], setdown=flags["grasped"] & (dxy < NEAR_XY)
+          carrying=flags["lifted"],
+          setdown=flags["grasped"] & (dxy < NEAR_XY),
+          after_let_go=retreat.let_go,
         )
       tally.measure_speed(flags["grasped"], *positions(env), env.step_dt, goal)
       tally.measure_set_down(
@@ -952,11 +1325,20 @@ def main() -> None:
         obj_vel,
         goal,
       )
-      obs, _, dones, extras = wrapped.step(policy(obs))
+      actions = policy(obs)
+      if args.handoff:
+        # The position controller: action 0 is the home pose with the jaw open, reached
+        # through the action term's slew (and its tool cap and bounds, where the run has them).
+        actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
+      obs, _, dones, extras = wrapped.step(actions)
       tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()
       if finished.numel():
+        n_before = len(tally.done)
         tally.finish(finished)
+        retreat.finish(
+          finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
+        )
         if plant is not None:
           plant.finish(finished)
         for key, value in extras.get("log", {}).items():
@@ -966,6 +1348,8 @@ def main() -> None:
             )
 
   result = summarise(tally, env.step_dt, args.episodes)
+  result.update(retreat.summarise(args.episodes))
+  result["handoff"] = bool(args.handoff)
   if plant is not None:
     result.update(plant.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
@@ -982,7 +1366,12 @@ def main() -> None:
           "seed": args.seed,
           **result,
           "reward_terms": rewards,
-          "episodes_detail": tally.done[: args.episodes],
+          "episodes_detail": [
+            {**r, **q}
+            for r, q in zip(
+              tally.done[: args.episodes], retreat.done[: args.episodes], strict=True
+            )
+          ],
         },
         indent=2,
       )

@@ -88,6 +88,27 @@ New Features & Tasks
   ``TOOL_SPEED`` through and adds them to the run name and wandb tags.
   (``346840a``, ``2d727b8``, ``f3bcfd0``.)
 
+- **New: letting go means opening the jaw, lifting clear after placing, and a
+  bound on the arm's effort** (plan S7-4), in
+  ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. Two new reward arms,
+  ``R-C-strict+M1+M2+M3+M6+J+M8`` and ``...+J+M8+S``. With ``J``, the cube
+  only counts as released once the jaw's measured angle is below 0.15 rad.
+  Before, it was enough for the pads to stop touching the cube, even with the
+  jaw still at the angle it holds the cube at. ``M8`` pays for lifting the
+  open gripper up to 5 cm above the placed cube and charges for touching it
+  again. ``S`` adds a bonus for putting the cube down on the table before
+  letting go. A new selector, ``EFFORT``, bounds the driven arm: ``C`` keeps
+  the arm's joint targets inside the joint ranges, and ``CTP`` adds a lower
+  effort limit (0.7 times the actuator's) and a penalty for effort above 80 %
+  of it. ``CTP`` enforces the limit on the simulated arm and again in the action,
+  where the target is kept within what the capped controller can deliver.
+  ``TOOL_SPEED=V0.5`` caps the gripper at 0.5 m/s (0.1 m/s near the table or
+  the target). ``EFFORT`` defaults to ``none`` and nothing changes for
+  existing runs. The IAS training script adds ``EFFORT`` to the run name and
+  wandb tags. The evaluation script reports whether the jaw really opens, and
+  ``--handoff`` hands the arm to a return-to-home controller once the gripper
+  is clear of the cube, as the robot will. (Branch ``siwei-s7-4``.)
+
 - **New: stiff arm gains instead of gravity compensation,** selected with
   ``GAINS`` in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. ``GAINS=G20`` gives
   the pelvis and both arms 20 times the identified stiffness and damping, the

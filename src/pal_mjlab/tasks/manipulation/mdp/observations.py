@@ -121,6 +121,30 @@ def _grasped_bool(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
   return per_pad.all(dim=-1)
 
 
+def _pad_contact_any(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+  """True while *either* pad touches the object: the grasp sensor's per-pad contact, any. (B,)"""
+  sensor: ContactSensor = env.scene[sensor_name]
+  found = sensor.data.found
+  assert found is not None, f"sensor {sensor_name!r} does not provide 'found'"
+  return found.view(found.shape[0], -1, sensor.cfg.num_slots).bool().any(dim=(-1, -2))
+
+
+#: Plan S7-4's module J: the jaw's measured angle below which it counts as open, rad. The jaw
+#: first touches a centred 5 cm cube at ~0.21 rad and holds it at ~0.30 (S7-4 plan, from S7-1's
+#: FR s2 probe), so 0.15 is open by 6 cm of pad travel and cannot be a hold.
+JAW_OPEN_BELOW = 0.15
+
+
+def _jaw_open_bool(
+  env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float
+) -> torch.Tensor:
+  """Plan S7-4's J: the jaw's measured angle is below ``jaw_open``. (B,)"""
+  robot: Entity = env.scene[jaw_cfg.name]
+  q = robot.data.joint_pos[:, jaw_cfg.joint_ids]
+  assert q.shape[-1] == 1, f"jaw_cfg must name one joint, got {jaw_cfg.joint_names}"
+  return q[:, 0] < jaw_open
+
+
 def is_on_surface(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
   """1.0 while the object still rests on the support surface. (B, 1)"""
   return _on_surface_bool(env, sensor_name).float().unsqueeze(-1)
@@ -213,6 +237,17 @@ class ReleaseLatch:
   rel_speed: torch.Tensor
   rel_dwell: torch.Tensor
   step: int = -1
+  # Plan S7-4's J (``jaw`` set): a release is the jaw opening, and the where / how of it is
+  # the pads' let-go before it, held here until the jaw opens (``pend_*``, valid while
+  # ``pend``). ``jaw_closed`` is "jaw at or above the open angle" at the last update.
+  jaw: tuple[str, float] | None = None
+  jaw_closed: torch.Tensor | None = None
+  pend: torch.Tensor | None = None
+  pend_dxy: torch.Tensor | None = None
+  pend_height: torch.Tensor | None = None
+  pend_on_table: torch.Tensor | None = None
+  pend_speed: torch.Tensor | None = None
+  pend_dwell: torch.Tensor | None = None
 
 
 def _release_latch(
@@ -222,9 +257,19 @@ def _release_latch(
   grasp_sensor_name: str,
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> ReleaseLatch:
   """Episode latch of the latest release after `was_lifted`. Cleared on reset by
   `events.reset_release_latch`.
+
+  With ``jaw_cfg`` and ``jaw_open`` (plan S7-4, module J) a release is the jaw's measured angle
+  falling below ``jaw_open`` after `was_lifted`, not the pads losing the object: S7-2/S7-3
+  policies "released" with the jaw still at the hold angle, the pads merely slipping off. What
+  the release is graded on -- where the object was, how high, its contact, speed and dwell --
+  is still taken when the pads let go (a drop is graded at the height it fell from), and is
+  committed when the jaw then opens; a let-go the jaw never opens after is not a release.
+  Every reader of one env's latch must pass the same two; mixing them raises.
 
   A release is the step the grasp opens -- held at the last update, not held now -- while the
   `was_lifted` latch is set, so letting go of a cube that was only ever pushed is not one.
@@ -249,6 +294,7 @@ def _release_latch(
   """
   from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
 
+  jaw = None if jaw_cfg is None else (jaw_cfg.name, float(jaw_open))
   latch = getattr(env, _RELEASE, None)
   if latch is None or latch.released.shape[0] != env.num_envs:
     no = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -265,17 +311,26 @@ def _release_latch(
       rel_on_table=no.clone(),
       rel_speed=zero.clone(),
       rel_dwell=count.clone(),
+      jaw=jaw,
     )
+    if jaw is not None:
+      latch.jaw_closed = no.clone()
+      latch.pend = no.clone()
+      latch.pend_dxy, latch.pend_height = zero.clone(), zero.clone()
+      latch.pend_on_table, latch.pend_speed = no.clone(), zero.clone()
+      latch.pend_dwell = count.clone()
     setattr(env, _RELEASE, latch)
+  if latch.jaw != jaw:
+    raise ValueError(
+      f"the release latch was built with jaw={latch.jaw}, read with jaw={jaw}: every "
+      "reader of one env's latch must define the release the same way"
+    )
   if latch.step == env.common_step_counter:
     return latch
   latch.step = env.common_step_counter
   grasped = _grasped_bool(env, grasp_sensor_name)
-  opened = (
-    latch.grasped
-    & ~grasped
-    & _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
-  )
+  was_lifted = _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  let_go = latch.grasped & ~grasped & was_lifted
   obj: Entity = env.scene[object_name]
   goal = env.command_manager.get_term(command_name).command
   pos = obj.data.root_link_pos_w
@@ -284,11 +339,40 @@ def _release_latch(
   dxy = torch.norm((pos - goal)[:, :2], dim=-1)
   speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
   on_table = _on_surface_bool(env, support_sensor_name)
-  latch.dxy = torch.where(opened, dxy, latch.dxy)
-  latch.height = torch.where(opened, pos[:, 2] - rest_z, latch.height)
-  latch.rel_on_table = torch.where(opened, on_table, latch.rel_on_table)
-  latch.rel_speed = torch.where(opened, speed, latch.rel_speed)
-  latch.rel_dwell = torch.where(opened, latch.dwell, latch.rel_dwell)
+  height = pos[:, 2] - rest_z
+  if jaw is None:
+    opened = let_go
+    now = (dxy, height, on_table, speed, latch.dwell)
+  else:
+    assert jaw_cfg is not None and jaw_open is not None
+    # The pads' let-go is held until the jaw opens; a jaw that opens with none pending (it
+    # cannot, around a 5 cm cube) is graded where the object is then.
+    w = lambda new, old: torch.where(let_go, new, old)  # noqa: E731
+    latch.pend_dxy, latch.pend_height = (
+      w(dxy, latch.pend_dxy),
+      w(height, latch.pend_height),
+    )
+    latch.pend_on_table = w(on_table, latch.pend_on_table)
+    latch.pend_speed = w(speed, latch.pend_speed)
+    latch.pend_dwell = w(latch.dwell, latch.pend_dwell)
+    latch.pend = latch.pend | let_go
+    jaw_is_open = _jaw_open_bool(env, jaw_cfg, jaw_open)
+    opened = latch.jaw_closed & jaw_is_open & was_lifted
+    p = latch.pend
+    now = (
+      torch.where(p, latch.pend_dxy, dxy),
+      torch.where(p, latch.pend_height, height),
+      torch.where(p, latch.pend_on_table, on_table),
+      torch.where(p, latch.pend_speed, speed),
+      torch.where(p, latch.pend_dwell, latch.dwell),
+    )
+    latch.pend = latch.pend & ~opened
+    latch.jaw_closed = ~jaw_is_open
+  latch.dxy = torch.where(opened, now[0], latch.dxy)
+  latch.height = torch.where(opened, now[1], latch.height)
+  latch.rel_on_table = torch.where(opened, now[2], latch.rel_on_table)
+  latch.rel_speed = torch.where(opened, now[3], latch.rel_speed)
+  latch.rel_dwell = torch.where(opened, now[4], latch.rel_dwell)
   latch.released |= opened
   latch.grasped = grasped
   # M7's dwell, after the release has been recorded with the count up to the last update.
@@ -311,8 +395,13 @@ def _placed_bool(
   threshold: float,
   velocity_threshold: float,
   support_sensor_name: str | None = None,
+  jaw_cfg: SceneEntityCfg | None = None,
+  jaw_open: float | None = None,
 ) -> torch.Tensor:
   """At the goal, released, and at rest. Shared by the success reward and termination.
+
+  With ``jaw_cfg`` and ``jaw_open`` (plan S7-4, module J) "released" also needs the jaw open,
+  below ``jaw_open``: an object that slipped out of a jaw still at the hold angle is not.
 
   `released` is `¬grasped`, which a cube that was never picked up also satisfies -- so on a
   table-height goal this counts a slide as a place. Passing `support_sensor_name` adds the
@@ -323,6 +412,9 @@ def _placed_bool(
   command = env.command_manager.get_term(command_name)
   at_goal = torch.norm(command.command - obj.data.root_link_pos_w, dim=-1) < threshold
   released = ~_grasped_bool(env, grasp_sensor_name)
+  if jaw_cfg is not None:
+    assert jaw_open is not None
+    released &= _jaw_open_bool(env, jaw_cfg, jaw_open)
   settled = torch.norm(obj.data.root_link_lin_vel_w, dim=-1) < velocity_threshold
   placed = at_goal & released & settled
   if support_sensor_name is not None:

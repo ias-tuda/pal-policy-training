@@ -429,7 +429,43 @@ def _route_gravcomp_through_actuators(spec: mujoco.MjSpec) -> None:
     )
 
 
-def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
+#: The driven arm's joints and their effort, for plan S7-4's torque bound T. Restated like
+#: `_TABLETOP_ACTGRAVCOMP_EFFORT`, and for the same reason.
+_LEFT_ARM_EFFORT = {
+  r"arm_left_[12]_joint": 50.0,
+  r"arm_left_[3-7]_joint": 25.0,
+}
+
+
+def _cap_left_arm_effort(spec: mujoco.MjSpec, scale: float) -> None:
+  """Lower the left arm's effort limit to ``scale`` x its effort (plan S7-4, module T).
+
+  On the joint's ``actuatorfrcrange``, not the actuator's ``forcerange``: MuJoCo clamps the
+  joint's total actuator force by it -- the PD term, plus gravity compensation where it is
+  routed through the actuator -- and it is set on the spec, so the compiled `MjModel` (and
+  everything that reads the limit off it: the action term's band, the effort hinge, the
+  eval's saturation read) carries the lowered cap. The actuator's own ``forcerange`` stays the
+  full effort and no longer binds.
+  """
+  if not 0.0 < scale <= 1.0:
+    raise ValueError(f"left-arm effort scale {scale} is outside (0, 1]")
+  matched = 0
+  for joint in spec.joints:
+    effort = next(
+      (e for rx, e in _LEFT_ARM_EFFORT.items() if re.fullmatch(rx, joint.name)), None
+    )
+    if effort is None:
+      continue
+    joint.actfrclimited = mujoco.mjtLimited.mjLIMITED_TRUE
+    joint.actfrcrange = (-scale * effort, scale * effort)
+    matched += 1
+  if matched != 7:
+    raise ValueError(f"expected the 7 left-arm joints, matched {matched}")
+
+
+def get_kangaroo_grippers_tabletop_spec(
+  gravcomp: bool = True, left_arm_effort_scale: float | None = None
+) -> mujoco.MjSpec:
   """The grippers model with a collision set a tabletop task can trust.
 
   `MANIPULATION_COLLISION` narrows the grippers model's colliders to the feet, arm 5-7 and
@@ -451,6 +487,9 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
   (`_route_gravcomp_through_actuators`). `gravcomp=False` is what the plan-S8 stiff-gain
   codes train on (`TABLETOP_GAINS`); under the SysID gains it is there to measure against,
   not to train with: without it the arm droops half a radian.
+
+  ``left_arm_effort_scale`` lowers the left arm's effort limit to that fraction of its effort
+  (plan S7-4's T, `_cap_left_arm_effort`); None leaves it at the actuators' own.
   """
   spec = _load_spec(KANGAROO_GRIPPERS_XML)
 
@@ -463,6 +502,9 @@ def get_kangaroo_grippers_tabletop_spec(gravcomp: bool = True) -> mujoco.MjSpec:
       if body.name.startswith(_TABLETOP_GRAVCOMP_BODIES):
         body.gravcomp = 1.0
     _route_gravcomp_through_actuators(spec)
+
+  if left_arm_effort_scale is not None:
+    _cap_left_arm_effort(spec, left_arm_effort_scale)
 
   for body_a, body_b in _TABLETOP_CONTACT_EXCLUDES:
     spec.add_exclude(name=f"{body_a}__{body_b}", bodyname1=body_a, bodyname2=body_b)
@@ -817,7 +859,9 @@ def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
 
 
 def get_kangaroo_grippers_tabletop_robot_cfg(
-  gravcomp: bool | None = None, gains: str = DEFAULT_TABLETOP_GAINS
+  gravcomp: bool | None = None,
+  gains: str = DEFAULT_TABLETOP_GAINS,
+  left_arm_effort_scale: float | None = None,
 ) -> EntityCfg:
   """The grippers variant for tabletop manipulation.
 
@@ -829,7 +873,8 @@ def get_kangaroo_grippers_tabletop_robot_cfg(
   ``gains`` names a plan-S8 gain code (`TABLETOP_GAINS`). G0, the default, is the robot as
   it was before S8; G15 / G20 / G20s carry stiff pelvis and arm gains and no gravity
   compensation. ``gravcomp`` defaults to the code's own; `gravcomp=False` on G0 reproduces
-  the plant before S4, for measuring against.
+  the plant before S4, for measuring against. ``left_arm_effort_scale`` is plan S7-4's
+  lowered arm effort limit (`get_kangaroo_grippers_tabletop_spec`); None is every run before.
   """
   if gains not in TABLETOP_GAINS:
     raise ValueError(
@@ -841,9 +886,12 @@ def get_kangaroo_grippers_tabletop_robot_cfg(
   cfg = _make_robot_cfg("grippers_tabletop", MANIPULATION_INIT_STATE)
   if gains != DEFAULT_TABLETOP_GAINS:
     cfg = dataclasses.replace(cfg, articulation=_tabletop_articulation(code))
-  if not gravcomp:
+  if not gravcomp or left_arm_effort_scale is not None:
     cfg = dataclasses.replace(
-      cfg, spec_fn=lambda: get_kangaroo_grippers_tabletop_spec(gravcomp=False)
+      cfg,
+      spec_fn=lambda: get_kangaroo_grippers_tabletop_spec(
+        gravcomp=gravcomp, left_arm_effort_scale=left_arm_effort_scale
+      ),
     )
   return cfg
 

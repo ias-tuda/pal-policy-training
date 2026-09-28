@@ -52,6 +52,8 @@ class RewardContext:
   grasp_sensor: str
   surface_sensor: str
   threshold: float
+  jaw: SceneEntityCfg | None = None
+  """The jaw's actuated joint, for plan S7-4's J (a release is the jaw opening)."""
 
   @property
   def grasp_params(self) -> dict:
@@ -492,6 +494,101 @@ def _m7(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
+# -- S7-4: J (a release is the jaw opening), M8 (the retreat), S (M7 revised) --------------
+#
+# Plan S7-4, revised 2026-09-28 21:33 (Siwei). S7-2's videos and a per-step probe of S7-1's FR s2
+# showed "released" (= the pads no longer both touch the cube) firing with the jaw still at the
+# hold angle (~0.30 rad; first touch of a 5 cm cube ~0.21). J makes a release the jaw's measured
+# angle falling below `JAW_OPEN` after `was_lifted`: M1's `release` and `placed` (and M6's grade,
+# through the release latch) need it. `grasped` stays the critic's input and the lift gate.
+#
+# M8 pays the tool point's height above the placed cube's top, up to `M8_CLEAR_HEIGHT`, while
+# the cube is placed (J) and no pad touches it (`mdp.retreat_height`), and prices pad-cube
+# contact after the release (`mdp.pad_contact_after_release`). `placed` keeps paying through the
+# retreat, so knocking the cube off loses both. Weights: the retreat at full clear is a quarter
+# of one step of `placed` (8), enough to make lifting clear beat resting the open hand on the
+# table and small against losing `placed` + `release` (~11.5 per step) by disturbing the cube.
+#
+# S keeps M6's grade for every J-release and adds a per-step bonus while the cube is placed after
+# a set-down: held on the table, still, within 1.5 cm of the target for `S_DWELL_STEPS` steps
+# since a touchdown there (`mdp.set_down_placed`). M7 as run floored every other release and was
+# not learned (0-5 % set-downs on B-S, S7-2 / S7-3); the plan's dwell here is 2 steps.
+JAW_OPEN = 0.15  # rad; `mdp.observations.JAW_OPEN_BELOW`
+M8_CLEAR_HEIGHT = 0.05  # m (plan S7-4 revision 2: was 8 cm)
+M8_RETREAT_WEIGHT = 2.0
+M8_CONTACT_WEIGHT = -1.0
+S_DWELL_STEPS = 2
+S_BONUS_WEIGHT = 4.0
+
+
+def _jaw_params(ctx: RewardContext) -> dict:
+  assert ctx.jaw is not None, "plan S7-4's J needs RewardContext.jaw"
+  return {"jaw_cfg": ctx.jaw, "jaw_open": JAW_OPEN}
+
+
+def _j(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in ("release", "placed"):
+    term = rewards.get(name)
+    assert term is not None and "support_sensor_name" in term.params, (
+      "J redefines M1's gated release and placed terms; apply M1 first"
+    )
+    rewards[name] = RewardTermCfg(
+      func=term.func, weight=term.weight, params={**term.params, **_jaw_params(ctx)}
+    )
+
+
+def _latched(ctx: RewardContext) -> dict:
+  return {
+    **_gated(ctx),
+    "surface_cfg": SceneEntityCfg(TABLE),
+    **_jaw_params(ctx),
+  }
+
+
+def _m8(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  gated = {**_gated(ctx), **_jaw_params(ctx)}
+  rewards["retreat"] = RewardTermCfg(
+    func=mdp.retreat_height,
+    weight=M8_RETREAT_WEIGHT,
+    params={**gated, "asset_cfg": ctx.tcp, "clear_height": M8_CLEAR_HEIGHT},
+  )
+  latched = _latched(ctx)
+  latched.pop("threshold")
+  rewards["pad_contact"] = RewardTermCfg(
+    func=mdp.pad_contact_after_release, weight=M8_CONTACT_WEIGHT, params=latched
+  )
+
+
+def _s(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["set_down"] = RewardTermCfg(
+    func=mdp.set_down_placed,
+    weight=S_BONUS_WEIGHT,
+    params={**_latched(ctx), "set_down_steps": S_DWELL_STEPS},
+  )
+
+
+# -- S7-4: P, the effort hinge (with T: the `EFFORT` code CTP) ------------------------------
+#
+# -w * sum_i max(|tau_i| / tau_cmd,i - 0.8, 0)^2 over the seven driven-arm joints, tau_cmd the
+# lowered limit T puts on the model (35 / 17.5 N.m): thresholds 28 / 14 N.m, above the ~11 N.m
+# gravity load at the home pose, so holding the arm up is never priced. With T the excess is at
+# most 0.2 per joint, 0.04 squared. Calibrated as the plan asks: a full-effort press on one joint
+# held after the release must cost more per step than the `placed` income it could protect
+# (8 x q <= 8): w x 0.04 > 8, w > 200; with 25 % margin, 250 (10 per step at the cap). The
+# other half of the calibration -- a clean carry costs < 1 % of its return -- is checked by
+# `tests/test_pick_place_s74.py` on the scripted pick-and-place.
+P_THRESHOLD = 0.8
+P_WEIGHT = -250.0
+
+
+def effort_hinge_reward(arm: SceneEntityCfg) -> RewardTermCfg:
+  return RewardTermCfg(
+    func=mdp.arm_effort_hinge,
+    weight=P_WEIGHT,
+    params={"asset_cfg": arm, "threshold": P_THRESHOLD},
+  )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -500,6 +597,9 @@ _MODULES = {
   "M5": _m5,
   "M6": _m6,
   "M7": _m7,
+  "J": _j,
+  "M8": _m8,
+  "S": _s,
 }
 
 
@@ -510,6 +610,13 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("M6 grades M1's release and placed terms; it needs M1 before it")
   if "M7" in modules and "M6" not in modules[: modules.index("M7")]:
     raise ValueError("M7 pays M6's grade for a set-down only; it needs M6 before it")
+  if "J" in modules and "M1" not in modules[: modules.index("J")]:
+    raise ValueError("J redefines M1's release and placed; it needs M1 before it")
+  for name, needs in (("M8", ("J",)), ("S", ("M6", "J"))):
+    if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
+      raise ValueError(f"{name} needs {' and '.join(needs)} before it")
+  if "M7" in modules and "S" in modules:
+    raise ValueError("S is M7 revised; pick one")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -543,7 +650,17 @@ S72_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+M7": ("M1", "M2", "M3", "M6", "M7"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S72_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS}
+#: The S7-4 arms (plan S7-4, revised 2026-09-28 21:33): FR + J + M8 for every code, + S for
+#: R-CTPS. The effort bound (C, TP) and V are not reward modules: `EFFORT`, `TOOL_SPEED`.
+S74_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8": ("M1", "M2", "M3", "M6", "J", "M8"),
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+S": ("M1", "M2", "M3", "M6", "J", "M8", "S"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S74_ARMS.items()})
+_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS}
+
+#: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
+JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)
 
 #: Arms whose success *termination* must also require the `was_lifted` latch. The reward
 #: dict cannot carry this on its own -- the termination is built by the tabletop factory --

@@ -102,6 +102,12 @@ WAYPOINT_NAMES = ("pregrasp", "grasp", "lift", "carry", "place", "retreat")
 #: there while held (plan S7-2, M7's drag test). Planned from the corrected place pose when the
 #: first phase that moves to it starts.
 DRAG_WAYPOINT = "place_goal"
+#: The place pose with the elbow's target walked `PRESS_ELBOW_DQ` (rad) further down: S7-3's
+#: press after the release (report section 8.4), where the policy drove the elbow target past
+#: its limit and the open hand pushed on the table at full effort (plan S7-4's M8 / P tests).
+#: A joint-space offset, not a pose: the planner will not plan into the table.
+PRESS_WAYPOINT = "place_press"
+PRESS_ELBOW_DQ = -0.5
 #: Phases after which the arm is held at its waypoint until it has actually stopped: before
 #: the jaw closes (a still-swinging arm shoves the cube across the table as the pads meet
 #: it), before `replan_place` measures the tracking bias (a snapshot of a swinging arm is
@@ -602,6 +608,7 @@ def rollout(
   targets: list[tuple[float, float]] | None = None,
   table_offsets: list[tuple[float, float, float]] | None = None,
   episode_length_s: float | None = None,
+  effort=None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -645,6 +652,10 @@ def rollout(
   ``robot`` replaces `KANGAROO_GRIPPERS_LEFT_ARM`, e.g. with other action scales (plan S7 P2's
   scales for a wider spawn). The script reads scales and offsets back from the action term,
   so it drives whatever the robot cfg defines.
+
+  ``effort`` is plan S7-4's effort bound (`pick_place_env_cfg.EFFORT_BOUNDS`; none if None);
+  T's plant half comes with ``robot``. Each row's ``band_hit_steps`` / ``range_hit_steps``
+  count the env's steps on which T's band / C's clip moved the arm's target, by phase.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -666,6 +677,7 @@ def rollout(
     dr=dr,
     baseline=baseline,
     tool_speed_cap=tool_speed_cap,
+    **({} if effort is None else {"effort": effort}),
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -848,6 +860,7 @@ def rollout(
     0  # env-steps whose commanded arm move exceeded the slew limit; should stay 0
   )
   stretched: dict[str, int] = {}
+  bound_hits: dict[str, dict[str, np.ndarray]] = {"band": {}, "range": {}}
 
   def move_and_settle(a: np.ndarray, b: np.ndarray, closed: bool) -> None:
     """Interpolate the arm from pose ``a`` to ``b``, then hold ``b`` until it settles."""
@@ -876,6 +889,11 @@ def rollout(
     clipped_env += over.cpu().numpy().astype(int)
     tally.observe(**ev.probe(env, grasp_sensor))
     _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
+    for key, attr in (("band", "band_hit"), ("range", "range_hit")):
+      hits = getattr(term, attr, None)
+      if hits is not None:
+        per_phase = bound_hits[key].setdefault(phase_now[0], np.zeros(num_envs, int))
+        per_phase += (hits & ~ended).cpu().numpy().astype(int)
     tally.terminal(ev.success_flags(env) & ~ended)
     if hook is not None:
       hook(phase_now[0], env)
@@ -928,6 +946,11 @@ def rollout(
           except RuntimeError as e:
             skipped_corrections.append((i, f"drag: {e}"))
             pl[DRAG_WAYPOINT] = pl["place"]
+      if wp == PRESS_WAYPOINT and PRESS_WAYPOINT not in plans[0]:
+        elbow = ARM_JOINTS.index("arm_left_4_joint")
+        for pl in plans:
+          pl[PRESS_WAYPOINT] = pl["place"].copy()
+          pl[PRESS_WAYPOINT][elbow] += PRESS_ELBOW_DQ
       nxt = np.stack([p[wp] for p in plans])
       n = n_steps(prev, nxt, steps, closed)
       if n > steps:
@@ -1058,6 +1081,10 @@ def rollout(
     r["ended_by"] = why[i]
     r["clipped_steps"] = int(clipped_env[i])
     r["plan_error"] = plan_error.get(r["env"])
+    for key in ("band", "range"):
+      r[f"{key}_hit_steps"] = {
+        ph: int(v[r["env"]]) for ph, v in bound_hits[key].items() if v[r["env"]]
+      }
     for key, v in diag.items():
       r[key] = float(v[i])
   return rows
