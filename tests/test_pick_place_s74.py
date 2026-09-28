@@ -616,6 +616,16 @@ def test_the_handoff_waits_for_the_jaw_release_and_the_lift():
   assert row["time_to_home_s"] == pytest.approx(0.02)
 
 
+def test_an_edge_grasp_is_released_by_its_let_go():
+  """A cube held across an edge, the pads touching at ~0.10 rad: the jaw is never above
+  `JAW_OPEN`, so the let-go itself is the release (7 of 64 S7-2 W1 s1 grasps, prep f)."""
+  t = ev.RetreatTally(1, "cpu", 0.02)
+  _feed(t, 5, jaw_q=0.10, grasped=True, lifted=True)
+  assert not bool(t.released[0])
+  _feed(t, 1, jaw_q=0.10, grasped=False)
+  assert bool(t.released[0])
+
+
 def test_the_handoff_falls_back_at_eight_seconds():
   t = ev.RetreatTally(1, "cpu", 0.02, handoff=True)
   hands = _feed(t, 401, jaw_q=0.3)

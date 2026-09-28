@@ -237,9 +237,10 @@ class ReleaseLatch:
   rel_speed: torch.Tensor
   rel_dwell: torch.Tensor
   step: int = -1
-  # Plan S7-4's J (``jaw`` set): a release is the jaw opening, and the where / how of it is
-  # the pads' let-go before it, held here until the jaw opens (``pend_*``, valid while
-  # ``pend``). ``jaw_closed`` is "jaw at or above the open angle" at the last update.
+  # Plan S7-4's J (``jaw`` set): a release is entering the released state -- jaw open and
+  # the pads off the object -- and the where / how of it is the pads' let-go before it, held
+  # here until then (``pend_*``, valid while ``pend``). ``jaw_closed`` is "not in the released
+  # state" at the last update.
   jaw: tuple[str, float] | None = None
   jaw_closed: torch.Tensor | None = None
   pend: torch.Tensor | None = None
@@ -263,9 +264,14 @@ def _release_latch(
   """Episode latch of the latest release after `was_lifted`. Cleared on reset by
   `events.reset_release_latch`.
 
-  With ``jaw_cfg`` and ``jaw_open`` (plan S7-4, module J) a release is the jaw's measured angle
-  falling below ``jaw_open`` after `was_lifted`, not the pads losing the object: S7-2/S7-3
-  policies "released" with the jaw still at the hold angle, the pads merely slipping off. What
+  With ``jaw_cfg`` and ``jaw_open`` (plan S7-4, module J) a release is entering the released
+  state -- the jaw's measured angle below ``jaw_open`` *and* the pads off the object, the
+  `_placed_bool` J predicate -- after `was_lifted`, not the pads losing the object alone:
+  S7-2/S7-3 policies "released" with the jaw still at the hold angle, the pads merely slipping
+  off. For a cube held face to face (the pads touch at ~0.21 rad) that is the jaw opening past
+  ``jaw_open``; for one held across an edge or at a yaw, which the pads touch at ~0.10 rad (7 of
+  64 S7-2 W1 s1 grasps, S7-4 prep f), it is the let-go itself -- the jaw was never above
+  ``jaw_open``, and "the jaw falls below it" would never fire. What
   the release is graded on -- where the object was, how high, its contact, speed and dwell --
   is still taken when the pads let go (a drop is graded at the height it fell from), and is
   committed when the jaw then opens; a let-go the jaw never opens after is not a release.
@@ -356,8 +362,8 @@ def _release_latch(
     latch.pend_speed = w(speed, latch.pend_speed)
     latch.pend_dwell = w(latch.dwell, latch.pend_dwell)
     latch.pend = latch.pend | let_go
-    jaw_is_open = _jaw_open_bool(env, jaw_cfg, jaw_open)
-    opened = latch.jaw_closed & jaw_is_open & was_lifted
+    released_now = _jaw_open_bool(env, jaw_cfg, jaw_open) & ~grasped
+    opened = latch.jaw_closed & released_now & was_lifted
     p = latch.pend
     now = (
       torch.where(p, latch.pend_dxy, dxy),
@@ -367,7 +373,7 @@ def _release_latch(
       torch.where(p, latch.pend_dwell, latch.dwell),
     )
     latch.pend = latch.pend & ~opened
-    latch.jaw_closed = ~jaw_is_open
+    latch.jaw_closed = ~released_now
   latch.dxy = torch.where(opened, now[0], latch.dxy)
   latch.height = torch.where(opened, now[1], latch.height)
   latch.rel_on_table = torch.where(opened, now[2], latch.rel_on_table)

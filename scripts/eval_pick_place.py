@@ -54,7 +54,8 @@ Plan S7-4: the release is the jaw opening, and the retreat (``RetreatTally``)
 --------------------------------------------------------------------------------
 Every read above keeps its old definition (a let-go = the pads losing the cube), so a number
 stays comparable with the S7-2 / S7-3 reports. Beside them, the J reads: whether the jaw really
-opens -- its measured angle falls below `JAW_OPEN` (0.15 rad) after the first lift -- its angle
+opens -- the cube enters "jaw below `JAW_OPEN` (0.15 rad), pads off it" after the first lift; for
+a cube held across an edge (pads touching at ~0.10 rad) the let-go itself -- its angle
 at the pads' let-go, and `placed` / `placed & lifted` with the jaw open. With ``--handoff`` a
 position controller takes over, as it will on the robot: once the jaw has opened after the lift
 and the TCP has stayed `HANDOFF_CLEAR` above the cube's top for `HANDOFF_STEPS` steps, or at
@@ -786,7 +787,10 @@ class RetreatTally:
     let_go = self.prev_grasped & ~grasped & self.lifted
     self.jaw_at_let_go = torch.where(let_go, jaw_q, self.jaw_at_let_go)
     self.let_go |= let_go
-    opened = self.prev_jaw_closed & jaw_open & self.lifted & ~self.released
+    # J's release: entering "jaw open and the pads off the cube" after the lift -- for a cube
+    # held across an edge (the pads touch at ~0.10 rad) that is the let-go itself.
+    released_now = jaw_open & ~grasped
+    opened = self.prev_jaw_closed & released_now & self.lifted & ~self.released
     self.released |= opened
     self.rel_step = torch.where(opened, self.age, self.rel_step)
     self.rel_xy = torch.where(opened.unsqueeze(-1), obj_xy, self.rel_xy)
@@ -817,7 +821,7 @@ class RetreatTally:
     self.final_dxy = goal_dxy
     self.final_xy = obj_xy.clone()
     self.prev_grasped = grasped.clone()
-    self.prev_jaw_closed = ~jaw_open
+    self.prev_jaw_closed = ~released_now
     self.age += 1
     return self.handed.clone()
 
