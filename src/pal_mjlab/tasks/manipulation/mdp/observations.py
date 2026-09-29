@@ -393,12 +393,30 @@ def _release_latch(
   return latch
 
 
+def _at_goal(
+  goal: torch.Tensor, pos: torch.Tensor, threshold: float | tuple[float, float]
+) -> torch.Tensor:
+  """The object is at the goal. (B,)
+
+  A float ``threshold`` is the 3-D distance, every run up to S7-4. A pair ``(xy, z)`` is plan
+  S7-5's Z: the horizontal distance below ``xy`` and the height off the goal below ``z`` in
+  magnitude. The goal is the object's resting centre on the surface (`SurfaceOffsetCommand`,
+  or `TARGET_Z` for the fixed goal), so ``z`` bounds the centre above its resting height: a
+  5 cm cube on an edge stands 1.0 cm up, on a corner 1.8 cm.
+  """
+  if isinstance(threshold, (tuple, list)):
+    xy, z = threshold
+    d = pos - goal
+    return (torch.norm(d[:, :2], dim=-1) < xy) & (d[:, 2].abs() < z)
+  return torch.norm(goal - pos, dim=-1) < threshold
+
+
 def _placed_bool(
   env: ManagerBasedRlEnv,
   command_name: str,
   object_name: str,
   grasp_sensor_name: str,
-  threshold: float,
+  threshold: float | tuple[float, float],
   velocity_threshold: float,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
@@ -408,6 +426,7 @@ def _placed_bool(
 
   With ``jaw_cfg`` and ``jaw_open`` (plan S7-4, module J) "released" also needs the jaw open,
   below ``jaw_open``: an object that slipped out of a jaw still at the hold angle is not.
+  ``threshold`` is a 3-D distance or plan S7-5's (xy, z) tolerance, `_at_goal`.
 
   `released` is `¬grasped`, which a cube that was never picked up also satisfies -- so on a
   table-height goal this counts a slide as a place. Passing `support_sensor_name` adds the
@@ -416,7 +435,7 @@ def _placed_bool(
   """
   obj: Entity = env.scene[object_name]
   command = env.command_manager.get_term(command_name)
-  at_goal = torch.norm(command.command - obj.data.root_link_pos_w, dim=-1) < threshold
+  at_goal = _at_goal(command.command, obj.data.root_link_pos_w, threshold)
   released = ~_grasped_bool(env, grasp_sensor_name)
   if jaw_cfg is not None:
     assert jaw_open is not None

@@ -109,6 +109,21 @@ New Features & Tasks
   ``--handoff`` hands the arm to a return-to-home controller once the gripper
   is clear of the cube, as the robot will. (Branch ``siwei-s7-4``.)
 
+- **New: a reward for opening the jaw at the target, and a separate horizontal
+  and vertical tolerance for "at the target"** (plan S7-5), in
+  ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. One new reward arm,
+  ``R-C-strict+M1+M2+M3+M6+J+M8+O+Z``. ``O`` pays up to 1 per step for
+  opening the jaw from 0.40 rad towards 0.15 rad while the lifted cube sits
+  within 2 cm of the target horizontally and vertically, until the jaw first
+  lets it go. ``Z`` changes "at the target", for the release, placed, retreat
+  and set-down rewards, from within 2.5 cm in 3-D to within 2 cm horizontally
+  and 2 cm vertically, so a cube resting tilted on an edge still counts. The
+  evaluation script reports the placed rates and success under both
+  tolerances, and the cube's tilt when the jaw lets go. A new script,
+  ``trace_pick_place.py``, records per step what the cube, the jaw and the arm
+  do, including where the arm's joint targets would put the gripper.
+  (Branch ``siwei-s7-5``.)
+
 - **New: stiff arm gains instead of gravity compensation,** selected with
   ``GAINS`` in ``Mjlab-PickPlace-Pal-Kangaroo-Grippers``. ``GAINS=G20`` gives
   the pelvis and both arms 20 times the identified stiffness and damping, the

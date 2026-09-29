@@ -589,6 +589,67 @@ def effort_hinge_reward(arm: SceneEntityCfg) -> RewardTermCfg:
   )
 
 
+# -- S7-5: O (open at the goal) and Z (the goal tolerance split into xy and z) --------------
+#
+# Plan S7-5 (designed 2026-09-29 12:08, Siwei). RCTP s2 (S7-4) carried the cube to the target and
+# held it there to the time-out, jaw closed (placed 5 %): nothing paid for starting to open. O
+# pays the jaw's opening from the hold angle `O_JAW_HOLD` towards `JAW_OPEN`, at most `O_WEIGHT`
+# per step, while the lifted, not yet J-released cube is at the goal by `Z_GOAL_TOL`
+# (`mdp.open_at_goal`); a half-open hover (the pads come off a 5 cm cube at ~0.21 rad) earns
+# 0.76 per step, well under `placed` (8 x M6's grade, >= 2 at the floor, + `release`).
+#
+# `O_JAW_HOLD` is 0.40 rad, not the plan's 0.30 (Siwei, 2026-09-29, on prep 3's trace): RCTP s2
+# squeezes the cube at the goal to a median 0.37 rad (p90 0.40; RCTP s1 0.30), so from 0.30 O
+# would pay nothing for the first part of s2's opening -- the state O exists for. A 0.30 hold
+# at the goal now earns 0.4 per step.
+#
+# Z makes "at the goal" xy < 2 cm and |dz| < 2 cm (was 3-D < 2.5 cm) in every term that tests
+# it after M1: `release`, `placed`, M8's `retreat` and S's `set_down`. Tighter in xy, looser in
+# z, so a cube resting tilted on an edge (+1.0 cm) or a corner (+1.8 cm) is at the goal. The plan
+# names `placed` (M1, M8's arming); M1's `release` is included so the two M1 terms keep one
+# definition -- otherwise `release` would pay where `placed` cannot. Z must be the last module,
+# so that it sees every such term. O's gate is Z's tolerance with or without Z.
+O_WEIGHT = 1.0
+O_JAW_HOLD = 0.40  # rad
+Z_GOAL_TOL = (0.02, 0.02)  # m: (xy, |dz|)
+
+
+def _o(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  params = _latched(ctx)
+  params.pop("threshold")
+  rewards["open_at_goal"] = RewardTermCfg(
+    func=mdp.open_at_goal,
+    weight=O_WEIGHT,
+    params={**params, "jaw_hold": O_JAW_HOLD, "gate": Z_GOAL_TOL},
+  )
+
+
+#: The terms whose "at the goal" Z redefines, by their function.
+_AT_GOAL_TERMS = (
+  mdp.released_at_goal,
+  mdp.released_at_goal_graded,
+  mdp.object_placed_reward,
+  mdp.object_placed_graded,
+  mdp.retreat_height,
+  mdp.set_down_placed,
+)
+
+
+def _z(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  hit = [n for n, t in rewards.items() if t.func in _AT_GOAL_TERMS]
+  assert {"release", "placed"} <= set(hit), (
+    "Z redefines M1's at-goal test; apply M1 first"
+  )
+  for name in hit:
+    term = rewards[name]
+    assert "threshold" in term.params, name
+    rewards[name] = RewardTermCfg(
+      func=term.func,
+      weight=term.weight,
+      params={**term.params, "threshold": Z_GOAL_TOL},
+    )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -600,6 +661,8 @@ _MODULES = {
   "J": _j,
   "M8": _m8,
   "S": _s,
+  "O": _o,
+  "Z": _z,
 }
 
 
@@ -617,6 +680,12 @@ def _s52_arm(modules: tuple[str, ...]):
       raise ValueError(f"{name} needs {' and '.join(needs)} before it")
   if "M7" in modules and "S" in modules:
     raise ValueError("S is M7 revised; pick one")
+  if "O" in modules and "J" not in modules[: modules.index("O")]:
+    raise ValueError("O needs J before it")
+  if "Z" in modules and ("M1" not in modules or modules[-1] != "Z"):
+    raise ValueError(
+      "Z redefines every at-goal term after M1; it needs M1 and comes last"
+    )
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -657,10 +726,17 @@ S74_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+S": ("M1", "M2", "M3", "M6", "J", "M8", "S"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S74_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS}
+#: The S7-5 arm (plan S7-5): S7-4's RCTP reward + O + Z. The control, RCTP, is S7-4's first arm.
+S75_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+O+Z": ("M1", "M2", "M3", "M6", "J", "M8", "O", "Z"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S75_ARMS.items()})
+_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS, **S75_ARMS}
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)
+#: Arms whose "at the goal" is plan S7-5's (xy, z) tolerance `Z_GOAL_TOL`.
+GOAL_TOL_XYZ = frozenset(n for n, m in _MODULE_ARMS.items() if "Z" in m)
 
 #: Arms whose success *termination* must also require the `was_lifted` latch. The reward
 #: dict cannot carry this on its own -- the termination is built by the tabletop factory --

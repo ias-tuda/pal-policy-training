@@ -19,6 +19,7 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from pal_mjlab.tasks.manipulation.mdp.observations import (
   STILL_SPEED,
+  _at_goal,
   _grasped_bool,
   _jaw_open_bool,
   _on_surface_bool,
@@ -90,11 +91,12 @@ def released_at_goal(
   `¬grasped` is also true of an object that was never grasped, so on a table-height goal
   this pays a slide. Passing `support_sensor_name` additionally requires the `was_lifted`
   latch; leaving it None is the pre-C2 behaviour. ``jaw_cfg`` / ``jaw_open`` (plan S7-4's J)
-  also require the jaw open (`observations._jaw_open_bool`).
+  also require the jaw open (`observations._jaw_open_bool`). ``threshold`` is a 3-D distance
+  or plan S7-5's (xy, z) tolerance (`observations._at_goal`).
   """
   obj: Entity = env.scene[object_name]
   command = env.command_manager.get_term(command_name)
-  at_goal = torch.norm(command.command - obj.data.root_link_pos_w, dim=-1) < threshold
+  at_goal = _at_goal(command.command, obj.data.root_link_pos_w, threshold)
   released = at_goal & ~_grasped_bool(env, grasp_sensor_name)
   if support_sensor_name is not None:
     released &= _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
@@ -558,6 +560,51 @@ def pad_contact_after_release(
     jaw_open,
   )
   return (latch.released & _pad_contact_any(env, grasp_sensor_name)).float()
+
+
+def open_at_goal(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float,
+  jaw_hold: float,
+  gate: tuple[float, float],
+) -> torch.Tensor:
+  """Plan S7-5's O: how far the jaw has opened from the hold angle towards open,
+  clip((jaw_hold - q) / (jaw_hold - jaw_open), 0, 1), paid while the object has been lifted
+  this episode, has not yet been J-released, and is at the goal by ``gate`` -- an (xy, z)
+  tolerance (`observations._at_goal`), any tilt, table contact not required. (B,)
+
+  Why: RCTP s2 (S7-4) parked the cube on the target and held it to the time-out, the jaw at
+  ~0.30 rad. Nothing paid for *starting* to open -- J and `placed` pay only once the jaw is
+  below ``jaw_open`` and the cube has settled within the tolerance -- so exploratory openings
+  from a tilted, rocking hold were rarely paid while holding was. This is the gradient
+  between. It stops at the first J-release (the release latch, `observations._release_latch`,
+  read with the same jaw), so re-grasping cannot farm it; the grasp is not part of the gate,
+  so it keeps paying between the pads' let-go and the jaw passing ``jaw_open``.
+  """
+  latch = _release_latch(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
+  was_lifted = _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  obj: Entity = env.scene[object_name]
+  goal = env.command_manager.get_term(command_name).command
+  near = _at_goal(goal, obj.data.root_link_pos_w, gate)
+  robot: Entity = env.scene[jaw_cfg.name]
+  q = robot.data.joint_pos[:, jaw_cfg.joint_ids][:, 0]
+  opened = ((jaw_hold - q) / (jaw_hold - jaw_open)).clamp(0.0, 1.0)
+  return opened * (was_lifted & ~latch.released & near).float()
 
 
 #: Attribute on the env caching `_joint_effort_caps`, keyed by the joints' global ids.
