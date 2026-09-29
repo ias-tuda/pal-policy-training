@@ -194,6 +194,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     help="plan S7-4: hand the arm to a position controller (action 0: home, jaw open) once "
     "the jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
   )
+  p.add_argument(
+    "--trace",
+    type=pathlib.Path,
+    default=None,
+    help="plan S7-7.0: write every step's jaw / cube-sensor state (all envs) to this .npz, "
+    "for calibrating O-K's held rule offline (needs an OCC / OBJ_OBS env)",
+  )
   return p.parse_args(argv)
 
 
@@ -1570,6 +1577,7 @@ def main() -> None:
   plant = PlantTally.from_env(env) if args.plant else None
   retreat = RetreatTally(args.num_envs, args.device, env.step_dt, args.handoff)
   occ = OccTally(args.num_envs, args.device)
+  trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
   arm_ids = [i for i in arm_ids if robot.joint_names[i].startswith("arm_left_")]
@@ -1610,6 +1618,29 @@ def main() -> None:
         occ.step(
           sensors[OBJECT], flags["grasped"], flags["lifted"], obj_pos, jaw_q, dxy
         )
+        if args.trace:
+          sensor = sensors[OBJECT]
+          _, tcp_w = positions(env)
+          term = env.action_manager.get_term("joint_pos")
+          jaw_cmd = term._processed_actions[:, sensor._jaw_action_idx]
+          trace.append(
+            {
+              "q": jaw_q,
+              "cmd": jaw_cmd,
+              "grasped": flags["grasped"],
+              "lifted": flags["lifted"],
+              "seen": sensor.seen,
+              "hidden": ~sensor.live_visible,
+              "held": sensor.held,
+              "score": sensor.blocked_score,
+              "unseen": sensor.unseen_steps,
+              "tcp_cube": torch.norm(tcp_w - obj_pos, dim=-1),
+              "last_tcp": torch.norm(sensor.last_pos - tcp_w, dim=-1),
+              "est_err": torch.norm(sensor.est_pos - obj_pos, dim=-1),
+              "dxy": dxy,
+              "step": env.episode_length_buf.clone(),
+            }
+          )
       tally.measure_speed(flags["grasped"], *positions(env), env.step_dt, goal)
       tally.measure_set_down(
         flags["grasped"],
@@ -1651,6 +1682,17 @@ def main() -> None:
     result.update(plant.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
+
+  if args.trace and trace:
+    import numpy as np
+
+    args.trace.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+      args.trace,
+      **{k: torch.stack([t[k] for t in trace]).cpu().numpy() for k in trace[0]},
+      step_dt=env.step_dt,
+    )
+    print(f"wrote {args.trace}")
 
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)
