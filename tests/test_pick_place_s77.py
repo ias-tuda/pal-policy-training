@@ -481,3 +481,68 @@ def test_hold_reports_the_last_reported_pose_while_lost(monkeypatch):
     assert bool(((sensor.pos_w - scene.live()).norm(dim=-1) > 0.05).all())
   finally:
     env.close()
+
+
+# -- The eval's occlusion reads -------------------------------------------------------------
+
+
+def _eval_module():
+  import importlib.util
+  import pathlib
+
+  spec = importlib.util.spec_from_file_location(
+    "eval_pick_place",
+    pathlib.Path(__file__).parent.parent / "scripts" / "eval_pick_place.py",
+  )
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+class _FakeSensor:
+  def __init__(self, n):
+    self.seen = torch.ones(n, dtype=torch.bool)
+    self.live_visible = torch.ones(n, dtype=torch.bool)
+    self.held = torch.zeros(n, dtype=torch.bool)
+    self.est_pos = torch.zeros(n, 3)
+    self.unseen_steps = torch.zeros(n, dtype=torch.long)
+
+
+def test_occ_tally_counts_closing_strokes_phases_and_the_held_rule():
+  ev = _eval_module()
+  tally = ev.OccTally(2, "cpu")
+  sensor = _FakeSensor(2)
+  obj = torch.zeros(2, 3)
+  far = torch.tensor([0.0, 0.2])  # env 0 is at the goal, env 1 is not
+  # env 0: one closing stroke, held from the second grasped step, lost while carried.
+  # env 1: closes, opens away from the goal after a lift, closes again (a re-approach).
+  jaw = {
+    0: [0.0, 0.1, 0.3, 0.35, 0.35, 0.35, 0.05],
+    1: [0.0, 0.3, 0.35, 0.10, 0.05, 0.3, 0.35],
+  }
+  grasped = {0: [0, 0, 1, 1, 1, 1, 0], 1: [0, 1, 1, 0, 0, 1, 1]}
+  lifted = {0: [0, 0, 0, 1, 1, 1, 0], 1: [0, 0, 1, 0, 0, 0, 1]}
+  held = {0: [0, 0, 0, 1, 1, 1, 0], 1: [0, 0, 0, 0, 0, 0, 0]}
+  seen = {0: [1, 1, 1, 1, 0, 0, 1], 1: [1, 1, 1, 1, 1, 1, 1]}
+  for t in range(7):
+    sensor.held = torch.tensor([bool(held[e][t]) for e in (0, 1)])
+    sensor.seen = torch.tensor([bool(seen[e][t]) for e in (0, 1)])
+    tally.step(
+      sensor,
+      torch.tensor([bool(grasped[e][t]) for e in (0, 1)]),
+      torch.tensor([bool(lifted[e][t]) for e in (0, 1)]),
+      obj,
+      torch.tensor([jaw[e][t] for e in (0, 1)]),
+      far,
+    )
+  tally.finish(torch.tensor([0, 1]))
+  a, b = tally.done
+  assert (a["occ_closings"], b["occ_closings"]) == (1, 2)
+  assert a["occ_reopen_away"] == 0 and b["occ_reopen_away"] == 1
+  assert a["occ_held_tp_fp_fn_tn"] == [3, 0, 1, 3]  # held 3 of the 4 grasped steps
+  assert a["occ_lost_steps_by_phase"][2] == 2  # both lost steps are in the carry phase
+  out = tally.summarise(2)
+  assert out["occ_reapproach"] == 0.5
+  assert (
+    out["occ_held_precision"] == 1.0 and out["occ_held_recall"] == 3 / 8
+  )  # both envs pooled

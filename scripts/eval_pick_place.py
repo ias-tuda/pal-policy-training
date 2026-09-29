@@ -139,6 +139,8 @@ M6_GRADE = {"dist_std": 0.02, "height_free": 0.01, "height_std": 0.01, "floor": 
 #: `HANDOFF_STEPS` consecutive steps, or at `HANDOFF_TIMEOUT_S`. "Home": every driven-arm joint
 #: within `HOME_TOL` (rad) of its default. Restated like `SET_DOWN_*`; the test checks them.
 JAW_OPEN = 0.15
+#: ... and closed above this (a stroke is open -> closed, with hysteresis; S7-7's re-approach count).
+JAW_CLOSED = 0.25
 JAW_JOINT = "gripper_left_finger_joint"
 HANDOFF_CLEAR = 0.03
 HANDOFF_STEPS = 5
@@ -987,6 +989,8 @@ class OccTally:
     self.prev_jaw_closed = zb()
     self.was_lifted = zb()
     self.grasp_starts = zl(n)
+    self.closings = zl(n)  # closing strokes of the jaw (open -> closed, hysteresis)
+    self.jaw_closed = zb()
     self.reopen_away = zl(n)
     self.tp, self.fp, self.fn, self.tn = zl(n), zl(n), zl(n), zl(n)
     self.grasp_step = zl(n) - 1  # the first step the pads hold the cube
@@ -1031,6 +1035,10 @@ class OccTally:
     self.grasp_starts += grasped & ~self.prev_grasped
     self.was_lifted |= lifted
     closed = jaw_q >= JAW_OPEN
+    # A closing stroke: the measured jaw goes from open (< JAW_OPEN) to closed (> JAW_CLOSED).
+    started = ~self.jaw_closed & (jaw_q > JAW_CLOSED)
+    self.closings += started
+    self.jaw_closed = (self.jaw_closed | started) & (jaw_q >= JAW_OPEN)
     self.reopen_away += (
       self.was_lifted & self.prev_jaw_closed & ~closed & (dxy_goal > 0.03)
     )
@@ -1058,6 +1066,7 @@ class OccTally:
         "occ_lost_steps_by_phase": self.lost_steps[i].tolist(),
         "occ_phase_steps": self.phase_steps[i].tolist(),
         "occ_grasp_starts": int(self.grasp_starts[i]),
+        "occ_closings": int(self.closings[i]),
         "occ_reopen_away": int(self.reopen_away[i]),
         "occ_held_tp_fp_fn_tn": [
           int(x[i]) for x in (self.tp, self.fp, self.fn, self.tn)
@@ -1073,6 +1082,7 @@ class OccTally:
       for acc in (
         self.steps,
         self.grasp_starts,
+        self.closings,
         self.reopen_away,
         self.tp,
         self.fp,
@@ -1089,6 +1099,7 @@ class OccTally:
       self.prev_grasped[i] = False
       self.prev_jaw_closed[i] = False
       self.was_lifted[i] = False
+      self.jaw_closed[i] = False
 
   def summarise(self, episodes: int) -> dict:
     rows = self.done[:episodes]
@@ -1118,7 +1129,8 @@ class OccTally:
         k: float(ph[i]) / max(float(ph.sum()), 1.0) for i, k in enumerate(self.PHASES)
       },
       "occ_grasp_starts_mean": sum(r["occ_grasp_starts"] for r in rows) / n,
-      "occ_reapproach": sum(r["occ_grasp_starts"] > 1 for r in rows) / n,
+      "occ_closings_mean": sum(r["occ_closings"] for r in rows) / n,
+      "occ_reapproach": sum(r["occ_closings"] > 1 for r in rows) / n,
       "occ_reopen_away": sum(r["occ_reopen_away"] > 0 for r in rows) / n,
       "occ_held_precision": tp / (tp + fp) if tp + fp else None,
       "occ_held_recall": tp / (tp + fn) if tp + fn else None,
