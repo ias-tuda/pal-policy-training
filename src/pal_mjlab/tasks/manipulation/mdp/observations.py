@@ -36,6 +36,106 @@ def _base_pose(robot: Entity) -> tuple[torch.Tensor, torch.Tensor]:
   return robot.data.body_link_pos_w[:, i], robot.data.body_link_quat_w[:, i]
 
 
+class _ObjectTracker:
+  """One object's world pose as a vision tracker reports it: a few control steps stale.
+
+  Ported from Claudius's `origin/faster-moves` (1d484c4, `mdp._ObjectTracker`) for plan S7-6,
+  without the dropout model (eb05a76; occlusion is left for later). FoundationPose publishes
+  a pose that is 100-150 ms old by the time the policy acts on it, against a 20 ms control
+  step: 5-8 steps, not the 0-2 a marker tracker costs and every run up to S7-5 trained with.
+
+  The lag sits on the object's *pose*, before any observation is formed from it, rather than
+  on mjlab's per-term ``delay_max_lag``, for two reasons. mjlab buffers each term's finished
+  output, so a term-level delay on a vector that mixes the object with the robot (Claudius's
+  jaw-to-cube vector) stales the encoder side too. And each term draws its own lag, so
+  ``object_pos`` and ``object_yaw`` would report the cube at two different moments. One
+  tracker per object, shared by every term that reads it, has neither problem.
+
+  The lag is drawn per env at each reset, uniformly in ``lag`` (inclusive), so the policy
+  cannot tune to one value. At a reset the whole history is refilled with the new pose: an
+  older sample is a cube from the previous episode, which no tracker would ever report.
+  """
+
+  def __init__(self, env: ManagerBasedRlEnv, object_name: str, lag: tuple[int, int]):
+    lo, hi = int(lag[0]), int(lag[1])
+    if not 0 <= lo <= hi:
+      raise ValueError(f"tracker lag must be 0 <= min <= max control steps; got {lag}")
+    self._name = object_name
+    self.lag_range = (lo, hi)
+    obj: Entity = env.scene[object_name]
+    n = env.num_envs
+    # Newest sample first, so the lag is an index straight into the history.
+    depth = hi + 1
+    self._pos = obj.data.root_link_pos_w.unsqueeze(0).repeat(depth, 1, 1)
+    self._quat = obj.data.root_link_quat_w.unsqueeze(0).repeat(depth, 1, 1)
+    #: The lag each env is reporting at now, control steps. Read by the tests.
+    self.lag = torch.zeros(n, dtype=torch.long, device=env.device)
+    self._envs = torch.arange(n, device=env.device)
+    # Latched per env until the next update fills the history (see the class docstring).
+    self._pending = torch.ones(n, dtype=torch.bool, device=env.device)
+    self._step = -1
+
+  def update(self, env: ManagerBasedRlEnv) -> None:
+    """Append this step's pose -- once per env step, however many terms ask."""
+    self._pending |= env.episode_length_buf == 0
+    obj: Entity = env.scene[self._name]
+    pos_w, quat_w = obj.data.root_link_pos_w, obj.data.root_link_quat_w
+    if env.common_step_counter != self._step:
+      self._step = env.common_step_counter
+      self._pos = torch.roll(self._pos, 1, dims=0)
+      self._quat = torch.roll(self._quat, 1, dims=0)
+      self._pos[0] = pos_w
+      self._quat[0] = quat_w
+    # After the append, so a term reading mid-step never sees a half-refilled history.
+    if bool(self._pending.any()):
+      fresh = self._pending
+      self._pos[:, fresh] = pos_w[fresh]
+      self._quat[:, fresh] = quat_w[fresh]
+      lo, hi = self.lag_range
+      self.lag[fresh] = torch.randint(
+        lo, hi + 1, (int(fresh.sum()),), device=self.lag.device
+      )
+      self._pending = torch.zeros_like(self._pending)
+
+  @property
+  def pose(self) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pose the tracker is reporting now. (B, 3), (B, 4)"""
+    return self._pos[self.lag, self._envs], self._quat[self.lag, self._envs]
+
+
+def object_tracker(env: ManagerBasedRlEnv, object_name: str) -> _ObjectTracker | None:
+  """The tracker built for ``object_name``, or None if no term has asked for one yet."""
+  return getattr(env, "_pal_object_trackers", {}).get(object_name)
+
+
+def _object_pose_w(
+  env: ManagerBasedRlEnv, object_name: str, lag: tuple[int, int] | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """The object's world pose, as a tracker ``lag`` control steps late reports it.
+
+  ``lag=None`` reads the simulator directly: every run up to S7-5, and the critic, which runs
+  only in sim and is never exported.
+  """
+  if lag is None:
+    obj: Entity = env.scene[object_name]
+    return obj.data.root_link_pos_w, obj.data.root_link_quat_w
+  trackers = getattr(env, "_pal_object_trackers", None)
+  if trackers is None:
+    trackers = {}
+    env._pal_object_trackers = trackers  # type: ignore[attr-defined]
+  tracker = trackers.get(object_name)
+  if tracker is None:
+    tracker = _ObjectTracker(env, object_name, lag)
+    trackers[object_name] = tracker
+  elif tracker.lag_range != (int(lag[0]), int(lag[1])):
+    raise ValueError(
+      f"object {object_name!r} is tracked at two latencies, {tracker.lag_range} and "
+      f"{tuple(lag)}. One object is one tracker."
+    )
+  tracker.update(env)
+  return tracker.pose
+
+
 def _to_base_frame(robot: Entity, pos_w: torch.Tensor) -> torch.Tensor:
   base_pos, base_quat = _base_pose(robot)
   return quat_apply(quat_inv(base_quat), pos_w - base_pos)
@@ -66,25 +166,33 @@ def ee_orientation_b(
 
 
 def object_position_b(
-  env: ManagerBasedRlEnv, object_name: str, asset_cfg: SceneEntityCfg = _ROBOT
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  asset_cfg: SceneEntityCfg = _ROBOT,
+  lag: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-  """Object position in the robot base frame. (B, 3)"""
+  """Object position in the robot base frame, as a tracker ``lag`` steps late reports it
+  (`_ObjectTracker`; None for the live pose). (B, 3)"""
   robot: Entity = env.scene[asset_cfg.name]
-  obj: Entity = env.scene[object_name]
-  return _to_base_frame(robot, obj.data.root_link_pos_w)
+  pos_w, _ = _object_pose_w(env, object_name, lag)
+  return _to_base_frame(robot, pos_w)
 
 
 def object_yaw_b(
-  env: ManagerBasedRlEnv, object_name: str, asset_cfg: SceneEntityCfg = _ROBOT
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  asset_cfg: SceneEntityCfg = _ROBOT,
+  lag: tuple[int, int] | None = None,
 ) -> torch.Tensor:
   """Object yaw relative to the robot base, as ``[cos, sin]``. (B, 2)
 
   Encoded as a unit vector rather than an angle so the observation stays continuous across
-  the +/-pi wrap, which a raw yaw does not.
+  the +/-pi wrap, which a raw yaw does not. ``lag`` as for `object_position_b`; the two
+  share one tracker, so they always report the cube at the same moment.
   """
   robot: Entity = env.scene[asset_cfg.name]
-  obj: Entity = env.scene[object_name]
-  quat_b = quat_mul(quat_inv(_base_pose(robot)[1]), obj.data.root_link_quat_w)
+  _, quat_w = _object_pose_w(env, object_name, lag)
+  quat_b = quat_mul(quat_inv(_base_pose(robot)[1]), quat_w)
   _, _, yaw = euler_xyz_from_quat(quat_b)
   return torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
 

@@ -153,6 +153,74 @@ _B_JOINT_POS_BIAS = 0.01
 _B_JOINT_LAG = (0, 1)
 
 
+#: Plan S7-6: the real robot's two latencies, ported from Claudius's `origin/faster-moves`
+#: (1d484c4 tracker, 71e1147 jaw servo; measured on the robot 2026-09-29).
+#:
+#: The cube is tracked by FoundationPose, 100-150 ms end to end (capture, inference, network,
+#: ROS) = 5-8 control steps at `CONTROL_DT`, against the 0-2 steps (`_DR_OBS_OBJECT_LAG`, on
+#: the actor's cube terms under DR-obs and baseline B) every run up to S7-5 trained with. Drawn per env per episode, on
+#: the cube's pose (`mdp._ObjectTracker`), replacing the term-level 0-2 on the actor's cube
+#: terms rather than adding to it.
+VISION_TRACKER_LAG = (5, 8)  # control steps
+#: The jaw servo: a first-order lag with a saturating speed between the jaw command and the
+#: joint (`mdp.RateLimitedJointPositionAction._resolve_servo`). Recorded strokes: 0.13-0.17 s
+#: steady lag, 1.3-1.7 rad/s peak. The two are not separable from one logged stroke (a pure
+#: 0.14 s lag fits the lag samples too), so both are modelled and both ranges are wide --
+#: Claudius's reading, kept as is. Per env, per episode.
+JAW_SERVO_TAU = (0.11, 0.19)  # s
+JAW_SERVO_MAX_VEL = (1.25, 1.75)  # rad/s
+
+
+@dataclasses.dataclass(frozen=True)
+class LatencyModelCfg:
+  """Plan S7-6's latency model: which of the robot's measured latencies training sees."""
+
+  tracker_lag: tuple[int, int] | None
+  """The cube tracker's lag, control steps, on the cube pose; None keeps the observation
+  set's own term-level lag (0-2 under DR-obs, every run up to S7-5)."""
+
+  jaw_servo: bool
+  """The jaw servo model (`JAW_SERVO_TAU`, `JAW_SERVO_MAX_VEL`) between command and joint."""
+
+
+#: Latency models by name (`LAG`). ``none`` is every run up to S7-5; ``FP`` the FoundationPose
+#: tracker alone, ``JS`` the jaw servo alone, ``FP+JS`` both (plan S7-6).
+LATENCY_MODELS = {
+  "none": LatencyModelCfg(tracker_lag=None, jaw_servo=False),
+  "FP": LatencyModelCfg(tracker_lag=VISION_TRACKER_LAG, jaw_servo=False),
+  "JS": LatencyModelCfg(tracker_lag=None, jaw_servo=True),
+  "FP+JS": LatencyModelCfg(tracker_lag=VISION_TRACKER_LAG, jaw_servo=True),
+}
+
+#: The actor's terms that read the tracked object, and so move onto the tracker's lag.
+_TRACKED_OBJECT_TERMS = ("object_pos", "object_yaw")
+
+
+def _apply_tracker_lag(cfg: ManagerBasedRlEnvCfg, lag: tuple[int, int]) -> None:
+  """Put the actor's cube terms on one shared tracker ``lag`` steps late, and the critic's on
+  the live pose.
+
+  After `apply_dr_level`, which may already have replaced the actor's cube terms (DR-obs). The
+  terms are *replaced*, not edited: in the ``S71`` set the actor and critic share term objects.
+  The term-level delay goes to zero on both, so the lag is the tracker's alone; the noise model
+  (per-episode bias, per-step jitter) is kept, and is applied to the lagged pose, as on the
+  robot.
+  """
+  for group_name, group in cfg.observations.items():
+    for name in _TRACKED_OBJECT_TERMS:
+      if name not in group.terms:
+        raise ValueError(
+          f"tracker lag asked for, but the {group_name!r} group has no {name!r} term"
+        )
+      term = group.terms[name]
+      group.terms[name] = dataclasses.replace(
+        term,
+        params={**term.params, "lag": lag if group_name == "actor" else None},
+        delay_min_lag=0,
+        delay_max_lag=0,
+      )
+
+
 @dataclasses.dataclass(frozen=True)
 class ToolSpeedCapCfg:
   """Plan S7-2's module V: a bound on the tool's speed in the action term. See
@@ -267,6 +335,7 @@ def make_tabletop_env_cfg(
   dr_spawn_widening: bool = True,
   arm_range_clip: bool = False,
   arm_effort_band: bool = False,
+  latency: LatencyModelCfg = LATENCY_MODELS["none"],
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -311,6 +380,8 @@ def make_tabletop_env_cfg(
     arm_effort_band: plan S7-4's T in the action term -- the arm's targets kept within
       q +/- tau_cmd / K, tau_cmd the effort limit the robot's model carries (lowered by the
       robot cfg, `robots.kangaroo_grippers_left_arm(arm_effort_scale=...)`).
+    latency: plan S7-6's latency model -- the cube tracker's lag and the jaw servo. See
+      `LATENCY_MODELS`; ``none`` is every run up to S7-5.
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
@@ -417,9 +488,13 @@ def make_tabletop_env_cfg(
     bounds["range_clip_joints"] = arm_regex
   if arm_effort_band:
     bounds["effort_band_joints"] = arm_regex
+  if latency.jaw_servo:
+    bounds["servo_joints"] = (re.escape(gripper.finger_joint),)
+    bounds["servo_tau"] = JAW_SERVO_TAU
+    bounds["servo_max_vel"] = JAW_SERVO_MAX_VEL
   if bounds and not rate_limit:
     raise ValueError(
-      "the arm bounds live in the rate-limited action term; no slew limit"
+      "the arm bounds and the jaw servo live in the rate-limited action term; no slew limit"
     )
   joint_pos_action: ActionTermCfg = (
     mdp.RateLimitedJointPositionActionCfg(
@@ -682,6 +757,8 @@ def make_tabletop_env_cfg(
   )
   if dr_level is not None:
     apply_dr_level(cfg, dr_level, action_joints, spawn_widening=dr_spawn_widening)
+  if latency.tracker_lag is not None:
+    _apply_tracker_lag(cfg, latency.tracker_lag)
   return cfg
 
 

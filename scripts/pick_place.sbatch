@@ -72,7 +72,18 @@ GAINS="${GAINS:-G0}"
 # none (every run before S7-4) | C (targets clipped to the joint range) | CTP (+ the effort limit
 # lowered to 0.7 x effort, mirrored as a target band, + the effort hinge).
 EFFORT="${EFFORT:-none}"
-export REWARD DR PPO SLEW BASELINE SPAWN TOOL_SPEED GAINS EFFORT
+# The real robot's latencies, the same way (plan S7-6, `tabletop_env_cfg.LATENCY_MODELS`): none
+# (every run before S7-6) | FP (the FoundationPose cube tracker, 5-8 steps on the cube pose) | JS
+# (the jaw servo's lag behind its command) | FP+JS. In the run name and tags only when set, so
+# every earlier run's name still reads the same.
+LAG="${LAG:-none}"
+export REWARD DR PPO SLEW BASELINE SPAWN TOOL_SPEED GAINS EFFORT LAG
+LAG_NAME=""
+LAG_TAG=""
+if [ "$LAG" != "none" ]; then
+  LAG_NAME="_lag${LAG}"
+  LAG_TAG=",\"lag${LAG}\""
+fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -104,7 +115,7 @@ if ! uv run --extra cu128 python -c \
      "from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import kangaroo_pick_place_env_cfg as f, kangaroo_pick_place_rl_cfg as g; f(); g()" \
      >/dev/null 2>"$REPO/.reward_check.$$"; then
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
-    "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT did not validate." >&2
+    "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -129,7 +140,7 @@ echo "reward/DR   $REWARD / $DR"
 echo "ppo         $PPO"
 echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
-echo "gains       $GAINS   effort $EFFORT"
+echo "gains       $GAINS   effort $EFFORT   lag $LAG"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
@@ -155,5 +166,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$RESUME_TAG)"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$RESUME_TAG)"

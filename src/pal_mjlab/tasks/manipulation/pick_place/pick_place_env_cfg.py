@@ -38,10 +38,12 @@ from pal_mjlab.tasks.manipulation.robot_cfg import ManipulationRobotCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
   DR_LEVELS_THAT_MOVE_THE_TABLE,
+  LATENCY_MODELS,
   OBJECT,
   ROBOT,
   SUPPORT_SENSOR,
   TABLE,
+  LatencyModelCfg,
   ToolSpeedCapCfg,
   apply_play_overrides,
   make_tabletop_env_cfg,
@@ -278,6 +280,7 @@ def make_pick_place_env_cfg(
   baseline: Baseline = BASELINES["S71"],
   tool_speed_cap: ToolSpeedCapCfg | None = None,
   effort: EffortBound = EFFORT_BOUNDS["none"],
+  latency: LatencyModelCfg = LATENCY_MODELS["none"],
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -298,6 +301,7 @@ def make_pick_place_env_cfg(
     tool_speed_cap: plan S7-2's module V, or None. See `tabletop_env_cfg.ToolSpeedCapCfg`.
     effort: plan S7-4's effort bound (C, TP). See `EFFORT_BOUNDS`; T's plant half comes with
       ``robot``.
+    latency: plan S7-6's latency model. See ``tabletop_env_cfg.LATENCY_MODELS``.
   """
   if target_xy is None:
     target_xy = baseline.target_xy
@@ -319,6 +323,7 @@ def make_pick_place_env_cfg(
     dr_spawn_widening=spawn.widen_at_dr_scene,
     arm_range_clip=effort.range_clip,
     arm_effort_band=effort.effort_scale is not None,
+    latency=latency,
   )
 
   gripper = robot.gripper(gripper_name)
