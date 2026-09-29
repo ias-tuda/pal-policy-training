@@ -634,6 +634,17 @@ def test_the_handoff_falls_back_at_eight_seconds():
   assert t.done[0]["handoff_by"] == "timeout" and not t.done[0]["success_retreat"]
 
 
+def test_a_timeout_handoff_opening_the_jaw_is_not_a_release():
+  """RCTP s2 @ 5 k holds the cube at the goal with the jaw closed until the 8 s fallback; the
+  controller then opens the jaw. That is not the policy's release."""
+  t = ev.RetreatTally(1, "cpu", 0.02, handoff=True)
+  _feed(t, 5, jaw_q=0.37, grasped=True, lifted=True)
+  _feed(t, 396, jaw_q=0.37, grasped=True)
+  assert bool(t.handed[0]) and not bool(t.released[0])
+  _feed(t, 20, jaw_q=0.0, grasped=False)
+  assert not bool(t.released[0])
+
+
 def test_no_handoff_without_the_flag():
   t = ev.RetreatTally(1, "cpu", 0.02, handoff=False)
   assert not any(bool(h) for h in _feed(t, 450, jaw_q=0.3))

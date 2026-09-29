@@ -790,7 +790,11 @@ class RetreatTally:
     # J's release: entering "jaw open and the pads off the cube" after the lift -- for a cube
     # held across an edge (the pads touch at ~0.10 rad) that is the let-go itself.
     released_now = jaw_open & ~grasped
-    opened = self.prev_jaw_closed & released_now & self.lifted & ~self.released
+    # Only the policy's releases: once the position controller has taken over it opens the
+    # jaw itself (a timeout hand-off of a policy still holding the cube is not a release).
+    opened = (
+      self.prev_jaw_closed & released_now & self.lifted & ~self.released & ~self.handed
+    )
     self.released |= opened
     self.rel_step = torch.where(opened, self.age, self.rel_step)
     self.rel_xy = torch.where(opened.unsqueeze(-1), obj_xy, self.rel_xy)
