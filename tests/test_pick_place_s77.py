@@ -106,7 +106,12 @@ def test_selectors_are_read_and_validated(monkeypatch):
   monkeypatch.setenv("OCC", "none")
   snap = kenv.kangaroo_pick_place_env_cfg()  # O-S is independent of the occlusion model
   assert snap.observations["actor"].terms["object_pos"].params["occ"].fill == "snap"
-  for bad in (("none", "zero"), ("arm", "live"), ("nope", "zero"), ("arm", "nope")):
+  # OCC=none with a filler: the machinery on, nothing hidden (a policy evaluated without OCC).
+  monkeypatch.setenv("OBJ_OBS", "zero")
+  clear = kenv.kangaroo_pick_place_env_cfg().observations["actor"].terms
+  assert clear["object_pos"].params["occ"].view == "none"
+  assert clear["object_pos"].params["occ"].dropout is None and "object_seen" in clear
+  for bad in (("arm", "live"), ("nope", "zero"), ("arm", "nope")):
     monkeypatch.setenv("OCC", bad[0])
     monkeypatch.setenv("OBJ_OBS", bad[1])
     with pytest.raises(ValueError):

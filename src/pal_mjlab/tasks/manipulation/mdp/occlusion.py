@@ -198,23 +198,33 @@ class OccCfg:
   """Random tracker loss ``(rate per step, min steps, max steps)`` (Claudius's ``-Drop``); a
   stand-in until the real tracker's rate is measured. None for none."""
 
-  # O-K's "held" rule (7-7.0 calibrates these against the sim's contact sensor).
-  hold_band: tuple[float, float] = (0.08, 0.43)
+  # O-K's "held" rule. Calibrated by 7-7.0 (`scripts/calibrate_held_rule.py`, `--trace` of RCTP s1
+  # / s3 at their own lag and at `LAG=FP+JS`, 64 episodes each, against the contact sensor): the
+  # F1 optimum of a 1620-point grid, with the lower band edge kept low for edge/corner grasps.
+  hold_band: tuple[float, float] = (0.10, 0.43)
   """The measured jaw angle (rad) inside which a stalled, commanded-closed jaw counts as
-  holding the cube. 5 cm cube: first touch ~0.21, hold 0.26-0.40 (S7-5's trace), edge/corner
-  grasps touch at ~0.10."""
-  hold_stall_vel: float = 0.15
-  """|dq/dt| of the jaw below which it counts as stalled, rad/s."""
-  hold_margin: float = 0.05
+  holding the cube. 5 cm cube: first touch ~0.21, hold 0.26-0.40 (S7-5's trace; 5-95 % of the
+  contact sensor's grasped steps 0.15-0.39 here), edge/corner grasps touch at ~0.10."""
+  hold_stall_vel: float = 1.5
+  """|dq/dt| of the jaw below which it counts as stalled, rad/s. The jaw is a stiff PD on a
+  compliant grasp: its speed while holding is 0.15 rad/s (median) but 0.9-1.3 (90th percentile),
+  so a tight stall test (0.15) missed 80 % of the holds."""
+  hold_margin: float = 0.10
   """The command must be this much further closed than the measured angle, rad."""
-  hold_steps: int = 4
-  """Consecutive control steps the three conditions must hold (the jaw trails its command by
-  0.13-0.17 s under JS: a jaw merely passing through the band must not count)."""
+  hold_steps: int = 3
+  """Consecutive control steps the three conditions must hold. The whole hold is short (median 14
+  steps = 0.3 s on G20), so the rule's own trail (N - 1 steps) matters: 2-3 steps."""
+  hold_release: float = 0.0
+  """Not held again when the command comes back to the measured angle, rad: the jaw is being
+  opened. The pads lose the cube about 8 steps before the jaw has opened below `open_below`; this
+  closes ~60 % of that gap (stale "held" steps 35 % -> 14 % of the rule's held steps)."""
   open_below: float = 0.15
   """Not held again when the jaw opens below this (`observations.JAW_OPEN_BELOW`), rad."""
-  envelope: float = 0.06
+  envelope: float = 0.20
   """The last visible cube must be within this distance of the TCP when the hold latches, m
-  (sim2sim's virtual-cube rule, ``kang_pick_place_node.cpp``)."""
+  (sim2sim's virtual-cube rule, ``kang_pick_place_node.cpp``). Loose on purpose: at 0.06 the rule
+  lost a third of the holds (the TCP site sits 4-5 cm from the cube's centre in a grasp, and the
+  last seen pose is up to 8 steps old); it only guards a jaw closing on air far from the cube."""
   reacquire: float = 0.03
   """A measured pose further than this from the estimate overrides the held belief, m."""
 
@@ -251,30 +261,25 @@ def occ_cfg(occ: str, obj_obs: str, flag: bool | None = None) -> OccCfg | None:
   """The occlusion config for the ``OCC`` / ``OBJ_OBS`` selectors; None for no occlusion
   (``OCC=none`` with ``OBJ_OBS=live``, every run up to S7-6).
 
-  ``OCC`` names the visibility model (``none`` | ``arm`` | ``hand``: ``none`` is *no*
-  occlusion at all), ``OBJ_OBS`` the filler (``live`` | ``hold`` | ``zero`` | ``estimate`` |
-  ``estimate+`` | ``snap``); ``flag`` overrides whether the actor gets the visibility flag.
+  ``OCC`` names the visibility model (``none`` | ``arm`` | ``hand``), ``OBJ_OBS`` the filler
+  (``live`` | ``hold`` | ``zero`` | ``estimate`` | ``estimate+`` | ``snap``); ``flag`` overrides
+  whether the actor gets the visibility flag. ``OCC=none`` with a filler is the filler's machinery
+  with nothing hidden -- the cube is always seen, the flag reads 1, the estimate is computed but
+  reported only for ``estimate+`` -- which is how a trained policy is evaluated *without*
+  occlusion, and how O-S (independent of occlusion) is trained.
   """
-  if occ == "none":
-    if obj_obs not in ("live", "snap"):
-      raise ValueError(f"OBJ_OBS={obj_obs} needs an occlusion model (OCC=arm|hand)")
-    if obj_obs == "live":
-      return None
-    # O-S is independent of occlusion: the snapshot is all the actor ever gets.
-    return OccCfg(
-      fill="snap", flag=False if flag is None else flag, view="none", dropout=None
-    )
   if occ not in OCC_VIEWS:
     raise ValueError(f"unknown OCC={occ!r}; have {OCC_VIEWS}")
   if obj_obs not in OBJ_OBS_FLAG:
     raise ValueError(f"unknown OBJ_OBS={obj_obs!r}; have {tuple(OBJ_OBS_FLAG)}")
   if obj_obs == "live":
-    raise ValueError("OBJ_OBS=live with an occlusion model would hide nothing")
-  return OccCfg(
-    fill=obj_obs,
-    flag=OBJ_OBS_FLAG[obj_obs] if flag is None else flag,
-    view=occ,
-  )
+    if occ != "none":
+      raise ValueError("OBJ_OBS=live with an occlusion model would hide nothing")
+    return None
+  has_flag = OBJ_OBS_FLAG[obj_obs] if flag is None else flag
+  if occ == "none":
+    return OccCfg(fill=obj_obs, flag=has_flag, view="none", dropout=None)
+  return OccCfg(fill=obj_obs, flag=has_flag, view=occ)
 
 
 # -- The sensor -----------------------------------------------------------------------------
@@ -336,6 +341,8 @@ class CubeSensor:
     # O-K.
     self.held = torch.zeros(n, dtype=torch.bool, device=dev)
     self._count = torch.zeros(n, dtype=torch.long, device=dev)
+    # A belief the cube contradicted stays dropped until the jaw stops meeting the hold conditions.
+    self._disarmed = torch.zeros(n, dtype=torch.bool, device=dev)
     self._has_offset = torch.zeros(n, dtype=torch.bool, device=dev)
     self._off_pos = torch.zeros(n, 3, device=dev)
     self._off_quat = self.quat_w.clone()
@@ -454,6 +461,7 @@ class CubeSensor:
       self.unseen_steps[fresh] = 0
       self.held[fresh] = False
       self._count[fresh] = 0
+      self._disarmed[fresh] = False
       self._has_offset[fresh] = False
       self._jaw_prev[fresh] = q_jaw[fresh]
 
@@ -496,7 +504,9 @@ class CubeSensor:
     last_pos = torch.where(seen_now.unsqueeze(-1), rep_pos, self.last_pos)
     last_quat = torch.where(seen_now.unsqueeze(-1), rep_quat, self.last_quat)
     in_envelope = torch.norm(last_pos - tcp_pos, dim=-1) < occ.envelope
-    latch = (~self.held) & (self._count >= occ.hold_steps) & in_envelope
+    latch = (
+      (~self.held) & ~self._disarmed & (self._count >= occ.hold_steps) & in_envelope
+    )
     # Re-acquisition: the offset the belief holds, evaluated at the reported pose's moment,
     # against what was measured -- a cube that is not in the hand any more overrides the belief.
     if bool(self._has_offset.any()):
@@ -505,8 +515,11 @@ class CubeSensor:
       drop = self.held & self._has_offset & seen_now & miss
     else:
       drop = torch.zeros_like(self.held)
-    let_go = self.held & ((q_jaw < occ.open_below) | (q_jaw > hi))
+    let_go = self.held & (
+      (q_jaw < occ.open_below) | (q_jaw > hi) | ((cmd_jaw - q_jaw) < occ.hold_release)
+    )
     stop = drop | let_go
+    self._disarmed = (self._disarmed | drop) & cand
     if bool(let_go.any()):
       # The cube is roughly where it was let go: at the TCP, in the pose the estimate had.
       self.last_pos = torch.where(let_go.unsqueeze(-1), self.est_pos, self.last_pos)
