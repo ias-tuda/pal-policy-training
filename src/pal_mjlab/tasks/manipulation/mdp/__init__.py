@@ -55,6 +55,14 @@ from .observations import (
   object_position_b,
   object_yaw_b,
 )
+from .occlusion import (
+  CubeSensor,
+  OccCfg,
+  object_position_occ,
+  object_seen,
+  object_unseen_steps,
+  object_yaw_occ,
+)
 from .rewards import (
   arm_effort_hinge,
   bring_object_after_lift,
@@ -90,6 +98,12 @@ from .terminations import (
 )
 
 __all__ = [
+  "CubeSensor",
+  "OccCfg",
+  "object_position_occ",
+  "object_seen",
+  "object_unseen_steps",
+  "object_yaw_occ",
   "RateLimitedJointPositionAction",
   "RateLimitedJointPositionActionCfg",
   "ToolSpeedCappedJointPositionAction",

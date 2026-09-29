@@ -221,6 +221,83 @@ def _apply_tracker_lag(cfg: ManagerBasedRlEnvCfg, lag: tuple[int, int]) -> None:
       )
 
 
+def _apply_occlusion(
+  cfg: ManagerBasedRlEnvCfg,
+  occ: mdp.OccCfg,
+  latency: LatencyModelCfg,
+  tcp: SceneEntityCfg,
+  jaw_name: str,
+) -> None:
+  """Plan S7-7: the actor's cube terms report through one `mdp.CubeSensor` -- the cube's pose as
+  the tracker reports it (``lag`` steps late), visible or not, with the filler ``occ.fill`` while
+  it is not -- and, if ``occ.flag``, a visibility flag; the critic keeps the live cube and gets
+  the flag and the steps since the cube was last seen.
+
+  After `_apply_tracker_lag` and `apply_dr_level`. The tracker's lag is S7-6's ``FP`` lag if the
+  run has one, else the 0-2 steps every run up to S7-5 trained with (`_DR_OBS_OBJECT_LAG`, which
+  moves from mjlab's term-level delay onto the tracker). The noise is the actor's cube terms'
+  own, applied inside the sensor so that a filler is not noised (`mdp.OccCfg.noise`).
+  """
+  lag = latency.tracker_lag or _DR_OBS_OBJECT_LAG
+  actor = cfg.observations["actor"]
+  sensor_params = {
+    "object_name": OBJECT,
+    "lag": lag,
+    "occ": dataclasses.replace(occ, noise=_occ_noise(actor.terms)),
+    "tcp_cfg": tcp,
+    "jaw_name": jaw_name,
+  }
+  terms = {}
+  for name, term in actor.terms.items():
+    if name == "object_pos":
+      term = dataclasses.replace(
+        term,
+        func=mdp.object_position_occ,
+        params=sensor_params,
+        noise=None,
+        delay_min_lag=0,
+        delay_max_lag=0,
+      )
+    elif name == "object_yaw":
+      term = dataclasses.replace(
+        term,
+        func=mdp.object_yaw_occ,
+        params=sensor_params,
+        noise=None,
+        delay_min_lag=0,
+        delay_max_lag=0,
+      )
+    terms[name] = term
+    if name == "object_yaw" and occ.flag:
+      terms["object_seen"] = ObservationTermCfg(
+        func=mdp.object_seen, params=sensor_params
+      )
+  if "object_yaw" not in actor.terms:
+    raise ValueError("occlusion asked for, but the actor has no 'object_yaw' term")
+  actor.terms = terms
+  critic = cfg.observations["critic"]
+  critic.terms = {
+    **critic.terms,
+    "object_seen": ObservationTermCfg(func=mdp.object_seen, params=sensor_params),
+    "object_unseen": ObservationTermCfg(
+      func=mdp.object_unseen_steps, params=sensor_params
+    ),
+  }
+
+
+def _occ_noise(terms) -> tuple[float, float, float, float]:
+  """(pos bias, pos jitter, yaw bias, yaw jitter) of the actor's cube terms, before they move
+  into the sensor."""
+
+  def bound(term) -> tuple[float, float]:
+    noise = term.noise
+    if noise is None:
+      return 0.0, 0.0
+    return float(noise.bias_noise_cfg.n_max), float(noise.noise_cfg.n_max)
+
+  return (*bound(terms["object_pos"]), *bound(terms["object_yaw"]))
+
+
 @dataclasses.dataclass(frozen=True)
 class ToolSpeedCapCfg:
   """Plan S7-2's module V: a bound on the tool's speed in the action term. See
@@ -336,6 +413,7 @@ def make_tabletop_env_cfg(
   arm_range_clip: bool = False,
   arm_effort_band: bool = False,
   latency: LatencyModelCfg = LATENCY_MODELS["none"],
+  occlusion: mdp.OccCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -382,6 +460,8 @@ def make_tabletop_env_cfg(
       robot cfg, `robots.kangaroo_grippers_left_arm(arm_effort_scale=...)`).
     latency: plan S7-6's latency model -- the cube tracker's lag and the jaw servo. See
       `LATENCY_MODELS`; ``none`` is every run up to S7-5.
+    occlusion: plan S7-7's occlusion model and filler, or None (every run up to S7-6). See
+      `mdp.OccCfg` and `_apply_occlusion`.
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
@@ -759,6 +839,8 @@ def make_tabletop_env_cfg(
     apply_dr_level(cfg, dr_level, action_joints, spawn_widening=dr_spawn_widening)
   if latency.tracker_lag is not None:
     _apply_tracker_lag(cfg, latency.tracker_lag)
+  if occlusion is not None:
+    _apply_occlusion(cfg, occlusion, latency, tcp, gripper.finger_joint)
   return cfg
 
 
