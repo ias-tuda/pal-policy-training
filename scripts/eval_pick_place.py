@@ -65,6 +65,13 @@ hand-off, the time from placed to it, the cube's displacement during the lift an
 whether it is still placed at the end, the time to home, and S7-4's success -- placed & lifted &
 J-released & lifted clear (>= `HANDOFF_CLEAR`) & still placed after the return.
 
+Plan S7-5: the goal tolerance split into xy and z, and the tilt at the let-go
+--------------------------------------------------------------------------------
+Every placed rate is read under both goal tolerances, whatever the run trained on: the 3-D
+distance below `GOAL_THRESHOLD` (every run to S7-4) and S7-5's Z, `GOAL_TOL_XYZ` (xy < 2 cm and
+|dz| < 2 cm) -- ``*_z`` keys -- so an S7-5 number stays comparable with S7-4's. Beside them, the
+cube's tilt at the pads' let-go: the angle between the vertical and the nearest face normal.
+
 Horizon
 --------------------------------------------------------------------------------
 Not the `--play` cfg as-is: `apply_play_overrides` sets `episode_length_s` to 1e9, so
@@ -137,6 +144,8 @@ HANDOFF_CLEAR = 0.03
 HANDOFF_STEPS = 5
 HANDOFF_TIMEOUT_S = 8.0
 HOME_TOL = 0.05
+#: Plan S7-5's Z: "at the goal" is xy < 2 cm and |dz| < 2 cm, `pick_place.rewards.Z_GOAL_TOL`.
+GOAL_TOL_XYZ = (0.02, 0.02)
 
 
 def release_grades(dxy: float, dz: float, passed: bool) -> tuple[float, float]:
@@ -208,6 +217,7 @@ class Tally:
     "lifted",
     "placed",
     "placed_and_lifted",
+    "placed_and_lifted_z",
     "dropped",
     "held_at_goal",
   )
@@ -756,6 +766,7 @@ class RetreatTally:
     self.released, self.rel_step = zb(), zl(-1)
     self.rel_xy = torch.zeros(num_envs, 2, device=device)
     self.placed_j, self.placed_j_step = zb(), zl(-1)
+    self.placed_jz, self.final_placed_jz, self.tilt_at_let_go = zb(), zb(), zf()
     self.clear_max = zf(float("-inf"))
     self.clear_run = zl()
     self.handed, self.hand_step, self.hand_by = zb(), zl(-1), zl()
@@ -776,16 +787,23 @@ class RetreatTally:
     obj_xy: torch.Tensor,
     goal_dxy: torch.Tensor,
     arm_home_err: torch.Tensor,
+    placed_jz: torch.Tensor | None = None,
+    tilt: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """One step's state -> the envs the position controller drives this step. (B,)
 
     ``tcp_above`` is the TCP's height above the cube's top, ``goal_dxy`` the cube's horizontal
-    distance to the target, ``arm_home_err`` the driven arm's max |q - q_default|."""
+    distance to the target, ``arm_home_err`` the driven arm's max |q - q_default|;
+    ``placed_jz`` is ``placed_j`` under plan S7-5's Z tolerance, ``tilt`` the cube's tilt
+    (rad), both optional."""
     grasped, lifted, placed_j = grasped.bool(), lifted.bool(), placed_j.bool()
+    placed_jz = torch.zeros_like(placed_j) if placed_jz is None else placed_jz.bool()
     jaw_open = jaw_q < JAW_OPEN
     self.lifted |= lifted
     let_go = self.prev_grasped & ~grasped & self.lifted
     self.jaw_at_let_go = torch.where(let_go, jaw_q, self.jaw_at_let_go)
+    if tilt is not None:
+      self.tilt_at_let_go = torch.where(let_go, tilt, self.tilt_at_let_go)
     self.let_go |= let_go
     # J's release: entering "jaw open and the pads off the cube" after the lift -- for a cube
     # held across an edge (the pads touch at ~0.10 rad) that is the let-go itself.
@@ -801,6 +819,7 @@ class RetreatTally:
     newly = placed_j & (self.placed_j_step < 0)
     self.placed_j_step = torch.where(newly, self.age, self.placed_j_step)
     self.placed_j |= placed_j
+    self.placed_jz |= placed_jz
     # The lift: after the J-release and before the hand-off, how high the TCP gets.
     lifting = self.released & ~self.handed
     self.clear_max = torch.where(
@@ -822,6 +841,7 @@ class RetreatTally:
       home = self.handed & (self.home_step < 0) & (arm_home_err < HOME_TOL)
       self.home_step = torch.where(home, self.age, self.home_step)
     self.final_placed_j = placed_j
+    self.final_placed_jz = placed_jz
     self.final_dxy = goal_dxy
     self.final_xy = obj_xy.clone()
     self.prev_grasped = grasped.clone()
@@ -840,6 +860,9 @@ class RetreatTally:
       row = {
         "jaw_released": rel,
         "jaw_at_let_go": float(self.jaw_at_let_go[i]) if bool(self.let_go[i]) else None,
+        "tilt_at_let_go": float(self.tilt_at_let_go[i])
+        if bool(self.let_go[i])
+        else None,
         "placed_j": bool(self.placed_j[i]),
         "placed_and_lifted_j": bool(self.placed_j[i]) and bool(self.lifted[i]),
         "lift_clear_max": float(self.clear_max[i]) if rel else None,
@@ -856,6 +879,8 @@ class RetreatTally:
         if handed
         else None,
         "final_placed_j": bool(self.final_placed_j[i]),
+        "placed_and_lifted_j_z": bool(self.placed_jz[i]) and bool(self.lifted[i]),
+        "final_placed_j_z": bool(self.final_placed_jz[i]),
         "final_dxy": float(self.final_dxy[i]),
         "time_to_home_s": (int(self.home_step[i]) - hand) * dt
         if handed and int(self.home_step[i]) >= 0
@@ -868,6 +893,9 @@ class RetreatTally:
         and bool(self.final_placed_j[i])
         and bool(self.placed_j[i])
       )
+      row["success_retreat_z"] = (
+        rel and clear and bool(self.final_placed_jz[i]) and bool(self.placed_jz[i])
+      )
       self.done.append(row)
     for acc in (
       self.prev_grasped,
@@ -876,6 +904,7 @@ class RetreatTally:
       self.let_go,
       self.released,
       self.placed_j,
+      self.placed_jz,
       self.handed,
     ):
       acc[env_ids] = False
@@ -884,6 +913,7 @@ class RetreatTally:
     for acc in (self.rel_step, self.placed_j_step, self.hand_step, self.home_step):
       acc[env_ids] = -1
     self.clear_max[env_ids] = float("-inf")
+    self.tilt_at_let_go[env_ids] = 0.0
 
   def summarise(self, episodes: int) -> dict:
     rows = self.done[:episodes]
@@ -911,6 +941,14 @@ class RetreatTally:
       "final_within_goal": sum(r["final_dxy"] < GOAL_THRESHOLD for r in rows) / n,
       "time_to_home_median_s": median(vals("time_to_home_s")),
       "success_retreat": share("success_retreat"),
+      "tilt_at_let_go_median_rad": median(vals("tilt_at_let_go")),
+      "tilt_at_let_go_over_10deg": sum(
+        t > math.radians(10) for t in vals("tilt_at_let_go")
+      )
+      / max(len(vals("tilt_at_let_go")), 1),
+      "placed_and_lifted_j_z": share("placed_and_lifted_j_z"),
+      "final_placed_j_z": share("final_placed_j_z"),
+      "success_retreat_z": share("success_retreat_z"),
     }
 
 
@@ -979,6 +1017,9 @@ def probe(env: ManagerBasedRlEnv, grasp_sensor: str) -> dict[str, torch.Tensor]:
     "lifted": grasped & ~on_surface,
     "placed": _placed_bool(*common),
     "placed_and_lifted": _placed_bool(*common, SUPPORT_SENSOR),
+    "placed_and_lifted_z": _placed_bool(
+      env, COMMAND, OBJECT, grasp_sensor, GOAL_TOL_XYZ, 0.05, SUPPORT_SENSOR
+    ),
     # The object is on the floor, not the table: `object_dropped`'s own condition.
     "dropped": obj.data.root_link_pos_w[:, 2]
     < env.cfg.terminations["object_dropped"].params["min_height"],
@@ -991,6 +1032,17 @@ def geometry(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
   pos = env.scene[OBJECT].data.root_link_pos_w
   goal = env.command_manager.get_term(COMMAND).command
   return torch.norm((pos - goal)[:, :2], dim=-1), pos[:, 2] - goal[:, 2]
+
+
+def tilt(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """The cube's tilt: the angle between the vertical and its nearest face normal, rad. 0 for
+  a cube resting on a face, pi/4 on an edge. (B,)"""
+  w, x, y, z = env.scene[OBJECT].data.root_link_quat_w.unbind(-1)
+  # The world-z components of the body's three axes: the last row of its rotation matrix.
+  row = torch.stack(
+    [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
+  )
+  return torch.acos(row.abs().amax(-1).clamp(max=1.0))
 
 
 def positions(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1084,6 +1136,7 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     "episodes": n,
     "placed": rate("placed"),
     "placed_and_lifted": rate("placed_and_lifted"),
+    "placed_and_lifted_z": rate("placed_and_lifted_z"),
     "grasped_ever": rate("grasped"),
     "lifted_ever": rate("lifted"),
     "held_at_goal": rate("held_at_goal"),
@@ -1112,6 +1165,10 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
   )
   print(
     f"    placed & lifted          {result['placed_and_lifted']:6.1%}   ... and it left the table"
+  )
+  print(
+    f"    placed & lifted, Z       {result['placed_and_lifted_z']:6.1%}   "
+    f"... at the goal by S7-5's xy/z tolerance {GOAL_TOL_XYZ}"
   )
   slid = result["placed"] - result["placed_and_lifted"]
   print(f"    -> slid, never picked up {slid:6.1%}")
@@ -1270,6 +1327,17 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"    SUCCESS (S7-4)           {result['success_retreat']:6.1%}   placed & lifted & "
       "jaw-released & lifted clear & still placed"
     )
+    print(
+      f"    ... under S7-5's Z       {result['success_retreat_z']:6.1%}   "
+      f"placed & lifted, jaw open {result['placed_and_lifted_j_z']:6.1%}, still placed "
+      f"{result['final_placed_j_z']:6.1%}"
+    )
+    tl = result["tilt_at_let_go_median_rad"]
+    print(
+      f"    cube tilt at let-go      "
+      f"{'n/a' if tl is None else f'{math.degrees(tl):6.1f} deg'}  (median; > 10 deg "
+      f"{result['tilt_at_let_go_over_10deg']:6.1%})"
+    )
 
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
@@ -1318,6 +1386,8 @@ def main() -> None:
         obj_pos[:, :2],
         dxy,
         home_err,
+        placed_jz=flags["placed_and_lifted_z"] & (jaw_q < JAW_OPEN),
+        tilt=tilt(env),
       )
       if plant is not None:
         plant.measure_env(
