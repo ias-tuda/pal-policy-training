@@ -80,7 +80,8 @@ task ids; avoid introducing unnecessary abstractions.
    with file/line or measurement evidence → decision → consequences → confidence and what
    would change it. Supersede old records rather than editing the history out of them.
 6. **Write a stage report at the end of each stage** — each milestone or experiment campaign —
-   in `../docs/reports/`; raw artifacts go in `artifacts/<stage>/` (gitignored). Written for
+   in `../docs/reports/`; raw artifacts go in `../results/<STAGE>/` and videos in `../videos/<STAGE>/`
+   (outside the repo, e.g. `../results/S7-3/`, `../videos/S7-3/`). Written for
    someone reading it cold in three months, it states: what the stage set out to do and which
    exit criteria were met, missed or dropped; the numbers and how they were measured; the
    decisions taken and where their records live; what broke; what is still open; and the
@@ -297,7 +298,9 @@ static/                     # images used by README and docs
   decisions/                # decision records NNNN-slug.md
   reports/                  # stage reports
   status_summary.md         # cross-task status matrix
-artifacts/<stage>/          # raw run artifacts (gitignored)
+../results/<STAGE>/         # raw run artifacts per stage (S5.2, S7-3, ...), outside the repo
+../videos/<STAGE>/          # rendered videos per stage
+artifacts/                  # gitignored scratch for script defaults; move to ../results/<STAGE>/
 memory_oppsie_kangaroo.md   # long-term project state
 mujoco_warp_io.patch        # local patch to an installed dependency (see below)
 ```
