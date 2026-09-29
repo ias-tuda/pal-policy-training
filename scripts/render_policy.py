@@ -94,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     help="idle steps after pinning: the cube settles and the 0-2 step object lag flushes",
   )
   p.add_argument("--caption", default=None, help="a line drawn into every frame")
+  p.add_argument(
+    "--handoff",
+    action="store_true",
+    help="plan S7-4: the eval's position controller takes over (home, jaw open) once the "
+    "jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
+  )
   return p.parse_args()
 
 
@@ -181,17 +187,19 @@ def pin_start(env, ev, args: argparse.Namespace) -> dict[str, tuple[float, ...]]
 
 
 def _captioner(text: str | None, step_dt: float):
-  """Frame -> frame with ``text`` and the episode clock drawn in the top-left corner."""
+  """Frame -> frame with ``text``, the episode clock and an optional status line drawn in
+  the top-left corner."""
   if text is None:
-    return lambda frame, step: frame
+    return lambda frame, step, status=None: frame
   from PIL import Image, ImageDraw, ImageFont
 
   font = ImageFont.load_default(size=16)
 
-  def draw(frame: np.ndarray, step: int) -> np.ndarray:
+  def draw(frame: np.ndarray, step: int, status: str | None = None) -> np.ndarray:
     img = Image.fromarray(frame)
     d = ImageDraw.Draw(img)
-    for i, line in enumerate((text, f"t = {step * step_dt:4.2f} s")):
+    lines = [text, f"t = {step * step_dt:4.2f} s"] + ([status] if status else [])
+    for i, line in enumerate(lines):
       d.text(
         (10, 8 + 20 * i),
         line,
@@ -256,6 +264,11 @@ def main() -> None:
   args.out.parent.mkdir(parents=True, exist_ok=True)
   writer = imageio.get_writer(str(args.out), fps=fps, codec="libx264", quality=7)
   obs = wrapped.get_observations()
+  robot = env.scene[ev.ROBOT]
+  arm_ids = [i for i, n in enumerate(robot.joint_names) if n.startswith("arm_left_")]
+  jaw_id = robot.joint_names.index(ev.JAW_JOINT)
+  retreat = ev.RetreatTally(1, args.device, env.step_dt, handoff=args.handoff)
+  status = None
   done_episodes = steps = 0
   ep_step = args.settle_steps if pinned else 0
   ended_by: list[str] = []
@@ -267,7 +280,30 @@ def main() -> None:
     while done_episodes < args.episodes and (
       args.max_steps is None or steps < args.max_steps
     ):
-      obs, _, dones, _ = wrapped.step(policy(obs))
+      flags = ev.probe(env, grasp_sensor)
+      jaw_q, tcp_above, home_err = ev.retreat_state(env, arm_ids, jaw_id)
+      obj_pos = env.scene[ev.OBJECT].data.root_link_pos_w
+      dxy, _ = ev.geometry(env)
+      handed = retreat.step(
+        jaw_q,
+        flags["grasped"],
+        flags["lifted"],
+        flags["placed_and_lifted"] & (jaw_q < ev.JAW_OPEN),
+        tcp_above,
+        obj_pos[:, :2],
+        dxy,
+        home_err,
+      )
+      actions = policy(obs)
+      if args.handoff:
+        actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
+      status = (
+        ("position controller: home" if bool(handed[0]) else "policy")
+        + f" | jaw {float(jaw_q[0]):.2f} rad"
+        + (" (open)" if float(jaw_q[0]) < ev.JAW_OPEN else "")
+        + f" | TCP over cube top {100 * float(tcp_above[0]):+.1f} cm"
+      )
+      obs, _, dones, _ = wrapped.step(actions)
       steps += 1
       ep_step += 1
       if bool(dones[0]):
@@ -279,6 +315,7 @@ def main() -> None:
         # The env has reset: its frame is the next episode's start, not this one's end.
         if done_episodes >= args.episodes:
           break
+        retreat.finish(torch.tensor([0]), [False])
         ep_step = 0
         first_placed.append(None)
         after.append([0, 0, 0])
@@ -292,7 +329,7 @@ def main() -> None:
           after[-1][0] += 1
           after[-1][1] += placed_now
           after[-1][2] += bool(state["grasped"][0])
-      writer.append_data(caption(env.render(), ep_step))
+      writer.append_data(caption(env.render(), ep_step, status))
   writer.close()
   env.close()
   per_episode = [
