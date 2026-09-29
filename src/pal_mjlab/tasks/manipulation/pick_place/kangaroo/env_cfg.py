@@ -55,6 +55,8 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
   DEFAULT_TABLETOP_GAINS,
   TABLETOP_GAINS,
 )
+from pal_mjlab.tasks.manipulation import mdp
+from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
@@ -83,6 +85,9 @@ TOOL_SPEED_ENV_VAR = "TOOL_SPEED"
 GAINS_ENV_VAR = "GAINS"
 EFFORT_ENV_VAR = "EFFORT"
 LAG_ENV_VAR = "LAG"
+OCC_ENV_VAR = "OCC"
+OBJ_OBS_ENV_VAR = "OBJ_OBS"
+OCC_FLAG_ENV_VAR = "OCC_FLAG"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -95,6 +100,8 @@ DEFAULT_TOOL_SPEED = "none"
 DEFAULT_GAINS = DEFAULT_TABLETOP_GAINS
 DEFAULT_EFFORT = "none"
 DEFAULT_LAG = "none"
+DEFAULT_OCC = "none"
+DEFAULT_OBJ_OBS = "live"
 
 #: The arm each spawn box trains with: the W boxes need P2's wider action scales (plan S7 P2).
 SPAWN_ROBOTS = {
@@ -159,7 +166,20 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     tool_speed_cap=TOOL_SPEED_CAPS[tool_speed],
     effort=effort,
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
+    occlusion=_select_occlusion(),
   )
+
+
+def _select_occlusion() -> mdp.OccCfg | None:
+  """Plan S7-7's ``OCC`` (visibility model) and ``OBJ_OBS`` (what the actor sees while the cube
+  is lost); ``OCC_FLAG`` = 0 / 1 overrides whether the actor gets the visibility flag (an
+  eval-only filler on a policy trained without it). Unset is no occlusion, every run to S7-6."""
+  occ = _select(OCC_ENV_VAR, DEFAULT_OCC, OCC_VIEWS)
+  obj_obs = _select(OBJ_OBS_ENV_VAR, DEFAULT_OBJ_OBS, OBJ_OBS_FLAG)
+  flag = os.environ.get(OCC_FLAG_ENV_VAR)
+  if flag not in (None, "0", "1"):
+    raise ValueError(f"{OCC_FLAG_ENV_VAR}={flag!r} is not 0 or 1")
+  return occ_cfg(occ, obj_obs, None if flag is None else flag == "1")
 
 
 def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:

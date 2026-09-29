@@ -952,6 +952,186 @@ class RetreatTally:
     }
 
 
+class OccTally:
+  """Plan S7-7's reads, per episode, from the run's `mdp.CubeSensor` (there only when the env has
+  an occlusion config; ``OCC`` / ``OBJ_OBS`` name it): how much of the episode the cube is not
+  reported, by phase (approach / grasp / carry / retreat), how far O-K's estimate is from the live
+  cube by the steps since the cube was last seen, how the jaw-only "held" rule compares with the
+  contact sensor (precision, recall, the steps it trails the real grasp by), and the re-approaches:
+  grasp attempts (the pads touching the cube again) and the jaw reopening away from the goal after
+  a lift. Tensors in; call `step` once per control step at the top of the step, after the sensor
+  has been updated (it is, by the observation the policy is about to read)."""
+
+  PHASES = ("approach", "grasp", "carry", "retreat")
+  #: Steps-since-seen bins for the estimate's error, [lo, hi).
+  BINS = ((0, 1), (1, 6), (6, 11), (11, 26), (26, 51), (51, 10**6))
+
+  def __init__(self, num_envs: int, device: str) -> None:
+    n = num_envs
+    zf = lambda *shape: torch.zeros(*shape, device=device)  # noqa: E731
+    zl = lambda *shape: torch.zeros(*shape, dtype=torch.long, device=device)  # noqa: E731
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=device)  # noqa: E731
+    self.steps = zl(n)
+    self.phase_steps = zl(n, 4)
+    self.lost_steps = zl(n, 4)  # reported lost (what the actor is told)
+    self.blocked_steps = zl(n, 4)  # the live line of sight / random loss says hidden
+    self.ever_grasped = zb()
+    self.prev_grasped = zb()
+    self.prev_jaw_closed = zb()
+    self.was_lifted = zb()
+    self.grasp_starts = zl(n)
+    self.reopen_away = zl(n)
+    self.tp, self.fp, self.fn, self.tn = zl(n), zl(n), zl(n), zl(n)
+    self.grasp_step = zl(n) - 1  # the first step the pads hold the cube
+    self.held_step = zl(n) - 1  # ... the first step the rule says held
+    self.err_sum = zf(len(self.BINS))
+    self.err_max = zf(len(self.BINS))
+    self.err_n = zl(len(self.BINS))
+    self.err_ep_max = zf(n)
+    self.done: list[dict] = []
+
+  def step(
+    self,
+    sensor,
+    grasped: torch.Tensor,
+    lifted: torch.Tensor,
+    obj_pos: torch.Tensor,
+    jaw_q: torch.Tensor,
+    dxy_goal: torch.Tensor,
+  ) -> None:
+    lost = ~sensor.seen
+    hidden = ~sensor.live_visible
+    self.ever_grasped |= grasped
+    phase = torch.where(
+      ~self.ever_grasped,
+      0,
+      torch.where(grasped & lifted, 2, torch.where(grasped, 1, 3)),
+    )
+    onehot = torch.nn.functional.one_hot(phase, 4)
+    self.steps += 1
+    self.phase_steps += onehot
+    self.lost_steps += onehot * lost.unsqueeze(-1)
+    self.blocked_steps += onehot * hidden.unsqueeze(-1)
+    held = sensor.held
+    self.tp += held & grasped
+    self.fp += held & ~grasped
+    self.fn += ~held & grasped
+    self.tn += ~held & ~grasped
+    first_g = grasped & (self.grasp_step < 0)
+    self.grasp_step = torch.where(first_g, self.steps, self.grasp_step)
+    first_h = held & (self.held_step < 0)
+    self.held_step = torch.where(first_h, self.steps, self.held_step)
+    self.grasp_starts += grasped & ~self.prev_grasped
+    self.was_lifted |= lifted
+    closed = jaw_q >= JAW_OPEN
+    self.reopen_away += (
+      self.was_lifted & self.prev_jaw_closed & ~closed & (dxy_goal > 0.03)
+    )
+    self.prev_grasped = grasped.clone()
+    self.prev_jaw_closed = closed
+    err = torch.norm(sensor.est_pos - obj_pos, dim=-1)
+    unseen = sensor.unseen_steps
+    for b, (lo, hi) in enumerate(self.BINS):
+      m = (unseen >= lo) & (unseen < hi)
+      if bool(m.any()):
+        self.err_sum[b] += err[m].sum()
+        self.err_max[b] = torch.maximum(self.err_max[b], err[m].max())
+        self.err_n[b] += int(m.sum())
+    self.err_ep_max = torch.maximum(
+      self.err_ep_max, torch.where(lost, err, torch.zeros_like(err))
+    )
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      n = max(int(self.steps[i]), 1)
+      row = {
+        "occ_steps": int(self.steps[i]),
+        "occ_lost_share": float(self.lost_steps[i].sum()) / n,
+        "occ_blocked_share": float(self.blocked_steps[i].sum()) / n,
+        "occ_lost_steps_by_phase": self.lost_steps[i].tolist(),
+        "occ_phase_steps": self.phase_steps[i].tolist(),
+        "occ_grasp_starts": int(self.grasp_starts[i]),
+        "occ_reopen_away": int(self.reopen_away[i]),
+        "occ_held_tp_fp_fn_tn": [
+          int(x[i]) for x in (self.tp, self.fp, self.fn, self.tn)
+        ],
+        "occ_held_lag_steps": (
+          int(self.held_step[i] - self.grasp_step[i])
+          if self.held_step[i] >= 0 and self.grasp_step[i] >= 0
+          else None
+        ),
+        "occ_est_err_max_while_lost": float(self.err_ep_max[i]),
+      }
+      self.done.append(row)
+      for acc in (
+        self.steps,
+        self.grasp_starts,
+        self.reopen_away,
+        self.tp,
+        self.fp,
+        self.fn,
+        self.tn,
+      ):
+        acc[i] = 0
+      for acc in (self.phase_steps, self.lost_steps, self.blocked_steps):
+        acc[i] = 0
+      self.grasp_step[i] = -1
+      self.held_step[i] = -1
+      self.err_ep_max[i] = 0.0
+      self.ever_grasped[i] = False
+      self.prev_grasped[i] = False
+      self.prev_jaw_closed[i] = False
+      self.was_lifted[i] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    ph = (
+      torch.tensor([r["occ_phase_steps"] for r in rows]).sum(0)
+      if rows
+      else torch.zeros(4)
+    )
+    lost = (
+      torch.tensor([r["occ_lost_steps_by_phase"] for r in rows]).sum(0)
+      if rows
+      else torch.zeros(4)
+    )
+    tp, fp, fn, tn = (sum(r["occ_held_tp_fp_fn_tn"][k] for r in rows) for k in range(4))
+    lags = [
+      r["occ_held_lag_steps"] for r in rows if r["occ_held_lag_steps"] is not None
+    ]
+    return {
+      "occ_lost_share": sum(r["occ_lost_share"] for r in rows) / n,
+      "occ_blocked_share": sum(r["occ_blocked_share"] for r in rows) / n,
+      "occ_lost_share_by_phase": {
+        k: (float(lost[i]) / float(ph[i]) if float(ph[i]) else None)
+        for i, k in enumerate(self.PHASES)
+      },
+      "occ_phase_share": {
+        k: float(ph[i]) / max(float(ph.sum()), 1.0) for i, k in enumerate(self.PHASES)
+      },
+      "occ_grasp_starts_mean": sum(r["occ_grasp_starts"] for r in rows) / n,
+      "occ_reapproach": sum(r["occ_grasp_starts"] > 1 for r in rows) / n,
+      "occ_reopen_away": sum(r["occ_reopen_away"] > 0 for r in rows) / n,
+      "occ_held_precision": tp / (tp + fp) if tp + fp else None,
+      "occ_held_recall": tp / (tp + fn) if tp + fn else None,
+      "occ_held_counts": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+      "occ_held_lag_median_steps": sorted(lags)[len(lags) // 2] if lags else None,
+      "occ_est_err_by_steps_unseen": {
+        f"{lo}-{hi - 1 if hi < 10**6 else 'inf'}": (
+          {
+            "mean_m": float(self.err_sum[b] / self.err_n[b]),
+            "max_m": float(self.err_max[b]),
+            "n": int(self.err_n[b]),
+          }
+          if int(self.err_n[b])
+          else None
+        )
+        for b, (lo, hi) in enumerate(self.BINS)
+      },
+    }
+
+
 def retreat_state(
   env: ManagerBasedRlEnv, arm_ids: list[int], jaw_id: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1339,6 +1519,35 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"{result['tilt_at_let_go_over_10deg']:6.1%})"
     )
 
+  if "occ_lost_share" in result:
+    print("\n  OCCLUSION (plan S7-7) ---------------------------------------------")
+    fmt_p = lambda v: "   n/a" if v is None else f"{v:6.1%}"  # noqa: E731
+    print(
+      f"    cube not reported        {result['occ_lost_share']:6.1%}   of steps (the line of "
+      f"sight and the random loss hide it {result['occ_blocked_share']:6.1%})"
+    )
+    by = result["occ_lost_share_by_phase"]
+    share = result["occ_phase_share"]
+    print(
+      "    lost by phase            "
+      + "  ".join(f"{k} {fmt_p(by[k])} (of {share[k]:.0%})" for k in by)
+    )
+    print(
+      f"    re-approaches            {result['occ_reapproach']:6.1%}   of episodes grasp more "
+      f"than once; the jaw reopens away from the goal in {result['occ_reopen_away']:6.1%}"
+    )
+    print(
+      f"    O-K held rule vs contact precision {fmt_p(result['occ_held_precision'])}  "
+      f"recall {fmt_p(result['occ_held_recall'])}  trails the grasp by "
+      f"{result['occ_held_lag_median_steps']} steps (median)"
+    )
+    for k, v in result["occ_est_err_by_steps_unseen"].items():
+      if v:
+        print(
+          f"    estimate error, unseen {k:>6} steps   mean {v['mean_m'] * 100:5.2f} cm  "
+          f"max {v['max_m'] * 100:5.2f} cm  (n {v['n']})"
+        )
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -1360,6 +1569,7 @@ def main() -> None:
   tally = Tally(args.num_envs, args.device)
   plant = PlantTally.from_env(env) if args.plant else None
   retreat = RetreatTally(args.num_envs, args.device, env.step_dt, args.handoff)
+  occ = OccTally(args.num_envs, args.device)
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
   arm_ids = [i for i in arm_ids if robot.joint_names[i].startswith("arm_left_")]
@@ -1395,6 +1605,11 @@ def main() -> None:
           setdown=flags["grasped"] & (dxy < NEAR_XY),
           after_let_go=retreat.let_go,
         )
+      sensors = getattr(env, "_pal_cube_sensors", None)
+      if sensors and OBJECT in sensors:
+        occ.step(
+          sensors[OBJECT], flags["grasped"], flags["lifted"], obj_pos, jaw_q, dxy
+        )
       tally.measure_speed(flags["grasped"], *positions(env), env.step_dt, goal)
       tally.measure_set_down(
         flags["grasped"],
@@ -1417,6 +1632,8 @@ def main() -> None:
         retreat.finish(
           finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
         )
+        if occ.steps.any() or occ.done:
+          occ.finish(finished)
         if plant is not None:
           plant.finish(finished)
         for key, value in extras.get("log", {}).items():
@@ -1427,6 +1644,8 @@ def main() -> None:
 
   result = summarise(tally, env.step_dt, args.episodes)
   result.update(retreat.summarise(args.episodes))
+  if occ.done:
+    result.update(occ.summarise(args.episodes))
   result["handoff"] = bool(args.handoff)
   if plant is not None:
     result.update(plant.summarise(args.episodes))
@@ -1445,9 +1664,12 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q}
-            for r, q in zip(
-              tally.done[: args.episodes], retreat.done[: args.episodes], strict=True
+            {**r, **q, **o}
+            for r, q, o in zip(
+              tally.done[: args.episodes],
+              retreat.done[: args.episodes],
+              occ.done[: args.episodes] or [{}] * args.episodes,
+              strict=True,
             )
           ],
         },

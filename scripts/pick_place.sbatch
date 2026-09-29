@@ -84,6 +84,20 @@ if [ "$LAG" != "none" ]; then
   LAG_NAME="_lag${LAG}"
   LAG_TAG=",\"lag${LAG}\""
 fi
+# The cube out of the camera's view (plan S7-7, `mdp/occlusion.py`): OCC is the visibility model
+# (none | arm | hand), OBJ_OBS what the actor sees while the cube is lost (live | hold | zero |
+# estimate | estimate+ | snap); OCC_FLAG=0/1 overrides whether the actor gets the visibility flag.
+# Unset is no occlusion, every run to S7-6; in the run name and tags only when set.
+OCC="${OCC:-none}"
+OBJ_OBS="${OBJ_OBS:-live}"
+export OCC OBJ_OBS
+[ -n "${OCC_FLAG:-}" ] && export OCC_FLAG
+OCC_NAME=""
+OCC_TAG=""
+if [ "$OCC" != "none" ] || [ "$OBJ_OBS" != "live" ]; then
+  OCC_NAME="_occ${OCC}_obj${OBJ_OBS}${OCC_FLAG:+_flag${OCC_FLAG}}"
+  OCC_TAG=",\"occ${OCC}\",\"obj${OBJ_OBS}\""
+fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -115,7 +129,8 @@ if ! uv run --extra cu128 python -c \
      "from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import kangaroo_pick_place_env_cfg as f, kangaroo_pick_place_rl_cfg as g; f(); g()" \
      >/dev/null 2>"$REPO/.reward_check.$$"; then
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
-    "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG did not validate." >&2
+    "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
+    "OBJ_OBS=$OBJ_OBS did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -140,7 +155,7 @@ echo "reward/DR   $REWARD / $DR"
 echo "ppo         $PPO"
 echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
-echo "gains       $GAINS   effort $EFFORT   lag $LAG"
+echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
@@ -166,5 +181,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$RESUME_TAG)"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$RESUME_TAG)"

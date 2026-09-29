@@ -281,6 +281,7 @@ def make_pick_place_env_cfg(
   tool_speed_cap: ToolSpeedCapCfg | None = None,
   effort: EffortBound = EFFORT_BOUNDS["none"],
   latency: LatencyModelCfg = LATENCY_MODELS["none"],
+  occlusion: mdp.OccCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -302,6 +303,7 @@ def make_pick_place_env_cfg(
     effort: plan S7-4's effort bound (C, TP). See `EFFORT_BOUNDS`; T's plant half comes with
       ``robot``.
     latency: plan S7-6's latency model. See ``tabletop_env_cfg.LATENCY_MODELS``.
+    occlusion: plan S7-7's occlusion model and filler (`mdp.OccCfg`), or None.
   """
   if target_xy is None:
     target_xy = baseline.target_xy
@@ -324,6 +326,7 @@ def make_pick_place_env_cfg(
     arm_range_clip=effort.range_clip,
     arm_effort_band=effort.effort_scale is not None,
     latency=latency,
+    occlusion=occlusion,
   )
 
   gripper = robot.gripper(gripper_name)
