@@ -60,6 +60,7 @@ class RateLimitedJointPositionAction(JointPositionAction):
     #: plan's check that neither binds during a scripted carry, and for the eval.
     self.band_hit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
     self.range_hit = torch.zeros_like(self.band_hit)
+    self._servo_idx, self._servo = self._resolve_servo(cfg, env)
 
   def _indices(self, patterns: tuple[str, ...], what: str) -> torch.Tensor:
     index_list, _ = resolve_matching_names(patterns, self._target_names)
@@ -127,6 +128,69 @@ class RateLimitedJointPositionAction(JointPositionAction):
       half.append((tau / k, d / k, k))
     return idx, torch.tensor(half, device=self.device)
 
+  def _resolve_servo(self, cfg, env):
+    """Plan S7-6's jaw servo model (Claudius's 71e1147, `BinaryJawAction`'s servo): the
+    target written to MuJoCo for the named joints is a rate-limited first-order lag of the
+    commanded target, not the command itself. (idx, (B, n) state) or (None, None).
+
+    The real gripper follows its command with a steady 0.13-0.17 s lag during a stroke, peaks
+    at 1.3-1.7 rad/s, keeps moving ~0.1 s after the command stops and creeps into the open stop
+    (Claudius's recording of ``/pal_policy/desired_state`` against the measured jaw, four
+    strokes). One pole with a saturating velocity reproduces all four. In sim without it the
+    jaw is a ~1e-4 kg m^2 finger behind a stiff PD that reaches any target inside one control
+    step, so reversing the jaw costs nothing -- on the robot a reversed stroke never completes.
+
+    Advanced per physics step (`apply_actions`), not per control step: it is a property of the
+    hardware, so it should not depend on the decimation. ``tau`` and the speed limit are drawn
+    per env at each reset. The command -- `_processed_actions`, what the slew, the bounds, the
+    trace and a deployer see -- is unchanged: on hardware the lag comes from the gripper, not
+    from the node sending it commands.
+    """
+    if not cfg.servo_joints:
+      return None, None
+    idx = self._indices(cfg.servo_joints, "servo_joints")
+    self._physics_dt = env.physics_dt
+    shape = (self.num_envs, len(idx))
+    self._servo_tau = torch.empty(shape, device=self.device)
+    self._servo_max_vel = torch.empty(shape, device=self.device)
+    self._sample_servo(slice(None))
+    return idx, self._default_target()[:, idx].clone()
+
+  def _sample_servo(self, env_ids: torch.Tensor | slice) -> None:
+    lo, hi = self.cfg.servo_tau
+    self._servo_tau[env_ids] = torch.empty_like(self._servo_tau[env_ids]).uniform_(
+      lo, hi
+    )
+    lo, hi = self.cfg.servo_max_vel
+    self._servo_max_vel[env_ids] = torch.empty_like(
+      self._servo_max_vel[env_ids]
+    ).uniform_(lo, hi)
+
+  def servo_target(self) -> torch.Tensor:
+    """The joint targets as they reach MuJoCo: the command with the servo's joints replaced by
+    the servo's state. `_processed_actions` itself when there is no servo. (B, A)"""
+    if self._servo_idx is None:
+      return self._processed_actions
+    target = self._processed_actions.clone()
+    target[:, self._servo_idx] = self._servo
+    return target
+
+  def apply_actions(self) -> None:
+    if self._servo_idx is None:
+      super().apply_actions()
+      return
+    # Under a ramp the jaw settles exactly tau behind the command; after the command stops it
+    # decays with tau; it never exceeds max_vel.
+    err = self._processed_actions[:, self._servo_idx] - self._servo
+    travel = self._servo_max_vel * self._physics_dt
+    self._servo = self._servo + (err * (self._physics_dt / self._servo_tau)).clamp(
+      -travel, travel
+    )
+    encoder_bias = self._entity.data.encoder_bias[:, self._target_ids]
+    self._entity.set_joint_position_target(
+      self.servo_target() - encoder_bias, joint_ids=self._target_ids
+    )
+
   def _bound(self) -> None:
     """Plan S7-4's bounds on the final target, after the slew and any tool cap: T's band
     about the measured position, then C's joint range."""
@@ -176,6 +240,10 @@ class RateLimitedJointPositionAction(JointPositionAction):
     if env_ids is None:
       env_ids = slice(None)
     self._last_target[env_ids] = self._default_target()[env_ids]
+    if self._servo_idx is not None:
+      # The servo restarts where the command does, with a fresh draw of its constants.
+      self._servo[env_ids] = self._default_target()[env_ids][:, self._servo_idx]
+      self._sample_servo(env_ids)
 
 
 @dataclass(kw_only=True)
@@ -198,6 +266,40 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
   stays within the effort cap, q* in q + (D / K) qdot +/- tau_cmd / K, after the slew
   (`RateLimitedJointPositionAction._resolve_effort_band`). None for none. Like the slew, a
   deployer must apply both bounds to reproduce training."""
+
+  servo_joints: tuple[str, ...] | None = None
+  """Plan S7-6's jaw servo model: actuator regexes whose written target lags the command
+  (`RateLimitedJointPositionAction._resolve_servo`). None for none, which is every run up to
+  S7-5. Unlike the slew and the bounds, a deployer must *not* apply it: the gripper does."""
+
+  servo_tau: tuple[float, float] | None = None
+  """Per-env range of the servo's time constant, s. Required with ``servo_joints``."""
+
+  servo_max_vel: tuple[float, float] | None = None
+  """Per-env range of the servo's speed limit, rad/s. Required with ``servo_joints``."""
+
+  def __post_init__(self) -> None:
+    super().__post_init__()
+    given = [
+      x is not None for x in (self.servo_joints, self.servo_tau, self.servo_max_vel)
+    ]
+    if any(given) and not all(given):
+      raise ValueError(
+        "servo_joints, servo_tau and servo_max_vel are one model and must be given "
+        f"together; got servo_joints={self.servo_joints}, servo_tau={self.servo_tau}, "
+        f"servo_max_vel={self.servo_max_vel}"
+      )
+    if self.servo_tau is not None and not 0.0 < self.servo_tau[0] <= self.servo_tau[1]:
+      raise ValueError(
+        f"servo_tau must be 0 < min <= max seconds; got {self.servo_tau}"
+      )
+    if (
+      self.servo_max_vel is not None
+      and not 0.0 < self.servo_max_vel[0] <= self.servo_max_vel[1]
+    ):
+      raise ValueError(
+        f"servo_max_vel must be 0 < min <= max rad/s; got {self.servo_max_vel}"
+      )
 
   def build(self, env: ManagerBasedRlEnv) -> RateLimitedJointPositionAction:
     return RateLimitedJointPositionAction(self, env)

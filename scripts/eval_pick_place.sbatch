@@ -9,7 +9,7 @@
 #
 # LIST has one checkpoint per line: `<json out> <checkpoint> [KEY=VALUE ...]`, the KEY=VALUEs
 # being the task's selectors that run trained with (REWARD, DR, BASELINE, SPAWN, TOOL_SPEED,
-# GAINS, EFFORT, SLEW, PPO) -- read at registration, so each eval is its own process. Blank
+# GAINS, EFFORT, LAG, SLEW, PPO) -- read at registration, so each eval is its own process. Blank
 # lines and lines starting with # are skipped. EVAL_ARGS (e.g. "--plant --handoff") go to
 # every eval. The expected-vs-actual count is printed at the end.
 #SBATCH --partition=main
