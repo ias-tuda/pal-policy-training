@@ -130,6 +130,8 @@ TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 NEAR_XY = 0.03
 #: The gripper's tool centre point, whose speed while holding is S7's speed-bound read.
 TCP_SITE = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site
+#: The two pad sites, whose midpoint is the "pad centre" of plan S8's grasp-height read.
+PAD_SITES = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").pad_sites
 
 #: Plan S7-2's M7 set-down, restated from `mdp.observations` / `pick_place.rewards` rather
 #: than imported, so this eval runs on checkouts that predate M7 (the D5 diagnosis reads an
@@ -329,6 +331,10 @@ class Tally:
       zf(0.0),
       zf(0.0),
     )
+    # Plan S8: the pad-site midpoint's height above the object's centre at the episode's first grasp
+    # (`measure_grasp_height`), m.
+    self.grasp_dz = zf(0.0)
+    self.grasp_seen = zb()
     # Per-episode records (`record`): the first step's spawn, table and target, the last
     # step's cube position.
     self.first = torch.zeros(num_envs, 9, device=device)
@@ -402,6 +408,15 @@ class Tally:
     self.prev_obj = obj_pos.clone()
     self.prev_tcp = tcp_pos.clone()
     self.prev_held = held.clone()
+
+  def measure_grasp_height(self, grasped: torch.Tensor, pad_dz: torch.Tensor) -> None:
+    """Plan S8: where on the ball the jaw closes. ``pad_dz`` is the pad-site midpoint's height above
+    the object's centre (m), and is kept at the step the grasp is first seen, per episode: an
+    instantaneous value, so it is the open-jaw one minus the ~10 mm the sites move toward the
+    fingertips as the jaw closes to the touch. Call once per step, alongside `measure`."""
+    first = grasped.bool() & ~self.grasp_seen
+    self.grasp_dz = torch.where(first, pad_dz, self.grasp_dz)
+    self.grasp_seen |= first
 
   def measure_set_down(
     self,
@@ -525,6 +540,9 @@ class Tally:
       )
       final = self.last_pos[i].tolist()
       row.update(zip(("final_x", "final_y", "final_z"), final, strict=True))
+      row["grasp_pad_dz"] = (
+        float(self.grasp_dz[i]) if bool(self.grasp_seen[i]) else None
+      )
       self.done.append(row)
     for name in self.FIELDS:
       self.live[name][env_ids] = False
@@ -545,6 +563,8 @@ class Tally:
     self.sd_touch_ok[env_ids] = False
     self.sd_dwell[env_ids] = 0
     self.sd_released[env_ids] = False
+    self.grasp_seen[env_ids] = False
+    self.grasp_dz[env_ids] = 0.0
 
 
 class PlantTally:
@@ -1462,6 +1482,14 @@ def tilt(env: ManagerBasedRlEnv) -> torch.Tensor:
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
 
 
+def pad_height_above_object(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """The pad-site midpoint's height above the object's centre, m (plan S8's grasp-height read). (B,)"""
+  robot = env.scene[ROBOT]
+  ids = [robot.site_names.index(n) for n in PAD_SITES]
+  mid = robot.data.site_pos_w[:, ids].mean(dim=1)
+  return mid[:, 2] - env.scene[OBJECT].data.root_link_pos_w[:, 2]
+
+
 def positions(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
   """The cube's and the TCP's world positions, for `Tally.measure_speed`. (B, 3), (B, 3)"""
   robot = env.scene[ROBOT]
@@ -1547,6 +1575,10 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     "release_over_3cm_high": sum(r["release_dz"] > DROP_HEIGHT for r in rel) / len(rel)
     if rel
     else None,
+    # Plan S8: the pad midpoint's height above the object's centre at the first grasp.
+    "grasp_pad_dz_median_m": median(
+      [r["grasp_pad_dz"] for r in rows if r.get("grasp_pad_dz") is not None]
+    ),
   }
   sd = [r for r in rows if r.get("release_set_down") is not None]
   set_down = {
@@ -1699,6 +1731,9 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
     )
     print(
       f"    roll after the let-go    {fmt(result['roll_after_let_go_median_m'])}  (median, let-go point to rest)"
+    )
+    print(
+      f"    pad midpoint above the object's centre at the first grasp  {fmt(result['grasp_pad_dz_median_m'])}  (median; the open-jaw value is ~0.010 m higher)"
     )
   else:
     print("    no release observed")
@@ -1900,6 +1935,7 @@ def main() -> None:
       tally.observe(**flags)
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
+      tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
       jaw_thr = jaw_open_for(env)
       handed = retreat.step(
