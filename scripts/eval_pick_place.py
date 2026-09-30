@@ -88,6 +88,7 @@ import math
 import pathlib
 from dataclasses import asdict
 
+import numpy as np
 import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
 import torch
 from mjlab.envs import ManagerBasedRlEnv
@@ -146,6 +147,14 @@ HANDOFF_CLEAR = 0.03
 HANDOFF_STEPS = 5
 HANDOFF_TIMEOUT_S = 8.0
 HOME_TOL = 0.05
+#: The vertical retreat (`--handoff-lift`, S7-5 report §8 item 1): the TCP goes straight up at
+#: most `LIFT_SPEED` (m/s) in `LIFT_WAYPOINT` (m) IK steps before the joint-space return; that
+#: return starts once the TCP is within `LIFT_TOL` (m) of the height asked for, or
+#: `LIFT_GRACE_S` after the planned path ends (the action term's slew, T's band may hold it back).
+LIFT_SPEED = 0.2
+LIFT_WAYPOINT = 0.01
+LIFT_TOL = 0.01
+LIFT_GRACE_S = 0.5
 #: Plan S7-5's Z: "at the goal" is xy < 2 cm and |dz| < 2 cm, `pick_place.rewards.Z_GOAL_TOL`.
 GOAL_TOL_XYZ = (0.02, 0.02)
 
@@ -195,6 +204,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     action="store_true",
     help="plan S7-4: hand the arm to a position controller (action 0: home, jaw open) once "
     "the jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
+  )
+  p.add_argument(
+    "--handoff-lift",
+    type=float,
+    default=None,
+    metavar="H",
+    help="with --handoff: the position controller first lifts the TCP straight up to H m over "
+    "the cube's top (S7-5 report §8 item 1), then goes home; default: straight home",
   )
   p.add_argument(
     "--trace",
@@ -961,6 +978,144 @@ class RetreatTally:
     }
 
 
+class VerticalRetreat:
+  """The hand-off's first leg (S7-5 report §8 item 1): straight up before the joint-space return.
+
+  The hand-off's home pose is reached by interpolating the joints, and at 3-7 cm over the cube
+  the fingers sweep back through it (40 of 45 post-place misses at S7-5's 5 k). Here, once
+  `RetreatTally` hands the arm over, the TCP first rises to ``height`` (m) over the cube's
+  top on a Cartesian line -- the hand keeps its orientation, damped least squares on the env's
+  own kinematics (`scripted_pick_place.Kin.ik_pose`), started from the arm's last commanded
+  target -- and only then does the action go to 0 (home, jaw open) as before. Every target goes
+  through the action term, so its slew, T's band and C's clip apply. An IK that fails skips the
+  lift for that episode (counted in ``ik_failed``)."""
+
+  def __init__(self, env: ManagerBasedRlEnv, height: float) -> None:
+    import importlib.util
+    import sys
+
+    # Registered before it runs: its `Kin` is a dataclass, which looks its module up by name.
+    sp = sys.modules.get("scripted_pick_place")
+    if sp is None:
+      spec = importlib.util.spec_from_file_location(
+        "scripted_pick_place", pathlib.Path(__file__).parent / "scripted_pick_place.py"
+      )
+      assert spec and spec.loader
+      sp = importlib.util.module_from_spec(spec)
+      sys.modules[spec.name] = sp
+      spec.loader.exec_module(sp)
+    self.height = height
+    self.kin = sp.Kin.from_model(env.sim.mj_model)
+    self.term = env.action_manager.get_term("joint_pos")
+    names = [n.split("/", 1)[-1] for n in self.term.target_names]
+    self.arm_idx = [names.index(j) for j in sp.ARM_JOINTS]
+    rate = getattr(self.term, "_rate", None)
+    self.slew = (
+      rate[0, self.arm_idx].cpu().numpy()
+      if rate is not None
+      else np.full(len(self.arm_idx), np.inf)
+    )
+    self.step_dt = env.step_dt
+    self.grace = round(LIFT_GRACE_S / env.step_dt)
+    n = env.num_envs
+    device = env.device
+    self.device = device
+    self.planned_at = torch.full((n,), -2, dtype=torch.long, device=device)
+    self.plan_len = torch.zeros(n, dtype=torch.long, device=device)
+    self.plan = torch.zeros(n, 1, self.term.action_dim, device=device)
+    self.home = torch.zeros(n, dtype=torch.bool, device=device)
+    self.planned = 0
+    self.ik_failed = 0
+    self.home_heights: list[float] = []
+
+  def _path(self, q0: np.ndarray, dz: float) -> np.ndarray | None:
+    """Joint targets, one per control step, that lift the TCP by ``dz`` from ``q0`` with the hand
+    keeping its orientation. None if the IK misses."""
+    kin = self.kin
+    pos0, rot0 = kin.fk(q0)
+    n_way = max(1, math.ceil(dz / LIFT_WAYPOINT - 1e-9))
+    # No faster than LIFT_SPEED, whatever the slew allows.
+    per_way_min = math.ceil(dz / n_way / (LIFT_SPEED * self.step_dt) - 1e-9)
+    q, rows = q0, []
+    for i in range(1, n_way + 1):
+      sol = kin.ik_pose(pos0 + np.array([0.0, 0.0, dz * i / n_way]), rot0, q, iters=100)
+      if sol is None:
+        return None
+      need = int(np.ceil((np.abs(sol - q) / self.slew).max() - 1e-9))
+      n = max(1, per_way_min, need)
+      rows.extend(q + (sol - q) * k / n for k in range(1, n + 1))
+      q = sol
+    return np.asarray(rows)
+
+  def _per_joint(self, x: torch.Tensor | float, e: int) -> torch.Tensor | float:
+    return x[e, self.arm_idx] if isinstance(x, torch.Tensor) else x
+
+  def act(
+    self,
+    handed: torch.Tensor,
+    hand_step: torch.Tensor,
+    age: torch.Tensor,
+    tcp_above: torch.Tensor,
+    actions: torch.Tensor,
+  ) -> torch.Tensor:
+    """This step's actions with the handed-off envs' replaced: the lift's targets, then 0.
+
+    ``hand_step`` / ``age`` are `RetreatTally`'s, read right after its `step`; ``tcp_above``
+    is the TCP's measured height over the cube's top."""
+    term = self.term
+    n = len(handed)
+    fresh = handed & (self.planned_at != hand_step)
+    for e in torch.nonzero(fresh, as_tuple=False).flatten().tolist():
+      self.planned_at[e] = hand_step[e]
+      self.planned += 1
+      dz = self.height - float(tcp_above[e])
+      bias = term._entity.data.encoder_bias[e, term.target_ids][self.arm_idx]
+      # The last target the term commanded, in the plant's frame (it subtracts the bias).
+      q0 = (term._processed_actions[e, self.arm_idx] - bias).cpu().numpy().astype(float)
+      path = self._path(q0, dz) if dz > 1e-3 else None
+      if dz > 1e-3 and path is None:
+        self.ik_failed += 1
+      if path is None:
+        self.plan_len[e] = 0
+        continue
+      target = torch.as_tensor(path, dtype=torch.float32, device=self.device) + bias
+      act = (target - self._per_joint(term.offset, e)) / self._per_joint(term.scale, e)
+      if act.shape[0] > self.plan.shape[1]:
+        grow = act.shape[0] - self.plan.shape[1]
+        self.plan = torch.cat(
+          [self.plan, self.plan.new_zeros(n, grow, self.plan.shape[2])], 1
+        )
+      self.plan[e] = 0.0
+      block = self.plan[e, : act.shape[0]]  # a view, (T, A)
+      block[:, self.arm_idx] = act
+      self.plan_len[e] = act.shape[0]
+    k = (age - 1 - hand_step).clamp(min=0)
+    # Home once the path has run out and the TCP is up there (or the grace has passed); at
+    # once when there is no path (already high enough, or the IK missed).
+    ready = (k >= self.plan_len) & (
+      (tcp_above >= self.height - LIFT_TOL) | (k >= self.plan_len + self.grace)
+    )
+    newly = handed & ~self.home & ((self.plan_len == 0) | ready)
+    self.home_heights.extend(tcp_above[newly].tolist())
+    self.home = (self.home | newly) & handed
+    self.planned_at = torch.where(handed, self.planned_at, -2)
+    rows = self.plan[
+      torch.arange(n, device=self.device),
+      torch.minimum(k, (self.plan_len - 1).clamp(min=0)),
+    ]
+    zero = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
+    return torch.where((handed & ~self.home).unsqueeze(-1), rows, zero)
+
+  def summarise(self) -> dict:
+    h = sorted(self.home_heights)
+    return {
+      "handoff_lift_m": self.height,
+      "handoff_lift_planned": self.planned,
+      "handoff_lift_ik_failed": self.ik_failed,
+      "handoff_lift_home_height_median_m": h[len(h) // 2] if h else None,
+    }
+
+
 class OccTally:
   """Plan S7-7's reads, per episode, from the run's `mdp.CubeSensor` (there only when the env has
   an occlusion config; ``OCC`` / ``OBJ_OBS`` name it): how much of the episode the cube is not
@@ -1522,6 +1677,12 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"{GOAL_THRESHOLD} m: {result['final_within_goal']:6.1%}"
     )
     print(f"    time to home             {fmt(result['time_to_home_median_s'], 's')}")
+    if "handoff_lift_m" in result:
+      print(
+        f"    vertical lift first      to {result['handoff_lift_m']} m over the cube  "
+        f"(reached {fmt(result['handoff_lift_home_height_median_m'])} median; IK missed "
+        f"{result['handoff_lift_ik_failed']} of {result['handoff_lift_planned']})"
+      )
     print(
       f"    SUCCESS (S7-4)           {result['success_retreat']:6.1%}   placed & lifted & "
       "jaw-released & lifted clear & still placed"
@@ -1588,6 +1749,9 @@ def main() -> None:
   tally = Tally(args.num_envs, args.device)
   plant = PlantTally.from_env(env) if args.plant else None
   retreat = RetreatTally(args.num_envs, args.device, env.step_dt, args.handoff)
+  if args.handoff_lift is not None and not args.handoff:
+    raise SystemExit("--handoff-lift needs --handoff")
+  lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
@@ -1662,7 +1826,9 @@ def main() -> None:
         goal,
       )
       actions = policy(obs)
-      if args.handoff:
+      if lift is not None:
+        actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
+      elif args.handoff:
         # The position controller: action 0 is the home pose with the jaw open, reached
         # through the action term's slew (and its tool cap and bounds, where the run has them).
         actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
@@ -1690,6 +1856,8 @@ def main() -> None:
   if occ.done:
     result.update(occ.summarise(args.episodes))
   result["handoff"] = bool(args.handoff)
+  if lift is not None:
+    result.update(lift.summarise())
   if plant is not None:
     result.update(plant.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
