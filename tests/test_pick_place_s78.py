@@ -270,6 +270,11 @@ def test_the_area_and_the_scales(area):
   assert cmd.offset == pytest.approx(((x0 + x1) / 2 - 0.55, (y0 + y1) / 2))
   assert cmd.offset_range == pytest.approx(((x1 - x0) / 2, (y1 - y0) / 2))
   assert cmd.min_object_distance == 0.10
+  assert pp._goal_area(box) == {
+    "x": pytest.approx((x0 - 0.55, x1 - 0.55)),
+    "y": pytest.approx((y0, y1)),
+    "distance": 0.10,
+  }
   # The area's arm has W2's action space widened where the area needs it, never narrowed.
   w, c = KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale, AREA_ARMS[area].action_scale
   assert set(w) == set(c)
@@ -490,6 +495,14 @@ def test_every_cube_and_target_is_in_the_area_at_least_10_cm_apart(area):
       assert bool(((rel_g >= lo - eps) & (rel_g <= hi + eps)).all()), (
         "target outside the area"
       )
+      # The cube is drawn only where the area has a point >= 10 cm away: in a 12 x 10 cm area the
+      # centre has none (every point is within 7.8 cm of it).
+      corners = torch.tensor(
+        [[x0 - 0.55, y0], [x0 - 0.55, y1], [x1 - 0.55, y0], [x1 - 0.55, y1]],
+        device=env.device,
+      )
+      reach = torch.norm(rel_c.unsqueeze(1) - corners, dim=-1).amax(dim=-1)
+      assert float(reach.min()) >= 0.10 - 1e-4, float(reach.min())
       d = torch.norm(cube - goal, dim=-1)
       assert float(d.min()) >= 0.10 - 1e-4, float(d.min())
       assert torch.allclose(command.metrics["carry_distance"], d, atol=1e-4)

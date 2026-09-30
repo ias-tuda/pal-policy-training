@@ -249,6 +249,17 @@ def _object_pose_range(spawn: SpawnBox) -> dict[str, tuple[float, float]]:
   }
 
 
+def _goal_area(area: SpawnBox) -> dict:
+  """``reset_objects_on_surface``'s ``goal_area`` for a target area: its x and y about the table
+  centre, and `TARGET_MIN_SEPARATION`."""
+  cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
+  return {
+    "x": (area.x[0] - cx, area.x[1] - cx),
+    "y": (area.y[0] - cy, area.y[1] - cy),
+    "distance": TARGET_MIN_SEPARATION,
+  }
+
+
 def _command_cfg(
   target_xy: tuple[float, float],
   dr: str,
@@ -390,6 +401,7 @@ def make_pick_place_env_cfg(
     stack_speed=stack_speed,
     action_mode=action_mode,
     command_obs=command_obs,
+    goal_area=None if target_area is None else _goal_area(target_area),
   )
 
   gripper = robot.gripper(gripper_name)
