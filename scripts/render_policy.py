@@ -100,6 +100,14 @@ def parse_args() -> argparse.Namespace:
     help="plan S7-4: the eval's position controller takes over (home, jaw open) once the "
     "jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
   )
+  p.add_argument(
+    "--handoff-lift",
+    type=float,
+    default=None,
+    metavar="H",
+    help="with --handoff: lift the TCP straight up to H m over the cube's top before the "
+    "return to home (S7-5 report §8 item 1)",
+  )
   return p.parse_args()
 
 
@@ -268,6 +276,11 @@ def main() -> None:
   arm_ids = [i for i, n in enumerate(robot.joint_names) if n.startswith("arm_left_")]
   jaw_id = robot.joint_names.index(ev.JAW_JOINT)
   retreat = ev.RetreatTally(1, args.device, env.step_dt, handoff=args.handoff)
+  if args.handoff_lift is not None and not args.handoff:
+    raise ValueError("--handoff-lift needs --handoff")
+  lift = (
+    None if args.handoff_lift is None else ev.VerticalRetreat(env, args.handoff_lift)
+  )
   status = None
   done_episodes = steps = 0
   ep_step = args.settle_steps if pinned else 0
@@ -295,10 +308,17 @@ def main() -> None:
         home_err,
       )
       actions = policy(obs)
-      if args.handoff:
+      if lift is not None:
+        actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
+      elif args.handoff:
         actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
       status = (
-        ("position controller: home" if bool(handed[0]) else "policy")
+        (
+          "position controller: "
+          + ("home" if lift is None or bool(lift.home[0]) else "lift")
+          if bool(handed[0])
+          else "policy"
+        )
         + f" | jaw {float(jaw_q[0]):.2f} rad"
         + (" (open)" if float(jaw_q[0]) < ev.JAW_OPEN else "")
         + f" | TCP over cube top {100 * float(tcp_above[0]):+.1f} cm"

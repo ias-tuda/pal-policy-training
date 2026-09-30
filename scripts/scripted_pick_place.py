@@ -243,6 +243,13 @@ class Kin:
     z_des = np.array([0.0, 0.0, -1.0])
     x_des = hand_x / np.linalg.norm(hand_x)
     r_des = np.column_stack([x_des, np.cross(z_des, x_des), z_des])
+    return self.ik_pose(goal, r_des, q_init, iters)
+
+  def ik_pose(
+    self, goal: np.ndarray, r_des: np.ndarray, q_init: np.ndarray, iters: int = 300
+  ) -> np.ndarray | None:
+    """`ik` onto an arbitrary hand orientation ``r_des`` (3x3, the hand's rotation matrix in
+    the world): plan S7-5 §8's vertical retreat keeps whatever tilt the hand has."""
     jacp = np.zeros((3, self.model.nv))
     jacr = np.zeros((3, self.model.nv))
     q = q_init.copy()
