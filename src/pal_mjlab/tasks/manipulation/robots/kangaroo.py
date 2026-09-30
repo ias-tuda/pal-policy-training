@@ -198,17 +198,17 @@ KANGAROO_GRIPPERS_LEFT_ARM_WC = dataclasses.replace(
     r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
   },
 )
-# `WCK` is the part of it that plans: x 0.40-0.52, y 0.10-0.26 (12 x 16 cm), where every triple of a
-# 2 cm spawn x 4 cm target sweep at those yaws has a plan. Its scales are those of the y 0.08-0.26
-# rectangle (93 % plannable), a superset, so the boundary rows are inside them: arm 1 and arm 4 widen,
-# the rest are W2's.
+# `WCK` is the part of it that plans robustly: x 0.40-0.52, y 0.16-0.26 (12 x 10 cm), where the whole 4 cm
+# pair sweep plans on the first pass. Its scales are the largest of the rectangles y 0.12-0.26 and
+# y 0.16-0.26 (both 100 % plannable), so the boundary rows are inside them: arm 1 and arm 4 widen to
+# 1.10, the rest are W2's.
 KANGAROO_GRIPPERS_LEFT_ARM_WCK = dataclasses.replace(
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   action_scale={
-    r"arm_left_1_joint": 1.15,
+    r"arm_left_1_joint": 1.10,
     r"arm_left_2_joint": 0.85,
     r"arm_left_3_joint": 0.65,
-    r"arm_left_4_joint": 1.20,
+    r"arm_left_4_joint": 1.10,
     r"arm_left_5_joint": 1.55,
     r"arm_left_6_joint": 2.40,
     r"arm_left_7_joint": 1.20,
