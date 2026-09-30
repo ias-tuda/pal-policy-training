@@ -88,9 +88,19 @@ class SurfaceOffsetCommand(LiftingCommand):
   With a nonzero ``offset_range`` the offset is drawn per env from a box around ``offset``
   each time the command resamples -- once per episode for a pick-and-place goal -- so the goal
   is a random point on the surface that stays fixed relative to it (plan S7-2 baseline B).
+
+  With ``min_object_distance`` > 0 (plan S7-8's ``TARGET=WC``) the box is the area the cube was
+  also drawn from, and the goal is redrawn until it is at least that far from where the cube
+  now sits: ``reset_objects_on_surface`` runs before the command manager's reset, and the cube's
+  pose is read from its free joint's ``qpos``, which the event wrote (the derived ``xpos`` is
+  stale until the next ``forward()``). The distance is logged as ``carry_distance``.
   """
 
   cfg: SurfaceOffsetCommandCfg
+
+  #: Rounds of redrawing for ``min_object_distance``; each fails with probability <= 0.53 for
+  #: plan S7-8's area and 10 cm, so 32 rounds leave ~1e-9 of the envs to the corner fallback.
+  MAX_REDRAWS = 32
 
   def __init__(self, cfg: SurfaceOffsetCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
@@ -101,6 +111,9 @@ class SurfaceOffsetCommand(LiftingCommand):
     )
     #: This episode's offset from the surface centre, per env. (B, 2)
     self.offsets = self._offset.repeat(self.num_envs, 1)
+    if cfg.min_object_distance > 0.0:
+      #: Plan S7-8: the goal's distance from the cube's spawn this episode, m, set at the resample.
+      self.metrics["carry_distance"] = torch.zeros(self.num_envs, device=self.device)
 
   def _goal_on_surface(self) -> torch.Tensor:
     from pal_mjlab.tasks.manipulation.mdp.events import (
@@ -119,13 +132,56 @@ class SurfaceOffsetCommand(LiftingCommand):
     self.offsets[env_ids] = offsets.to(self.offsets)
     self.target_pos[env_ids] = self._goal_on_surface()[env_ids]
 
+  def _draw(self, n: int) -> torch.Tensor:
+    """``n`` offsets, uniform in the box about ``offset``. (n, 2)"""
+    noise = (2.0 * torch.rand(n, 2, device=self.device) - 1.0) * self._half_range
+    return self._offset + noise
+
+  def _object_xy(self, env_ids: torch.Tensor) -> torch.Tensor:
+    """The cube's world xy, from the free joint's ``qpos`` -- what a reset event wrote, valid
+    before the next ``forward()``. (N, 2)"""
+    adr = self.object.data.indexing.free_joint_q_adr[:2]
+    return self.object.data.data.qpos[:, adr][env_ids]
+
+  def _draw_clear_of_object(self, env_ids: torch.Tensor) -> torch.Tensor:
+    """Offsets for ``env_ids`` at least ``min_object_distance`` from the cube, by vectorised
+    rejection (each round redraws only the envs still too close); the few left after
+    ``MAX_REDRAWS`` rounds take the box's corner farthest from the cube, which is at least half
+    the box's diagonal away. Always terminates, never loops per env. (N, 2)"""
+    from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy
+
+    n = len(env_ids)
+    centre = _surface_centre_xy(self._env, self._surface_cfg)[env_ids]
+    cube = self._object_xy(env_ids)
+    dist = self.cfg.min_object_distance
+    offsets = self._draw(n)
+    for _ in range(self.MAX_REDRAWS):
+      too_close = torch.norm(centre + offsets - cube, dim=-1) < dist
+      if not bool(too_close.any()):
+        return offsets
+      offsets = torch.where(too_close.unsqueeze(-1), self._draw(n), offsets)
+    too_close = torch.norm(centre + offsets - cube, dim=-1) < dist
+    signs = torch.tensor(
+      [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]], device=self.device
+    )
+    corners = self._offset + signs * self._half_range  # (4, 2)
+    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(
+      -1
+    )
+    return torch.where(too_close.unsqueeze(-1), corners[far], offsets)
+
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     super()._resample_command(env_ids)
-    noise = (2.0 * torch.rand(len(env_ids), 2, device=self.device) - 1.0) * (
-      self._half_range
-    )
-    self.offsets[env_ids] = self._offset + noise
+    if self.cfg.min_object_distance > 0.0:
+      offsets = self._draw_clear_of_object(env_ids)
+    else:
+      offsets = self._draw(len(env_ids))
+    self.offsets[env_ids] = offsets
     self.target_pos[env_ids] = self._goal_on_surface()[env_ids]
+    if self.cfg.min_object_distance > 0.0:
+      self.metrics["carry_distance"][env_ids] = torch.norm(
+        self.target_pos[env_ids, :2] - self._object_xy(env_ids), dim=-1
+      )
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     super()._update_command(env_ids)
@@ -144,6 +200,12 @@ class SurfaceOffsetCommandCfg(LiftingCommandCfg):
   offset_range: tuple[float, float] = (0.0, 0.0)
   """Half-widths in x and y of the box the offset is drawn from at each resample, centred on
   ``offset``. Zero, the default, is a fixed point."""
+
+  min_object_distance: float = 0.0
+  """Redraw the offset until the goal is at least this far (xy, m) from the cube's current
+  position -- plan S7-8's ``TARGET=WC``, where the goal is drawn from the area the cube spawned
+  in. Zero, the default, draws once. Needs the cube already placed when the command resamples,
+  which the reset events guarantee."""
 
   # Placement belongs to a reset event, not to the command -- as for `EntityOffsetCommandCfg`.
   # Without this the inherited default is mjlab's own spawn range (x 0.30-0.35, y +/-0.10,

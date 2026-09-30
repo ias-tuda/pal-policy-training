@@ -62,6 +62,12 @@ class RateLimitedJointPositionAction(JointPositionAction):
     self.range_hit = torch.zeros_like(self.band_hit)
     self._servo_idx, self._servo = self._resolve_servo(cfg, env)
 
+  @property
+  def commanded_target(self) -> torch.Tensor:
+    """The target this term last commanded: after the slew and the bounds, before the jaw
+    servo. What a deployer sends, and what plan S7-8's ``CMD_OBS`` shows the actor. (B, A)"""
+    return self._last_target
+
   def _indices(self, patterns: tuple[str, ...], what: str) -> torch.Tensor:
     index_list, _ = resolve_matching_names(patterns, self._target_names)
     if not index_list:
@@ -303,6 +309,62 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> RateLimitedJointPositionAction:
     return RateLimitedJointPositionAction(self, env)
+
+
+class DeltaRateLimitedJointPositionAction(RateLimitedJointPositionAction):
+  """Plan S7-8's DEL: the action moves the commanded target, it does not set it.
+
+  ``target_t = clip(target_{t-1} + step_max * clip(a, -1, 1), box)`` with ``step_max`` the
+  ``rate_limit`` of each joint (the jaw's too) and ``box`` the box the absolute form would span,
+  ``default +/- scale`` (the jaw: its open-to-closed clip). |a| = 1 is full speed, so the whole
+  action range is usable and no separate slew is needed. This is the delta form of the stack task
+  and of Claudius's ``DeltaJointPositionAction`` (``origin/faster-moves``): behind a slew clamp an
+  absolute action saturates the clamp and the policy cannot see it.
+
+  The integrator's state is the commanded target after plan S7-4's bounds (`_bound`: T's effort
+  band about the measured position, C's joint range), not the unbounded sum, so it cannot wind up
+  past a bound. It starts from the default pose at every reset, like the slew reference. The
+  policy needs to see its state: ``CMD_OBS`` (`mdp.commanded_target_rel`). A deployer must keep
+  the integrator and apply the same clip -- the ONNX output is a velocity command in units of
+  ``step_max`` per control step.
+  """
+
+  cfg: DeltaRateLimitedJointPositionActionCfg
+
+  def __init__(
+    self, cfg: DeltaRateLimitedJointPositionActionCfg, env: ManagerBasedRlEnv
+  ):
+    super().__init__(cfg=cfg, env=env)
+    if not torch.isfinite(self._rate).all():
+      raise ValueError(
+        "a delta action needs a per-step limit on every joint (it is the action's full "
+        f"scale); rate_limit={cfg.rate_limit}, targets={self._target_names}"
+      )
+    lo = self._offset - self._scale
+    hi = self._offset + self._scale
+    if cfg.clip is not None:
+      lo = torch.maximum(lo, self._clip[..., 0])
+      hi = torch.minimum(hi, self._clip[..., 1])
+    self._box_lo, self._box_hi = lo, hi
+
+  def process_actions(self, actions: torch.Tensor) -> None:
+    previous = self._last_target
+    self._raw_actions[:] = actions
+    step = self._raw_actions.clamp(-1.0, 1.0) * self._rate
+    self._processed_actions = torch.clamp(previous + step, self._box_lo, self._box_hi)
+    self._shape_step(previous)
+    self._bound()
+    self._last_target = self._processed_actions.clone()
+
+
+@dataclass(kw_only=True)
+class DeltaRateLimitedJointPositionActionCfg(RateLimitedJointPositionActionCfg):
+  """``rate_limit`` is the largest change of the target per control step, per joint, rad (the
+  action's full scale, so every joint needs one); ``scale`` and ``clip`` give the box the
+  target is held inside, exactly as they do the absolute form's action range."""
+
+  def build(self, env: ManagerBasedRlEnv) -> DeltaRateLimitedJointPositionAction:
+    return DeltaRateLimitedJointPositionAction(self, env)
 
 
 class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):

@@ -141,6 +141,42 @@ SIM_TIMESTEP = 0.002
 DECIMATION = 10
 CONTROL_DT = SIM_TIMESTEP * DECIMATION
 
+#: Plan S7-8's stack-task speeds (`SLEW=stack`): the arm at a fraction of the URDF speed
+#: (`robots.kangaroo.KANGAROO_GRIPPERS`' `joint_velocity_limits`) per joint group, the jaw at
+#: 0.03 rad per control step (1.5 rad/s). Claudius's recipe (`origin/faster-moves` b236d62,
+#: ``Slow25`` = 0.25 x ``STANDING_SLEW_RATE_SCALE``): arm 1-3 at 1/16, arm 4-7 at 1/8 (0.122 /
+#: 0.147 / 0.294 rad/s), the jaw at 0.15 x ``JAW_SLEW_LIMIT`` 0.20. The groups cut across the
+#: URDF limits' (1-2 | 3-7), so the rates are built per joint (`stack_arm_rate_limit`).
+STACK_ARM_SPEED_FRACTION = {
+  r"arm_.*_[123]_joint": 1.0 / 16.0,
+  r"arm_.*_[4-7]_joint": 1.0 / 8.0,
+}
+STACK_JAW_STEP = 0.03
+
+
+def stack_arm_rate_limit(urdf_limits: Mapping[str, float]) -> dict[str, float]:
+  """Largest change of each arm joint's command per control step at the stack task's speeds,
+  rad, keyed ``arm_.*_<i>_joint``: the joint's URDF limit (``urdf_limits``, rad/s, by regex) times
+  its `STACK_ARM_SPEED_FRACTION` times `CONTROL_DT`. Joints 1-7, sampled as ``arm_left_<i>_joint``."""
+
+  def lookup(table: Mapping[str, float], name: str) -> float:
+    for pattern, value in table.items():
+      if re.fullmatch(pattern, name):
+        return value
+    raise ValueError(f"no entry for {name!r} in {tuple(table)}")
+
+  return {
+    f"arm_.*_{i}_joint": lookup(urdf_limits, f"arm_left_{i}_joint")
+    * lookup(STACK_ARM_SPEED_FRACTION, f"arm_left_{i}_joint")
+    * CONTROL_DT
+    for i in range(1, 8)
+  }
+
+
+#: The action modes (`ACTION`): the policy's action sets the commanded target (``abs``, every run
+#: up to S7-7) or moves it (``delta``, plan S7-8; `mdp.DeltaRateLimitedJointPositionAction`).
+ACTION_MODES = ("abs", "delta")
+
 #: What the policy observes, by name (plan S7-2). ``S71`` is every run up to S7-1: 36-D, with
 #: `grasped` in the actor. ``B`` is baseline B's actor (Claudius's `origin/faster-moves`
 #: dc498d9): 38-D, only what the robot can measure -- see `_deployable_observations`.
@@ -414,6 +450,9 @@ def make_tabletop_env_cfg(
   arm_effort_band: bool = False,
   latency: LatencyModelCfg = LATENCY_MODELS["none"],
   occlusion: mdp.OccCfg | None = None,
+  stack_speed: bool = False,
+  action_mode: str = "abs",
+  command_obs: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -462,11 +501,28 @@ def make_tabletop_env_cfg(
       `LATENCY_MODELS`; ``none`` is every run up to S7-5.
     occlusion: plan S7-7's occlusion model and filler, or None (every run up to S7-6). See
       `mdp.OccCfg` and `_apply_occlusion`.
+    stack_speed: plan S7-8's stack-task speeds (`STACK_ARM_SPEED_FRACTION`, `STACK_JAW_STEP`)
+      in place of the URDF slew times ``action_slew_rate_scale`` (which must stay 1.0) and of
+      ``jaw_slew_rate``.
+    action_mode: ``abs`` (today's) or ``delta`` (`ACTION_MODES`). ``delta`` needs a per-step limit
+      on every joint -- the action's full scale -- and no tool speed cap.
+    command_obs: plan S7-8's ``CMD_OBS``: the actor's and critic's ``actions`` term shows the
+      commanded target relative to the default pose (`mdp.commanded_target_rel`) instead of the
+      raw last action. Still 8-D.
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
       f"unknown observation set {observation_set!r}; have {OBSERVATION_SETS}"
     )
+  if action_mode not in ACTION_MODES:
+    raise ValueError(f"unknown action mode {action_mode!r}; have {ACTION_MODES}")
+  if stack_speed and action_slew_rate_scale != 1.0:
+    raise ValueError(
+      "stack_speed replaces the URDF slew factor; action_slew_rate_scale must stay 1.0, "
+      f"got {action_slew_rate_scale}"
+    )
+  if action_mode == "delta" and tool_speed_cap is not None:
+    raise ValueError("a delta action is not built on the tool speed cap (plan S7-8)")
   gripper = robot.gripper(gripper_name)
   if objects is None:
     objects = {OBJECT: scene.get_cube_cfg(name=OBJECT)}
@@ -531,6 +587,17 @@ def make_tabletop_env_cfg(
       grasp_sensor,
     )
 
+  if command_obs:
+    # Plan S7-8's CMD_OBS: what the term commanded, not the raw last action -- same place, same
+    # width. Replaced, not edited: in the S71 set the actor and critic share term objects.
+    for group in observations.values():
+      group.terms = {
+        name: ObservationTermCfg(func=mdp.commanded_target_rel)
+        if name == "actions"
+        else term
+        for name, term in group.terms.items()
+      }
+
   # -- Actions --------------------------------------------------------------------
   # With `joint_velocity_limits` the commanded target may move at most limit * CONTROL_DT
   # per control step (S5.1 item 4): still an absolute target, `default + scale * action`, so
@@ -556,12 +623,18 @@ def make_tabletop_env_cfg(
       f"action_slew_rate_scale={action_slew_rate_scale}, but the robot has no "
       "joint_velocity_limits for it to scale"
     )
-  rate_limit = {
-    pattern: limit * CONTROL_DT * action_slew_rate_scale
-    for pattern, limit in (robot.joint_velocity_limits or {}).items()
-  }
-  if jaw_slew_rate is not None:
-    rate_limit[re.escape(gripper.finger_joint)] = jaw_slew_rate
+  if stack_speed:
+    if robot.joint_velocity_limits is None:
+      raise ValueError("stack_speed needs the robot's joint_velocity_limits")
+    rate_limit = stack_arm_rate_limit(robot.joint_velocity_limits)
+    rate_limit[re.escape(gripper.finger_joint)] = STACK_JAW_STEP
+  else:
+    rate_limit = {
+      pattern: limit * CONTROL_DT * action_slew_rate_scale
+      for pattern, limit in (robot.joint_velocity_limits or {}).items()
+    }
+    if jaw_slew_rate is not None:
+      rate_limit[re.escape(gripper.finger_joint)] = jaw_slew_rate
   # Plan S7-4's bounds on the arm's final target (C, T); `mdp.RateLimitedJointPositionAction`.
   bounds = {}
   if arm_range_clip:
@@ -576,10 +649,19 @@ def make_tabletop_env_cfg(
     raise ValueError(
       "the arm bounds and the jaw servo live in the rate-limited action term; no slew limit"
     )
-  joint_pos_action: ActionTermCfg = (
-    mdp.RateLimitedJointPositionActionCfg(
-      **joint_pos_kwargs, rate_limit=rate_limit, **bounds
+  if command_obs and not rate_limit:
+    raise ValueError(
+      "command_obs reads the commanded target of the rate-limited action term; no slew limit"
     )
+  if action_mode == "delta" and not rate_limit:
+    raise ValueError("a delta action needs a per-step limit on every joint")
+  action_cfg = (
+    mdp.DeltaRateLimitedJointPositionActionCfg
+    if action_mode == "delta"
+    else mdp.RateLimitedJointPositionActionCfg
+  )
+  joint_pos_action: ActionTermCfg = (
+    action_cfg(**joint_pos_kwargs, rate_limit=rate_limit, **bounds)
     if rate_limit
     else JointPositionActionCfg(**joint_pos_kwargs)
   )

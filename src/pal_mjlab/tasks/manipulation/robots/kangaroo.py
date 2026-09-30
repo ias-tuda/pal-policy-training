@@ -176,6 +176,16 @@ KANGAROO_GRIPPERS_LEFT_ARM_WIDE = dataclasses.replace(
 )
 
 
+# The same arm with the action scales plan S7-8 Part B derived for the wide area `W-C` (x 0.40-0.60,
+# y -0.04-0.26, cube yaw +/-45 deg, targets from the same area >= 10 cm from the cube), by the
+# S5.0 rule over the area's corners, edge midpoints and centre as spawn and as target, never below
+# the W2 scales. PROVISIONAL: W2's, until `results/S7-8/wc/derive_wc.json` is in.
+KANGAROO_GRIPPERS_LEFT_ARM_WC = dataclasses.replace(
+  KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  action_scale=dict(KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale),
+)
+
+
 def kangaroo_grippers_left_arm(
   gains: str = DEFAULT_TABLETOP_GAINS,
   base: ManipulationRobotCfg = KANGAROO_GRIPPERS_LEFT_ARM,

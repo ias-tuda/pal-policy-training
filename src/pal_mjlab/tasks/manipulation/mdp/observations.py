@@ -197,6 +197,22 @@ def object_yaw_b(
   return torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
 
 
+def commanded_target_rel(
+  env: ManagerBasedRlEnv, action_name: str = "joint_pos"
+) -> torch.Tensor:
+  """The target the arm and jaw were last commanded to, relative to the default pose. (B, A)
+
+  Plan S7-8's ``CMD_OBS``, in place of `last_action`. At the stack task's speeds a saturated
+  absolute action needs 5-7 s to arrive, and an integrated (delta) target is policy state; the
+  raw last action shows neither. This is what the term actually sent: after the slew, the box
+  and plan S7-4's bounds, before the jaw servo. The same width as `last_action`, so the actor
+  stays 38-D.
+  """
+  term = env.action_manager.get_term(action_name)
+  robot: Entity = env.scene[term.cfg.entity_name]
+  return term.commanded_target - robot.data.default_joint_pos[:, term.target_ids]
+
+
 def goal_position_b(
   env: ManagerBasedRlEnv, command_name: str, asset_cfg: SceneEntityCfg = _ROBOT
 ) -> torch.Tensor:
