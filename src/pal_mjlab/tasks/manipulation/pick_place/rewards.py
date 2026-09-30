@@ -35,7 +35,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from pal_mjlab.tasks.manipulation import mdp
-from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
+from pal_mjlab.tasks.manipulation.mdp.shapes import BySize, PerShape
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
   OBJECT,
@@ -55,7 +55,7 @@ class RewardContext:
   threshold: float
   jaw: SceneEntityCfg | None = None
   """The jaw's actuated joint, for plan S7-4's J (a release is the jaw opening)."""
-  jaw_open: float | PerShape = 0.15
+  jaw_open: float | BySize | PerShape = 0.15
   """J's threshold (`JAW_OPEN`), rad: below it, with the pads off, the jaw is open. A `PerShape`
   when the object's shape changes where the jaw first touches it (plan S8, L7)."""
   pads: SceneEntityCfg | None = None
@@ -520,11 +520,18 @@ def _m7(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
 # since a touchdown there (`mdp.set_down_placed`). M7 as run floored every other release and was
 # not learned (0-5 % set-downs on B-S, S7-2 / S7-3); the plan's dwell here is 2 steps.
 JAW_OPEN = 0.15  # rad; `mdp.observations.JAW_OPEN_BELOW`
-#: J's threshold for plan S8's 6 cm ball (L7: it is size-dependent). The jaw first touches the ball at
-#: a smaller angle than the cube's ~0.21 rad (the pads are 79.3 mm apart open, 50 mm at the cube's
-#: touch), so the cube's 0.15 would already count as "open" on a ball held lightly. Plan: the
-#: ball's touch angle minus 0.05 rad; measured by `scripts/gripper_bench.py --stimulus touch`.
-BALL_JAW_OPEN = 0.09
+#: J's threshold for plan S8's ball (L7: it is size-dependent). The plan's proposal is the ball's touch angle minus
+#: 0.05 rad (the cube's is 0.06 below its ~0.21). The gripper bench (`scripts/gripper_bench.py --stimulus touch`,
+#: `../results/S8-ball/bench/`, G20, the jaw ramped to closed over 5 s) first touches a 60 mm ball at 0.2752 rad and
+#: holds it at 0.309; the pad-site gap curve (`--stimulus kinematics`: 79.2 mm open, 60.7 mm at 0.275 rad) moves that
+#: 0.012 rad per mm of diameter, so BALL-DR's 55-65 mm balls are touched at 0.336 / 0.275 / 0.211 rad. A fixed
+#: threshold would sit above the big ball's hold angle, and "released" would fire with the jaw still closed on it (the
+#: pads merely slipping off) -- what J was made to stop -- so the threshold follows the radius.
+BALL_JAW_OPEN_BY_RADIUS = BySize(
+  radii=(0.0275, 0.03, 0.0325), values=(0.286, 0.225, 0.161)
+)
+#: ... and at the nominal radius (BALL, BALL-EQ, the eval's prints and tests).
+BALL_JAW_OPEN = 0.225
 M8_CLEAR_HEIGHT = 0.05  # m (plan S7-4 revision 2: was 8 cm)
 M8_RETREAT_WEIGHT = 2.0
 M8_CONTACT_WEIGHT = -1.0
@@ -677,12 +684,19 @@ def _z(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
 # Weight 1: the order of one `grasp` step, well under `lift`, `goal` and `placed`, so hovering
 # at the right height is never worth more than carrying.
 #
-# EQ_OFFSET is the pad-site midpoint's height above the ball's centre at which the bench's grasp
-# holds best (the plan's proposal is 0: the equator).
+# EQ_OFFSET is the pad-site midpoint's height above the ball's centre at which it is paid: -10 mm, the
+# middle of what holds, not the plan's 0 (the equator). The gripper bench (`scripts/gripper_bench.py
+# --stimulus ballheight`, `../results/S8-ball/bench/`, G20, the arm shaken at the stack task's speeds for
+# 30 s) loses no ball with the pad midpoint from 20 mm below the ball's centre to its centre, and loses
+# every one from 5 mm above it (the contact normals tilt up and the jaw squeezes the ball out); 20 mm
+# below, the ball sits 4 mm into the palm. At the equator the retained force is lowest (48 N against
+# 62 N at -15 mm) and the ball creeps most (17 mm against 14 mm in 30 s). The scripted pick-and-place
+# confirms it: with the pad midpoint at the equator the ball was let go 2-8 cm up in 7 of 12 corner
+# episodes (placed 4 / 12); at -10 mm it is placed 60 / 64, none let go high.
 EQ_WEIGHT = 1.0
 EQ_STD = 0.005  # m
 EQ_NEAR = 0.03  # m, horizontal
-EQ_OFFSET = 0.0  # m
+EQ_OFFSET = -0.010  # m
 
 
 def _eq(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:

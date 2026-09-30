@@ -19,6 +19,18 @@ at its nominal target, as `hold_nominal_targets` does in the task:
 * ``kinematics``  a slow open -> closed ramp; pad gap against jaw angle, the curve every
   model change has to reproduce.
 
+Plan S8 (the 6 cm ball) adds two more, for whichever object ``$SHAPE`` / ``--shape`` picks
+(``cube`` | ``ball``); neither is part of ``--stimulus all``:
+
+* ``touch``   the object supported between the open pads (pad-site midpoint at its centre
+  height) while the jaw target ramps slowly from open to closed: the jaw angle at which each
+  pad first reports a force, the angle at which both do ("touch angle"), then the settled hold
+  angle and per-pad normal forces once the support is released.
+* ``ballheight``   the object clamped with the pad-site midpoint ``--offsets`` mm off its
+  centre along the hand's approach axis (positive = pads toward the wrist, i.e. above a
+  top-down grasp's centre), then the ``shake`` -- arm-target slew-limited to the stack task's
+  speeds with ``--shake-slew stack``. Slip, drops and pad force against grasp height.
+
 The jaw target is formed exactly as mjlab's `JointPositionAction` forms it:
 ``default + scale * action`` with no clip, and the jaw actuator is not ``ctrllimited``, so
 at ``--jaw-scale 0.95`` an action of -1 commands -0.95 rad and drives the jaw into its open
@@ -72,10 +84,24 @@ PASSIVE_JOINT_REGEX = (
 PAD_GEOM_REGEX = rf"gripper_{SIDE}_(fingertip|inner_finger)_(left|right)_collision"
 
 CONTROL_DT = 0.02  # 50 Hz, the task's decimation 10 x 2 ms
+PAD_CLEARANCE = 0.01  # m, pad sites over the table at the scripted pick's grasp pose
 JAW_CLOSED = 0.95  # the joint's upper limit, `robots/kangaroo.py` _JAW_CLOSED
 MIN_PAD_FORCE = 0.5  # N per side; the plan's upgraded grasp test (ManiSkill min_force)
 DROP_SLIP = 0.02  # m of cube motion in the hand frame that counts as a drop
 STIMULI = ("step", "random", "shake", "kinematics")
+#: Plan S8's object stimuli. Not in ``--stimulus all``, which stays the S6 set.
+S8_STIMULI = ("touch", "ballheight")
+TOUCH_FORCE = 0.05  # N per pad; "the pad is in contact" for `touch`
+#: Seconds the arm settles under gravity before an S8 stimulus places the object.
+SETTLE_S = 1.0
+#: ``$BENCH_POSE`` (set by ``--pose``): ``nominal`` is the robot's start pose, the hand
+#: pointing forward and ~22 deg down, as S6 ran every stimulus; ``topdown`` is the arm at the
+#: pose the scripted pick grasps from -- the hand's +z straight down, so the approach axis is
+#: vertical and gravity acts along it, as it does in the task (plan S8).
+POSE_ENV_VAR = "BENCH_POSE"
+#: The selectors the task reads from the environment (`kangaroo/env_cfg.py`); the record
+#: keeps them, since a result is only reproducible with the same plant and object.
+ENV_SELECTORS = ("GAINS", "SHAPE", "BASELINE", "SPAWN", "DR", "EFFORT", POSE_ENV_VAR)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,11 +123,15 @@ class Levers:
   jaw_clip: float | None = None
 
 
+def _slew_arg(text: str) -> float | str:
+  return text if text == "stack" else float(text)
+
+
 def parse_args() -> argparse.Namespace:
   p = argparse.ArgumentParser(
     description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
   )
-  p.add_argument("--stimulus", choices=(*STIMULI, "all"), default="all")
+  p.add_argument("--stimulus", choices=(*STIMULI, *S8_STIMULI, "all"), default="all")
   p.add_argument("--name", default="baseline", help="label for this configuration")
   p.add_argument("--jaw-scale", type=float, default=0.95, help="S5.0 full-range jaw")
   p.add_argument("--worlds", type=int, default=64, help="random/shake worlds")
@@ -109,14 +139,59 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--shake-amp", type=float, default=0.3, help="rad, arm target noise")
   p.add_argument(
     "--shake-slew",
-    type=float,
+    type=_slew_arg,
     default=None,
-    help="rate-limit the shake's arm target like the task does: this factor x the URDF "
-    "slew (plan S7 FA: 0.5). Default: unlimited, as S6 ran it",
+    help="rate-limit the shake's arm target like the task does: a factor x the URDF "
+    "slew (plan S7 FA: 0.5), or 'stack' for the stack task's per-joint speeds (plan "
+    "S7-8; arm 1-3 at 1/16, 4-7 at 1/8 of the URDF limit). Default: unlimited, as S6 "
+    "ran it",
   )
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--workers", type=int, default=8)
   p.add_argument("--out", type=pathlib.Path, default=pathlib.Path("artifacts/s6"))
+  p.add_argument(
+    "--pose",
+    choices=("nominal", "topdown"),
+    default=None,
+    help="arm pose the stimuli run in: the robot's start pose (S6's) or the scripted "
+    "pick's top-down grasp pose, where the approach axis is vertical. Sets "
+    "$BENCH_POSE. Default: as it is, else nominal",
+  )
+  p.add_argument(
+    "--shape",
+    default=None,
+    help="plan-S8 object (cube | ball); sets $SHAPE for the registry. Default: $SHAPE as "
+    "it is, else cube",
+  )
+  p.add_argument(
+    "--offsets",
+    type=float,
+    nargs="+",
+    default=[-20, -15, -10, -5, 0, 5, 10, 15, 20],
+    help="ballheight: height (mm) of the pad-site midpoint above the object's centre, "
+    "along the hand's approach axis",
+  )
+  p.add_argument(
+    "--touch-offsets",
+    type=float,
+    nargs="+",
+    default=[0.0],
+    help="touch: heights (mm) of the pad-site midpoint above the object's centre; the "
+    "first is the headline",
+  )
+  p.add_argument(
+    "--touch-yaw",
+    type=float,
+    default=0.0,
+    help="touch: turn the object about the approach axis by this many degrees "
+    "(0 = a cube's faces square to the pads)",
+  )
+  p.add_argument(
+    "--touch-seconds",
+    type=float,
+    default=5.0,
+    help="touch: duration of the jaw-target ramp from open to --jaw-scale",
+  )
   p.add_argument(
     "--gains",
     default=None,
@@ -324,18 +399,104 @@ def resolve(model: mujoco.MjModel) -> Ids:
   )
 
 
+_TOPDOWN_CACHE: dict[int, np.ndarray] = {}
+
+
+def _set_topdown_pose(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+  """Write the arm pose the scripted pick grasps the spawn point from into ``data``.
+
+  Damped least squares on the left arm for the grasp point (``tcp_left``) above `SPAWN_XY`,
+  the hand's +z straight down and its +x along whichever world axis the start pose's is
+  nearest -- the IK of `scripted_pick_place.Kin` (soft joint limits, a pull toward the start
+  pose), copied so the bench does not import a script that changes under it. The height is a
+  grasp at the table: the pad sites `PAD_CLEARANCE` above it.
+  """
+  from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import SPAWN_XY
+  from pal_mjlab.tasks.manipulation.scene import TABLE_TOP_Z
+  from scene_model import joint_qadr, site_id, soft_limits
+
+  names = [f"arm_{SIDE}_{k}_joint" for k in range(1, 8)]
+  qadr = joint_qadr(model, names)
+  if id(model) not in _TOPDOWN_CACHE:
+    work = mujoco.MjData(model)
+    work.qpos[:] = data.qpos
+    lo, hi = soft_limits(model, names)
+    tcp = site_id(model, f"robot/tcp_{SIDE}")
+    hand = mujoco.mj_name2id(
+      model, mujoco.mjtObj.mjOBJ_BODY, f"robot/arm_{SIDE}_7_link"
+    )
+    pads = [
+      site_id(model, f"robot/gripper_{SIDE}_fingertip_{s}_site")
+      for s in ("left", "right")
+    ]
+    dofs = np.array(
+      [
+        model.jnt_dofadr[
+          mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{n}")
+        ]
+        for n in names
+      ]
+    )
+
+    def fk(q):
+      work.qpos[qadr] = q
+      mujoco.mj_kinematics(model, work)
+      mujoco.mj_comPos(model, work)
+      return work.site_xpos[tcp].copy(), work.xmat[hand].reshape(3, 3).copy()
+
+    q0 = data.qpos[qadr].copy()
+    pos0, rot0 = fk(q0)
+    yaw0 = round(math.atan2(rot0[1, 0], rot0[0, 0]) / (math.pi / 2)) * (math.pi / 2)
+    x_des = np.array([math.cos(yaw0), math.sin(yaw0), 0.0])
+    z_des = np.array([0.0, 0.0, -1.0])
+    r_des = np.column_stack([x_des, np.cross(z_des, x_des), z_des])
+    reach = max(float((work.site_xpos[p] - pos0) @ rot0[:, 2]) for p in pads)
+    goal = np.array([*SPAWN_XY, TABLE_TOP_Z + reach + PAD_CLEARANCE])
+    jacp, jacr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+    q = q0.copy()
+    for _ in range(600):
+      pos, rot = fk(q)
+      err = np.concatenate(
+        [goal - pos, 0.5 * sum(np.cross(rot[:, i], r_des[:, i]) for i in range(3))]
+      )
+      if np.linalg.norm(err[:3]) < 1e-3 and np.linalg.norm(err[3:]) < 1e-2:
+        break
+      mujoco.mj_jacSite(model, work, jacp, jacr, tcp)
+      jac = np.vstack([jacp[:, dofs], jacr[:, dofs]])
+      pinv = jac.T @ np.linalg.inv(jac @ jac.T + 1e-3 * np.eye(6))
+      step = pinv @ err + (np.eye(7) - pinv @ jac) @ (0.2 * (q0 - q))
+      q = np.clip(q + np.clip(step, -0.2, 0.2), lo, hi)
+    else:
+      raise RuntimeError(
+        f"the top-down grasp pose has no IK solution: goal {goal}, residual {err}"
+      )
+    _TOPDOWN_CACHE[id(model)] = q
+  data.qpos[qadr] = _TOPDOWN_CACHE[id(model)]
+  mujoco.mj_forward(model, data)
+
+
 def _nominal(model: mujoco.MjModel) -> mujoco.MjData:
   from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import SPAWN_XY
   from pal_mjlab.tasks.manipulation.scene import TABLE_TOP_Z
   from scene_model import nominal_data
 
   data = nominal_data(model)
+  if os.environ.get(POSE_ENV_VAR, "nominal") == "topdown":
+    _set_topdown_pose(model, data)
   # Park the cube at the task's spawn point so it sits where it would in an episode and
   # stays out of the jaw's way for the object-free stimuli.
   cube = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "object/object")
   jnt = next(j for j in range(model.njnt) if model.jnt_bodyid[j] == cube)
   adr = model.jnt_qposadr[jnt]
-  data.qpos[adr : adr + 7] = (*SPAWN_XY, TABLE_TOP_Z + 0.025, 1.0, 0.0, 0.0, 0.0)
+  # Its centre's resting height: a box's half-size, a sphere's radius (plan S8's ball is
+  # 3 cm, not 2.5). Every geom of the body has its size in geom_size[:, 0] (sphere) or
+  # geom_size[:, :3] (box), and the largest number is the half-height of either.
+  rest = max(
+    float(model.geom_size[g].max())
+    for g in range(model.ngeom)
+    if model.geom_bodyid[g] == cube
+  )
+  data.qpos[adr : adr + 7] = (*SPAWN_XY, TABLE_TOP_Z + rest, 1.0, 0.0, 0.0, 0.0)
   mujoco.mj_forward(model, data)
   return data
 
@@ -449,6 +610,13 @@ class World:
     s1, s2 = self.ids.pad_sites
     return float(np.linalg.norm(self.d.site_xpos[s1] - self.d.site_xpos[s2]))
 
+  def pad_mid_in_hand(self) -> np.ndarray:
+    """The midpoint of the two pad sites in the hand frame (x closing, z approach), m."""
+    s1, s2 = self.ids.pad_sites
+    mid = 0.5 * (self.d.site_xpos[s1] + self.d.site_xpos[s2])
+    hb = self.ids.hand_body
+    return self.d.xmat[hb].reshape(3, 3).T @ (mid - self.d.xpos[hb])
+
   def pad_forces(self) -> tuple[float, float]:
     """Normal force (N) of the cube on the left-side and right-side pads."""
     left = right = 0.0
@@ -465,6 +633,45 @@ class World:
       elif pair & ids.pad_geoms_right:
         right += abs(f[0])
     return left, right
+
+  def object_contacts(self) -> list[dict]:
+    """Every contact the object is in: which geom, how deep, the normal force (N), and where
+    it is and which way it pushes, in the hand frame (x closing, z approach). The normal points
+    from the other geom toward the object."""
+    ids, m, d = self.ids, self.m, self.d
+    hb = ids.hand_body
+    rot, origin = d.xmat[hb].reshape(3, 3), d.xpos[hb]
+    f = np.zeros(6)
+    out = []
+    for i in range(d.ncon):
+      c = d.contact[i]
+      pair = (int(c.geom1), int(c.geom2))
+      mine = [g in ids.cube_geoms for g in pair]
+      if not any(mine):
+        continue
+      other = pair[1] if mine[0] else pair[0]
+      mujoco.mj_contactForce(m, d, i, f)
+      normal = np.array(c.frame[:3])
+      if mine[0]:
+        normal = -normal  # frame[:3] points geom1 -> geom2
+      side = (
+        "left"
+        if other in ids.pad_geoms_left
+        else "right"
+        if other in ids.pad_geoms_right
+        else None
+      )
+      out.append(
+        {
+          "geom": _name(m, mujoco.mjtObj.mjOBJ_GEOM, other),
+          "side": side,
+          "dist": float(c.dist),
+          "force_N": float(abs(f[0])),
+          "pos_hand": (rot.T @ (np.array(c.pos) - origin)).tolist(),
+          "normal_hand": (rot.T @ normal).tolist(),
+        }
+      )
+    return out
 
   def cube_in_hand(self) -> np.ndarray:
     hb = self.ids.hand_body
@@ -601,17 +808,26 @@ def _shake_worker(lv: Levers, args, world_ids: list[int]) -> dict:
   return out
 
 
-def _arm_slew_per_step(factor: float) -> np.ndarray:
+def _arm_slew_per_step(factor: float | str) -> np.ndarray:
   """The task's arm slew limit in rad per control step, in `Ids.arm_act` order.
 
   The robot's URDF joint speeds (`KANGAROO_GRIPPERS.joint_velocity_limits`) x the control
   period x ``factor`` -- what `mdp.RateLimitedJointPositionAction` allows a target to move per
   step. Without it a shake jumps the target by up to 2 x ``--shake-amp`` per step, which a
   stiff arm (plan S8) follows at several m/s at the tool.
+
+  ``"stack"`` is plan S7-8's per-joint speeds instead of one factor: arm joints 1-3 at 1/16
+  and 4-7 at 1/8 of their URDF limit (`tabletop_env_cfg.stack_arm_rate_limit`, 2.4-5.9 mrad
+  per step).
   """
   from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS
 
   limits = KANGAROO_GRIPPERS.joint_velocity_limits
+  if factor == "stack":
+    from pal_mjlab.tasks.manipulation.tabletop_env_cfg import stack_arm_rate_limit
+
+    per_step = stack_arm_rate_limit(limits)
+    return np.array([per_step[f"arm_.*_{k}_joint"] for k in range(1, 8)])
   return np.array(
     [
       next(v for rx, v in limits.items() if re.fullmatch(rx, f"arm_{SIDE}_{k}_joint"))
@@ -636,8 +852,17 @@ class _PeakSpeed:
     self.prev = p.copy()
 
 
-def _place_cube_in_jaw(w: World):
-  """Put the cube between the open pads, faces square to them, at rest."""
+def _place_cube_in_jaw(w: World, height: float = 0.0, yaw: float = 0.0):
+  """Put the object between the open pads, faces square to them, at rest.
+
+  ``height`` (m) is how far the pad-site midpoint is *above the object's centre* along the
+  hand's approach axis (z, from the wrist toward the fingertips; it points down when the hand
+  is top-down, as in a pick). So the object's centre is placed at ``mid + height * z``:
+  ``height = -0.015`` puts the pads 15 mm below the centre, deeper toward the wrist for the
+  object, which is where the scripted pick puts them for the cube. ``yaw`` (rad) turns the
+  object about the approach axis (a cube's faces are square to the pads at 0). A sphere has
+  no faces; its orientation does not matter.
+  """
   ids, d = w.ids, w.d
   s1, s2 = ids.pad_sites
   mid = 0.5 * (d.site_xpos[s1] + d.site_xpos[s2])
@@ -647,9 +872,11 @@ def _place_cube_in_jaw(w: World):
   z = z - x * (z @ x)
   z /= np.linalg.norm(z)
   rot = np.column_stack([x, np.cross(z, x), z])
+  c, sn = math.cos(yaw), math.sin(yaw)
+  rot = rot @ np.array([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]])
   quat = np.zeros(4)
   mujoco.mju_mat2Quat(quat, rot.ravel())
-  d.qpos[ids.cube_qpos : ids.cube_qpos + 7] = (*mid, *quat)
+  d.qpos[ids.cube_qpos : ids.cube_qpos + 7] = (*(mid + height * z), *quat)
   d.qvel[ids.cube_dof : ids.cube_dof + 6] = 0.0
   mujoco.mj_forward(w.m, d)
 
@@ -745,11 +972,277 @@ def run_kinematics(lv: Levers, args) -> dict:
   return out
 
 
+##
+# Plan S8: the object in the jaw (touch angle, hold angle, grasp height).
+##
+
+
+def _free_table(model: mujoco.MjModel, ids: Ids) -> None:
+  """Take the table out of the way, as `_shake_worker` does: a jaw over the start pose would
+  otherwise push a clamped object into it."""
+  for g in ids.table_geoms:
+    model.geom_contype[g] = 0
+    model.geom_conaffinity[g] = 0
+
+
+def _first(trace: list[float], q: list[float], thr: float) -> float | None:
+  """Jaw angle at the first sample where ``trace`` reaches ``thr``; None if it never does."""
+  return next((qk for qk, x in zip(q, trace, strict=True) if x >= thr), None)
+
+
+def _touch_once(model: mujoco.MjModel, ids: Ids, lv: Levers, args, offset_mm: float):
+  """One `touch` ramp with the pad-site midpoint ``offset_mm`` above the object's centre."""
+  weight = model.body_subtreemass[ids.cube_body] * -model.opt.gravity[2]
+  w = World(model, ids, lv)
+  settle(w, SETTLE_S)
+  _place_cube_in_jaw(w, 1e-3 * offset_mm, math.radians(args.touch_yaw))
+  start_overlap = max(
+    [-c["dist"] for c in w.object_contacts() if c["side"] is None], default=0.0
+  )
+  w.d.xfrc_applied[ids.cube_body, 2] = weight
+  base = ids.default_ctrl[ids.jaw_act]
+  n = round(args.touch_seconds / CONTROL_DT)
+  q, tgt, gap, left, right, any_l, any_r, mid_z = [], [], [], [], [], [], [], []
+  ok = True
+  for k in range(n):
+    w.set_jaw(base + args.jaw_scale * (k + 1) / n)
+    ok = w.control_step() and ok
+    fl, fr = w.pad_forces()
+    sides = {c["side"] for c in w.object_contacts()}
+    q.append(float(w.d.qpos[ids.jaw_qpos]))
+    tgt.append(float(w._jaw_target))
+    gap.append(1e3 * w.pad_gap())
+    mid_z.append(1e3 * float(w.pad_mid_in_hand()[2]))
+    left.append(fl)
+    right.append(fr)
+    any_l.append(float("left" in sides))
+    any_r.append(float("right" in sides))
+  both = [min(a, b) for a, b in zip(left, right, strict=True)]
+  any_both = [min(a, b) for a, b in zip(any_l, any_r, strict=True)]
+  q_ramp, (fl_ramp, fr_ramp) = q[-1], w.pad_forces()
+  ref = w.cube_in_hand()
+  ok = all(w.control_step() for _ in range(round(0.5 / CONTROL_DT))) and ok
+  q_supported, forces_supported = float(w.d.qpos[ids.jaw_qpos]), w.pad_forces()
+  w.d.xfrc_applied[ids.cube_body, 2] = 0.0
+  ok = all(w.control_step() for _ in range(round(1.0 / CONTROL_DT))) and ok
+  fl, fr = w.pad_forces()
+  touch_q = _first(both, q, TOUCH_FORCE)
+  k_touch = q.index(touch_q) if touch_q is not None else None
+  out = summarise([w])
+  out.update(
+    offset_mm=offset_mm,
+    start_palm_overlap_mm=1e3 * start_overlap,
+    # Where the pad-site midpoint has moved to along the approach axis by the touch, from
+    # where it was with the jaw open (the pads' z shifts toward the fingertips as they close):
+    # the requested offset is the open jaw's, the offset at the touch is this much lower.
+    mid_z_shift_at_touch_mm=None if k_touch is None else mid_z[k_touch] - mid_z[0],
+    mid_z_shift_at_hold_mm=1e3 * float(w.pad_mid_in_hand()[2]) - mid_z[0],
+    h_hold_mm=1e3 * float(w.cube_in_hand()[2] - w.pad_mid_in_hand()[2]),
+    yaw_deg=args.touch_yaw,
+    ok=ok,
+    first_force_q={
+      "left": _first(left, q, TOUCH_FORCE),
+      "right": _first(right, q, TOUCH_FORCE),
+    },
+    first_contact_q={"left": _first(any_l, q, 1.0), "right": _first(any_r, q, 1.0)},
+    touch_q=touch_q,
+    touch_contact_q=_first(any_both, q, 1.0),
+    touch_force_N=TOUCH_FORCE,
+    ramp_end_q=q_ramp,
+    ramp_end_forces_N=[fl_ramp, fr_ramp],
+    supported_hold_q=q_supported,
+    supported_forces_N=list(forces_supported),
+    hold_q=float(w.d.qpos[ids.jaw_qpos]),
+    hold_forces_N=[fl, fr],
+    hold_gap_mm=1e3 * w.pad_gap(),
+    slip_after_release_mm=1e3 * float(np.linalg.norm(w.cube_in_hand() - ref)),
+    contacts=w.object_contacts(),
+    object_in_hand_mm=(1e3 * w.cube_in_hand()).tolist(),
+    curve_q=q,
+    curve_target=tgt,
+    curve_gap_mm=gap,
+    curve_mid_z_mm=mid_z,
+    curve_left_N=left,
+    curve_right_N=right,
+  )
+  return out
+
+
+def run_touch(lv: Levers, args) -> dict:
+  """The object supported between the open pads, the jaw target ramped open -> closed.
+
+  Its weight is carried by an applied upward force while the jaw closes (a free object would
+  otherwise sit on whatever it touches first), which is released after the ramp and a
+  settle. Reads the jaw angle at which each pad first reports a normal force >= ``TOUCH_FORCE``
+  on the object (``first_force_q``), the angle at which both do at the same step
+  (``touch_q``), the same for a contact of any force, and -- after the release -- the hold
+  angle and the per-pad normal forces.
+
+  The top level is the first of ``--touch-offsets`` (default 0: the pad-site midpoint at the
+  object's centre height); ``by_offset`` has every one, without the curves.
+  """
+  model = build_model(lv)
+  ids = resolve(model)
+  _free_table(model, ids)
+  runs = [_touch_once(model, ids, lv, args, off) for off in args.touch_offsets]
+  out = dict(runs[0])
+  out["by_offset"] = [
+    {k: v for k, v in r.items() if not k.startswith("curve")} for r in runs
+  ]
+  return out
+
+
+def _ballheight_worker(lv: Levers, args, jobs: list[tuple[float, int]]) -> list[dict]:
+  """`_shake_worker` for one object height per job: ``(offset_mm, world id)``.
+
+  The shake seed depends on the world id only, so every offset sees the same 'random'
+  arm motions and the offsets are compared on equal terms.
+  """
+  model = build_model(lv)
+  ids = resolve(model)
+  _free_table(model, ids)
+  weight = model.body_subtreemass[ids.cube_body] * -model.opt.gravity[2]
+  n_ctrl = round(args.seconds / CONTROL_DT)
+  slew = None if args.shake_slew is None else _arm_slew_per_step(args.shake_slew)
+  arm_default = ids.default_ctrl[ids.arm_act]
+  out = []
+  for off_mm, wid in jobs:
+    rng = np.random.default_rng([args.seed, 20_000 + wid])
+    w = World(model, ids, lv)
+    settle(w, SETTLE_S)
+    _place_cube_in_jaw(w, 1e-3 * off_mm)
+    start = w.object_contacts()
+    mid_z_open = float(w.pad_mid_in_hand()[2])
+    w.d.xfrc_applied[ids.cube_body, 2] = weight
+    w.set_jaw(ids.default_ctrl[ids.jaw_act] + args.jaw_scale)
+    ok = all(w.control_step() for _ in range(round(0.5 / CONTROL_DT)))
+    w.d.xfrc_applied[ids.cube_body, 2] = 0.0
+    ok = ok and all(w.control_step() for _ in range(round(0.5 / CONTROL_DT)))
+    fl, fr = w.pad_forces()
+    contacts = w.object_contacts()
+    pads = [c for c in contacts if c["side"] is not None]
+    hold_q = float(w.d.qpos[ids.jaw_qpos])
+    ref = w.cube_in_hand()
+    h_hold = 1e3 * float(ref[2] - w.pad_mid_in_hand()[2])
+    max_slip, min_force, n_loss = 0.0, min(fl, fr), 0
+    # The object in the hand frame, mm from `ref`, once a second.
+    track = [[0.0, 0.0, 0.0]]
+    arm_target = arm_default.copy()
+    for k in range(n_ctrl if ok else 0):
+      proposal = arm_default + rng.uniform(-args.shake_amp, args.shake_amp, size=7)
+      if slew is None:
+        arm_target = proposal
+      else:
+        arm_target = arm_target + np.clip(proposal - arm_target, -slew, slew)
+      w.d.ctrl[ids.arm_act] = arm_target
+      if not w.control_step():
+        break
+      max_slip = max(max_slip, float(np.linalg.norm(w.cube_in_hand() - ref)))
+      f = min(w.pad_forces())
+      min_force = min(min_force, f)
+      n_loss += f < TOUCH_FORCE
+      if (k + 1) % round(1.0 / CONTROL_DT) == 0:
+        track.append((1e3 * (w.cube_in_hand() - ref)).tolist())
+    end = w.cube_in_hand() - ref
+    other = [c for c in contacts if c["side"] is None]
+    out.append(
+      {
+        "offset_mm": off_mm,
+        "world": wid,
+        "ok": bool(ok),
+        "diverged": w.divergences > 0,
+        "grasped": bool(ok and min(fl, fr) >= MIN_PAD_FORCE),
+        "dropped": bool((not ok) or w.divergences > 0 or max_slip > DROP_SLIP),
+        "force_left_N": fl,
+        "force_right_N": fr,
+        "min_pad_force_N": min(fl, fr),
+        "hold_q": hold_q,
+        "h_hold_mm": h_hold,
+        "mid_z_shift_hold_mm": 1e3 * float(w.pad_mid_in_hand()[2] - mid_z_open),
+        "start_palm_overlap_mm": 1e3
+        * max([-c["dist"] for c in start if c["side"] is None], default=0.0),
+        "end_q": float(w.d.qpos[ids.jaw_qpos]),
+        "slip_m": max_slip,
+        "end_slip_mm": (1e3 * end).tolist(),
+        "track_mm": track,
+        "shake_min_force_N": min_force,
+        "shake_steps_below_0.05N": int(n_loss),
+        "n_pad_contacts": len(pads),
+        "pad_normal_z": [c["normal_hand"][2] for c in pads],
+        "pad_contact_z_mm": [1e3 * c["pos_hand"][2] for c in pads],
+        "other_contacts": [(c["geom"], c["force_N"]) for c in other],
+        "max_connect_mm": 1e3 * w.max_connect,
+      }
+    )
+  return out
+
+
+def _wilson_upper(k: int, n: int, z: float = 1.96) -> float:
+  """Upper end of the 95 % Wilson interval for k events in n."""
+  p = k / n
+  centre = p + z * z / (2 * n)
+  half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+  return (centre + half) / (1 + z * z / n)
+
+
+def _height_row(offset_mm: float, rs: list[dict]) -> dict:
+  n = len(rs)
+  drops = sum(r["dropped"] for r in rs)
+  forces = [r["min_pad_force_N"] for r in rs]
+  return {
+    "offset_mm": offset_mm,
+    "n": n,
+    "grasp_rate": float(np.mean([r["grasped"] for r in rs])),
+    "drop_rate": drops / n,
+    "drop_upper95": _wilson_upper(drops, n),
+    "diverged": int(sum(r["diverged"] for r in rs)),
+    "median_slip_mm": 1e3 * float(np.median([r["slip_m"] for r in rs])),
+    "max_slip_mm": 1e3 * float(np.max([r["slip_m"] for r in rs])),
+    "hold_q_median": float(np.median([r["hold_q"] for r in rs])),
+    "h_hold_mm_median": float(np.median([r["h_hold_mm"] for r in rs])),
+    "palm_overlap_mm": float(max(r["start_palm_overlap_mm"] for r in rs)),
+    "end_q_median": float(np.median([r["end_q"] for r in rs])),
+    "min_pad_force_N": float(np.min(forces)),
+    "median_pad_force_N": float(np.median(forces)),
+    "shake_min_force_median_N": float(np.median([r["shake_min_force_N"] for r in rs])),
+    "worlds_losing_contact": int(sum(r["shake_steps_below_0.05N"] > 0 for r in rs)),
+    "median_normal_z": float(
+      np.median([abs(z) for r in rs for z in r["pad_normal_z"]] or [math.nan])
+    ),
+  }
+
+
+def run_ballheight(lv: Levers, args) -> dict:
+  """Slip and drops against the height of the grasp on the object (plan S8 step 0.3)."""
+  jobs = [(off, wid) for off in args.offsets for wid in range(args.worlds)]
+  chunks = [jobs[i :: args.workers] for i in range(args.workers)]
+  chunks = [c for c in chunks if c]
+  with concurrent.futures.ProcessPoolExecutor(len(chunks)) as pool:
+    parts = list(
+      pool.map(_ballheight_worker, [lv] * len(chunks), [args] * len(chunks), chunks)
+    )
+  per_world = sorted(
+    (r for part in parts for r in part),
+    key=lambda r: (args.offsets.index(r["offset_mm"]), r["world"]),
+  )
+  rows = [
+    _height_row(off, [r for r in per_world if r["offset_mm"] == off])
+    for off in args.offsets
+  ]
+  return {
+    "rows": rows,
+    "per_world": per_world,
+    "shape": os.environ.get("SHAPE", "cube"),
+  }
+
+
 RUNNERS = {
   "step": run_step,
   "random": run_random,
   "shake": run_shake,
   "kinematics": run_kinematics,
+  "touch": run_touch,
+  "ballheight": run_ballheight,
 }
 
 
@@ -823,6 +1316,27 @@ def report(directory: pathlib.Path) -> None:
     )
 
 
+def height_table(rows: list[dict]) -> str:
+  """The ballheight sweep as a markdown table, one row per offset."""
+  hdr = (
+    "| offset mm | h at hold mm | palm overlap mm | n | grasp | drop (95 % upper) | "
+    "median / max slip mm | hold q rad | min / median pad N | "
+    "shake min force (median) N | contact lost | normal z |"
+  )
+  lines = [hdr, "|" + "---|" * (hdr.count("|") - 1)]
+  for r in rows:
+    lines.append(
+      f"| {r['offset_mm']:+g} | {r['h_hold_mm_median']:+.1f} | {r['palm_overlap_mm']:.1f} "
+      f"| {r['n']} | {r['grasp_rate']:.3f} "
+      f"| {r['drop_rate']:.3f} ({r['drop_upper95']:.3f}) "
+      f"| {r['median_slip_mm']:.2f} / {r['max_slip_mm']:.1f} | {r['hold_q_median']:.3f} "
+      f"| {r['min_pad_force_N']:.1f} / {r['median_pad_force_N']:.1f} "
+      f"| {r['shake_min_force_median_N']:.1f} | {r['worlds_losing_contact']}/{r['n']} "
+      f"| {r['median_normal_z']:.3f} |"
+    )
+  return "\n".join(lines)
+
+
 def _f(d: dict, key: str, fmt: str = ".1f") -> str:
   v = d.get(key) if d else None
   return "—" if v is None else format(v, fmt)
@@ -838,6 +1352,11 @@ def main() -> None:
     # `build_model` imports the registry lazily, here and in every worker process, and the
     # pick-place cfg reads $GAINS at import (plan S8) -- so setting it now selects the plant.
     os.environ["GAINS"] = args.gains
+  if args.pose is not None:
+    os.environ[POSE_ENV_VAR] = args.pose
+  if args.shape is not None:
+    # Same for the object: the task cfg reads $SHAPE when `build_model` builds it.
+    os.environ["SHAPE"] = args.shape
   stimuli = STIMULI if args.stimulus == "all" else (args.stimulus,)
   args.out.mkdir(parents=True, exist_ok=True)
   path = args.out / f"{args.name}.json"
@@ -852,6 +1371,8 @@ def main() -> None:
     shake_slew=args.shake_slew,
     seed=args.seed,
     gains=os.environ.get("GAINS", "G0"),
+    shape=os.environ.get("SHAPE", "cube"),
+    env={k: os.environ.get(k) for k in ENV_SELECTORS},
     provenance=provenance(),
   )
   for s in stimuli:
@@ -865,6 +1386,8 @@ def main() -> None:
       if not isinstance(v, (list, dict)) and not k.startswith("curve")
     }
     print(f"[{args.name}] {s}: {json.dumps(brief, default=float)}", flush=True)
+    if s == "ballheight":
+      print(height_table(res["rows"]), flush=True)
   path.write_text(json.dumps(record, indent=1, default=float))
   print(f"wrote {path}")
 

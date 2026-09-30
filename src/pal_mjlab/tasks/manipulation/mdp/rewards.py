@@ -29,6 +29,7 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
   _was_lifted_bool,
 )
 from pal_mjlab.tasks.manipulation.mdp.shapes import (
+  BySize,
   PerShape,
   object_half_height,
   resolve,
@@ -85,7 +86,7 @@ def released_at_goal(
   threshold: float = 0.05,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> torch.Tensor:
   """1.0 when the object is at the goal and no longer held.
 
@@ -120,7 +121,7 @@ def object_placed(
   velocity_threshold: float = 0.05,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> torch.Tensor:
   """1.0 on full success: at the goal, released, and come to rest.
 
@@ -295,7 +296,7 @@ def release_quality(
   floor: float = 0.25,
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
@@ -341,7 +342,7 @@ def released_at_goal_graded(
   floor: float = 0.25,
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -393,7 +394,7 @@ def object_placed_graded(
   floor: float = 0.25,
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -459,7 +460,7 @@ def set_down_placed(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float | PerShape,
+  jaw_open: float | BySize | PerShape,
   set_down_steps: int,
   threshold: float = 0.05,
   velocity_threshold: float = 0.05,
@@ -510,7 +511,7 @@ def retreat_height(
   grasp_sensor_name: str,
   support_sensor_name: str,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float | PerShape,
+  jaw_open: float | BySize | PerShape,
   asset_cfg: SceneEntityCfg,
   clear_height: float = 0.05,
   threshold: float = 0.05,
@@ -550,7 +551,7 @@ def pad_contact_after_release(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float | PerShape,
+  jaw_open: float | BySize | PerShape,
 ) -> torch.Tensor:
   """1.0 while either pad touches the object after this episode's J-release; weight it
   negative (plan S7-4's M8: the nudging after the set-down in S7-2's videos). (B,)"""
@@ -575,8 +576,8 @@ def open_at_goal(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float | PerShape,
-  jaw_hold: float | PerShape,
+  jaw_open: float | BySize | PerShape,
+  jaw_hold: float | BySize | PerShape,
   gate: tuple[float, float],
 ) -> torch.Tensor:
   """Plan S7-5's O: how far the jaw has opened from the hold angle towards open,

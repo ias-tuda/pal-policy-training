@@ -16,7 +16,11 @@ plant (G20, baseline B, CTP, DR-scene, LAG=FP+JS, the stack task's speeds):
 * EQ (the pads' closing height) pays at the right height before the lift and only then.
 """
 
+import collections
 import dataclasses
+import importlib.util
+import pathlib
+import sys
 
 import mujoco
 import numpy as np
@@ -36,7 +40,7 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
   _grasped_bool,
   _jaw_open_bool,
 )
-from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
+from pal_mjlab.tasks.manipulation.mdp.shapes import BySize, PerShape
 from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
 from pal_mjlab.tasks.manipulation.pick_place import rewards as rw
 from pal_mjlab.tasks.manipulation.pick_place.kangaroo import env_cfg as kenv
@@ -221,6 +225,32 @@ def test_the_S8_arm_is_a_jaw_release_arm_with_a_success_free_episode():
     rw._s52_arm(("EQ",))
 
 
+def test_by_size_interpolates_linearly_and_holds_at_the_ends():
+  table = BySize(radii=(0.0275, 0.03, 0.0325), values=(0.286, 0.225, 0.161))
+  r = torch.tensor([0.02, 0.0275, 0.02875, 0.03, 0.03125, 0.0325, 0.04])
+  assert torch.allclose(
+    table.at(r),
+    torch.tensor([0.286, 0.286, 0.2555, 0.225, 0.193, 0.161, 0.161]),
+    atol=1e-6,
+  )
+  with pytest.raises(ValueError, match="increasing"):
+    BySize(radii=(0.03, 0.03), values=(1.0, 2.0))
+
+
+def test_the_balls_J_threshold_is_its_touch_angle_minus_0_05_at_the_nominal_radius():
+  """The gripper bench (`../results/S8-ball/bench/`): a 60 mm ball is first touched at 0.2752 rad."""
+  nominal = rw.BALL_JAW_OPEN_BY_RADIUS.at(torch.tensor([scene.BALL_RADIUS])).item()
+  assert (
+    nominal == pytest.approx(rw.BALL_JAW_OPEN) == pytest.approx(0.2752 - 0.05, abs=1e-3)
+  )
+  # A bigger ball is touched earlier, so its "open" is lower: never above its hold angle.
+  assert (
+    rw.BALL_JAW_OPEN_BY_RADIUS.values[0]
+    > rw.BALL_JAW_OPEN
+    > rw.BALL_JAW_OPEN_BY_RADIUS.values[-1]
+  )
+
+
 # -- The object in a live env ---------------------------------------------------------------
 
 
@@ -302,7 +332,7 @@ def test_J_threshold_is_per_shape_per_env(mix_env):
   env = mix_env
   env.reset()
   mask = mdp.ball_mask(env)
-  thr = mdp.resolve(env, PerShape(cube=rw.JAW_OPEN, ball=rw.BALL_JAW_OPEN))
+  thr = mdp.resolve(env, PerShape(cube=rw.JAW_OPEN, ball=rw.BALL_JAW_OPEN_BY_RADIUS))
   assert torch.allclose(thr[mask], torch.full_like(thr[mask], rw.BALL_JAW_OPEN))
   assert torch.allclose(thr[~mask], torch.full_like(thr[~mask], rw.JAW_OPEN))
   # A float stays a float; a cube's number is exactly what it was.
@@ -315,8 +345,11 @@ def test_J_threshold_is_per_shape_per_env(mix_env):
   q = robot.data.joint_pos.clone()
   q[:, jaw.joint_ids[0]] = between
   robot.write_joint_position_to_sim(q)
-  opened = _jaw_open_bool(env, jaw, PerShape(cube=rw.JAW_OPEN, ball=rw.BALL_JAW_OPEN))
-  assert bool(opened[~mask].all()) and not bool(opened[mask].any())
+  opened = _jaw_open_bool(
+    env, jaw, PerShape(cube=rw.JAW_OPEN, ball=rw.BALL_JAW_OPEN_BY_RADIUS)
+  )
+  # the ball's threshold (0.225) is above the cube's (0.15): open for a ball, still closed for a cube
+  assert bool(opened[mask].all()) and not bool(opened[~mask].any())
 
 
 @pytest.fixture(scope="module")
@@ -347,6 +380,16 @@ def test_ball_dr_draws_the_radius_per_episode_and_the_goal_follows_it(ball_dr_en
   f = env.sim.model.geom_friction[:, ball_g, 2] / scene.BALL_ROLLING_FRICTION
   lo_s, hi_s = pp.BALL_DR_ROLLING_SCALE
   assert f.min() >= lo_s - 1e-4 and f.max() <= hi_s + 1e-4 and f.std() > 0.1
+
+
+def test_ball_dr_J_threshold_follows_each_balls_radius(ball_dr_env):
+  env = ball_dr_env
+  env.reset()
+  hh = mdp.object_half_height(env).clone()
+  thr = mdp.resolve(env, rw.BALL_JAW_OPEN_BY_RADIUS)
+  assert torch.allclose(thr, rw.BALL_JAW_OPEN_BY_RADIUS.at(hh))
+  order = hh.argsort()
+  assert bool((thr[order].diff() <= 1e-9).all()), "a bigger ball has a lower threshold"
 
 
 def test_the_grasp_sensor_fires_on_a_ball_between_the_pads_and_not_before(ball_dr_env):
@@ -518,6 +561,191 @@ def test_a_thrown_ball_earns_less_than_one_set_down_and_rolls_away():
     assert earned[0] > 100.0, earned.tolist()
   finally:
     env.close()
+
+
+# -- EQ ----------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def eq_env():
+  env = ManagerBasedRlEnv(
+    cfg=_cfg("ball", num_envs=3, reward=RCTP_EQ), device=get_test_device()
+  )
+  env.reset()
+  yield env
+  env.close()
+
+
+def _place_ball_relative_to_pads(
+  env, dz: torch.Tensor, dxy: torch.Tensor | None = None
+):
+  """The ball's centre ``dz`` above the pad sites' midpoint (and ``dxy`` m aside), per env, held
+  there (its weight supported) through one step, which makes the teleport visible to the terms."""
+  robot, obj = env.scene["robot"], env.scene["object"]
+  sites = [
+    robot.site_names.index(f"gripper_left_fingertip_{s}_site")
+    for s in ("left", "right")
+  ]
+  mid = robot.data.site_pos_w[:, sites].mean(dim=1)
+  pose = obj.data.root_link_pose_w.clone()
+  pose[:, :3] = mid
+  pose[:, 2] += dz
+  if dxy is not None:
+    pose[:, 0] += dxy
+  obj.write_root_link_pose_to_sim(pose)
+  obj.write_root_link_velocity_to_sim(torch.zeros_like(obj.data.root_link_vel_w))
+  weight = torch.zeros(env.num_envs, 1, 3, device=env.device)
+  weight[:, 0, 2] = env.sim.model.body_mass[:, obj.indexing.body_ids[0]] * 9.81
+  obj.write_external_wrench_to_sim(weight, torch.zeros_like(weight))
+  env.step(torch.zeros(env.action_space.shape, device=env.device))
+  obj.write_external_wrench_to_sim(torch.zeros_like(weight), torch.zeros_like(weight))
+
+
+def test_eq_pays_at_the_height_the_bench_found_and_less_off_it(eq_env):
+  env = eq_env
+  env.reset()
+  zero = torch.zeros(env.action_space.shape, device=env.device)
+  for _ in range(30):  # the arm settles from the reset's jitter
+    env.step(zero)
+  # pad midpoint - ball centre = EQ_OFFSET, then 15 mm too high, then 15 mm too low
+  _place_ball_relative_to_pads(
+    env, -torch.tensor([rw.EQ_OFFSET, rw.EQ_OFFSET + 0.015, rw.EQ_OFFSET - 0.015])
+  )
+  value = _term(env, "pad_height")
+  assert value[0] > 0.8, value.tolist()
+  assert value[1] < 0.05 and value[2] < 0.05, value.tolist()
+  assert env.reward_manager.get_term_cfg("pad_height").weight == rw.EQ_WEIGHT
+
+
+def test_eq_pays_nothing_once_the_ball_has_been_lifted_or_when_the_pads_are_far(eq_env):
+  env = eq_env
+  env.reset()
+  zero = torch.zeros(env.action_space.shape, device=env.device)
+  for _ in range(30):
+    env.step(zero)
+  ideal = -torch.full((3,), rw.EQ_OFFSET, device=env.device)
+  _place_ball_relative_to_pads(
+    env, ideal, dxy=torch.tensor([0.0, 0.0, 0.05], device=env.device)
+  )
+  value = _term(env, "pad_height")
+  assert value[0] > 0.8 and value[1] > 0.8 and value[2] == 0.0, (
+    value.tolist()
+  )  # 5 cm aside: not `near`
+  was_lifted = getattr(env, _WAS_LIFTED)
+  saved = was_lifted.clone()
+  was_lifted[:] = True
+  try:
+    assert torch.all(_term(env, "pad_height") == 0.0)
+  finally:
+    was_lifted[:] = saved
+
+
+# -- L5: the per-step reward rises along the task, with a ball -----------------------------------
+
+_SCRIPT = pathlib.Path(__file__).parent.parent / "scripts/scripted_pick_place.py"
+_SPEC = importlib.util.spec_from_file_location("scripted_pick_place_s8", _SCRIPT)
+assert _SPEC and _SPEC.loader
+scripted = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = scripted
+_SPEC.loader.exec_module(scripted)
+
+ORDER = ("reach", "carry", "over_target", "held_on_target", "placed")
+#: c1a's hover height: the state the policies converged to before M2, as in the S5.2 ordering test.
+CARRY_HEIGHT = 0.07
+VERTICAL_LOWERING = tuple(
+  step
+  for phase in scripted.PHASES
+  for step in (
+    (("lower", "retreat", True, 30), ("lower_down", "place", True, 40))
+    if phase[0] == "lower"
+    else (phase,)
+  )
+)
+
+
+@pytest.fixture(scope="module")
+def ball_episode():
+  """One scripted episode with a ball under the S8 arm (RCTP + EQ), every reward term recorded at
+  every step for env 0 (weighted, as the manager sums them): the states the ordering is about are
+  reached physically -- a held ball cannot be teleported into the jaw."""
+  rec = collections.defaultdict(list)
+  terms: dict = {}
+
+  def hook(phase, env):
+    if not terms:
+      for name in env.reward_manager.active_terms:
+        terms[name] = env.reward_manager.get_term_cfg(name)
+    rec[phase].append(
+      {
+        name: float(cfg.weight * cfg.func(env, **cfg.params)[0])
+        for name, cfg in terms.items()
+        if name
+        in (
+          "reach",
+          "grasp",
+          "lift",
+          "goal",
+          "goal_near",
+          "release",
+          "placed",
+          "retreat",
+          "pad_height",
+        )
+      }
+    )
+
+  saved = scripted.CLEAR_HEIGHT
+  scripted.CLEAR_HEIGHT = CARRY_HEIGHT
+  try:
+    rows = scripted.rollout(
+      num_envs=1,
+      device=get_test_device(),
+      reward=RCTP_EQ,
+      verbose=False,
+      hook=hook,
+      phases=VERTICAL_LOWERING,
+      shape=pp.OBJECT_SHAPES["ball"],
+    )
+  finally:
+    scripted.CLEAR_HEIGHT = saved
+  assert rows[0]["placed_and_lifted"], rows[0]
+  return rec
+
+
+def _state_totals(rec) -> dict[str, float]:
+  total = lambda step: sum(step.values())  # noqa: E731
+  placed = [t for t in rec["open"] if t["placed"] > 0]
+  assert placed, "the ball never counted as placed after the jaw opened"
+  return {
+    "reach": total(rec["descend"][-1]),
+    "carry": total(rec["lift"][-1]),
+    "over_target": total(rec["steady"][-1]),
+    "held_on_target": total(rec["hold"][-1]),
+    "placed": total(placed[-1]),
+  }
+
+
+def test_the_reward_rises_strictly_along_the_task_with_a_ball(ball_episode):
+  totals = _state_totals(ball_episode)
+  values = [totals[name] for name in ORDER]
+  assert all(a < b for a, b in zip(values, values[1:], strict=False)), totals
+
+
+def test_the_ball_is_paid_for_the_grasp_height_only_on_the_way_to_the_grasp(
+  ball_episode,
+):
+  """EQ is on during the approach and the close, and off from the lift on."""
+  approach = [t["pad_height"] for t in ball_episode["descend"] + ball_episode["close"]]
+  assert max(approach) > 0.5, "EQ never paid on the way to the grasp"
+  for phase in ("lift", "carry", "steady", "lower", "hold", "open"):
+    assert all(t["pad_height"] == 0.0 for t in ball_episode[phase]), phase
+
+
+def test_placed_keeps_paying_through_the_retreat_with_a_ball(ball_episode):
+  after = ball_episode["open"] + ball_episode["retreat"] + ball_episode["settle"]
+  first = next(i for i, t in enumerate(after) if t["placed"] > 0)
+  paid = [t["placed"] > 0 for t in after[first:]]
+  assert sum(paid) / len(paid) > 0.9
 
 
 # -- Rolling -----------------------------------------------------------------------------------
