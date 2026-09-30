@@ -13,7 +13,12 @@ these worlds only add what is static in the training scene:
 Poses are placed relative to the robot's standing base in the PAL simulator, measured from
 /simulator/floating_base_state after it settles (the base is not fixed there).
 
-  python3 make_worlds.py --out <dir> [--base x y z qx qy qz qw]
+  python3 make_worlds.py --out <dir> [--base x y z qx qy qz qw] [--profile pick_place_profile.yaml]
+
+`--profile` (S7 models, `export_for_pal_s7.py`) takes the table height, table extent and spawn
+centre from the model's profile instead of the S5.2 constants above, and the episodes'
+offsets are from that spawn centre. The table's top is then 0.085 m below base_link
+(baseline B, table at 0.815 m), the spawn centre (0.40, 0.27).
 """
 
 from __future__ import annotations
@@ -110,18 +115,34 @@ def main() -> None:
   p.add_argument(
     "--episodes", type=Path, default=Path(__file__).with_name("episodes.json")
   )
+  p.add_argument("--profile", type=Path, default=None)
   args = p.parse_args()
+  table_top_z, table_center, table_half, spawn = (
+    TABLE_TOP_Z_B,
+    TABLE_CENTER_B,
+    TABLE_HALF,
+    SPAWN_B,
+  )
+  if args.profile is not None:
+    import yaml
+
+    prof = yaml.safe_load(args.profile.read_text())
+    tx, ty = prof["table_x_b"], prof["table_y_b"]
+    table_top_z = prof["table_top_z_b"]
+    table_center = ((tx[0] + tx[1]) / 2, (ty[0] + ty[1]) / 2)
+    table_half = ((tx[1] - tx[0]) / 2, (ty[1] - ty[0]) / 2)
+    spawn = tuple(prof["cube_spawn_center_b"][:2])
   args.out.mkdir(parents=True, exist_ok=True)
   base = tuple(args.base)
   yaw0 = base_yaw(base)
 
   top_c = to_world(
-    base, (TABLE_CENTER_B[0], TABLE_CENTER_B[1], TABLE_TOP_Z_B - TABLE_THICKNESS / 2)
+    base, (table_center[0], table_center[1], table_top_z - TABLE_THICKNESS / 2)
   )
   table = box_model(
     "table",
     (*top_c, 0.0, 0.0, yaw0),
-    (2 * TABLE_HALF[0], 2 * TABLE_HALF[1], TABLE_THICKNESS),
+    (2 * table_half[0], 2 * table_half[1], TABLE_THICKNESS),
   )
   (args.out / "table.world").write_text(world(table))
   meta = {
@@ -131,7 +152,7 @@ def main() -> None:
   }
   for e in json.loads(args.episodes.read_text())["episodes"]:
     c = to_world(
-      base, (SPAWN_B[0] + e["dx"], SPAWN_B[1] + e["dy"], TABLE_TOP_Z_B + CUBE_HALF)
+      base, (spawn[0] + e["dx"], spawn[1] + e["dy"], table_top_z + CUBE_HALF)
     )
     cube = box_model(
       "static_cube", (*c, 0.0, 0.0, yaw0 + e["dyaw"]), (2 * CUBE_HALF,) * 3

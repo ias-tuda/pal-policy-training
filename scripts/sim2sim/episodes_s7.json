@@ -1,0 +1,112 @@
+{
+ "description": "Episode specs shared by the MuJoCo reference and the PAL sim2sim runs of the S7 (RCTP) policies. x, y, yaw: cube spawn in the training env frame, inside the W2 box (x 0.34-0.46, y 0.20-0.34, every yaw; a cube is 4-fold symmetric so 0.78 = pi/4 is the extreme); dx, dy, dyaw: the same relative to the W2 centre (0.40, 0.27) for the node; goal_dx, goal_dy: the goal's offset from the box centre (0.46, 0.08), inside baseline B's +-2 cm target box. Robot starts exactly at its default pose, table nominal.",
+ "spawn_center_env_xy": [
+  0.4,
+  0.27
+ ],
+ "goal_center_env_xy": [
+  0.46,
+  0.08
+ ],
+ "episodes": [
+  {
+   "id": 0,
+   "x": 0.4,
+   "y": 0.27,
+   "yaw": 0.0,
+   "dx": 0.0,
+   "dy": 0.0,
+   "dyaw": 0.0,
+   "goal_dx": 0.0,
+   "goal_dy": 0.0
+  },
+  {
+   "id": 1,
+   "x": 0.35,
+   "y": 0.22,
+   "yaw": 0.6,
+   "dx": -0.05,
+   "dy": -0.05,
+   "dyaw": 0.6,
+   "goal_dx": 0.02,
+   "goal_dy": 0.02
+  },
+  {
+   "id": 2,
+   "x": 0.45,
+   "y": 0.22,
+   "yaw": -0.6,
+   "dx": 0.05,
+   "dy": -0.05,
+   "dyaw": -0.6,
+   "goal_dx": 0.02,
+   "goal_dy": -0.02
+  },
+  {
+   "id": 3,
+   "x": 0.35,
+   "y": 0.32,
+   "yaw": -0.3,
+   "dx": -0.05,
+   "dy": 0.05,
+   "dyaw": -0.3,
+   "goal_dx": -0.02,
+   "goal_dy": 0.02
+  },
+  {
+   "id": 4,
+   "x": 0.45,
+   "y": 0.32,
+   "yaw": 0.3,
+   "dx": 0.05,
+   "dy": 0.05,
+   "dyaw": 0.3,
+   "goal_dx": -0.02,
+   "goal_dy": -0.02
+  },
+  {
+   "id": 5,
+   "x": 0.4,
+   "y": 0.21,
+   "yaw": 0.78,
+   "dx": 0.0,
+   "dy": -0.06,
+   "dyaw": 0.78,
+   "goal_dx": 0.0,
+   "goal_dy": 0.0
+  },
+  {
+   "id": 6,
+   "x": 0.4,
+   "y": 0.33,
+   "yaw": -0.4,
+   "dx": 0.0,
+   "dy": 0.06,
+   "dyaw": -0.4,
+   "goal_dx": 0.0,
+   "goal_dy": 0.0
+  },
+  {
+   "id": 7,
+   "x": 0.34,
+   "y": 0.27,
+   "yaw": 0.2,
+   "dx": -0.06,
+   "dy": 0.0,
+   "dyaw": 0.2,
+   "goal_dx": 0.0,
+   "goal_dy": 0.0
+  },
+  {
+   "id": 8,
+   "x": 0.46,
+   "y": 0.27,
+   "yaw": -0.2,
+   "dx": 0.06,
+   "dy": 0.0,
+   "dyaw": -0.2,
+   "goal_dx": 0.0,
+   "goal_dy": 0.0
+  }
+ ]
+}
