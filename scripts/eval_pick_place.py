@@ -100,10 +100,16 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
   _on_surface_bool,
   _placed_bool,
 )
+from pal_mjlab.tasks.manipulation.mdp.shapes import (
+  PerShape,
+  object_half_height,
+  resolve,
+)
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   GOAL_THRESHOLD,
   OBJECT,
 )
+from pal_mjlab.tasks.manipulation.pick_place.rewards import BALL_JAW_OPEN
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
@@ -141,6 +147,17 @@ M6_GRADE = {"dist_std": 0.02, "height_free": 0.01, "height_std": 0.01, "floor": 
 #: `HANDOFF_STEPS` consecutive steps, or at `HANDOFF_TIMEOUT_S`. "Home": every driven-arm joint
 #: within `HOME_TOL` (rad) of its default. Restated like `SET_DOWN_*`; the test checks them.
 JAW_OPEN = 0.15
+#: Plan S8: J's threshold depends on the object (L7) -- the ball's is `rewards.BALL_JAW_OPEN`;
+#: `jaw_open_for` is the number for an env's own object, per env when it can be either.
+JAW_OPEN_BY_SHAPE = PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN)
+
+
+def jaw_open_for(env: ManagerBasedRlEnv) -> float | torch.Tensor:
+  """J's threshold for ``env``'s object: `JAW_OPEN` for a cube (a float, as every run before S8),
+  `BALL_JAW_OPEN` for a ball, per env for plan S8's MIX."""
+  return resolve(env, JAW_OPEN_BY_SHAPE)
+
+
 #: ... and closed above this (a stroke is open -> closed, with hysteresis; S7-7's re-approach count).
 JAW_CLOSED = 0.25
 JAW_JOINT = "gripper_left_finger_joint"
@@ -843,16 +860,18 @@ class RetreatTally:
     arm_home_err: torch.Tensor,
     placed_jz: torch.Tensor | None = None,
     tilt: torch.Tensor | None = None,
+    jaw_open_below: float | torch.Tensor = JAW_OPEN,
   ) -> torch.Tensor:
     """One step's state -> the envs the position controller drives this step. (B,)
 
     ``tcp_above`` is the TCP's height above the cube's top, ``goal_dxy`` the cube's horizontal
     distance to the target, ``arm_home_err`` the driven arm's max |q - q_default|;
     ``placed_jz`` is ``placed_j`` under plan S7-5's Z tolerance, ``tilt`` the cube's tilt
-    (rad), both optional."""
+    (rad), both optional; ``jaw_open_below`` J's threshold (`jaw_open_for`, per env for a mix of
+    objects)."""
     grasped, lifted, placed_j = grasped.bool(), lifted.bool(), placed_j.bool()
     placed_jz = torch.zeros_like(placed_j) if placed_jz is None else placed_jz.bool()
-    jaw_open = jaw_q < JAW_OPEN
+    jaw_open = jaw_q < jaw_open_below
     self.lifted |= lifted
     let_go = self.prev_grasped & ~grasped & self.lifted
     self.jaw_at_let_go = torch.where(let_go, jaw_q, self.jaw_at_let_go)
@@ -1352,7 +1371,7 @@ def retreat_state(
   max |q - q_default|, for `RetreatTally.step`. (B,) each"""
   robot, obj = env.scene[ROBOT], env.scene[OBJECT]
   q = robot.data.joint_pos
-  half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+  half_z = object_half_height(env, OBJECT)
   _, tcp = positions(env)
   above = tcp[:, 2] - (obj.data.root_link_pos_w[:, 2] + half_z)
   home_err = (q[:, arm_ids] - robot.data.default_joint_pos[:, arm_ids]).abs().amax(-1)
@@ -1725,7 +1744,8 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
     fmt = lambda v, u="m": "n/a" if v is None else f"{v:6.3f} {u}"  # noqa: E731
     print("\n  RELEASE BY THE JAW, RETREAT, HAND-OFF (plan S7-4) ------------------")
     print(
-      f"    jaw opened (< {JAW_OPEN} rad)   {result['jaw_released']:6.1%}   after the lift"
+      f"    jaw opened (< {JAW_OPEN} rad; a ball {BALL_JAW_OPEN})   "
+      f"{result['jaw_released']:6.1%}   after the lift"
     )
     print(
       f"    jaw at the pads' let-go  {fmt(result['jaw_at_let_go_median_rad'], 'rad')}  (median)"
@@ -1856,17 +1876,19 @@ def main() -> None:
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
+      jaw_thr = jaw_open_for(env)
       handed = retreat.step(
         jaw_q,
         flags["grasped"],
         flags["lifted"],
-        flags["placed_and_lifted"] & (jaw_q < JAW_OPEN),
+        flags["placed_and_lifted"] & (jaw_q < jaw_thr),
         tcp_above,
         obj_pos[:, :2],
         dxy,
         home_err,
-        placed_jz=flags["placed_and_lifted_z"] & (jaw_q < JAW_OPEN),
+        placed_jz=flags["placed_and_lifted_z"] & (jaw_q < jaw_thr),
         tilt=tilt(env),
+        jaw_open_below=jaw_thr,
       )
       if plant is not None:
         plant.measure_env(

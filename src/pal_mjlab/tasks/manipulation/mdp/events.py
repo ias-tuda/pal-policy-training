@@ -21,6 +21,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
 
 from pal_mjlab.tasks.manipulation.mdp.observations import _RELEASE, _WAS_LIFTED
+from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
 
 #: Same module-level singleton the observation terms use: a SceneEntityCfg built in an
 #: argument default is evaluated once at import and shared, which ruff flags as B008.
@@ -87,7 +88,7 @@ def reset_objects_on_surface(
   """Place free objects upright on a surface, clear of one another.
 
   Each object is dropped exactly onto the surface (its own half-height above the measured
-  top face), at an XY offset sampled from ``pose_range`` relative to the surface centre,
+  top face -- a box's half-z, a ball's radius, `shapes.object_half_height`), at an XY offset sampled from ``pose_range`` relative to the surface centre,
   with a yaw from ``pose_range["yaw"]``.
 
   ``min_separation`` is enforced by vectorised rejection: up to ``max_attempts`` rounds,
@@ -150,7 +151,7 @@ def reset_objects_on_surface(
       )
     placed.append(xy)
 
-    half_z = env.sim.model.geom_size[env_ids, asset.indexing.geom_ids[0], 2]
+    half_z = object_half_height(env, asset_cfg.name, env_ids)
     pos = torch.cat([xy, (top_z + half_z).unsqueeze(-1)], dim=-1)
 
     zeros = torch.zeros(n, device=device)

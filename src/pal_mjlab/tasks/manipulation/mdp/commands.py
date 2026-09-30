@@ -22,6 +22,8 @@ from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.manipulation.mdp.commands import LiftingCommand, LiftingCommandCfg
 
+from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
@@ -49,9 +51,8 @@ class EntityOffsetCommand(LiftingCommand):
   @property
   def _stacking_height(self) -> torch.Tensor:
     """Half-height of the reference plus half-height of the object, per env."""
-    geom_size = self._env.sim.model.geom_size
-    ref_half_z = geom_size[:, self.reference.indexing.geom_ids[0], 2]
-    obj_half_z = geom_size[:, self.object.indexing.geom_ids[0], 2]
+    ref_half_z = object_half_height(self._env, self.cfg.reference_name)
+    obj_half_z = object_half_height(self._env, self.cfg.entity_name)
     return ref_half_z + obj_half_z
 
   def _goal_from_reference(self) -> torch.Tensor:
@@ -83,7 +84,8 @@ class SurfaceOffsetCommand(LiftingCommand):
 
   This reads the same two quantities ``mdp.events.reset_objects_on_surface`` does -- the
   surface geom's world XY and the height of its top face -- so the goal and the cube's
-  spawn agree about where the table is by construction.
+  spawn agree about where the table is by construction. The goal's height is the surface plus
+  the object's own half-height (a ball's radius, plan S8: `shapes.object_half_height`).
 
   With a nonzero ``offset_range`` the offset is drawn per env from a box around ``offset``
   each time the command resamples -- once per episode for a pick-and-place goal -- so the goal
@@ -123,7 +125,7 @@ class SurfaceOffsetCommand(LiftingCommand):
 
     centre_xy = _surface_centre_xy(self._env, self._surface_cfg)
     top_z = surface_top_z(self._env, self._surface_cfg)
-    half_z = self._env.sim.model.geom_size[:, self.object.indexing.geom_ids[0], 2]
+    half_z = object_half_height(self._env, self.cfg.entity_name)
     return torch.cat([centre_xy + self.offsets, (top_z + half_z).unsqueeze(-1)], dim=-1)
 
   def set_offsets(self, env_ids: torch.Tensor, offsets: torch.Tensor) -> None:

@@ -454,6 +454,7 @@ def make_tabletop_env_cfg(
   action_mode: str = "abs",
   command_obs: bool = False,
   goal_area: dict | None = None,
+  object_geoms: tuple[str, ...] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -512,6 +513,8 @@ def make_tabletop_env_cfg(
     command_obs: plan S7-8's ``CMD_OBS``: the actor's and critic's ``actions`` term shows the
       commanded target relative to the default pose (`mdp.commanded_target_rel`) instead of the
       raw last action. Still 8-D.
+    object_geoms: the manipulated object's geom names, for the DR of its friction (`DR-object`);
+      None is the one geom ``{OBJECT}_geom`` a cube and a ball have. Plan S8's MIX has two.
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
@@ -922,7 +925,13 @@ def make_tabletop_env_cfg(
     episode_length_s=episode_length_s,
   )
   if dr_level is not None:
-    apply_dr_level(cfg, dr_level, action_joints, spawn_widening=dr_spawn_widening)
+    apply_dr_level(
+      cfg,
+      dr_level,
+      action_joints,
+      spawn_widening=dr_spawn_widening,
+      object_geoms=object_geoms,
+    )
   if latency.tracker_lag is not None:
     _apply_tracker_lag(cfg, latency.tracker_lag)
   if occlusion is not None:
@@ -1095,6 +1104,7 @@ def apply_dr_level(
   action_joints: SceneEntityCfg,
   object_name: str = OBJECT,
   spawn_widening: bool = True,
+  object_geoms: tuple[str, ...] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Set the environment's domain randomisation to a named rung, in place.
 
@@ -1111,7 +1121,9 @@ def apply_dr_level(
   cfg.events["reset_robot_joints"].params["position_range"] = (0.0, 0.0)
 
   if rung >= _dr_index("DR-object"):
-    object_geom = SceneEntityCfg(object_name, geom_names=(f"{object_name}_geom",))
+    object_geom = SceneEntityCfg(
+      object_name, geom_names=object_geoms or (f"{object_name}_geom",)
+    )
     cfg.events["object_friction"] = EventTermCfg(
       mode="startup",
       func=dr.geom_friction,

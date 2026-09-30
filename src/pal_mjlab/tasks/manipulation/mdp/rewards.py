@@ -28,6 +28,11 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
   _release_latch,
   _was_lifted_bool,
 )
+from pal_mjlab.tasks.manipulation.mdp.shapes import (
+  PerShape,
+  object_half_height,
+  resolve,
+)
 
 _ROBOT = SceneEntityCfg("robot")
 
@@ -80,7 +85,7 @@ def released_at_goal(
   threshold: float = 0.05,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> torch.Tensor:
   """1.0 when the object is at the goal and no longer held.
 
@@ -115,7 +120,7 @@ def object_placed(
   velocity_threshold: float = 0.05,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> torch.Tensor:
   """1.0 on full success: at the goal, released, and come to rest.
 
@@ -290,7 +295,7 @@ def release_quality(
   floor: float = 0.25,
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
@@ -336,7 +341,7 @@ def released_at_goal_graded(
   floor: float = 0.25,
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -388,7 +393,7 @@ def object_placed_graded(
   floor: float = 0.25,
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -454,7 +459,7 @@ def set_down_placed(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float,
+  jaw_open: float | PerShape,
   set_down_steps: int,
   threshold: float = 0.05,
   velocity_threshold: float = 0.05,
@@ -494,7 +499,7 @@ def _tcp_above_object_top(
   robot: Entity = env.scene[asset_cfg.name]
   obj: Entity = env.scene[object_name]
   tcp_z = robot.data.site_pos_w[:, asset_cfg.site_ids].squeeze(1)[:, 2]
-  half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+  half_z = object_half_height(env, object_name)
   return tcp_z - (obj.data.root_link_pos_w[:, 2] + half_z)
 
 
@@ -505,7 +510,7 @@ def retreat_height(
   grasp_sensor_name: str,
   support_sensor_name: str,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float,
+  jaw_open: float | PerShape,
   asset_cfg: SceneEntityCfg,
   clear_height: float = 0.05,
   threshold: float = 0.05,
@@ -545,7 +550,7 @@ def pad_contact_after_release(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float,
+  jaw_open: float | PerShape,
 ) -> torch.Tensor:
   """1.0 while either pad touches the object after this episode's J-release; weight it
   negative (plan S7-4's M8: the nudging after the set-down in S7-2's videos). (B,)"""
@@ -570,8 +575,8 @@ def open_at_goal(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg,
-  jaw_open: float,
-  jaw_hold: float,
+  jaw_open: float | PerShape,
+  jaw_hold: float | PerShape,
   gate: tuple[float, float],
 ) -> torch.Tensor:
   """Plan S7-5's O: how far the jaw has opened from the hold angle towards open,
@@ -603,7 +608,8 @@ def open_at_goal(
   near = _at_goal(goal, obj.data.root_link_pos_w, gate)
   robot: Entity = env.scene[jaw_cfg.name]
   q = robot.data.joint_pos[:, jaw_cfg.joint_ids][:, 0]
-  opened = ((jaw_hold - q) / (jaw_hold - jaw_open)).clamp(0.0, 1.0)
+  hold, open_ = resolve(env, jaw_hold), resolve(env, jaw_open)
+  opened = ((hold - q) / (hold - open_)).clamp(0.0, 1.0)
   return opened * (was_lifted & ~latch.released & near).float()
 
 
@@ -730,6 +736,37 @@ def keypoint_distance_reward(
     torch.exp(kernel_a * distance) + kernel_b + torch.exp(-kernel_a * distance)
   )
   return kernel.mean(dim=-1) * (2.0 + kernel_b)
+
+
+def grasp_height_match(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  pad_cfg: SceneEntityCfg,
+  offset: float = 0.0,
+  std: float = 0.005,
+  near: float = 0.03,
+) -> torch.Tensor:
+  """Plan S8's EQ: how well the pads' centre is at the height a ball is held at.
+
+  ``G(z_pads - z_object - offset, std)``, paid while the pads' midpoint (the two pad sites in
+  ``pad_cfg``) is within ``near`` of the object horizontally and the object has not been lifted
+  yet (the `was_lifted` latch), so the approach's last centimetres and the close are steered to
+  the height the bench found holds best (``offset``); once it is lifted the term is 0 and cannot be
+  farmed by a carry. Parallel pads touch a sphere on the line between them; off the equator the
+  contact normals tilt and the ball is squeezed up or down out of the jaw. (B,)
+  """
+  robot: Entity = env.scene[pad_cfg.name]
+  obj: Entity = env.scene[object_name]
+  pads = robot.data.site_pos_w[:, pad_cfg.site_ids]
+  assert pads.shape[1] == 2, f"pad_cfg must name two sites, got {pad_cfg.site_names}"
+  mid = pads.mean(dim=1)
+  pos = obj.data.root_link_pos_w
+  dz = mid[:, 2] - pos[:, 2] - offset
+  near_xy = torch.norm(mid[:, :2] - pos[:, :2], dim=-1) < near
+  lifted = _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
+  return torch.exp(-torch.square(dz / std)) * (near_xy & ~lifted).float()
 
 
 def time_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:

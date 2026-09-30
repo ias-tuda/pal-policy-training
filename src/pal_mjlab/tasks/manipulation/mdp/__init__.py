@@ -72,6 +72,7 @@ from .rewards import (
   bring_object_when_lifted,
   contact_penalty,
   entity_lin_vel_l2,
+  grasp_height_match,
   grasped,
   held_object_slide_speed,
   held_object_speed_hinge,
@@ -93,6 +94,14 @@ from .rewards import (
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
+from .shapes import (
+  PerShape,
+  ball_mask,
+  object_half_height,
+  resolve,
+  set_object_shape,
+  shape_kind,
+)
 from .terminations import (
   entity_below_height,
   entity_out_of_reach,
@@ -101,6 +110,13 @@ from .terminations import (
 )
 
 __all__ = [
+  "PerShape",
+  "ball_mask",
+  "grasp_height_match",
+  "object_half_height",
+  "resolve",
+  "set_object_shape",
+  "shape_kind",
   "CubeSensor",
   "OccCfg",
   "object_position_occ",

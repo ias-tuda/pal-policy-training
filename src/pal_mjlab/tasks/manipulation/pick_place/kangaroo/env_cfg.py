@@ -48,6 +48,9 @@ Plan S7-8 adds `SLEW=stack` (the stack task's speeds, per joint group, in place 
 what the actor's ``actions`` term shows -- the raw last action, or the commanded target; `delta`
 always shows the target), `SPAWN=WC` / `WCK` and `TARGET` (`B` | `WC` | `WCK`: the cube and the target
 drawn from one wide area -- Claudius's, or the part of it that plans -- >= 10 cm apart) and `EPISODE_S` (the episode length, s). Unset is S7-7's cfg exactly.
+Plan S8 adds `SHAPE` (`cube` | `ball` | `ball-dr` | `mix`, `pick_place_env_cfg.OBJECT_SHAPES`): what is
+picked up -- the 5 cm cube of every run up to S7-8, a 6 cm ball, the ball with its size and rolling
+friction drawn, or a cube or a ball at random each episode. Unset is the cube.
 """
 
 from __future__ import annotations
@@ -66,6 +69,7 @@ from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, 
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
+  OBJECT_SHAPES,
   SPAWN_BOXES,
   TARGET_AREAS,
   TOOL_SPEED_CAPS,
@@ -105,6 +109,7 @@ ACTION_ENV_VAR = "ACTION"
 CMD_OBS_ENV_VAR = "CMD_OBS"
 TARGET_ENV_VAR = "TARGET"
 EPISODE_ENV_VAR = "EPISODE_S"
+SHAPE_ENV_VAR = "SHAPE"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -121,6 +126,7 @@ DEFAULT_OCC = "none"
 DEFAULT_OBJ_OBS = "live"
 DEFAULT_ACTION = "abs"
 DEFAULT_TARGET = "B"
+DEFAULT_SHAPE = "cube"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -237,6 +243,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     stack_speed=stack_speed,
     action_mode=action,
     command_obs=_select_command_obs(action),
+    shape=OBJECT_SHAPES[_select(SHAPE_ENV_VAR, DEFAULT_SHAPE, OBJECT_SHAPES)],
   )
 
 

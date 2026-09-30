@@ -16,17 +16,25 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
+from collections.abc import Mapping
 
+from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp import (
+  dr as dr_terms,
+)  # `dr` is make_pick_place_env_cfg's rung argument
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 
 from pal_mjlab.tasks.manipulation import mdp, scene
+from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  BALL_JAW_OPEN,
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
+  JAW_OPEN,
   NO_SUCCESS_TERMINATION,
   REQUIRE_LIFTED,
   RewardContext,
@@ -234,6 +242,62 @@ EFFORT_BOUNDS = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class ObjectShape:
+  """What is manipulated (plan S8, `SHAPE`): the object's model, where J's threshold sits for it,
+  and what is drawn per episode or per world."""
+
+  objects: Mapping[str, EntityCfg] | None
+  """The scene's objects; None is the default 5 cm cube."""
+
+  jaw_open: float | PerShape
+  """Plan S7-4's J threshold: the jaw counts as open below it. The jaw first touches a 6 cm ball
+  at a different angle to a 5 cm cube, so it is a per-shape number (plan S8, L7)."""
+
+  geoms: tuple[str, ...] | None = None
+  """The object's geoms for the DR of its friction; None is ``object_geom``."""
+
+  ball_probability: float | None = None
+  """Draw the shape per episode (`mdp.set_object_shape`): a ball with this probability, else a
+  cube. None for an object whose shape never changes."""
+
+  ball_radius: tuple[float, float] | None = None
+  """BALL-DR's radius range, m, drawn per episode; None keeps the spec's."""
+
+  rolling_scale: tuple[float, float] | None = None
+  """BALL-DR's factor on the ball's rolling friction, drawn log-uniformly per world."""
+
+
+#: BALL-DR (plan S8): the ball's diameter 5.5-6.5 cm and its rolling friction x (0.5, 2). The mass
+#: (30-100 g) and sliding friction come with `DR-object`, which every run here has.
+BALL_DR_RADIUS = (0.0275, 0.0325)
+BALL_DR_ROLLING_SCALE = (0.5, 2.0)
+
+#: The manipulated object by name (`SHAPE`, plan S8). ``cube`` is every run up to S7-8. ``ball`` is
+#: a 6 cm sphere (BALL, BALL-FT, BALL-EQ), ``ball-dr`` the same with its size and rolling friction
+#: drawn (BALL-DR), ``mix`` one body that is a cube or a ball, 50/50 per episode (MIX; the two
+#: shapes are two geoms of the body, one of them shrunk to a speck in any world).
+OBJECT_SHAPES = {
+  "cube": ObjectShape(objects=None, jaw_open=JAW_OPEN),
+  "ball": ObjectShape(
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT)}, jaw_open=BALL_JAW_OPEN
+  ),
+  "ball-dr": ObjectShape(
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT)},
+    jaw_open=BALL_JAW_OPEN,
+    ball_probability=1.0,
+    ball_radius=BALL_DR_RADIUS,
+    rolling_scale=BALL_DR_ROLLING_SCALE,
+  ),
+  "mix": ObjectShape(
+    objects={OBJECT: scene.get_mixed_cfg(name=OBJECT)},
+    jaw_open=PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN),
+    geoms=(f"{OBJECT}_geom", scene.mixed_ball_geom_name(OBJECT)),
+    ball_probability=0.5,
+  ),
+}
+
+
 def _object_pose_range(spawn: SpawnBox) -> dict[str, tuple[float, float]]:
   """Spawn box for ``mdp.reset_objects_on_surface``, which samples about the table centre.
 
@@ -346,6 +410,7 @@ def make_pick_place_env_cfg(
   stack_speed: bool = False,
   action_mode: str = "abs",
   command_obs: bool = False,
+  shape: ObjectShape = OBJECT_SHAPES["cube"],
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -374,7 +439,13 @@ def make_pick_place_env_cfg(
       (or the reward variant's).
     stack_speed, action_mode, command_obs: plan S7-8's ``SLEW=stack``, ``ACTION`` and ``CMD_OBS``.
       See `make_tabletop_env_cfg`.
+    shape: plan S8's ``SHAPE`` -- the manipulated object (`OBJECT_SHAPES`): the 5 cm cube of every
+      run up to S7-8, a 6 cm ball, the ball with its size and rolling friction drawn, or either.
   """
+  if occlusion is not None and shape is not OBJECT_SHAPES["cube"]:
+    raise ValueError(
+      "the occlusion model's line of sight is built for the 5 cm cube; SHAPE is not cube (plan S8)"
+    )
   if target_xy is None:
     target_xy = baseline.target_xy
   cfg = make_tabletop_env_cfg(
@@ -402,7 +473,36 @@ def make_pick_place_env_cfg(
     action_mode=action_mode,
     command_obs=command_obs,
     goal_area=None if target_area is None else _goal_area(target_area),
+    objects=shape.objects,
+    object_geoms=shape.geoms,
   )
+  if shape.ball_probability is not None:
+    # Before `reset_objects`, which places the object at its half-height above the table, and
+    # before the goal command resamples at the half-height of this episode's shape.
+    cfg.events = {
+      "reset_object_shape": EventTermCfg(
+        func=mdp.set_object_shape,
+        mode="reset",
+        params={
+          "asset_cfg": SceneEntityCfg(OBJECT),
+          "ball_probability": shape.ball_probability,
+          "ball_radius": shape.ball_radius,
+        },
+      ),
+      **cfg.events,
+    }
+  if shape.rolling_scale is not None:
+    cfg.events["ball_rolling_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr_terms.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(OBJECT, geom_names=(f"{OBJECT}_geom",)),
+        "operation": "scale",
+        "distribution": "log_uniform",
+        "axes": [2],  # rolling; sliding is DR-object's, torsional the pads'.
+        "ranges": shape.rolling_scale,
+      },
+    )
 
   gripper = robot.gripper(gripper_name)
   grasp_sensor = gripper.contact_sensor_name
@@ -422,6 +522,8 @@ def make_pick_place_env_cfg(
       surface_sensor=gripper.surface_sensor_name,
       threshold=GOAL_THRESHOLD,
       jaw=SceneEntityCfg(ROBOT, joint_names=(re.escape(gripper.finger_joint),)),
+      jaw_open=shape.jaw_open,
+      pads=SceneEntityCfg(ROBOT, site_names=gripper.pad_sites),
     ),
   )
   if effort.hinge:
