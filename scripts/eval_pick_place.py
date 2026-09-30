@@ -109,7 +109,10 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   GOAL_THRESHOLD,
   OBJECT,
 )
-from pal_mjlab.tasks.manipulation.pick_place.rewards import BALL_JAW_OPEN
+from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  BALL_JAW_OPEN,
+  BALL_JAW_OPEN_BY_RADIUS,
+)
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
@@ -147,9 +150,9 @@ M6_GRADE = {"dist_std": 0.02, "height_free": 0.01, "height_std": 0.01, "floor": 
 #: `HANDOFF_STEPS` consecutive steps, or at `HANDOFF_TIMEOUT_S`. "Home": every driven-arm joint
 #: within `HOME_TOL` (rad) of its default. Restated like `SET_DOWN_*`; the test checks them.
 JAW_OPEN = 0.15
-#: Plan S8: J's threshold depends on the object (L7) -- the ball's is `rewards.BALL_JAW_OPEN`;
+#: Plan S8: J's threshold depends on the object (L7) -- the ball's is `rewards.BALL_JAW_OPEN_BY_RADIUS`;
 #: `jaw_open_for` is the number for an env's own object, per env when it can be either.
-JAW_OPEN_BY_SHAPE = PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN)
+JAW_OPEN_BY_SHAPE = PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS)
 
 
 def jaw_open_for(env: ManagerBasedRlEnv) -> float | torch.Tensor:
@@ -182,6 +185,8 @@ TABLE_CENTRE_XY = (0.55, 0.0)
 CARRY_BINS = ((0.10, 0.15), (0.15, 0.20), (0.20, 0.30), (0.30, 9.99))
 #: Plan S7-5's Z: "at the goal" is xy < 2 cm and |dz| < 2 cm, `pick_place.rewards.Z_GOAL_TOL`.
 GOAL_TOL_XYZ = (0.02, 0.02)
+#: Plan S8: a let-go this far above the resting height (m) is a drop, not a set-down.
+DROP_HEIGHT = 0.03
 
 
 def release_grades(dxy: float, dz: float, passed: bool) -> tuple[float, float]:
@@ -1529,6 +1534,19 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     else None,
     "release_dz_median_m": median([r["release_dz"] for r in rel]),
     "release_speed_median_mps": median([r["release_speed"] for r in rel]),
+    # Plan S8: a ball let go above the table rolls. How far it went from where it was let go to where
+    # it ended (the release point is the set-down read's), and how many were let go more than
+    # `DROP_HEIGHT` above their resting height -- a drop in the carry, not a set-down.
+    "roll_after_let_go_median_m": median(
+      [
+        math.hypot(r["final_x"] - r["release_x"], r["final_y"] - r["release_y"])
+        for r in rel
+        if r.get("release_x") is not None and r.get("final_x") is not None
+      ]
+    ),
+    "release_over_3cm_high": sum(r["release_dz"] > DROP_HEIGHT for r in rel) / len(rel)
+    if rel
+    else None,
   }
   sd = [r for r in rows if r.get("release_set_down") is not None]
   set_down = {
@@ -1674,6 +1692,13 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
     )
     print(
       f"    cube speed at release    {fmt(result['release_speed_median_mps'], 'm/s')}  (median)"
+    )
+    print(
+      f"    let go > {DROP_HEIGHT * 100:.0f} cm up       {result['release_over_3cm_high']:6.1%}   "
+      f"(a drop in the carry)"
+    )
+    print(
+      f"    roll after the let-go    {fmt(result['roll_after_let_go_median_m'])}  (median, let-go point to rest)"
     )
   else:
     print("    no release observed")

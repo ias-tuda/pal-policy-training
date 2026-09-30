@@ -31,7 +31,7 @@ from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
-  BALL_JAW_OPEN,
+  BALL_JAW_OPEN_BY_RADIUS,
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
   JAW_OPEN,
@@ -280,18 +280,18 @@ BALL_DR_ROLLING_SCALE = (0.5, 2.0)
 OBJECT_SHAPES = {
   "cube": ObjectShape(objects=None, jaw_open=JAW_OPEN),
   "ball": ObjectShape(
-    objects={OBJECT: scene.get_ball_cfg(name=OBJECT)}, jaw_open=BALL_JAW_OPEN
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT)}, jaw_open=BALL_JAW_OPEN_BY_RADIUS
   ),
   "ball-dr": ObjectShape(
     objects={OBJECT: scene.get_ball_cfg(name=OBJECT)},
-    jaw_open=BALL_JAW_OPEN,
+    jaw_open=BALL_JAW_OPEN_BY_RADIUS,
     ball_probability=1.0,
     ball_radius=BALL_DR_RADIUS,
     rolling_scale=BALL_DR_ROLLING_SCALE,
   ),
   "mix": ObjectShape(
     objects={OBJECT: scene.get_mixed_cfg(name=OBJECT)},
-    jaw_open=PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN),
+    jaw_open=PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS),
     geoms=(f"{OBJECT}_geom", scene.mixed_ball_geom_name(OBJECT)),
     ball_probability=0.5,
   ),

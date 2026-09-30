@@ -22,6 +22,7 @@ from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply, quat_inv, quat_mul
 
 from pal_mjlab.tasks.manipulation.mdp.shapes import (
+  BySize,
   PerShape,
   ball_mask,
   object_half_height,
@@ -276,7 +277,7 @@ JAW_OPEN_BELOW = 0.15
 
 
 def _jaw_open_bool(
-  env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float | PerShape
+  env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float | BySize | PerShape
 ) -> torch.Tensor:
   """Plan S7-4's J: the jaw's measured angle is below ``jaw_open`` (plan S8: a `PerShape`, one
   threshold for a cube and one for a ball, per env). (B,)"""
@@ -400,7 +401,7 @@ def _release_latch(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> ReleaseLatch:
   """Episode latch of the latest release after `was_lifted`. Cleared on reset by
   `events.reset_release_latch`.
@@ -444,7 +445,10 @@ def _release_latch(
   jaw = (
     None
     if jaw_cfg is None
-    else (jaw_cfg.name, jaw_open if isinstance(jaw_open, PerShape) else float(jaw_open))
+    else (
+      jaw_cfg.name,
+      jaw_open if isinstance(jaw_open, (PerShape, BySize)) else float(jaw_open),
+    )
   )
   latch = getattr(env, _RELEASE, None)
   if latch is None or latch.released.shape[0] != env.num_envs:
@@ -565,7 +569,7 @@ def _placed_bool(
   velocity_threshold: float,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | PerShape | None = None,
+  jaw_open: float | BySize | PerShape | None = None,
 ) -> torch.Tensor:
   """At the goal, released, and at rest. Shared by the success reward and termination.
 

@@ -95,6 +95,7 @@ from .rewards import (
 )
 from .rewards import object_placed as object_placed_reward
 from .shapes import (
+  BySize,
   PerShape,
   ball_mask,
   object_half_height,
@@ -110,6 +111,7 @@ from .terminations import (
 )
 
 __all__ = [
+  "BySize",
   "PerShape",
   "ball_mask",
   "grasp_height_match",

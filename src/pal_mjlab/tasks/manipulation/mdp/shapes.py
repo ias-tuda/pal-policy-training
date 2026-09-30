@@ -39,10 +39,36 @@ _GEOMS = "_pal_shape_geoms"
 
 @dataclasses.dataclass(frozen=True)
 class PerShape:
-  """A value that depends on the object's shape, per env (plan S8's MIX)."""
+  """A value that depends on the object's shape, per env (plan S8's MIX). The ball's may be a
+  `BySize`."""
 
   cube: float
-  ball: float
+  ball: "float | BySize"
+
+
+@dataclasses.dataclass(frozen=True)
+class BySize:
+  """A number that depends on the ball's radius, piecewise-linear over ``radii`` (m, increasing)
+  and held at the ends (plan S8's J threshold: a ball of another size is first touched by the jaw
+  at another angle, so its "open" is too -- BALL-DR draws the diameter 5.5-6.5 cm)."""
+
+  radii: tuple[float, ...]
+  values: tuple[float, ...]
+
+  def __post_init__(self) -> None:
+    if len(self.radii) != len(self.values) or len(self.radii) < 2:
+      raise ValueError("BySize needs at least two (radius, value) pairs")
+    if any(b <= a for a, b in zip(self.radii, self.radii[1:], strict=False)):
+      raise ValueError(f"BySize radii must be increasing, got {self.radii}")
+
+  def at(self, radius: torch.Tensor) -> torch.Tensor:
+    """The value at ``radius`` (m), per element."""
+    xs = torch.tensor(self.radii, device=radius.device, dtype=radius.dtype)
+    ys = torch.tensor(self.values, device=radius.device, dtype=radius.dtype)
+    r = radius.clamp(self.radii[0], self.radii[-1])
+    i = torch.bucketize(r, xs[1:-1])  # the segment each radius is in
+    t = (r - xs[i]) / (xs[i + 1] - xs[i])
+    return ys[i] + t * (ys[i + 1] - ys[i])
 
 
 def _object_geoms(env: ManagerBasedRlEnv, object_name: str) -> list[tuple[int, int]]:
@@ -106,22 +132,33 @@ def ball_mask(env: ManagerBasedRlEnv, object_name: str = "object") -> torch.Tens
 
 
 def resolve(
-  env: ManagerBasedRlEnv, value: float | PerShape, object_name: str = "object"
+  env: ManagerBasedRlEnv,
+  value: float | BySize | PerShape,
+  object_name: str = "object",
 ) -> float | torch.Tensor:
-  """``value`` for this object: a float stays one; a `PerShape` is the model's shape's number,
-  per env when the object can be either (B,)."""
+  """``value`` for this object: a float stays one; a `BySize` is its number at the object's
+  half-height (the ball's radius), per env (B,); a `PerShape` is the model's shape's number, per
+  env when the object can be either (B,)."""
+  if isinstance(value, BySize):
+    return value.at(object_half_height(env, object_name))
   if not isinstance(value, PerShape):
     return value
+  cube, ball = (
+    resolve(env, value.cube, object_name),
+    resolve(env, value.ball, object_name),
+  )
   kind = shape_kind(env, object_name)
   if kind == "cube":
-    return value.cube
+    return cube
   if kind == "ball":
-    return value.ball
-  return torch.where(
-    ball_mask(env, object_name),
-    torch.full((env.num_envs,), value.ball, device=env.device),
-    torch.full((env.num_envs,), value.cube, device=env.device),
-  )
+    return ball
+
+  def as_env(v: float | torch.Tensor) -> torch.Tensor:
+    if isinstance(v, torch.Tensor):
+      return v
+    return torch.full((env.num_envs,), float(v), device=env.device)
+
+  return torch.where(ball_mask(env, object_name), as_env(ball), as_env(cube))
 
 
 @requires_model_fields("geom_size", "geom_rbound", "geom_aabb")
