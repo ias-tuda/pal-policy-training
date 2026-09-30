@@ -110,14 +110,15 @@ SPAWN_BOXES = {
   "WC": SpawnBox(
     x=(0.40, 0.60), y=(-0.04, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
-  # ... and the part of it the scripted planner can plan a place in (S7-8 step 0, 2026-09-30,
-  # `results/S7-8/wc/`): only 35 % of the full area's (spawn, target >= 10 cm apart, yaw) triples
-  # have a contact-free plan against the plan's 98 %, and none at x >= 0.56 for y < 0.18. The
-  # plan's default for that case is to cut the failing part and keep the rest: this box, x
-  # 0.40-0.52, y 0.10-0.26 (12 x 16 cm = 192 cm2, 32 % of the area), where a 2 cm spawn x 4 cm
-  # target sweep at yaw -45 / 0 / +45 plans 100 % of its 1620 triples.
+  # ... and the part of it the scripted planner plans robustly (S7-8 step 0, 2026-09-30,
+  # `results/S7-8/wc/`, `results/S7-8/step0/`): only 35 % of the full area's (spawn, target >= 10 cm
+  # apart, yaw) triples have a contact-free plan against the plan's 98 %. The plan's default for that
+  # case is to cut the failing part and keep the rest: x 0.40-0.52, y 0.16-0.26 (12 x 10 cm = 120 cm2),
+  # where 100 % of the 4 cm pair sweep plans on the first pass. Narrower than it looks: with y from
+  # 0.10, DR-scene's +/-2 cm table shift and a cube yaw off the three swept ones, 15 of 64 random
+  # scripted episodes had no plan or no grasp, all with a target near the torso (y < 0.13).
   "WCK": SpawnBox(
-    x=(0.40, 0.52), y=(0.10, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
+    x=(0.40, 0.52), y=(0.16, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
 }
 

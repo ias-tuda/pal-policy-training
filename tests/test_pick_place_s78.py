@@ -245,10 +245,10 @@ def test_cmd_obs_changes_only_the_actions_term():
 
 #: The two areas, in the robot frame: Claudius's ``WIDE_OBJECT_POSE_RANGE`` (about the table centre
 #: (0.55, 0): x -0.15..+0.05, y -0.04..+0.26) and the part of it the scripted planner can plan a
-#: place in (S7-8 step 0: x 0.40-0.52, y 0.10-0.26).
+#: place in (S7-8 step 0: x 0.40-0.52, y 0.16-0.26).
 AREA_BOUNDS = {
   "WC": ((0.40, 0.60), (-0.04, 0.26)),
-  "WCK": ((0.40, 0.52), (0.10, 0.26)),
+  "WCK": ((0.40, 0.52), (0.16, 0.26)),
 }
 
 
