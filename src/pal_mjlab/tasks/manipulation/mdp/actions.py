@@ -431,11 +431,12 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
 
     from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
     from pal_mjlab.tasks.manipulation.mdp.observations import _grasped_bool
+    from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
 
     env, cfg = self._env, self.cfg
     obj = env.scene[cfg.object_name]
     pos = obj.data.root_link_pos_w
-    half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+    half_z = object_half_height(env, cfg.object_name)
     height = pos[:, 2] - surface_top_z(env, SceneEntityCfg(cfg.surface_name)) - half_z
     goal = env.command_manager.get_term(cfg.command_name).command
     near = (height < cfg.slow_zone) | (

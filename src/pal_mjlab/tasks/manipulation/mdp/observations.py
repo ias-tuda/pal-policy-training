@@ -21,6 +21,14 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply, quat_inv, quat_mul
 
+from pal_mjlab.tasks.manipulation.mdp.shapes import (
+  PerShape,
+  ball_mask,
+  object_half_height,
+  resolve,
+  shape_kind,
+)
+
 _ROBOT = SceneEntityCfg("robot")
 
 #: The body every observation is expressed in: the frame PAL's stack publishes the robot and
@@ -189,12 +197,20 @@ def object_yaw_b(
   Encoded as a unit vector rather than an angle so the observation stays continuous across
   the +/-pi wrap, which a raw yaw does not. ``lag`` as for `object_position_b`; the two
   share one tracker, so they always report the cube at the same moment.
+
+  A ball has no yaw (plan S8): its orientation is whatever it has rolled to, and the tracker
+  would report noise. The observation keeps its width -- the 38-D contract -- and shows the
+  constant ``[1, 0]`` for every env whose object is a ball, exactly; MIX's cubes keep their yaw.
   """
   robot: Entity = env.scene[asset_cfg.name]
   _, quat_w = _object_pose_w(env, object_name, lag)
   quat_b = quat_mul(quat_inv(_base_pose(robot)[1]), quat_w)
   _, _, yaw = euler_xyz_from_quat(quat_b)
-  return torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
+  cos_sin = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
+  if shape_kind(env, object_name) == "cube":
+    return cos_sin
+  constant = torch.tensor([1.0, 0.0], device=cos_sin.device).expand_as(cos_sin)
+  return torch.where(ball_mask(env, object_name).unsqueeze(-1), constant, cos_sin)
 
 
 def commanded_target_rel(
@@ -260,13 +276,14 @@ JAW_OPEN_BELOW = 0.15
 
 
 def _jaw_open_bool(
-  env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float
+  env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float | PerShape
 ) -> torch.Tensor:
-  """Plan S7-4's J: the jaw's measured angle is below ``jaw_open``. (B,)"""
+  """Plan S7-4's J: the jaw's measured angle is below ``jaw_open`` (plan S8: a `PerShape`, one
+  threshold for a cube and one for a ball, per env). (B,)"""
   robot: Entity = env.scene[jaw_cfg.name]
   q = robot.data.joint_pos[:, jaw_cfg.joint_ids]
   assert q.shape[-1] == 1, f"jaw_cfg must name one joint, got {jaw_cfg.joint_names}"
-  return q[:, 0] < jaw_open
+  return q[:, 0] < resolve(env, jaw_open)
 
 
 def is_on_surface(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
@@ -383,7 +400,7 @@ def _release_latch(
   support_sensor_name: str,
   surface_cfg: SceneEntityCfg,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> ReleaseLatch:
   """Episode latch of the latest release after `was_lifted`. Cleared on reset by
   `events.reset_release_latch`.
@@ -424,7 +441,11 @@ def _release_latch(
   """
   from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
 
-  jaw = None if jaw_cfg is None else (jaw_cfg.name, float(jaw_open))
+  jaw = (
+    None
+    if jaw_cfg is None
+    else (jaw_cfg.name, jaw_open if isinstance(jaw_open, PerShape) else float(jaw_open))
+  )
   latch = getattr(env, _RELEASE, None)
   if latch is None or latch.released.shape[0] != env.num_envs:
     no = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -464,7 +485,7 @@ def _release_latch(
   obj: Entity = env.scene[object_name]
   goal = env.command_manager.get_term(command_name).command
   pos = obj.data.root_link_pos_w
-  half_z = env.sim.model.geom_size[:, obj.indexing.geom_ids[0], 2]
+  half_z = object_half_height(env, object_name)
   rest_z = surface_top_z(env, surface_cfg) + half_z
   dxy = torch.norm((pos - goal)[:, :2], dim=-1)
   speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
@@ -544,7 +565,7 @@ def _placed_bool(
   velocity_threshold: float,
   support_sensor_name: str | None = None,
   jaw_cfg: SceneEntityCfg | None = None,
-  jaw_open: float | None = None,
+  jaw_open: float | PerShape | None = None,
 ) -> torch.Tensor:
   """At the goal, released, and at rest. Shared by the success reward and termination.
 

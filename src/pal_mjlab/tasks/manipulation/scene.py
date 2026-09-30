@@ -112,3 +112,97 @@ def get_cube_spec(
 
 def get_cube_cfg(name: str = "object", **kwargs) -> EntityCfg:
   return EntityCfg(spec_fn=lambda: get_cube_spec(name=name, **kwargs))
+
+
+#: Plan S8 (the ball): a 6 cm sphere in place of the 5 cm cube. Its centre rests 3 cm above the
+#: table (the cube's 2.5 cm), and it leaves 9.7 mm per side in the 79.3 mm open jaw (the cube
+#: 14.7 mm).
+BALL_RADIUS = 0.03
+#: The real ball's mass is not known yet (plan S8, open item 1): the cube's 50 g until it is.
+BALL_MASS = 0.05
+#: Rolling friction of the ball (MuJoCo's third friction coefficient, a length, m). The plan's
+#: rule until the real ball is measured: a ball let go at 0.05 m/s stops within 1 cm. Calibrated
+#: against the task's own scene and solver settings (`tests/test_pick_place_s8.py`, step 0 of the
+#: S8 report): released at 0.05 m/s with no spin it stops after 0.53 cm, rolling already (the
+#: stricter start) after 0.95 cm; at 5e-4 the rolling start took 1.16 cm. The table's 1e-4, which
+#: the element-wise max would leave in force, rolls the same ball 9-13 cm.
+BALL_ROLLING_FRICTION = 6e-4
+#: A shape that is switched off in one env (plan S8's MIX, and the DR of the ball's size) is not
+#: removed -- mujoco_warp's ``geom_type`` is one per model, not per world -- but shrunk to this
+#: half-size / radius (m) at the body's centre, inside the shape that is on.
+INACTIVE_SIZE = 1e-3
+
+
+def get_ball_spec(
+  name: str = "object",
+  radius: float = BALL_RADIUS,
+  mass: float = BALL_MASS,
+  rolling: float = BALL_ROLLING_FRICTION,
+  rgba: tuple[float, float, float, float] = (0.2, 0.4, 0.9, 1.0),
+) -> mujoco.MjSpec:
+  """A free ball, for the same jaw (79 mm open, so a 60 mm ball leaves 19 mm).
+
+  The body is named ``name`` and its geom ``{name}_geom`` exactly as the cube's, so every sensor
+  and term that matches the cube's body (and the DR of its friction and mass) matches the ball.
+  ``condim=6`` so that rolling friction exists: the pads' own contact keeps condim 4 (priority 2
+  picks theirs), and the ball's rolling friction only acts against the table.
+  """
+  spec = mujoco.MjSpec()
+  body = spec.worldbody.add_body(name=name)
+  body.add_freejoint(name=f"{name}_joint")
+  body.add_geom(
+    name=f"{name}_geom",
+    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+    size=(radius, 0.0, 0.0),
+    mass=mass,
+    rgba=rgba,
+    condim=6,
+    friction=(0.9, 0.02, rolling),
+    solref=(0.02, 1.0),
+    solimp=(0.99, 0.995, 0.001, 0.5, 2),
+  )
+  return spec
+
+
+def get_ball_cfg(name: str = "object", **kwargs) -> EntityCfg:
+  return EntityCfg(spec_fn=lambda: get_ball_spec(name=name, **kwargs))
+
+
+def mixed_ball_geom_name(name: str = "object") -> str:
+  """The ball geom of `get_mixed_spec`'s body (its cube geom is ``{name}_geom``, as a cube's)."""
+  return f"{name}_geom_ball"
+
+
+def get_mixed_spec(
+  name: str = "object",
+  half_size: float = 0.025,
+  radius: float = BALL_RADIUS,
+  mass: float = 0.05,
+  rolling: float = BALL_ROLLING_FRICTION,
+) -> mujoco.MjSpec:
+  """One body that is a cube in some worlds and a ball in others (plan S8's MIX).
+
+  Both shapes are geoms of the one body -- the cube first, so ``geom_ids[0]`` is the cube's as
+  for every other object -- and ``mdp.set_object_shape`` switches one of them off per env and
+  episode by shrinking it to `INACTIVE_SIZE` (`mdp.shapes`). The body's mass and inertia are
+  the cube's (2.1e-5 kg m^2); a 50 g ball's would be 1.8e-5, which is not worth a per-world
+  inertia.
+  """
+  spec = get_cube_spec(name=name, half_size=half_size, mass=mass)
+  body = spec.body(name)
+  body.add_geom(
+    name=mixed_ball_geom_name(name),
+    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+    size=(radius, 0.0, 0.0),
+    mass=0.0,
+    rgba=(0.2, 0.4, 0.9, 1.0),
+    condim=6,
+    friction=(0.9, 0.02, rolling),
+    solref=(0.02, 1.0),
+    solimp=(0.99, 0.995, 0.001, 0.5, 2),
+  )
+  return spec
+
+
+def get_mixed_cfg(name: str = "object", **kwargs) -> EntityCfg:
+  return EntityCfg(spec_fn=lambda: get_mixed_spec(name=name, **kwargs))

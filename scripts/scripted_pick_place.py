@@ -291,21 +291,35 @@ def hand_x_for(kin: Kin, cube_yaw: float) -> np.ndarray:
   return np.array([math.cos(best), math.sin(best), 0.0])
 
 
+def ball_pad_clearance(offset: float | None = None) -> float:
+  """Height of the pad sites' midpoint above the table at a ball's grasp (plan S8): the ball's
+  radius (its centre) plus ``offset`` -- `pick_place.rewards.EQ_OFFSET`, the height above the
+  centre the gripper bench found holds best, if None."""
+  from pal_mjlab.tasks.manipulation import scene
+  from pal_mjlab.tasks.manipulation.pick_place import rewards
+
+  return scene.BALL_RADIUS + (rewards.EQ_OFFSET if offset is None else offset)
+
+
 def waypoints(
   kin: Kin,
   cube_xy: np.ndarray,
   cube_yaw: float,
   target_xy: np.ndarray,
   table_z: float | None = None,
+  pad_clearance: float = PAD_CLEARANCE,
 ) -> dict[str, np.ndarray]:
   """Joint configurations for every phase, each IK seeded from the previous one so the
   sequence stays on one solution branch. Raises if any waypoint has no solution or puts
-  the arm in contact. ``table_z`` is the table's top face (m); `scene.TABLE_TOP_Z` if None."""
+  the arm in contact. ``table_z`` is the table's top face (m); `scene.TABLE_TOP_Z` if None.
+  ``pad_clearance`` is the height of the pad sites above the table at the grasp pose: 1 cm for
+  the 5 cm cube; for plan S8's ball, `ball_pad_clearance` (the pad centre at the ball's equator
+  plus the bench's best offset)."""
   from pal_mjlab.tasks.manipulation import scene
 
   if table_z is None:
     table_z = scene.TABLE_TOP_Z
-  z_grasp = table_z + kin.pad_offset() + PAD_CLEARANCE
+  z_grasp = table_z + kin.pad_offset() + pad_clearance
   z_high = z_grasp + CLEAR_HEIGHT
   hand_x = hand_x_for(kin, cube_yaw)
   goals = {
@@ -620,6 +634,8 @@ def rollout(
   target_area=None,
   stack_speed: bool = False,
   action_mode: str = "abs",
+  shape=None,
+  ball_offset: float | None = None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -673,6 +689,10 @@ def rollout(
   speed), ``latency`` (`tabletop_env_cfg.LATENCY_MODELS`, S7-8 runs it at ``JS``) and
   ``target_area`` (`pick_place_env_cfg.TARGET_AREAS`: the goal drawn from the spawn area). The
   rows carry each episode's peak TCP and held-cube speed (``peak_tcp_speed_held``, ...).
+
+  Plan S8: ``shape`` (`pick_place_env_cfg.OBJECT_SHAPES`; the cube if None) builds the env with a
+  ball. A ball has no yaw to grasp across -- the wrist keeps its start yaw -- and is taken with the
+  pad sites' midpoint ``ball_offset`` above its centre (`ball_pad_clearance`).
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -700,6 +720,7 @@ def rollout(
     stack_speed=stack_speed,
     action_mode=action_mode,
     command_obs=action_mode == "delta",
+    **({} if shape is None else {"shape": shape}),
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -834,9 +855,15 @@ def rollout(
   plans = []
   hand_xs = []
   plan_error: dict[int, str] = {}
+  from pal_mjlab.tasks.manipulation.mdp import ball_mask
+
+  is_ball = ball_mask(env).cpu().numpy()
+  hand_yaw0 = math.atan2(kin.fk(kin.q_default)[1][1, 0], kin.fk(kin.q_default)[1][0, 0])
   for i in range(num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    if is_ball[i]:
+      yaw = hand_yaw0  # a sphere is grasped across any pair of points: no wrist turn
     kin.move_table(shift[i])
     try:
       plans.append(
@@ -846,6 +873,9 @@ def rollout(
           yaw,
           goals[i, :2] + release_off[i, :2],
           table_z=float(table_z[i]),
+          pad_clearance=ball_pad_clearance(ball_offset)
+          if is_ball[i]
+          else PAD_CLEARANCE,
         )
       )
     except RuntimeError as e:
@@ -1221,6 +1251,18 @@ def parse_args() -> argparse.Namespace:
   )
   r.add_argument("--effort", default="none", help="EFFORT_BOUNDS name (CTP)")
   r.add_argument(
+    "--shape",
+    default="cube",
+    help="OBJECT_SHAPES name (plan S8: cube | ball | ball-dr | mix)",
+  )
+  r.add_argument(
+    "--ball-offset",
+    type=float,
+    default=None,
+    help="plan S8: height of the pad sites' midpoint above a ball's centre at the grasp, m "
+    "(default: pick_place.rewards.EQ_OFFSET)",
+  )
+  r.add_argument(
     "--episode-s", type=float, default=None, help="episode length; the script is slow"
   )
   r.add_argument("--json", type=pathlib.Path, default=None)
@@ -1283,6 +1325,8 @@ def main() -> None:
     stack_speed=args.stack_speed,
     action_mode=args.action,
     episode_length_s=args.episode_s,
+    shape=pp.OBJECT_SHAPES[args.shape],
+    ball_offset=args.ball_offset,
   )
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)

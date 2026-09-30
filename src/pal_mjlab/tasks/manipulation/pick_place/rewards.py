@@ -35,6 +35,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from pal_mjlab.tasks.manipulation import mdp
+from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
   OBJECT,
@@ -54,6 +55,11 @@ class RewardContext:
   threshold: float
   jaw: SceneEntityCfg | None = None
   """The jaw's actuated joint, for plan S7-4's J (a release is the jaw opening)."""
+  jaw_open: float | PerShape = 0.15
+  """J's threshold (`JAW_OPEN`), rad: below it, with the pads off, the jaw is open. A `PerShape`
+  when the object's shape changes where the jaw first touches it (plan S8, L7)."""
+  pads: SceneEntityCfg | None = None
+  """The two pad sites, for plan S8's EQ (the height the pads close at)."""
 
   @property
   def grasp_params(self) -> dict:
@@ -514,6 +520,11 @@ def _m7(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
 # since a touchdown there (`mdp.set_down_placed`). M7 as run floored every other release and was
 # not learned (0-5 % set-downs on B-S, S7-2 / S7-3); the plan's dwell here is 2 steps.
 JAW_OPEN = 0.15  # rad; `mdp.observations.JAW_OPEN_BELOW`
+#: J's threshold for plan S8's 6 cm ball (L7: it is size-dependent). The jaw first touches the ball at
+#: a smaller angle than the cube's ~0.21 rad (the pads are 79.3 mm apart open, 50 mm at the cube's
+#: touch), so the cube's 0.15 would already count as "open" on a ball held lightly. Plan: the
+#: ball's touch angle minus 0.05 rad; measured by `scripts/gripper_bench.py --stimulus touch`.
+BALL_JAW_OPEN = 0.09
 M8_CLEAR_HEIGHT = 0.05  # m (plan S7-4 revision 2: was 8 cm)
 M8_RETREAT_WEIGHT = 2.0
 M8_CONTACT_WEIGHT = -1.0
@@ -523,7 +534,7 @@ S_BONUS_WEIGHT = 4.0
 
 def _jaw_params(ctx: RewardContext) -> dict:
   assert ctx.jaw is not None, "plan S7-4's J needs RewardContext.jaw"
-  return {"jaw_cfg": ctx.jaw, "jaw_open": JAW_OPEN}
+  return {"jaw_cfg": ctx.jaw, "jaw_open": ctx.jaw_open}
 
 
 def _j(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
@@ -615,6 +626,11 @@ Z_GOAL_TOL = (0.02, 0.02)  # m: (xy, |dz|)
 
 
 def _o(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  if ctx.jaw_open != JAW_OPEN:
+    raise ValueError(
+      f"O pays the jaw's opening from the cube's hold angle ({O_JAW_HOLD} rad) to {JAW_OPEN}; "
+      f"this object's J threshold is {ctx.jaw_open}, and its hold angle is not calibrated (plan S8)"
+    )
   params = _latched(ctx)
   params.pop("threshold")
   rewards["open_at_goal"] = RewardTermCfg(
@@ -650,6 +666,42 @@ def _z(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
     )
 
 
+# -- S8: EQ, the height the pads close at (plan S8, BALL-EQ) ---------------------------------
+#
+# Plan S8 (designed 2026-09-30 22:30-23:00, Siwei). Parallel pads touch a ball at two points on
+# the line between them; a pad centre above or below the ball's equator squeezes the ball out
+# (step 0 measures the slip against the height, `scripts/gripper_bench.py --stimulus ballheight`).
+# EQ pays G(pad-centre height - ball-centre height - EQ_OFFSET, EQ_STD) while the pads are around the
+# ball -- within `EQ_NEAR` of it horizontally -- and it has not been lifted yet (`was_lifted`), so
+# the last centimetres of the approach, and the close, are steered to the height that holds.
+# Weight 1: the order of one `grasp` step, well under `lift`, `goal` and `placed`, so hovering
+# at the right height is never worth more than carrying.
+#
+# EQ_OFFSET is the pad-site midpoint's height above the ball's centre at which the bench's grasp
+# holds best (the plan's proposal is 0: the equator).
+EQ_WEIGHT = 1.0
+EQ_STD = 0.005  # m
+EQ_NEAR = 0.03  # m, horizontal
+EQ_OFFSET = 0.0  # m
+
+
+def _eq(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  assert ctx.pads is not None, "plan S8's EQ needs RewardContext.pads"
+  rewards["pad_height"] = RewardTermCfg(
+    func=mdp.grasp_height_match,
+    weight=EQ_WEIGHT,
+    params={
+      "object_name": OBJECT,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "support_sensor_name": SUPPORT_SENSOR,
+      "pad_cfg": ctx.pads,
+      "offset": EQ_OFFSET,
+      "std": EQ_STD,
+      "near": EQ_NEAR,
+    },
+  )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -663,6 +715,7 @@ _MODULES = {
   "S": _s,
   "O": _o,
   "Z": _z,
+  "EQ": _eq,
 }
 
 
@@ -686,6 +739,8 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError(
       "Z redefines every at-goal term after M1; it needs M1 and comes last"
     )
+  if "EQ" in modules and "M1" not in modules:
+    raise ValueError("EQ is a term beside M1's; it needs M1 in the arm")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -731,7 +786,13 @@ S75_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+O+Z": ("M1", "M2", "M3", "M6", "J", "M8", "O", "Z"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S75_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS, **S75_ARMS}
+#: The S8 arm (plan S8's BALL-EQ): S7-4's RCTP reward + EQ, the pads' closing height. The other
+#: S8 codes (BALL, BALL-FT, BALL-DR, MIX) are RCTP itself on another object (`SHAPE`).
+S8_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+EQ": ("M1", "M2", "M3", "M6", "J", "M8", "EQ"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S8_ARMS.items()})
+_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS, **S75_ARMS, **S8_ARMS}
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)
