@@ -453,6 +453,7 @@ def make_tabletop_env_cfg(
   stack_speed: bool = False,
   action_mode: str = "abs",
   command_obs: bool = False,
+  goal_area: dict | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -506,6 +507,8 @@ def make_tabletop_env_cfg(
       ``jaw_slew_rate``.
     action_mode: ``abs`` (today's) or ``delta`` (`ACTION_MODES`). ``delta`` needs a per-step limit
       on every joint -- the action's full scale -- and no tool speed cap.
+    goal_area: plan S7-8's area the goal is drawn from, for ``reset_objects_on_surface``'s
+      ``goal_area`` (the object is drawn where that area has a point far enough from it).
     command_obs: plan S7-8's ``CMD_OBS``: the actor's and critic's ``actions`` term shows the
       commanded target relative to the default pose (`mdp.commanded_target_rel`) instead of the
       raw last action. Still 8-D.
@@ -736,6 +739,7 @@ def make_tabletop_env_cfg(
         "surface_cfg": SceneEntityCfg(TABLE),
         "pose_range": dict(object_pose_range),
         "min_separation": min_separation,
+        **({} if goal_area is None else {"goal_area": goal_area}),
       },
     ),
     "pad_friction_slide": EventTermCfg(

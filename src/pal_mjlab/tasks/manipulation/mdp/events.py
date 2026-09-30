@@ -82,6 +82,7 @@ def reset_objects_on_surface(
   pose_range: dict[str, tuple[float, float]],
   min_separation: float = 0.0,
   max_attempts: int = 10,
+  goal_area: dict | None = None,
 ) -> None:
   """Place free objects upright on a surface, clear of one another.
 
@@ -93,6 +94,14 @@ def reset_objects_on_surface(
   each resampling only the envs that are still too close to an already-placed object. Any
   env still conflicting afterwards is pushed apart deterministically, so the function always
   terminates with a valid layout and never loops per-env in Python.
+
+  ``goal_area`` (plan S7-8's ``TARGET=WC`` / ``WCK``) is ``{"x": (lo, hi), "y": (lo, hi),
+  "distance": d}``, the area the goal will be drawn from, relative to the surface centre like
+  ``pose_range``, and the distance it must keep from the object. The object is drawn only where
+  the goal area has a point at least ``d`` away -- the farthest of its four corners is -- by the same
+  vectorised rejection, and a straggler goes to a random corner of the goal area. Without it a cube
+  near the centre of a small area has no valid goal at all (12 x 10 cm: every point is within
+  7.8 cm of the centre), and the command would have to break the distance it promises.
   """
   if not asset_cfgs:
     return
@@ -135,6 +144,10 @@ def reset_objects_on_surface(
           needs_push = (dist.squeeze(-1) < min_separation).unsqueeze(-1)
           xy = torch.where(needs_push, other + direction * min_separation, xy)
 
+    if goal_area is not None:
+      xy = _clear_of_goal_area(
+        xy, centre_xy, goal_area, lower, upper, n, device, max_attempts
+      )
     placed.append(xy)
 
     half_z = env.sim.model.geom_size[env_ids, asset.indexing.geom_ids[0], 2]
@@ -148,6 +161,38 @@ def reset_objects_on_surface(
     asset.write_root_link_velocity_to_sim(
       torch.zeros(n, 6, device=device), env_ids=env_ids
     )
+
+
+def _clear_of_goal_area(
+  xy: torch.Tensor,
+  centre_xy: torch.Tensor,
+  goal_area: dict,
+  lower: torch.Tensor,
+  upper: torch.Tensor,
+  n: int,
+  device,
+  max_attempts: int,
+) -> torch.Tensor:
+  """``xy`` (n, 2, world) redrawn, where it has no goal-area point at least
+  ``goal_area["distance"]`` away, from the same box; see `reset_objects_on_surface`."""
+  (x0, x1), (y0, y1) = goal_area["x"], goal_area["y"]
+  corners = torch.tensor([[x0, y0], [x0, y1], [x1, y0], [x1, y1]], device=device)
+  distance = float(goal_area["distance"])
+
+  def reach(p: torch.Tensor) -> torch.Tensor:  # distance to the farthest corner (n,)
+    return torch.norm((p - centre_xy).unsqueeze(1) - corners, dim=-1).amax(dim=-1)
+
+  # A big enough margin over the worst-case draw: each round fails for at most the share of the
+  # box that lies within `distance` of all four corners, well under one half for the areas used.
+  for _ in range(max(max_attempts, 32)):
+    bad = reach(xy) < distance
+    if not bool(bad.any()):
+      return xy
+    redraw = sample_uniform(lower, upper, (n, 2), device=device) + centre_xy
+    xy = torch.where(bad.unsqueeze(-1), redraw, xy)
+  bad = reach(xy) < distance
+  pick = torch.randint(0, 4, (n,), device=device)
+  return torch.where(bad.unsqueeze(-1), corners[pick] + centre_xy, xy)
 
 
 def reset_was_lifted(

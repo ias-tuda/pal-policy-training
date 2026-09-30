@@ -146,8 +146,9 @@ class SurfaceOffsetCommand(LiftingCommand):
   def _draw_clear_of_object(self, env_ids: torch.Tensor) -> torch.Tensor:
     """Offsets for ``env_ids`` at least ``min_object_distance`` from the cube, by vectorised
     rejection (each round redraws only the envs still too close); the few left after
-    ``MAX_REDRAWS`` rounds take the box's corner farthest from the cube, which is at least half
-    the box's diagonal away. Always terminates, never loops per env. (N, 2)"""
+    ``MAX_REDRAWS`` rounds take the box's corner farthest from the cube, which is at least
+    ``min_object_distance`` away when the cube was drawn where one exists (``goal_area`` of
+    `reset_objects_on_surface`). Always terminates, never loops per env. (N, 2)"""
     from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy
 
     n = len(env_ids)
