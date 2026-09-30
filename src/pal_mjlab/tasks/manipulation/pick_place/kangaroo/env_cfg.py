@@ -43,10 +43,16 @@ real robot's latencies -- `FP` the FoundationPose cube tracker's 5-8 steps on th
 `JS` the jaw servo's lag behind its command. Unset is `none`, every run up to S7-5.
 `TOOL_SPEED=V0.5` is S7-4's V at 0.5 m/s. The release-by-jaw (J) and the retreat (M8) are reward
 modules, named in `REWARD`.
+Plan S7-8 adds `SLEW=stack` (the stack task's speeds, per joint group, in place of a factor),
+`ACTION` (`abs` | `delta`: the action sets or moves the commanded target), `CMD_OBS` (`act` | `cmd`:
+what the actor's ``actions`` term shows -- the raw last action, or the commanded target; `delta`
+always shows the target), `SPAWN=WC` and `TARGET` (`B` | `WC`: the cube and the target drawn from
+one wide area, >= 10 cm apart) and `EPISODE_S` (the episode length, s). Unset is S7-7's cfg exactly.
 """
 
 from __future__ import annotations
 
+import math
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -61,6 +67,7 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
   SPAWN_BOXES,
+  TARGET_AREAS,
   TOOL_SPEED_CAPS,
   make_pick_place_env_cfg,
 )
@@ -68,11 +75,16 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
   KANGAROO_GRIPPERS_LEFT_ARM,
+  KANGAROO_GRIPPERS_LEFT_ARM_WC,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   kangaroo_grippers_left_arm,
 )
 from pal_mjlab.tasks.manipulation.runner import ManipulationRunnerCfg
-from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DR_LEVELS, LATENCY_MODELS
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
+  ACTION_MODES,
+  DR_LEVELS,
+  LATENCY_MODELS,
+)
 
 #: Environment variables read at registration. Named as the plan names them.
 REWARD_ENV_VAR = "REWARD"
@@ -88,6 +100,10 @@ LAG_ENV_VAR = "LAG"
 OCC_ENV_VAR = "OCC"
 OBJ_OBS_ENV_VAR = "OBJ_OBS"
 OCC_FLAG_ENV_VAR = "OCC_FLAG"
+ACTION_ENV_VAR = "ACTION"
+CMD_OBS_ENV_VAR = "CMD_OBS"
+TARGET_ENV_VAR = "TARGET"
+EPISODE_ENV_VAR = "EPISODE_S"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -102,12 +118,19 @@ DEFAULT_EFFORT = "none"
 DEFAULT_LAG = "none"
 DEFAULT_OCC = "none"
 DEFAULT_OBJ_OBS = "live"
+DEFAULT_ACTION = "abs"
+DEFAULT_TARGET = "B"
+#: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
+SLEW_STACK = "stack"
+#: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
+CMD_OBS_NAMES = ("act", "cmd")
 
 #: The arm each spawn box trains with: the W boxes need P2's wider action scales (plan S7 P2).
 SPAWN_ROBOTS = {
   "S71": KANGAROO_GRIPPERS_LEFT_ARM,
   "W1": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   "W2": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  "WC": KANGAROO_GRIPPERS_LEFT_ARM_WC,
 }
 
 
@@ -121,19 +144,57 @@ def _select(var: str, default: str, valid) -> str:
   return name
 
 
-def _select_slew() -> float:
+def _select_slew() -> tuple[float, bool]:
+  """(factor on the URDF slew, whether it is the stack task's speeds): `SLEW` is a number in
+  (0, 1] or ``stack`` (plan S7-8, `tabletop_env_cfg.STACK_ARM_SPEED_FRACTION`)."""
   raw = os.environ.get(SLEW_ENV_VAR)
   if raw is None:
-    return DEFAULT_SLEW
+    return DEFAULT_SLEW, False
+  if raw == SLEW_STACK:
+    return DEFAULT_SLEW, True
   try:
     value = float(raw)
   except ValueError:
     value = float("nan")
   if not 0.0 < value <= 1.0:  # also catches nan
     raise ValueError(
-      f"{SLEW_ENV_VAR}={raw!r} is not a slew-rate factor in (0, 1]. Set it to e.g. 0.5 "
-      f"(plan S7, speed bound A), or unset it for {DEFAULT_SLEW}."
+      f"{SLEW_ENV_VAR}={raw!r} is not a slew-rate factor in (0, 1] or {SLEW_STACK!r}. Set it "
+      f"to e.g. 0.5 (plan S7, speed bound A), or unset it for {DEFAULT_SLEW}."
     )
+  return value, False
+
+
+def _select_command_obs(action: str) -> bool:
+  """`CMD_OBS`: whether the actor's ``actions`` term shows the commanded target. Unset is the raw
+  last action for ``abs`` and the target for ``delta``, whose integrator is state the policy must
+  see; ``CMD_OBS=act`` with ``delta`` raises (plan S7-8)."""
+  name = os.environ.get(CMD_OBS_ENV_VAR)
+  if name is None:
+    return action == "delta"
+  if name not in CMD_OBS_NAMES:
+    raise ValueError(
+      f"{CMD_OBS_ENV_VAR}={name!r} is not a known name; have {CMD_OBS_NAMES}. Set it to one "
+      "of those, or unset it."
+    )
+  if name == "act" and action == "delta":
+    raise ValueError(
+      f"{CMD_OBS_ENV_VAR}=act with {ACTION_ENV_VAR}=delta: a delta action integrates, so the "
+      "policy has to see the target (plan S7-8). Use cmd, or unset it."
+    )
+  return name == "cmd"
+
+
+def _select_episode() -> float | None:
+  """`EPISODE_S`: the episode length in seconds, or None for the baseline's (plan S7-8)."""
+  raw = os.environ.get(EPISODE_ENV_VAR)
+  if raw is None:
+    return None
+  try:
+    value = float(raw)
+  except ValueError:
+    value = float("nan")
+  if not value > 0.0 or math.isinf(value):  # also catches nan
+    raise ValueError(f"{EPISODE_ENV_VAR}={raw!r} is not a positive number of seconds")
   return value
 
 
@@ -150,6 +211,8 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
   tool_speed = _select(TOOL_SPEED_ENV_VAR, DEFAULT_TOOL_SPEED, TOOL_SPEED_CAPS)
   effort = EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)]
+  slew, stack_speed = _select_slew()
+  action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
   return make_pick_place_env_cfg(
     kangaroo_grippers_left_arm(
       _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
@@ -161,12 +224,17 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     reward=_select(REWARD_ENV_VAR, DEFAULT_REWARD, REWARD_VARIANTS),
     dr=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     play=play,
-    action_slew_rate_scale=_select_slew(),
+    action_slew_rate_scale=slew,
     baseline=BASELINES[baseline],
     tool_speed_cap=TOOL_SPEED_CAPS[tool_speed],
     effort=effort,
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
     occlusion=_select_occlusion(),
+    target_area=TARGET_AREAS[_select(TARGET_ENV_VAR, DEFAULT_TARGET, TARGET_AREAS)],
+    episode_length_s=_select_episode(),
+    stack_speed=stack_speed,
+    action_mode=action,
+    command_obs=_select_command_obs(action),
   )
 
 

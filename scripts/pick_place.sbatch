@@ -56,6 +56,8 @@ PPO="${PPO:-PPO-stack}"
 # The arm's speed bound, the same way (plan S7): a factor in (0, 1] on the URDF slew limit.
 # 0.5 is speed bound A (FA); 1.0 is every run before S7. It goes into the run name and the
 # tags, so an FA curve can never be mistaken for an F one.
+# Plan S7-8: SLEW=stack is the stack task's speeds (arm 1-3 at 1/16 of the URDF speed, arm 4-7 at 1/8,
+# the jaw 0.03 rad per step), in place of a factor.
 SLEW="${SLEW:-1.0}"
 # Plan S7-2, the same way (`pick_place/kangaroo/env_cfg.py`): BASELINE (S71 | B -- table height,
 # episode length, target box, observations, jaw slew), SPAWN (S71 | W1 | W2; a W box brings
@@ -99,6 +101,36 @@ if [ "$OCC" != "none" ] || [ "$OBJ_OBS" != "live" ]; then
   OCC_TAG=",\"occ${OCC}\",\"obj${OBJ_OBS}\""
 fi
 
+# Plan S7-8 (`pick_place/kangaroo/env_cfg.py`): ACTION (abs | delta -- the action sets or moves the
+# commanded target), CMD_OBS (act | cmd -- what the actor's `actions` term shows; unset is act for abs
+# and cmd for delta, which must show it), TARGET (B | WC -- the target from B's small box, or from
+# the same wide area as the cube, >= 10 cm apart; SPAWN=WC is the cube's half) and EPISODE_S (the
+# episode length in s; unset is the baseline's). Unset is S7-7's cfg; in the run name and the tags
+# only when set, so every earlier run's name still reads the same.
+ACTION="${ACTION:-abs}"
+TARGET="${TARGET:-B}"
+export ACTION TARGET
+[ -n "${CMD_OBS:-}" ] && export CMD_OBS
+[ -n "${EPISODE_S:-}" ] && export EPISODE_S
+S78_NAME=""
+S78_TAG=""
+if [ "$ACTION" != "abs" ]; then
+  S78_NAME="${S78_NAME}_act${ACTION}"
+  S78_TAG="${S78_TAG},\"act${ACTION}\""
+fi
+if [ -n "${CMD_OBS:-}" ]; then
+  S78_NAME="${S78_NAME}_cmdobs${CMD_OBS}"
+  S78_TAG="${S78_TAG},\"cmdobs${CMD_OBS}\""
+fi
+if [ "$TARGET" != "B" ]; then
+  S78_NAME="${S78_NAME}_tgt${TARGET}"
+  S78_TAG="${S78_TAG},\"tgt${TARGET}\""
+fi
+if [ -n "${EPISODE_S:-}" ]; then
+  S78_NAME="${S78_NAME}_ep${EPISODE_S}"
+  S78_TAG="${S78_TAG},\"ep${EPISODE_S}\""
+fi
+
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -130,7 +162,8 @@ if ! uv run --extra cu128 python -c \
      >/dev/null 2>"$REPO/.reward_check.$$"; then
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
-    "OBJ_OBS=$OBJ_OBS did not validate." >&2
+    "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
+    "EPISODE_S=${EPISODE_S:-(default)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -156,6 +189,7 @@ echo "ppo         $PPO"
 echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
+echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
@@ -181,5 +215,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$RESUME_TAG)"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$RESUME_TAG)"

@@ -28,6 +28,8 @@ from mjlab.tasks.manipulation.mdp import (
 )
 
 from .actions import (
+  DeltaRateLimitedJointPositionAction,
+  DeltaRateLimitedJointPositionActionCfg,
   RateLimitedJointPositionAction,
   RateLimitedJointPositionActionCfg,
   ToolSpeedCappedJointPositionAction,
@@ -47,6 +49,7 @@ from .events import (
   surface_top_z,
 )
 from .observations import (
+  commanded_target_rel,
   ee_orientation_b,
   ee_position_b,
   goal_position_b,
@@ -104,6 +107,8 @@ __all__ = [
   "object_seen",
   "object_unseen_steps",
   "object_yaw_occ",
+  "DeltaRateLimitedJointPositionAction",
+  "DeltaRateLimitedJointPositionActionCfg",
   "RateLimitedJointPositionAction",
   "RateLimitedJointPositionActionCfg",
   "ToolSpeedCappedJointPositionAction",
@@ -130,6 +135,7 @@ __all__ = [
   "reset_objects_on_surface",
   "surface_top_z",
   # Observations.
+  "commanded_target_rel",
   "ee_orientation_b",
   "ee_position_b",
   "goal_position_b",

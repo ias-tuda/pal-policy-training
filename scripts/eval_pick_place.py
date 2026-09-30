@@ -94,6 +94,7 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from pal_mjlab.tasks.manipulation.mdp.actions import DeltaRateLimitedJointPositionAction
 from pal_mjlab.tasks.manipulation.mdp.observations import (
   _grasped_bool,
   _on_surface_bool,
@@ -155,6 +156,12 @@ LIFT_SPEED = 0.2
 LIFT_WAYPOINT = 0.01
 LIFT_TOL = 0.01
 LIFT_GRACE_S = 0.5
+#: Plan S7-8's reads by where the cube starts and how far it goes: the old W2 spawn box about the
+#: table centre (0.55, 0) -- x -0.21..-0.09, y 0.20..0.34 -- and the carry bins, m (10-20 / 20-30 /
+#: over 30 cm; `TARGET=WC` draws 10 cm up to the area's 36 cm diagonal).
+W2_REL_X, W2_REL_Y = (-0.21, -0.09), (0.20, 0.34)
+TABLE_CENTRE_XY = (0.55, 0.0)
+CARRY_BINS = ((0.10, 0.20), (0.20, 0.30), (0.30, 9.99))
 #: Plan S7-5's Z: "at the goal" is xy < 2 cm and |dz| < 2 cm, `pick_place.rewards.Z_GOAL_TOL`.
 GOAL_TOL_XYZ = (0.02, 0.02)
 
@@ -204,6 +211,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     action="store_true",
     help="plan S7-4: hand the arm to a position controller (action 0: home, jaw open) once "
     "the jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
+  )
+  p.add_argument(
+    "--handoff-timeout",
+    type=float,
+    default=HANDOFF_TIMEOUT_S,
+    metavar="S",
+    help="with --handoff: the episode time (s) at which the position controller takes over a "
+    f"policy that has not lifted clear (default {HANDOFF_TIMEOUT_S}). At plan S7-8's stack speeds "
+    "the return home takes up to ~8 s and the episode is 30 s: pass ~21.",
   )
   p.add_argument(
     "--handoff-lift",
@@ -478,6 +494,12 @@ class Tally:
       keys = ("spawn_x", "spawn_y", "spawn_yaw", "table_dx", "table_dy", "table_dz")
       row.update(dict(zip(keys, first[:6], strict=True)))
       row.update(target_x=first[6], target_y=first[7], target_z=first[8])
+      row["carry_m"] = math.hypot(first[6] - first[0], first[7] - first[1])
+      rel_x = first[0] - (TABLE_CENTRE_XY[0] + first[3])
+      rel_y = first[1] - (TABLE_CENTRE_XY[1] + first[4])
+      row["spawn_in_w2"] = (
+        W2_REL_X[0] <= rel_x <= W2_REL_X[1] and W2_REL_Y[0] <= rel_y <= W2_REL_Y[1]
+      )
       final = self.last_pos[i].tolist()
       row.update(zip(("final_x", "final_y", "final_z"), final, strict=True))
       self.done.append(row)
@@ -778,11 +800,16 @@ class RetreatTally:
   hand-off mask it returns to that step's action."""
 
   def __init__(
-    self, num_envs: int, device: str, step_dt: float, handoff: bool = False
+    self,
+    num_envs: int,
+    device: str,
+    step_dt: float,
+    handoff: bool = False,
+    timeout_s: float = HANDOFF_TIMEOUT_S,
   ) -> None:
     self.step_dt = step_dt
     self.handoff = handoff
-    self.timeout_steps = round(HANDOFF_TIMEOUT_S / step_dt)
+    self.timeout_steps = round(timeout_s / step_dt)
     zb = lambda: torch.zeros(num_envs, dtype=torch.bool, device=device)  # noqa: E731
     zl = lambda v=0: torch.full((num_envs,), v, dtype=torch.long, device=device)  # noqa: E731
     zf = lambda v=0.0: torch.full((num_envs,), v, device=device)  # noqa: E731
@@ -1306,6 +1333,17 @@ class OccTally:
     }
 
 
+def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
+  """The position controller's action: home pose, jaw open. ``zero`` (B, A) for an absolute
+  action, whose 0 is the default pose; for plan S7-8's ``ACTION=delta`` the action moves the
+  target, so it is the step home, |a| <= 1, at the stack speed."""
+  term = env.action_manager.get_term("joint_pos")
+  if not isinstance(term, DeltaRateLimitedJointPositionAction):
+    return zero
+  home = term._default_target()
+  return ((home - term.commanded_target) / term._rate).clamp(-1.0, 1.0)
+
+
 def retreat_state(
   env: ManagerBasedRlEnv, arm_ids: list[int], jaw_id: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1486,8 +1524,30 @@ def summarise(tally: Tally, step_dt: float, episodes: int) -> dict:
     "release_q_m6_median": median([r["release_q_m6"] for r in rel]),
     "release_q_m7_median": median([r["release_q_m7"] for r in rel]),
   }
+
+  def share(group: list) -> dict:
+    return {
+      "n": len(group),
+      "placed": sum(r["placed"] for r in group) / len(group) if group else None,
+      "placed_and_lifted": sum(r["placed_and_lifted"] for r in group) / len(group)
+      if group
+      else None,
+    }
+
+  by_carry = {
+    f"{lo * 100:.0f}-{min(hi, 0.99) * 100:.0f}cm": share(
+      [r for r in rows if lo <= r["carry_m"] < hi]
+    )
+    for lo, hi in CARRY_BINS
+  }
+  by_spawn = {
+    "inside_w2": share([r for r in rows if r["spawn_in_w2"]]),
+    "outside_w2": share([r for r in rows if not r["spawn_in_w2"]]),
+  }
   return {
     "episodes": n,
+    "by_carry": by_carry,
+    "by_spawn": by_spawn,
     "placed": rate("placed"),
     "placed_and_lifted": rate("placed_and_lifted"),
     "placed_and_lifted_z": rate("placed_and_lifted_z"),
@@ -1526,6 +1586,24 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
   )
   slid = result["placed"] - result["placed_and_lifted"]
   print(f"    -> slid, never picked up {slid:6.1%}")
+  by_carry = result["by_carry"]
+  if sum(v["n"] > 0 for v in by_carry.values()) > 1:
+    print(
+      "    by carry length          "
+      + "   ".join(
+        f"{k} {v['placed_and_lifted']:.0%} (n={v['n']})"
+        for k, v in by_carry.items()
+        if v["n"]
+      )
+    )
+    print(
+      "    by spawn                 "
+      + "   ".join(
+        f"{k} {v['placed_and_lifted']:.0%} (n={v['n']})"
+        for k, v in result["by_spawn"].items()
+        if v["n"]
+      )
+    )
 
   print("\n  DIAGNOSTIC RATES -------------------------------------------------")
   print(
@@ -1748,9 +1826,15 @@ def main() -> None:
 
   tally = Tally(args.num_envs, args.device)
   plant = PlantTally.from_env(env) if args.plant else None
-  retreat = RetreatTally(args.num_envs, args.device, env.step_dt, args.handoff)
+  retreat = RetreatTally(
+    args.num_envs, args.device, env.step_dt, args.handoff, args.handoff_timeout
+  )
   if args.handoff_lift is not None and not args.handoff:
     raise SystemExit("--handoff-lift needs --handoff")
+  if args.handoff_lift is not None and isinstance(
+    env.action_manager.get_term("joint_pos"), DeltaRateLimitedJointPositionAction
+  ):
+    raise SystemExit("--handoff-lift is written for absolute targets, not ACTION=delta")
   lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
   trace: list[dict[str, torch.Tensor]] = []
@@ -1831,7 +1915,9 @@ def main() -> None:
       elif args.handoff:
         # The position controller: action 0 is the home pose with the jaw open, reached
         # through the action term's slew (and its tool cap and bounds, where the run has them).
-        actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
+        actions = torch.where(
+          handed.unsqueeze(-1), handoff_action(env, torch.zeros_like(actions)), actions
+        )
       obs, _, dones, extras = wrapped.step(actions)
       tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()

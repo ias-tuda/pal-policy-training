@@ -103,7 +103,22 @@ SPAWN_BOXES = {
   "W2": SpawnBox(
     x=(0.34, 0.46), y=(0.20, 0.34), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
+  # Plan S7-8 Part B: Claudius's ``WIDE_OBJECT_POSE_RANGE`` (`origin/faster-moves`,
+  # `grasp/kangaroo/env_cfg.py`), x -0.15..+0.05 and y -0.04..+0.26 about the table centre
+  # (0.55, 0): 20 x 30 cm, 3.6 x W2. His +/-180 deg of yaw is +/-45 here (a cube looks the same
+  # every 90). Needs the wider action scales of `robots.KANGAROO_GRIPPERS_LEFT_ARM_WC`.
+  "WC": SpawnBox(
+    x=(0.40, 0.60), y=(-0.04, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
+  ),
 }
+
+#: Where the target is drawn from, by name (`TARGET`, plan S7-8). ``B``: baseline B's small box.
+#: ``WC``: the same area the cube spawns in (`SPAWN_BOXES["WC"]`), redrawn until it is at least
+#: `TARGET_MIN_SEPARATION` from the cube -- Claudius's recipe stack task
+#: (`stack/recipe_stack_env_cfg.py`: both cubes from the ``-Wide`` range, ``min_separation=0.10``).
+#: A `SpawnBox` is only used for its x and y.
+TARGET_AREAS: dict[str, SpawnBox | None] = {"B": None, "WC": SPAWN_BOXES["WC"]}
+TARGET_MIN_SEPARATION = 0.10
 
 
 @dataclasses.dataclass(frozen=True)
@@ -225,6 +240,7 @@ def _command_cfg(
   dr: str,
   table_top_z: float = scene.TABLE_TOP_Z,
   target_half_xy: float = 0.0,
+  target_area: SpawnBox | None = None,
 ):
   """The goal: a point on the table, expressed in whichever way the DR level allows.
 
@@ -241,7 +257,25 @@ def _command_cfg(
 
   A target box (``target_half_xy`` > 0, plan S7-2's baseline B) is always the surface-offset
   goal, drawn once per episode relative to the table, at every rung.
+
+  A ``target_area`` (plan S7-8, `TARGET_AREAS`) replaces the box: the goal is drawn from the
+  area, table-relative, at least `TARGET_MIN_SEPARATION` from the cube (`mdp.SurfaceOffsetCommand`).
   """
+  if target_area is not None:
+    cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
+    return mdp.SurfaceOffsetCommandCfg(
+      entity_name=OBJECT,
+      surface_name=TABLE,
+      offset=(sum(target_area.x) / 2 - cx, sum(target_area.y) / 2 - cy),
+      offset_range=(
+        (target_area.x[1] - target_area.x[0]) / 2,
+        (target_area.y[1] - target_area.y[0]) / 2,
+      ),
+      min_object_distance=TARGET_MIN_SEPARATION,
+      resampling_time_range=(1e9, 1e9),
+      success_threshold=GOAL_THRESHOLD,
+      debug_vis=True,
+    )
   if dr in DR_LEVELS_THAT_MOVE_THE_TABLE or target_half_xy > 0.0:
     return mdp.SurfaceOffsetCommandCfg(
       entity_name=OBJECT,
@@ -282,6 +316,11 @@ def make_pick_place_env_cfg(
   effort: EffortBound = EFFORT_BOUNDS["none"],
   latency: LatencyModelCfg = LATENCY_MODELS["none"],
   occlusion: mdp.OccCfg | None = None,
+  target_area: SpawnBox | None = None,
+  episode_length_s: float | None = None,
+  stack_speed: bool = False,
+  action_mode: str = "abs",
+  command_obs: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -304,6 +343,12 @@ def make_pick_place_env_cfg(
       ``robot``.
     latency: plan S7-6's latency model. See ``tabletop_env_cfg.LATENCY_MODELS``.
     occlusion: plan S7-7's occlusion model and filler (`mdp.OccCfg`), or None.
+    target_area: plan S7-8's ``TARGET`` -- draw the goal from this area instead of the baseline's
+      target box. See `TARGET_AREAS`.
+    episode_length_s: plan S7-8's ``EPISODE_S``, the episode length; None keeps the baseline's
+      (or the reward variant's).
+    stack_speed, action_mode, command_obs: plan S7-8's ``SLEW=stack``, ``ACTION`` and ``CMD_OBS``.
+      See `make_tabletop_env_cfg`.
   """
   if target_xy is None:
     target_xy = baseline.target_xy
@@ -311,11 +356,12 @@ def make_pick_place_env_cfg(
     robot,
     gripper_name=gripper_name,
     command_cfg=_command_cfg(
-      target_xy, dr, baseline.table_top_z, baseline.target_half_xy
+      target_xy, dr, baseline.table_top_z, baseline.target_half_xy, target_area
     ),
     object_pose_range=_object_pose_range(spawn),
     dr_level=dr,
-    episode_length_s=baseline.episode_length_s
+    episode_length_s=episode_length_s
+    or baseline.episode_length_s
     or EPISODE_LENGTH_S.get(reward, DEFAULT_EPISODE_LENGTH_S),
     action_slew_rate_scale=action_slew_rate_scale,
     table_top_z=baseline.table_top_z,
@@ -327,6 +373,9 @@ def make_pick_place_env_cfg(
     arm_effort_band=effort.effort_scale is not None,
     latency=latency,
     occlusion=occlusion,
+    stack_speed=stack_speed,
+    action_mode=action_mode,
+    command_obs=command_obs,
   )
 
   gripper = robot.gripper(gripper_name)

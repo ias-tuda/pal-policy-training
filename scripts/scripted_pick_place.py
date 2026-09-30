@@ -616,6 +616,10 @@ def rollout(
   table_offsets: list[tuple[float, float, float]] | None = None,
   episode_length_s: float | None = None,
   effort=None,
+  latency=None,
+  target_area=None,
+  stack_speed: bool = False,
+  action_mode: str = "abs",
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -663,6 +667,12 @@ def rollout(
   ``effort`` is plan S7-4's effort bound (`pick_place_env_cfg.EFFORT_BOUNDS`; none if None);
   T's plant half comes with ``robot``. Each row's ``band_hit_steps`` / ``range_hit_steps``
   count the env's steps on which T's band / C's clip moved the arm's target, by phase.
+
+  Plan S7-8: ``stack_speed`` (the stack task's per-joint speeds), ``action_mode`` (``delta``:
+  the script's absolute waypoints are sent as the step towards them, |a| <= 1 at the stack
+  speed), ``latency`` (`tabletop_env_cfg.LATENCY_MODELS`, S7-8 runs it at ``JS``) and
+  ``target_area`` (`pick_place_env_cfg.TARGET_AREAS`: the goal drawn from the spawn area). The
+  rows carry each episode's peak TCP and held-cube speed (``peak_tcp_speed_held``, ...).
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -685,6 +695,11 @@ def rollout(
     baseline=baseline,
     tool_speed_cap=tool_speed_cap,
     **({} if effort is None else {"effort": effort}),
+    **({} if latency is None else {"latency": latency}),
+    target_area=target_area,
+    stack_speed=stack_speed,
+    action_mode=action_mode,
+    command_obs=action_mode == "delta",
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -890,11 +905,18 @@ def rollout(
     target_q = offset.clone()
     target_q[:, arm_idx] = torch.as_tensor(q, dtype=torch.float32, device=env.device)
     target_q[:, jaw_idx] = jaw_closed * float(closed)
-    raw = (target_q - offset) / scale
+    if hasattr(
+      term, "_box_lo"
+    ):  # plan S7-8's delta action: the step towards the waypoint
+      raw = (target_q - term.commanded_target) / term._rate
+    else:
+      raw = (target_q - offset) / scale
     over = (raw.abs() > 1.0 + 1e-6).any(dim=-1)
     clipped += int(over.sum())
     clipped_env += over.cpu().numpy().astype(int)
-    tally.observe(**ev.probe(env, grasp_sensor))
+    flags = ev.probe(env, grasp_sensor)
+    tally.observe(**flags)
+    tally.measure_speed(flags["grasped"], *ev.positions(env), env.step_dt, goal_w)
     _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
     for key, attr in (("band", "band_hit"), ("range", "range_hit")):
       hits = getattr(term, attr, None)
@@ -1183,6 +1205,24 @@ def parse_args() -> argparse.Namespace:
     help="plan-S8 gain code the robot is built on (G0 | G15 | G20 | G20s); default: "
     "the spawn box's arm as it is, i.e. G0",
   )
+  r.add_argument(
+    "--stack-speed",
+    action="store_true",
+    help="plan S7-8: the stack task's arm and jaw speeds instead of --slew",
+  )
+  r.add_argument(
+    "--action", default="abs", help="ACTION_MODES name (S7-8: abs | delta)"
+  )
+  r.add_argument("--lag", default="none", help="LATENCY_MODELS name (S7-8 runs JS)")
+  r.add_argument(
+    "--target",
+    default="B",
+    help="TARGET_AREAS name (S7-8: WC, the goal from the spawn area)",
+  )
+  r.add_argument("--effort", default="none", help="EFFORT_BOUNDS name (CTP)")
+  r.add_argument(
+    "--episode-s", type=float, default=None, help="episode length; the script is slow"
+  )
   r.add_argument("--json", type=pathlib.Path, default=None)
   m = sub.add_parser(
     "map", help="action-space reach map over a spawn grid (plan S7 P2)"
@@ -1214,13 +1254,17 @@ def main() -> None:
   if args.cmd == "map":
     reach_map(args)
     return
+  from pal_mjlab.tasks.manipulation import tabletop_env_cfg as tt
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
   from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
   from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
 
   robot = SPAWN_ROBOTS[args.spawn]
   if args.gains is not None:
-    robot = kangaroo_grippers_left_arm(args.gains, robot)
+    effort = pp.EFFORT_BOUNDS[args.effort]
+    robot = kangaroo_grippers_left_arm(
+      args.gains, robot, arm_effort_scale=effort.effort_scale
+    )
   rows = rollout(
     num_envs=args.num_envs,
     device=args.device,
@@ -1233,6 +1277,12 @@ def main() -> None:
     spawn_box=pp.SPAWN_BOXES[args.spawn],
     dr=args.dr,
     tool_speed_cap=pp.TOOL_SPEED_CAPS[args.tool_speed],
+    effort=pp.EFFORT_BOUNDS[args.effort],
+    latency=tt.LATENCY_MODELS[args.lag],
+    target_area=pp.TARGET_AREAS[args.target],
+    stack_speed=args.stack_speed,
+    action_mode=args.action,
+    episode_length_s=args.episode_s,
   )
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)
