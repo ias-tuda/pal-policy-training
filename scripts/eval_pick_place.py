@@ -88,6 +88,8 @@ import math
 import pathlib
 from dataclasses import asdict
 
+import mujoco
+import numpy as np
 import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
 import torch
 from mjlab.envs import ManagerBasedRlEnv
@@ -146,6 +148,16 @@ HANDOFF_CLEAR = 0.03
 HANDOFF_STEPS = 5
 HANDOFF_TIMEOUT_S = 8.0
 HOME_TOL = 0.05
+#: The position controller's return (2026-09-30, after S7-5's 5 k read: 40 of 45 placed-but-failed
+#: episodes had the cube moved by the joint-space return sweeping the fingers through it). It now
+#: opens the jaw (at most `HANDOFF_OPEN_MAX_S`; a lift hand-off is already open), raises the TCP
+#: straight up by `HANDOFF_RISE` at `HANDOFF_RISE_SPEED`, crosses at that height to above the home
+#: TCP and comes straight down onto it at `HANDOFF_MOVE_SPEED` (`VerticalRetreat`).
+#: ``--handoff-direct`` keeps the old return (home at once) for comparison with S7-4/S7-5.
+HANDOFF_RISE = 0.10
+HANDOFF_RISE_SPEED = 0.10
+HANDOFF_MOVE_SPEED = 0.15
+HANDOFF_OPEN_MAX_S = 0.5
 #: Plan S7-5's Z: "at the goal" is xy < 2 cm and |dz| < 2 cm, `pick_place.rewards.Z_GOAL_TOL`.
 GOAL_TOL_XYZ = (0.02, 0.02)
 
@@ -193,8 +205,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   p.add_argument(
     "--handoff",
     action="store_true",
-    help="plan S7-4: hand the arm to a position controller (action 0: home, jaw open) once "
-    "the jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
+    help="plan S7-4: hand the arm to a position controller once the jaw has opened after "
+    "the lift and the TCP is clear of the cube, or at 8 s; it opens the jaw, rises "
+    "HANDOFF_RISE straight up, crosses to above home and comes down onto it",
+  )
+  p.add_argument(
+    "--handoff-direct",
+    action="store_true",
+    help="with --handoff: the S7-4/S7-5 return -- home at once, no rise (joint-space sweep)",
   )
   p.add_argument(
     "--trace",
@@ -1151,6 +1169,219 @@ class OccTally:
     }
 
 
+class VerticalRetreat:
+  """The position controller's return with ``--handoff``: open, rise, cross over, come down home.
+
+  Per env, from the step `RetreatTally` hands it over:
+
+  1. *open* -- the arm held at its last commanded target, the jaw commanded open, until the
+     measured jaw is below `JAW_OPEN` or `HANDOFF_OPEN_MAX_S` has passed (a lift hand-off is
+     already open: zero steps);
+  2. *move* -- a Cartesian path for the TCP: straight up by `HANDOFF_RISE` at
+     `HANDOFF_RISE_SPEED`, the hand's orientation kept; then level, at that height, to above the
+     home pose's TCP, the orientation turning to home's; then straight down onto it, both at
+     `HANDOFF_MOVE_SPEED`. The last leg exists because the home TCP sits at about the cube's
+     height (1-3 cm above its centre on S7-5's RCTP s3): a joint-space move home from a raised
+     pose comes back down through the goal region (2026-09-30, `../results/S7-5/handoff/`);
+  3. *home* -- action 0 (the default pose, jaw open), as the direct return did.
+
+  The path is solved once, when the move starts, by damped least squares on the host model
+  (`env.sim.mj_model`) with that world's joint positions and the arm at its commanded target --
+  the target, not the measured pose, so the rise starts where the arm is being held and not a
+  gravity sag below it; the null space is pulled toward the home pose, so the path ends on it.
+  Every phase goes through the action term (slew, C, T), like the policy's actions.
+  """
+
+  OPEN, MOVE, HOME = 0, 1, 2
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    self.env = env
+    term = env.action_manager.get_term("joint_pos")
+    self.term = term
+    names = [n.split("/", 1)[-1] for n in term.target_names]
+    self.arm_idx = [names.index(f"arm_left_{i}_joint") for i in range(1, 8)]
+    self.jaw_idx = names.index(JAW_JOINT)
+    n, dim = env.num_envs, len(names)
+    scale = term.scale
+    self.scale = (
+      scale
+      if isinstance(scale, torch.Tensor)
+      else torch.full((n, dim), float(scale), device=env.device)
+    )
+    offset = term.offset
+    self.offset = (
+      offset
+      if isinstance(offset, torch.Tensor)
+      else torch.full((n, dim), float(offset), device=env.device)
+    )
+    model = env.sim.mj_model
+    self.model, self.data = model, mujoco.MjData(model)
+    jids = [
+      mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/arm_left_{i}_joint")
+      for i in range(1, 8)
+    ]
+    # The host model names the robot's elements with its entity prefix (`robot/`).
+    self.tcp = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"robot/{TCP_SITE}")
+    if self.tcp < 0 or min(jids) < 0:
+      raise KeyError(f"no robot/{TCP_SITE} or robot/arm_left_*_joint in the host model")
+    self.qadr = np.asarray([model.jnt_qposadr[j] for j in jids])
+    self.dofs = np.asarray([model.jnt_dofadr[j] for j in jids])
+    self.lo = model.jnt_range[jids, 0].copy()
+    self.hi = model.jnt_range[jids, 1].copy()
+    self.open_max = round(HANDOFF_OPEN_MAX_S / env.step_dt)
+    self.phase = torch.full((n,), self.OPEN, dtype=torch.long, device=env.device)
+    self.active = torch.zeros(n, dtype=torch.bool, device=env.device)
+    self.k = torch.zeros(n, dtype=torch.long, device=env.device)
+    self.paths: list[torch.Tensor | None] = [None] * n
+    self.n_rise = [0] * n
+    self.hold = torch.zeros(n, 7, device=env.device)
+    #: Per env: the TCP's world z when the move started and when its rise leg ended (nan until
+    #: then), and whether every waypoint's IK converged -- banked by `finish`.
+    self.rise_z0 = torch.full((n,), float("nan"), device=env.device)
+    self.rise_z1 = torch.full((n,), float("nan"), device=env.device)
+    self.ik_ok = torch.ones(n, dtype=torch.bool, device=env.device)
+    self.done: list[dict] = []
+
+  def _fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    self.data.qpos[self.qadr] = q
+    mujoco.mj_kinematics(self.model, self.data)
+    return (
+      self.data.site_xpos[self.tcp].copy(),
+      self.data.site_xmat[self.tcp].reshape(3, 3).copy(),
+    )
+
+  def _solve(self, i: int, q_start: np.ndarray) -> tuple[np.ndarray, int, bool]:
+    """World ``i``'s path: arm targets for each step (steps, 7), how many of them are the
+    rise, and whether every waypoint converged."""
+    m, d = self.model, self.data
+    d.qpos[:] = self.env.sim.data.qpos[i].detach().cpu().numpy()
+    q_home = self.offset[i, self.arm_idx].detach().cpu().numpy().astype(np.float64)
+    p0, r0 = self._fk(q_start)
+    ph, rh = self._fk(q_home)
+    top = p0[2] + HANDOFF_RISE
+    dt = self.env.step_dt
+    # Waypoints (position, fraction of the turn from r0 to rh), one per control step.
+    legs = [
+      (p0, np.array([p0[0], p0[1], top]), HANDOFF_RISE_SPEED, (0.0, 0.0)),
+      (
+        np.array([p0[0], p0[1], top]),
+        np.array([ph[0], ph[1], top]),
+        HANDOFF_MOVE_SPEED,
+        (0.0, 1.0),
+      ),
+      (np.array([ph[0], ph[1], top]), ph, HANDOFF_MOVE_SPEED, (1.0, 1.0)),
+    ]
+    way, n_rise = [], 0
+    for li, (a, b, speed, (f0, f1)) in enumerate(legs):
+      steps = max(1, int(np.ceil(np.linalg.norm(b - a) / (speed * dt) - 1e-6)))
+      for s in range(1, steps + 1):
+        u = s / steps
+        way.append((a + (b - a) * u, f0 + (f1 - f0) * u))
+      if li == 0:
+        n_rise = len(way)
+    # The turn r0 -> rh as an axis-angle, applied in fractions.
+    rel = r0.T @ rh
+    angle = np.arccos(np.clip((np.trace(rel) - 1.0) / 2.0, -1.0, 1.0))
+    if angle > 1e-6:
+      axis = np.array(
+        [rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]]
+      ) / (2.0 * np.sin(angle))
+    else:
+      axis = np.array([0.0, 0.0, 1.0])
+    jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+    q, out, ok = q_start.copy(), [], True
+    for goal, frac in way:
+      quat, turn = np.zeros(4), np.zeros(9)
+      mujoco.mju_axisAngle2Quat(quat, axis, angle * frac)
+      mujoco.mju_quat2Mat(turn, quat)
+      r_des = r0 @ turn.reshape(3, 3)
+      for _ in range(20):
+        pos, rot = self._fk(q)
+        err = np.concatenate(
+          [goal - pos, 0.5 * sum(np.cross(rot[:, j], r_des[:, j]) for j in range(3))]
+        )
+        if np.linalg.norm(err[:3]) < 5e-4 and np.linalg.norm(err[3:]) < 1e-2:
+          break
+        mujoco.mj_comPos(m, d)
+        mujoco.mj_jacSite(m, d, jacp, jacr, self.tcp)
+        jac = np.vstack([jacp[:, self.dofs], jacr[:, self.dofs]])
+        pinv = jac.T @ np.linalg.inv(jac @ jac.T + 1e-4 * np.eye(6))
+        null = np.eye(7) - pinv @ jac
+        step = pinv @ err + null @ (0.1 * (q_home - q))
+        q = np.clip(q + np.clip(step, -0.1, 0.1), self.lo, self.hi)
+      else:
+        ok = False
+      out.append(q.copy())
+    return np.stack(out), n_rise, ok
+
+  def action(
+    self, handed: torch.Tensor, jaw_q: torch.Tensor, tcp_z: torch.Tensor
+  ) -> torch.Tensor:
+    """This step's raw action for the handed envs (rows of the others are unused). (B, A)"""
+    # Hold the arm where it was commanded when the controller took over.
+    newly = handed & ~self.active
+    self.hold[newly] = self.term._last_target[newly][:, self.arm_idx]
+    self.active |= newly
+    in_open = handed & (self.phase == self.OPEN)
+    self.k = torch.where(in_open, self.k + 1, self.k)
+    go = in_open & ((jaw_q < JAW_OPEN) | (self.k > self.open_max))
+    for i in torch.nonzero(go).flatten().tolist():
+      q0 = self.hold[i].cpu().numpy().astype(np.float64)
+      path, n_rise, ok = self._solve(i, q0)
+      self.paths[i] = torch.as_tensor(
+        path, dtype=torch.float32, device=self.hold.device
+      )
+      self.n_rise[i] = n_rise
+      self.ik_ok[i] = ok
+      self.rise_z0[i] = tcp_z[i]
+    self.phase = torch.where(go, self.MOVE, self.phase)
+    self.k = torch.where(go, torch.zeros_like(self.k), self.k)
+    arm = self.hold.clone()
+    for i in torch.nonzero(handed & (self.phase == self.MOVE)).flatten().tolist():
+      k, path = int(self.k[i]), self.paths[i]
+      if k == self.n_rise[i]:
+        self.rise_z1[i] = tcp_z[i]
+      if k >= len(path):
+        self.phase[i] = self.HOME
+        continue
+      arm[i] = path[k]
+      self.k[i] = k + 1
+    full = self.offset.clone()
+    full[:, self.arm_idx] = arm
+    raw = ((full - self.offset) / self.scale).clamp(-1.0, 1.0)
+    raw[:, self.jaw_idx] = 0.0  # the default jaw target: open
+    home = self.phase == self.HOME
+    return torch.where(home.unsqueeze(-1), torch.zeros_like(raw), raw)
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      z0, z1 = float(self.rise_z0[i]), float(self.rise_z1[i])
+      self.done.append(
+        {
+          "rise": (z1 - z0) if not (math.isnan(z0) or math.isnan(z1)) else None,
+          "path_ik_ok": bool(self.ik_ok[i]) if not math.isnan(z0) else None,
+        }
+      )
+      self.paths[i] = None
+    self.phase[env_ids] = self.OPEN
+    self.active[env_ids] = False
+    self.k[env_ids] = 0
+    self.hold[env_ids] = 0.0
+    self.rise_z0[env_ids] = float("nan")
+    self.rise_z1[env_ids] = float("nan")
+    self.ik_ok[env_ids] = True
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    rises = sorted(r["rise"] for r in rows if r["rise"] is not None)
+    oks = [r["path_ik_ok"] for r in rows if r["path_ik_ok"] is not None]
+    return {
+      "handoff_rise_median_m": rises[len(rises) // 2] if rises else None,
+      "handoff_rise_min_m": rises[0] if rises else None,
+      "handoff_path_ik_ok": sum(oks) / len(oks) if oks else None,
+    }
+
+
 def retreat_state(
   env: ManagerBasedRlEnv, arm_ids: list[int], jaw_id: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1589,6 +1820,7 @@ def main() -> None:
   plant = PlantTally.from_env(env) if args.plant else None
   retreat = RetreatTally(args.num_envs, args.device, env.step_dt, args.handoff)
   occ = OccTally(args.num_envs, args.device)
+  lift = VerticalRetreat(env) if args.handoff and not args.handoff_direct else None
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
@@ -1663,9 +1895,15 @@ def main() -> None:
       )
       actions = policy(obs)
       if args.handoff:
-        # The position controller: action 0 is the home pose with the jaw open, reached
-        # through the action term's slew (and its tool cap and bounds, where the run has them).
-        actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
+        # The position controller, through the action term's slew (and its tool cap and
+        # bounds, where the run has them): open, rise, cross, come down home (`VerticalRetreat`);
+        # with --handoff-direct, action 0 at once (the home pose with the jaw open).
+        ctrl = (
+          torch.zeros_like(actions)
+          if lift is None
+          else lift.action(handed, jaw_q, positions(env)[1][:, 2])
+        )
+        actions = torch.where(handed.unsqueeze(-1), ctrl, actions)
       obs, _, dones, extras = wrapped.step(actions)
       tally.terminal(success_flags(env))
       finished = torch.nonzero(dones, as_tuple=False).flatten()
@@ -1677,6 +1915,8 @@ def main() -> None:
         )
         if occ.steps.any() or occ.done:
           occ.finish(finished)
+        if lift is not None:
+          lift.finish(finished)
         if plant is not None:
           plant.finish(finished)
         for key, value in extras.get("log", {}).items():
@@ -1690,6 +1930,11 @@ def main() -> None:
   if occ.done:
     result.update(occ.summarise(args.episodes))
   result["handoff"] = bool(args.handoff)
+  result["handoff_return"] = (
+    None if not args.handoff else ("direct" if lift is None else "rise")
+  )
+  if lift is not None:
+    result.update(lift.summarise(args.episodes))
   if plant is not None:
     result.update(plant.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
