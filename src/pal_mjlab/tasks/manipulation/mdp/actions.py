@@ -326,7 +326,7 @@ class DeltaRateLimitedJointPositionAction(RateLimitedJointPositionAction):
   past a bound. It starts from the default pose at every reset, like the slew reference. The
   policy needs to see its state: ``CMD_OBS`` (`mdp.commanded_target_rel`). A deployer must keep
   the integrator and apply the same clip -- the ONNX output is a velocity command in units of
-  ``step_max`` per control step.
+  ``step_max`` per control step, and ``scale`` (the ONNX ``action_scale``) is ``step_max``.
   """
 
   cfg: DeltaRateLimitedJointPositionActionCfg
@@ -346,6 +346,11 @@ class DeltaRateLimitedJointPositionAction(RateLimitedJointPositionAction):
       lo = torch.maximum(lo, self._clip[..., 0])
       hi = torch.minimum(hi, self._clip[..., 1])
     self._box_lo, self._box_hi = lo, hi
+    # From here on ``scale`` is the per-step rate, as in Claudius's delta term, so the ONNX
+    # ``action_scale`` metadata (mjlab's exporter reads ``_scale``) says what a deployer must do:
+    # ``target += action_scale * clip(action, -1, 1)``. The box stays in ``_box_lo`` / ``_box_hi``
+    # and is not in the metadata -- the deployer needs it (plan S7-8, open item 5).
+    self._scale = self._rate.clone()
 
   def process_actions(self, actions: torch.Tensor) -> None:
     previous = self._last_target

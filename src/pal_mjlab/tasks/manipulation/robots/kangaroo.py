@@ -176,13 +176,44 @@ KANGAROO_GRIPPERS_LEFT_ARM_WIDE = dataclasses.replace(
 )
 
 
-# The same arm with the action scales plan S7-8 Part B derived for the wide area `W-C` (x 0.40-0.60,
-# y -0.04-0.26, cube yaw +/-45 deg, targets from the same area >= 10 cm from the cube), by the
-# S5.0 rule over the area's corners, edge midpoints and centre as spawn and as target, never below
-# the W2 scales. PROVISIONAL: W2's, until `results/S7-8/wc/derive_wc.json` is in.
+# The same arm with the action scales plan S7-8 Part B (2026-09-30) derived for the wide areas, by the
+# S5.0 rule (1.5 x the largest excursion of any waypoint, rounded up to 0.05 rad, never below the W2
+# scales, capped at half the joint's range) over the contact-free plans of the area's spawn x target
+# pairs at cube yaw -45 / 0 / +45 deg, on the 0.815 m table with the 5 cm carry
+# (`results/S7-8/wc/`).
+#
+# `WC` is Claudius's whole `-Wide` area (x 0.40-0.60, y -0.04-0.26). NOT TRAINED: only 35 % of its
+# (spawn, target >= 10 cm apart, yaw) triples have a plan against the plan's 98 %, and the scales
+# below are driven by elbow-flipped solutions at edge triples (arm 1 and arm 4 at their caps).
 KANGAROO_GRIPPERS_LEFT_ARM_WC = dataclasses.replace(
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
-  action_scale=dict(KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale),
+  action_scale={
+    r"arm_left_1_joint": 2.35,
+    r"arm_left_2_joint": 0.85,
+    r"arm_left_3_joint": 0.65,
+    r"arm_left_4_joint": 1.79,
+    r"arm_left_5_joint": 1.55,
+    r"arm_left_6_joint": 2.40,
+    r"arm_left_7_joint": 1.20,
+    r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
+  },
+)
+# `WCK` is the part of it that plans: x 0.40-0.52, y 0.10-0.26 (12 x 16 cm), where every triple of a
+# 2 cm spawn x 4 cm target sweep at those yaws has a plan. Its scales are those of the y 0.08-0.26
+# rectangle (93 % plannable), a superset, so the boundary rows are inside them: arm 1 and arm 4 widen,
+# the rest are W2's.
+KANGAROO_GRIPPERS_LEFT_ARM_WCK = dataclasses.replace(
+  KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  action_scale={
+    r"arm_left_1_joint": 1.15,
+    r"arm_left_2_joint": 0.85,
+    r"arm_left_3_joint": 0.65,
+    r"arm_left_4_joint": 1.20,
+    r"arm_left_5_joint": 1.55,
+    r"arm_left_6_joint": 2.40,
+    r"arm_left_7_joint": 1.20,
+    r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
+  },
 )
 
 

@@ -46,8 +46,8 @@ modules, named in `REWARD`.
 Plan S7-8 adds `SLEW=stack` (the stack task's speeds, per joint group, in place of a factor),
 `ACTION` (`abs` | `delta`: the action sets or moves the commanded target), `CMD_OBS` (`act` | `cmd`:
 what the actor's ``actions`` term shows -- the raw last action, or the commanded target; `delta`
-always shows the target), `SPAWN=WC` and `TARGET` (`B` | `WC`: the cube and the target drawn from
-one wide area, >= 10 cm apart) and `EPISODE_S` (the episode length, s). Unset is S7-7's cfg exactly.
+always shows the target), `SPAWN=WC` / `WCK` and `TARGET` (`B` | `WC` | `WCK`: the cube and the target
+drawn from one wide area -- Claudius's, or the part of it that plans -- >= 10 cm apart) and `EPISODE_S` (the episode length, s). Unset is S7-7's cfg exactly.
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
   KANGAROO_GRIPPERS_LEFT_ARM,
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
+  KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   kangaroo_grippers_left_arm,
 )
@@ -131,6 +132,7 @@ SPAWN_ROBOTS = {
   "W1": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   "W2": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   "WC": KANGAROO_GRIPPERS_LEFT_ARM_WC,
+  "WCK": KANGAROO_GRIPPERS_LEFT_ARM_WCK,
 }
 
 

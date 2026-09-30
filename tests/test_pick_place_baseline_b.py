@@ -271,6 +271,10 @@ def test_the_spawn_boxes_clear_the_target_box_by_10_cm():
   tx = (B.target_xy[0] - h, B.target_xy[0] + h)
   ty = (B.target_xy[1] - h, B.target_xy[1] + h)
   for name, box in pp.SPAWN_BOXES.items():
+    if name == "WC":
+      # Plan S7-8: the target is not this box but a draw from the cube's own area, redrawn until it
+      # is >= 10 cm from the cube (`TARGET=WC`; tests/test_pick_place_s78.py).
+      continue
     dx = max(0.0, box.x[0] - tx[1], tx[0] - box.x[1])
     dy = max(0.0, box.y[0] - ty[1], ty[0] - box.y[1])
     assert math.hypot(dx, dy) >= 0.10 - 1e-9, name

@@ -157,11 +157,12 @@ LIFT_WAYPOINT = 0.01
 LIFT_TOL = 0.01
 LIFT_GRACE_S = 0.5
 #: Plan S7-8's reads by where the cube starts and how far it goes: the old W2 spawn box about the
-#: table centre (0.55, 0) -- x -0.21..-0.09, y 0.20..0.34 -- and the carry bins, m (10-20 / 20-30 /
-#: over 30 cm; `TARGET=WC` draws 10 cm up to the area's 36 cm diagonal).
+#: table centre (0.55, 0) -- x -0.21..-0.09, y 0.20..0.34 -- and the carry bins, m. `TARGET=WC` draws
+#: 10 cm up to the area's 36 cm diagonal (the kept part `WCK`: up to 20 cm), so the plan's 10-20 / 20-30 /
+#: over 30 cm bins are split at 15 cm.
 W2_REL_X, W2_REL_Y = (-0.21, -0.09), (0.20, 0.34)
 TABLE_CENTRE_XY = (0.55, 0.0)
-CARRY_BINS = ((0.10, 0.20), (0.20, 0.30), (0.30, 9.99))
+CARRY_BINS = ((0.10, 0.15), (0.15, 0.20), (0.20, 0.30), (0.30, 9.99))
 #: Plan S7-5's Z: "at the goal" is xy < 2 cm and |dz| < 2 cm, `pick_place.rewards.Z_GOAL_TOL`.
 GOAL_TOL_XYZ = (0.02, 0.02)
 

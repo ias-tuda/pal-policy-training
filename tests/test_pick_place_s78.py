@@ -32,6 +32,7 @@ from pal_mjlab.tasks.manipulation.pick_place.kangaroo import env_cfg as kenv
 from pal_mjlab.tasks.manipulation.pick_place.rewards import S52_BASE
 from pal_mjlab.tasks.manipulation.robots import (
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
+  KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   kangaroo_grippers_left_arm,
 )
@@ -50,6 +51,9 @@ S76_ENV = {
   "LAG": "FP+JS",
 }
 NEW_VARS = ("ACTION", "CMD_OBS", "TARGET", "EPISODE_S")
+#: The arm each wide area trains with.
+AREA_ARMS = {"WC": KANGAROO_GRIPPERS_LEFT_ARM_WC, "WCK": KANGAROO_GRIPPERS_LEFT_ARM_WCK}
+AREAS = tuple(AREA_ARMS)
 
 
 def _env_vars(monkeypatch, **changes):
@@ -65,24 +69,26 @@ def _env_vars(monkeypatch, **changes):
 
 def _cfg(
   *,
-  wc: bool = False,
+  area: str | None = None,
   action: str = "abs",
   cmd_obs: bool = False,
   stack: bool = True,
   num_envs: int | None = None,
 ):
-  arm = KANGAROO_GRIPPERS_LEFT_ARM_WC if wc else KANGAROO_GRIPPERS_LEFT_ARM_WIDE
+  """S7-6's RCTP-FJ at the stack speeds; ``area`` draws the cube and the target from that
+  `SPAWN_BOXES` area (`WC`, `WCK`), else W2 and B's target box."""
+  arm = KANGAROO_GRIPPERS_LEFT_ARM_WIDE if area is None else AREA_ARMS[area]
   cfg = pp.make_pick_place_env_cfg(
     kangaroo_grippers_left_arm("G20", arm, arm_effort_scale=CTP.effort_scale),
     gripper_name="left",
     reward=RCTP,
     action_slew_rate_scale=1.0 if stack else 0.5,
     baseline=pp.BASELINES["B"],
-    spawn=pp.SPAWN_BOXES["WC" if wc else "W2"],
+    spawn=pp.SPAWN_BOXES["W2" if area is None else area],
     dr="DR-scene",
     effort=CTP,
     latency=tt.LATENCY_MODELS["FP+JS"],
-    target_area=pp.TARGET_AREAS["WC"] if wc else None,
+    target_area=None if area is None else pp.TARGET_AREAS[area],
     stack_speed=stack,
     action_mode=action,
     command_obs=cmd_obs,
@@ -162,7 +168,7 @@ def test_unset_reproduces_s76(monkeypatch):
 
 def test_the_selectors_are_read_and_validated(monkeypatch):
   _env_vars(
-    monkeypatch, SLEW="stack", ACTION="delta", SPAWN="WC", TARGET="WC", EPISODE_S="30"
+    monkeypatch, SLEW="stack", ACTION="delta", SPAWN="WCK", TARGET="WCK", EPISODE_S="30"
   )
   cfg = kenv.kangaroo_pick_place_env_cfg()
   assert (
@@ -237,32 +243,39 @@ def test_cmd_obs_changes_only_the_actions_term():
         assert got[name] == want[name], (group, name)
 
 
-def test_the_area_and_the_scales():
-  wc = pp.SPAWN_BOXES["WC"]
-  # Claudius's WIDE_OBJECT_POSE_RANGE about the table centre (0.55, 0): x -0.15..+0.05, y -0.04..+0.26.
-  assert wc.x == pytest.approx((0.40, 0.60))
-  assert wc.y == pytest.approx((-0.04, 0.26))
-  assert not wc.widen_at_dr_scene
-  assert pp._object_pose_range(wc) == {
-    "x": pytest.approx((-0.15, 0.05)),
-    "y": pytest.approx((-0.04, 0.26)),
+#: The two areas, in the robot frame: Claudius's ``WIDE_OBJECT_POSE_RANGE`` (about the table centre
+#: (0.55, 0): x -0.15..+0.05, y -0.04..+0.26) and the part of it the scripted planner can plan a
+#: place in (S7-8 step 0: x 0.40-0.52, y 0.10-0.26).
+AREA_BOUNDS = {
+  "WC": ((0.40, 0.60), (-0.04, 0.26)),
+  "WCK": ((0.40, 0.52), (0.10, 0.26)),
+}
+
+
+@pytest.mark.parametrize("area", AREAS)
+def test_the_area_and_the_scales(area):
+  box = pp.SPAWN_BOXES[area]
+  (x0, x1), (y0, y1) = AREA_BOUNDS[area]
+  assert box.x == pytest.approx((x0, x1))
+  assert box.y == pytest.approx((y0, y1))
+  assert not box.widen_at_dr_scene
+  assert pp._object_pose_range(box) == {
+    "x": pytest.approx((x0 - 0.55, x1 - 0.55)),
+    "y": pytest.approx((y0, y1)),
     "yaw": pytest.approx((-0.7853981633974483, 0.7853981633974483)),
   }
-  assert pp.TARGET_AREAS["B"] is None and pp.TARGET_AREAS["WC"] is wc
+  assert pp.TARGET_AREAS["B"] is None and pp.TARGET_AREAS[area] is box
   assert pp.TARGET_MIN_SEPARATION == 0.10
-  cmd = pp._command_cfg((0.0, 0.0), "DR-scene", target_area=wc)
-  assert cmd.offset == pytest.approx((-0.05, 0.11))
-  assert cmd.offset_range == pytest.approx((0.10, 0.15))
+  cmd = pp._command_cfg((0.0, 0.0), "DR-scene", target_area=box)
+  assert cmd.offset == pytest.approx(((x0 + x1) / 2 - 0.55, (y0 + y1) / 2))
+  assert cmd.offset_range == pytest.approx(((x1 - x0) / 2, (y1 - y0) / 2))
   assert cmd.min_object_distance == 0.10
-  # The WC arm has W2's action space widened where the area needs it, never narrowed.
-  w, c = (
-    KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale,
-    KANGAROO_GRIPPERS_LEFT_ARM_WC.action_scale,
-  )
+  # The area's arm has W2's action space widened where the area needs it, never narrowed.
+  w, c = KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale, AREA_ARMS[area].action_scale
   assert set(w) == set(c)
   assert all(c[k] >= w[k] for k in w), (w, c)
   assert (
-    dataclasses.replace(KANGAROO_GRIPPERS_LEFT_ARM_WC, action_scale=w)
+    dataclasses.replace(AREA_ARMS[area], action_scale=w)
     == KANGAROO_GRIPPERS_LEFT_ARM_WIDE
   )
 
@@ -339,6 +352,9 @@ def test_delta_holds_at_zero_clips_at_the_box_and_does_not_wind_up():
     env.reset()
     term = _term(env)
     rate, lo, hi = term._rate[0], term._box_lo, term._box_hi
+    # `scale` is the per-step rate: what the ONNX `action_scale` metadata must say for a delta term.
+    assert torch.equal(term._scale, term._rate)
+    assert bool((hi - lo > 10 * rate).all()), "the box is many steps wide"
     zero = torch.zeros(env.action_space.shape, device=env.device)
     # a = 0 holds the target, from the default pose and after moving.
     start = term.commanded_target.clone()
@@ -433,12 +449,10 @@ def test_the_actor_is_38d_and_the_action_8d(action, cmd_obs):
 
 # -- The wide area --------------------------------------------------------------------------
 
-AREA_X, AREA_Y = (-0.15, 0.05), (-0.04, 0.26)  # about the table centre
 
-
-def _wc_env(num_envs: int = 256):
+def _wc_env(area: str, num_envs: int = 256):
   return ManagerBasedRlEnv(
-    cfg=_cfg(wc=True, action="delta", cmd_obs=True, num_envs=num_envs),
+    cfg=_cfg(area=area, action="delta", cmd_obs=True, num_envs=num_envs),
     device=get_test_device(),
   )
 
@@ -450,11 +464,14 @@ def _cube_and_goal(env):
   return centre, cube, goal
 
 
-def test_every_cube_and_target_is_in_the_area_at_least_10_cm_apart():
-  env = _wc_env()
+@pytest.mark.parametrize("area", AREAS)
+def test_every_cube_and_target_is_in_the_area_at_least_10_cm_apart(area):
+  env = _wc_env(area)
   try:
-    lo = torch.tensor([AREA_X[0], AREA_Y[0]], device=env.device)
-    hi = torch.tensor([AREA_X[1], AREA_Y[1]], device=env.device)
+    (x0, x1), (y0, y1) = AREA_BOUNDS[area]
+    lo = torch.tensor([x0 - 0.55, y0], device=env.device)
+    hi = torch.tensor([x1 - 0.55, y1], device=env.device)
+    diagonal = float(torch.norm(hi - lo))
     seen_cube, seen_goal, dists = [], [], []
     command = env.command_manager.get_term(tt.COMMAND)
     for _ in range(6):
@@ -485,20 +502,22 @@ def test_every_cube_and_target_is_in_the_area_at_least_10_cm_apart():
       assert bool((pts.min(0).values < lo + 0.02).all()) and bool(
         (pts.max(0).values > hi - 0.02).all()
       )
-    # ...and the carries are of every length the area allows: 10 cm up to its diagonal (36 cm).
-    assert float(d.max()) > 0.30 and float(d.min()) < 0.13
+    # ...and the carries are of every length the area allows: 10 cm up to about its diagonal.
+    assert float(d.max()) > 0.85 * diagonal and float(d.min()) < 0.13
     # The area's far side is used as a target as well as a cube's spawn (not "always the same way").
+    span = float(hi[0] - lo[0])
     assert (
-      float((goal[:, 0] - cube[:, 0]).min()) < -0.05
-      and float((goal[:, 0] - cube[:, 0]).max()) > 0.05
+      float((goal[:, 0] - cube[:, 0]).min()) < -0.25 * span
+      and float((goal[:, 0] - cube[:, 0]).max()) > 0.25 * span
     )
   finally:
     env.close()
 
 
-def test_the_fallback_when_rejection_gives_up_is_still_10_cm_away(monkeypatch):
+@pytest.mark.parametrize("area", AREAS)
+def test_the_fallback_when_rejection_gives_up_is_still_10_cm_away(monkeypatch, area):
   monkeypatch.setattr(mdp.SurfaceOffsetCommand, "MAX_REDRAWS", 0)
-  env = _wc_env(num_envs=512)
+  env = _wc_env(area, num_envs=512)
   try:
     env.reset()
     env.sim.forward()
@@ -510,7 +529,7 @@ def test_the_fallback_when_rejection_gives_up_is_still_10_cm_away(monkeypatch):
 
 def test_the_goal_follows_the_table_once_drawn():
   """The goal is table-relative, so a step later it is still where it was drawn about the table."""
-  env = _wc_env(num_envs=8)
+  env = _wc_env("WCK", num_envs=8)
   try:
     env.reset()
     command = env.command_manager.get_term(tt.COMMAND)
@@ -562,7 +581,7 @@ def test_the_eval_reads_the_new_flag_and_bins_by_carry_and_spawn():
   assert args.handoff_timeout == ev.HANDOFF_TIMEOUT_S == 8.0
   args = ev.parse_args(["--checkpoint", "x.pt", "--handoff", "--handoff-timeout", "21"])
   assert args.handoff_timeout == 21.0
-  assert ev.CARRY_BINS == ((0.10, 0.20), (0.20, 0.30), (0.30, 9.99))
+  assert ev.CARRY_BINS == ((0.10, 0.15), (0.15, 0.20), (0.20, 0.30), (0.30, 9.99))
   # The old W2 box about the table centre is where `SPAWN=W2` draws the cube.
   w2 = pp.SPAWN_BOXES["W2"]
   assert w2.x == pytest.approx(

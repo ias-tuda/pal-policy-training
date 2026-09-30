@@ -110,6 +110,15 @@ SPAWN_BOXES = {
   "WC": SpawnBox(
     x=(0.40, 0.60), y=(-0.04, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
+  # ... and the part of it the scripted planner can plan a place in (S7-8 step 0, 2026-09-30,
+  # `results/S7-8/wc/`): only 35 % of the full area's (spawn, target >= 10 cm apart, yaw) triples
+  # have a contact-free plan against the plan's 98 %, and none at x >= 0.56 for y < 0.18. The
+  # plan's default for that case is to cut the failing part and keep the rest: this box, x
+  # 0.40-0.52, y 0.10-0.26 (12 x 16 cm = 192 cm2, 32 % of the area), where a 2 cm spawn x 4 cm
+  # target sweep at yaw -45 / 0 / +45 plans 100 % of its 1620 triples.
+  "WCK": SpawnBox(
+    x=(0.40, 0.52), y=(0.10, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
+  ),
 }
 
 #: Where the target is drawn from, by name (`TARGET`, plan S7-8). ``B``: baseline B's small box.
@@ -117,7 +126,11 @@ SPAWN_BOXES = {
 #: `TARGET_MIN_SEPARATION` from the cube -- Claudius's recipe stack task
 #: (`stack/recipe_stack_env_cfg.py`: both cubes from the ``-Wide`` range, ``min_separation=0.10``).
 #: A `SpawnBox` is only used for its x and y.
-TARGET_AREAS: dict[str, SpawnBox | None] = {"B": None, "WC": SPAWN_BOXES["WC"]}
+TARGET_AREAS: dict[str, SpawnBox | None] = {
+  "B": None,
+  "WC": SPAWN_BOXES["WC"],
+  "WCK": SPAWN_BOXES["WCK"],
+}
 TARGET_MIN_SEPARATION = 0.10
 
 
