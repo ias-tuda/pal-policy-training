@@ -691,8 +691,8 @@ def _z(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
 # every one from 5 mm above it (the contact normals tilt up and the jaw squeezes the ball out); 20 mm
 # below, the ball sits 4 mm into the palm. At the equator the retained force is lowest (48 N against
 # 62 N at -15 mm) and the ball creeps most (17 mm against 14 mm in 30 s). The scripted pick-and-place
-# confirms it: with the pad midpoint at the equator the ball was let go 2-8 cm up in 7 of 12 corner
-# episodes (placed 4 / 12); at -10 mm it is placed 60 / 64, none let go high.
+# confirms it: with the pad midpoint at the equator the ball was let go 1.5-8.6 cm above its resting
+# height in 8 of the 11 grasped corner episodes (placed 4 / 12); at -10 mm it is placed 60 / 64, none let go > 3 cm up.
 EQ_WEIGHT = 1.0
 EQ_STD = 0.005  # m
 EQ_NEAR = 0.03  # m, horizontal
