@@ -63,6 +63,17 @@ def main() -> None:
   spawns = scripted.box_corners(pp.SPAWN_BOXES["W2"])[: args.spawns]
   cases = [(s, bx) for bx in boxes for s in spawns]
   n = len(cases)
+
+  arm_steps = None
+
+  def arm_hook(phase: str, env) -> None:
+    """Plan S10 item 5: AC must not fire on the scripted motion -- count each env's steps with arm
+    1-6 on the table above AC's 1 N."""
+    nonlocal arm_steps
+    term = env.reward_manager.get_term_cfg("arm_table_contact")
+    hit = term.func(env, **term.params).bool().cpu().numpy()
+    arm_steps = hit.astype(int) if arm_steps is None else arm_steps + hit
+
   rows = scripted.rollout(
     num_envs=n,
     device="cpu",
@@ -83,7 +94,10 @@ def main() -> None:
     arm_table=ARM_TABLE_CODES["AC"],
     pad_clearance=args.pad_clearance,
     yaw_errors=[math.radians(args.yaw_error)] * n,
+    hook=arm_hook,
   )
+  for r in rows:
+    r["arm_table_steps"] = int(arm_steps[r["env"]]) if arm_steps is not None else None
   for r, (sp, bx) in zip(rows, cases, strict=True):
     r["spawn"] = [float(sp[0][0]), float(sp[0][1]), float(sp[1])]
     r["box"] = [float(bx[0][0]), float(bx[0][1]), float(bx[1])]
@@ -95,6 +109,7 @@ def main() -> None:
     f"both {sum(ok)}/{n}; hand on a wall while held in {sum(r.get('hand_wall_held_steps', 0) > 0 for r in rows)}, "
     f"cube on a wall while held in {sum(r.get('cube_wall_held_steps', 0) > 0 for r in rows)}; "
     f"plan errors {sum(r['plan_error'] is not None for r in rows)}; "
+    f"AC fired (arm 1-6 on the table > 1 N) in {sum((r['arm_table_steps'] or 0) > 0 for r in rows)}; "
     f"box moved median {np.median([r.get('box_displacement_mm', 0) for r in rows]):.1f} mm"
   )
   args.json.parent.mkdir(parents=True, exist_ok=True)
