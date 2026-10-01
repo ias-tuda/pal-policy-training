@@ -50,6 +50,16 @@ Every episode's spawn pose, table offset from its nominal pose, target, release 
 and final cube position go into the JSON (``episodes_detail``): what plan S7-2's D5
 diagnosis and the W runs' placed rate by spawn distance are read from.
 
+Plan S7-10: the arm on the table (``ArmTally``)
+--------------------------------------------------------------------------------
+Per episode, the driven arm's links 1-6 against the table: whether any presses harder than
+`ARM_CONTACT_N` (1 N), on how many steps, the peak force, which link, and in which phase (before
+the first grasp, while held, after the let-go, other). The contact reads need the arm-table
+sensor, i.e. an env built with ``ARM_TABLE`` set (``ARM_TABLE=watch`` for a policy trained without
+it); without it they are left out. The clearance read needs no sensor: each link's lowest
+collision point above the table top, the episode's minimum, and the share of episodes that come
+within 1 / 2 / 3 cm -- the margin a real arm with tracking error needs.
+
 Plan S7-4: the release is the jaw opening, and the retreat (``RetreatTally``)
 --------------------------------------------------------------------------------
 Every read above keeps its old definition (a let-go = the pads losing the cube), so a number
@@ -792,6 +802,178 @@ class PlantTally:
       "plant_driven_target_out_of_range": dict(zip(names, out, strict=True)),
       "plant_driven_target_out_of_range_max": max(out, default=None),
     }
+
+
+#: Arm-table force above which a contact counts (N): plan S7-10's AC threshold.
+ARM_CONTACT_N = 1.0
+#: Phases an arm-table contact is filed under (plan S7-10 step 0).
+ARM_PHASES = ("before_grasp", "held", "after_let_go", "other")
+
+
+class ArmTally:
+  """Plan S7-10's reads, per episode, kept beside `Tally` and banked with it. Tensors in, like
+  `PlantTally`; `from_env` wires one to an env. ``force`` is (B, L) per link (None: no sensor),
+  ``clearance`` (B, L) per link, m (+inf: not over the table)."""
+
+  def __init__(self, num_envs: int, device: str, links: list[str]) -> None:
+    self.links = links
+    n = len(links)
+    self.contact_steps = torch.zeros(num_envs, n, dtype=torch.long, device=device)
+    self.phase_steps = torch.zeros(
+      num_envs, len(ARM_PHASES), dtype=torch.long, device=device
+    )
+    self.peak = torch.zeros(num_envs, device=device)
+    self.min_clear = torch.full((num_envs, n), float("inf"), device=device)
+    self.ever_grasped = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.has_force = False
+    self.done: list[dict] = []
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> ArmTally:
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+      ARM_TABLE_SENSOR,
+      arm_body_regex,
+    )
+
+    gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+    asset = SceneEntityCfg(ROBOT, body_names=(arm_body_regex(gripper),))
+    asset.resolve(env.scene)
+    robot = env.scene[ROBOT]
+    links = [robot.body_names[i] for i in asset.body_ids]
+    tally = cls(env.num_envs, env.device, links)
+    tally._env, tally._asset = env, asset
+    tally._sensor = None
+    try:
+      tally._sensor = env.scene[ARM_TABLE_SENSOR]
+    except KeyError:
+      pass
+    if tally._sensor is not None:
+      names = [n.split("/")[-1] for n in tally._sensor.primary_names]
+      if names != links:  # slot i must be link i for the per-link reads
+        raise RuntimeError(f"arm-table sensor primaries {names} are not {links}")
+      tally.has_force = True
+    return tally
+
+  def step_env(self, grasped: torch.Tensor, let_go: torch.Tensor) -> None:
+    """`step` from the env `from_env` was built on, at the current state."""
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.tabletop_env_cfg import TABLE
+
+    force = None
+    if self._sensor is not None:
+      hist = self._sensor.data.force_history  # (B, L, H, 3)
+      force = torch.norm(hist, dim=-1).amax(dim=-1)
+    clearance = mdp.arm_table_clearance(self._env, self._asset, SceneEntityCfg(TABLE))
+    self.step(force, clearance, grasped, let_go)
+
+  def step(
+    self,
+    force: torch.Tensor | None,
+    clearance: torch.Tensor,
+    grasped: torch.Tensor,
+    let_go: torch.Tensor,
+  ) -> None:
+    grasped, let_go = grasped.bool(), let_go.bool()
+    self.ever_grasped |= grasped
+    self.min_clear = torch.minimum(self.min_clear, clearance)
+    if force is None:
+      return
+    touch = force > ARM_CONTACT_N  # (B, L)
+    self.contact_steps += touch.long()
+    self.peak = torch.maximum(self.peak, force.amax(dim=-1))
+    any_touch = touch.any(dim=-1)
+    phase = torch.full_like(self.ever_grasped, 3, dtype=torch.long)  # other
+    phase = torch.where(grasped, torch.ones_like(phase), phase)
+    phase = torch.where(let_go & ~grasped, torch.full_like(phase, 2), phase)
+    phase = torch.where(~self.ever_grasped, torch.zeros_like(phase), phase)
+    self.phase_steps += torch.nn.functional.one_hot(
+      phase, len(ARM_PHASES)
+    ) * any_touch.unsqueeze(-1)
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      clear = self.min_clear[i].tolist()
+      row: dict = {
+        "arm_min_clearance_m": min(clear),
+        "arm_min_clearance_by_link_m": dict(zip(self.links, clear, strict=True)),
+      }
+      if self.has_force:
+        steps = self.contact_steps[i].tolist()
+        row.update(
+          {
+            "arm_table_contact": any(steps),
+            "arm_table_contact_steps": max(steps) if steps else 0,
+            "arm_table_peak_force_n": float(self.peak[i]),
+            "arm_table_contact_by_link": dict(zip(self.links, steps, strict=True)),
+            "arm_table_contact_by_phase": dict(
+              zip(ARM_PHASES, self.phase_steps[i].tolist(), strict=True)
+            ),
+          }
+        )
+      self.done.append(row)
+    self.contact_steps[env_ids] = 0
+    self.phase_steps[env_ids] = 0
+    self.peak[env_ids] = 0.0
+    self.min_clear[env_ids] = float("inf")
+    self.ever_grasped[env_ids] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    if not rows:
+      return {}
+    n = len(rows)
+    median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+    finite = [
+      r["arm_min_clearance_m"] for r in rows if math.isfinite(r["arm_min_clearance_m"])
+    ]
+    out: dict = {
+      "arm_min_clearance_median_m": median(finite),
+      "arm_min_clearance_min_m": min(finite, default=None),
+      "arm_min_clearance_median_by_link_m": {
+        link: median(
+          [
+            r["arm_min_clearance_by_link_m"][link]
+            for r in rows
+            if math.isfinite(r["arm_min_clearance_by_link_m"][link])
+          ]
+        )
+        for link in self.links
+      },
+      **{
+        f"arm_within_{cm}cm_share": sum(
+          r["arm_min_clearance_m"] < cm / 100 for r in rows
+        )
+        / n
+        for cm in (1, 2, 3)
+      },
+    }
+    if self.has_force:
+      touched = [r for r in rows if r["arm_table_contact"]]
+      out.update(
+        {
+          "arm_table_contact_share": len(touched) / n,
+          "arm_table_contact_share_by_link": {
+            link: sum(r["arm_table_contact_by_link"][link] > 0 for r in rows) / n
+            for link in self.links
+          },
+          "arm_table_contact_steps_by_phase": {
+            p: sum(r["arm_table_contact_by_phase"][p] for r in rows) for p in ARM_PHASES
+          },
+          "arm_table_peak_force_median_n": median(
+            [r["arm_table_peak_force_n"] for r in touched]
+          ),
+          "arm_table_peak_force_max_n": max(
+            (r["arm_table_peak_force_n"] for r in rows), default=None
+          ),
+          "arm_table_over_30n_share": sum(
+            r["arm_table_peak_force_n"] > 30.0 for r in rows
+          )
+          / n,
+        }
+      )
+    return out
 
 
 class RetreatTally:
@@ -1807,6 +1989,35 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
           f"max {v['max_m'] * 100:5.2f} cm  (n {v['n']})"
         )
 
+  if "arm_min_clearance_median_m" in result:
+    print("\n  ARM VS TABLE, links 1-6 (plan S7-10) --------------------------------")
+    cm = lambda v: "   n/a" if v is None else f"{v * 100:6.2f} cm"  # noqa: E731
+    fmt3 = lambda v, u: "n/a" if v is None else f"{v:7.4f} {u}"  # noqa: E731
+    print(
+      f"    lowest point over table  {cm(result['arm_min_clearance_median_m'])}"
+      f"  (episode min, median; min {cm(result['arm_min_clearance_min_m'])})"
+    )
+    for link, v in result["arm_min_clearance_median_by_link_m"].items():
+      print(f"      {link:22s} {cm(v)}")
+    print(
+      "    within 1 / 2 / 3 cm      "
+      + " / ".join(f"{result[f'arm_within_{c}cm_share']:.0%}" for c in (1, 2, 3))
+    )
+    if "arm_table_contact_share" in result:
+      print(
+        f"    episodes with contact    {result['arm_table_contact_share']:.0%}"
+        f"  (> 30 N {result['arm_table_over_30n_share']:.0%}; peak median "
+        f"{fmt3(result['arm_table_peak_force_median_n'], 'N')}, max "
+        f"{fmt3(result['arm_table_peak_force_max_n'], 'N')})"
+      )
+      for link, v in result["arm_table_contact_share_by_link"].items():
+        print(f"      {link:22s} {v:.0%}")
+      print(
+        f"    contact steps by phase   {result['arm_table_contact_steps_by_phase']}"
+      )
+    else:
+      print("    contact: no arm-table sensor in this env (set ARM_TABLE=watch)")
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -1838,6 +2049,7 @@ def main() -> None:
     raise SystemExit("--handoff-lift is written for absolute targets, not ACTION=delta")
   lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
+  arm = ArmTally.from_env(env)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
@@ -1874,6 +2086,7 @@ def main() -> None:
           setdown=flags["grasped"] & (dxy < NEAR_XY),
           after_let_go=retreat.let_go,
         )
+      arm.step_env(flags["grasped"], retreat.let_go)
       sensors = getattr(env, "_pal_cube_sensors", None)
       if sensors and OBJECT in sensors:
         occ.step(
@@ -1932,6 +2145,7 @@ def main() -> None:
           occ.finish(finished)
         if plant is not None:
           plant.finish(finished)
+        arm.finish(finished)
         for key, value in extras.get("log", {}).items():
           if key.startswith("Episode_Reward/"):
             reward_sums.setdefault(key.removeprefix("Episode_Reward/"), []).append(
@@ -1947,6 +2161,7 @@ def main() -> None:
     result.update(lift.summarise())
   if plant is not None:
     result.update(plant.summarise(args.episodes))
+  result.update(arm.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
@@ -1973,11 +2188,12 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o}
-            for r, q, o in zip(
+            {**r, **q, **o, **a}
+            for r, q, o, a in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
+              arm.done[: args.episodes],
               strict=True,
             )
           ],

@@ -1223,6 +1223,11 @@ def parse_args() -> argparse.Namespace:
   r.add_argument(
     "--episode-s", type=float, default=None, help="episode length; the script is slow"
   )
+  r.add_argument(
+    "--arm-clearance",
+    action="store_true",
+    help="plan S7-10: arm 1-6's lowest point over the table, per phase and link",
+  )
   r.add_argument("--json", type=pathlib.Path, default=None)
   m = sub.add_parser(
     "map", help="action-space reach map over a spawn grid (plan S7 P2)"
@@ -1246,6 +1251,57 @@ def parse_args() -> argparse.Namespace:
   return p.parse_args()
 
 
+class ArmClearanceHook:
+  """Plan S7-10 step 0, item 4: how close a *legal* pick-and-place brings arm 1-6 to the table.
+
+  A `rollout` hook: per phase, per env and per link, the lowest collision point over the
+  table's footprint (`mdp.arm_table_clearance`, AH's own measure). AH's margin must stay below
+  the scripted motion's minimum, or the term fires on a correct pick. No sensor is needed."""
+
+  def __init__(self) -> None:
+    self.asset = None
+    self.links: list[str] = []
+    self.by_phase: dict = {}  # phase -> (B, L) tensor, m
+
+  def __call__(self, phase: str, env) -> None:
+    import torch
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.pick_place.arm_table import arm_body_regex
+    from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+
+    if self.asset is None:
+      gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+      self.asset = SceneEntityCfg("robot", body_names=(arm_body_regex(gripper),))
+      self.asset.resolve(env.scene)
+      robot = env.scene["robot"]
+      self.links = [robot.body_names[i] for i in self.asset.body_ids]
+    c = mdp.arm_table_clearance(env, self.asset, SceneEntityCfg("table"))
+    prev = self.by_phase.get(phase)
+    self.by_phase[phase] = c if prev is None else torch.minimum(prev, c)
+
+  def report(self, rows: list[dict]) -> None:
+    """Print the table and add each env's per-link minimum (m) to its row."""
+    import torch
+
+    if not self.by_phase:
+      return
+    every = torch.stack(list(self.by_phase.values())).amin(dim=0)  # (B, L)
+    cm = lambda v: "      -" if not math.isfinite(v) else f"{v * 100:7.1f}"  # noqa: E731
+    print(
+      "\nARM 1-6 OVER THE TABLE (plan S7-10 step 0 item 4), lowest point, cm, min over envs"
+    )
+    print(f"{'phase':10s}" + "".join(f"{n.split('_')[2]:>7s}" for n in self.links))
+    for phase, c in self.by_phase.items():
+      print(f"{phase:10s}" + "".join(cm(float(v)) for v in c.amin(dim=0)))
+    print(f"{'all':10s}" + "".join(cm(float(v)) for v in every.amin(dim=0)))
+    for i, row in enumerate(rows):
+      if i < every.shape[0]:
+        row["arm_min_clearance_by_link_m"] = dict(
+          zip(self.links, every[i].tolist(), strict=True)
+        )
+
+
 def main() -> None:
   args = parse_args()
   if args.cmd == "derive":
@@ -1259,6 +1315,7 @@ def main() -> None:
   from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
   from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
 
+  arm_hook = ArmClearanceHook() if args.arm_clearance else None
   robot = SPAWN_ROBOTS[args.spawn]
   if args.gains is not None:
     effort = pp.EFFORT_BOUNDS[args.effort]
@@ -1283,7 +1340,10 @@ def main() -> None:
     stack_speed=args.stack_speed,
     action_mode=args.action,
     episode_length_s=args.episode_s,
+    hook=arm_hook,
   )
+  if arm_hook is not None:
+    arm_hook.report(rows)
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(rows, indent=2))

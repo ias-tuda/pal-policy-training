@@ -24,6 +24,10 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 
 from pal_mjlab.tasks.manipulation import mdp, scene
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+  ArmTableCfg,
+  apply_arm_table,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
@@ -346,6 +350,7 @@ def make_pick_place_env_cfg(
   stack_speed: bool = False,
   action_mode: str = "abs",
   command_obs: bool = False,
+  arm_table: ArmTableCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -374,6 +379,8 @@ def make_pick_place_env_cfg(
       (or the reward variant's).
     stack_speed, action_mode, command_obs: plan S7-8's ``SLEW=stack``, ``ACTION`` and ``CMD_OBS``.
       See `make_tabletop_env_cfg`.
+    arm_table: plan S7-10's ``ARM_TABLE`` -- the arm-table sensor and the terms on it. See
+      `arm_table.ARM_TABLE_CODES`; None is every run before S7-10.
   """
   if target_xy is None:
     target_xy = baseline.target_xy
@@ -430,6 +437,9 @@ def make_pick_place_env_cfg(
     )
   # Not part of any arm's comparison: every variant carries the same trunk penalty.
   cfg.rewards.update(trunk_clearance_rewards(robot))
+  # Plan S7-10: the arm off the table. After the variant's dict, like the trunk penalty, so
+  # that the same code adds the same terms to every variant.
+  apply_arm_table(cfg, gripper, arm_table)
   cfg.curriculum = reward_curriculum_cfg()
 
   success_params = {
