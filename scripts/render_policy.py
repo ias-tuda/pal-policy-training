@@ -101,6 +101,15 @@ def parse_args() -> argparse.Namespace:
     "jaw has opened after the lift and the TCP is clear of the cube, or at 8 s",
   )
   p.add_argument(
+    "--handoff-timeout",
+    type=float,
+    default=None,
+    metavar="S",
+    help="with --handoff: the episode time (s) at which the position controller takes over a "
+    "policy that has not lifted clear (default: the eval's 8 s). Plan S7-8's stack speeds: ~46 "
+    "for a 55 s episode.",
+  )
+  p.add_argument(
     "--handoff-lift",
     type=float,
     default=None,
@@ -275,7 +284,15 @@ def main() -> None:
   robot = env.scene[ev.ROBOT]
   arm_ids = [i for i, n in enumerate(robot.joint_names) if n.startswith("arm_left_")]
   jaw_id = robot.joint_names.index(ev.JAW_JOINT)
-  retreat = ev.RetreatTally(1, args.device, env.step_dt, handoff=args.handoff)
+  retreat = ev.RetreatTally(
+    1,
+    args.device,
+    env.step_dt,
+    handoff=args.handoff,
+    timeout_s=ev.HANDOFF_TIMEOUT_S
+    if args.handoff_timeout is None
+    else args.handoff_timeout,
+  )
   if args.handoff_lift is not None and not args.handoff:
     raise ValueError("--handoff-lift needs --handoff")
   lift = (
@@ -311,7 +328,13 @@ def main() -> None:
       if lift is not None:
         actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
       elif args.handoff:
-        actions = torch.where(handed.unsqueeze(-1), torch.zeros_like(actions), actions)
+        # Action 0 is home with the jaw open for an absolute action; for plan S7-8's delta
+        # action it is the step towards home (`eval_pick_place.handoff_action`).
+        actions = torch.where(
+          handed.unsqueeze(-1),
+          ev.handoff_action(env, torch.zeros_like(actions)),
+          actions,
+        )
       status = (
         (
           "position controller: "

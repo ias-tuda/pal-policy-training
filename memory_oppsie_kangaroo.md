@@ -211,6 +211,18 @@ Plans live in `oppsie-data/docs/` beside this repo, outside git (`docs/roadmap.m
   link, 0.9 m below `base_link` (`_to_base_frame` uses the root link; `fda9492` moves them to
   `base_link`). A deployment needs both mappings; the sim2sim profile carries them
   (`joint_signs`, `base_in_obs_frame_*`).
+- **A run's directory has had `start_observation_distribution.json` and
+  `deployment_start_config.json` only since 2026-10-01** (`ManipulationRunner.__init__`;
+  `tasks/manipulation/deployment.py` is Claudius's, verbatim from `origin/faster-moves` `7b2be00`,
+  introduced in `fda9492` — whose export half `5e09c30` did not take). The distribution is the
+  actor's observation per term over the training envs right after a reset (`num_initial_envs` =
+  the run's `num_envs`), what `pal_policy_deployer`'s `check_start_distribution.py` compares the
+  robot's start against. A failed write is a warning, and its `env.reset()` before the first
+  iteration shifts the run's RNG stream against the same seed without it. Runs before that (S7-8
+  and earlier) get it from `scripts/write_start_distribution.py <run dir>`, which rebuilds the env
+  from the selectors and writes nothing unless its cfg equals `params/env.yaml` (0 differing lines
+  for S7-8 WC-ABS-c s1, `../results/S7-8/ias_runs/<run>/`, 2048 envs, Mac CPU 19 s). Tests
+  `tests/test_manipulation_deployment.py`.
 - **PAL's physics simulator has no free bodies** (static Bullet world objects only), so a cube
   cannot be simulated there. Its gripper settles 0.0387 rad more closed than commanded, and its
   jaw velocity chatters at ±2 rad/s at 1 kHz (0.1 N·m URDF effort limit in a limit cycle) —
