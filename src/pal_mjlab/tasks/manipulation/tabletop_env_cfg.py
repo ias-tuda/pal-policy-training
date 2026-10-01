@@ -349,6 +349,11 @@ class ToolSpeedCapCfg:
   """The slow zone: a held object within this distance of its resting height on the table,
   or horizontally of the goal, m."""
 
+  slow_near_surface: bool = True
+  """Whether the slow zone includes "within ``slow_zone`` of the resting height" (lifting off,
+  setting down anywhere). False keeps only "horizontally near the goal": plan S7-9's PV, a slow
+  approach to the target with no other bound."""
+
 
 def _deployable_observations(
   action_joints: SceneEntityCfg,
@@ -681,6 +686,7 @@ def make_tabletop_env_cfg(
       speed_limit=tool_speed_cap.speed,
       slow_speed_limit=tool_speed_cap.slow_speed,
       slow_zone=tool_speed_cap.slow_zone,
+      slow_near_surface=tool_speed_cap.slow_near_surface,
       control_dt=CONTROL_DT,
       object_name=OBJECT,
       grasp_sensor_name=grasp_sensor,

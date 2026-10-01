@@ -388,7 +388,8 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
 
   v_max is ``speed_limit``, and ``slow_speed_limit`` while the object is held and either
   within ``slow_zone`` of its resting height on the surface (lifting off, setting down) or
-  within ``slow_zone`` of the goal horizontally (arriving over it).
+  within ``slow_zone`` of the goal horizontally (arriving over it). With ``slow_near_surface``
+  off only the second (plan S7-9's PV); an infinite ``speed_limit`` is no bound outside it.
 
   Like the slew, this lives in the action term: a deployment must apply the same bound to
   reproduce what was trained. The bound uses the robot's own kinematics (anchors, axes, tool
@@ -439,9 +440,9 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
     half_z = object_half_height(env, cfg.object_name)
     height = pos[:, 2] - surface_top_z(env, SceneEntityCfg(cfg.surface_name)) - half_z
     goal = env.command_manager.get_term(cfg.command_name).command
-    near = (height < cfg.slow_zone) | (
-      torch.norm((pos - goal)[:, :2], dim=-1) < cfg.slow_zone
-    )
+    near = torch.norm((pos - goal)[:, :2], dim=-1) < cfg.slow_zone
+    if cfg.slow_near_surface:
+      near = near | (height < cfg.slow_zone)
     slow = _grasped_bool(env, cfg.grasp_sensor_name) & near
     return torch.where(
       slow,
@@ -478,6 +479,9 @@ class ToolSpeedCappedJointPositionActionCfg(RateLimitedJointPositionActionCfg):
   slow_zone: float
   """Distance (m) to the object's resting height, or horizontally to the goal, inside which a
   held object gets ``slow_speed_limit``."""
+
+  slow_near_surface: bool = True
+  """Whether the resting-height half of the slow zone applies (False: near the goal only)."""
 
   control_dt: float
   """Control period, s: the bound is a speed times this."""
