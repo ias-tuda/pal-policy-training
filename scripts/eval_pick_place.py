@@ -1378,6 +1378,123 @@ class OccTally:
     }
 
 
+class StackTally:
+  """Plan S9's reads on a stack goal (`GOAL=stack`), per episode.
+
+  At every let-go of the pads after `was_lifted`: the five quantities of the release condition
+  (`mdp.stack`: xy offset to the goal on the base, height above it, tilt, yaw against the base,
+  speed) and whether ``OK`` held; the last let-go's are reported, plus whether any let-go was
+  ``OK`` and how many there were. The lock's steps (`GATE=stack`): armed (held, lifted, not OK)
+  and refused (the policy asked to open while armed) -- the stall read. And the base cube's
+  largest horizontal displacement from where it spawned.
+  """
+
+  NAMES = ("dxy", "height", "tilt", "yaw", "speed")
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation.mdp.stack import stack_command_reference
+
+    n, device = env.num_envs, env.device
+    self.reference = stack_command_reference(env, COMMAND)
+    zf = lambda: torch.zeros(n, device=device)  # noqa: E731
+    zl = lambda: torch.zeros(n, dtype=torch.long, device=device)  # noqa: E731
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=device)  # noqa: E731
+    self.prev = zb()
+    self.rel = {k: zf() for k in self.NAMES}
+    self.rel_ok, self.any_ok, self.n_let_go = zb(), zb(), zl()
+    self.armed, self.refused = zl(), zl()
+    self.fresh = torch.ones(n, dtype=torch.bool, device=device)
+    self.base0 = torch.zeros(n, 2, device=device)
+    self.base_moved = zf()
+    self.done: list[dict] = []
+
+  @property
+  def active(self) -> bool:
+    return self.reference is not None
+
+  def step(self, env: ManagerBasedRlEnv, grasped: torch.Tensor) -> None:
+    from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
+    from pal_mjlab.tasks.manipulation.mdp.stack import stack_state
+
+    lifted = getattr(env, _WAS_LIFTED, None)
+    lifted = torch.zeros_like(grasped) if lifted is None else lifted
+    let_go = self.prev & ~grasped & lifted
+    self.prev = grasped.clone()
+    state = stack_state(env, OBJECT, self.reference, COMMAND)
+    for k in self.NAMES:
+      self.rel[k] = torch.where(let_go, getattr(state, k), self.rel[k])
+    self.rel_ok = torch.where(let_go, state.ok, self.rel_ok)
+    self.any_ok |= let_go & state.ok
+    self.n_let_go += let_go.long()
+    term = env.action_manager.get_term("joint_pos")
+    if hasattr(term, "armed"):
+      self.armed += term.armed.long()
+      self.refused += term.locked.long()
+    base_xy = env.scene[self.reference].data.root_link_pos_w[:, :2]
+    self.base0 = torch.where(self.fresh.unsqueeze(-1), base_xy, self.base0)
+    self.fresh[:] = False
+    self.base_moved = torch.maximum(
+      self.base_moved, torch.norm(base_xy - self.base0, dim=-1)
+    )
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      seen = int(self.n_let_go[i]) > 0
+      row = {
+        f"stack_release_{k}": float(self.rel[k][i]) if seen else None
+        for k in self.NAMES
+      }
+      row["stack_release_ok"] = bool(self.rel_ok[i]) if seen else None
+      row["stack_any_ok"] = bool(self.any_ok[i])
+      row["stack_let_gos"] = int(self.n_let_go[i])
+      row["stack_lock_armed_steps"] = int(self.armed[i])
+      row["stack_lock_refused_steps"] = int(self.refused[i])
+      row["stack_base_moved_m"] = float(self.base_moved[i])
+      self.done.append(row)
+    for t in (self.prev, self.rel_ok, self.any_ok):
+      t[env_ids] = False
+    self.n_let_go[env_ids] = 0
+    self.armed[env_ids] = 0
+    self.refused[env_ids] = 0
+    self.base_moved[env_ids] = 0.0
+    self.fresh[env_ids] = True
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    released = [r for r in rows if r["stack_let_gos"] > 0]
+    out = {
+      "stack_episodes_with_let_go": len(released) / n,
+      "stack_let_go_ok": (
+        sum(r["stack_release_ok"] for r in released) / len(released)
+        if released
+        else None
+      ),
+      "stack_any_ok": sum(r["stack_any_ok"] for r in rows) / n,
+      "stack_lock_armed_median_s": None,
+      "stack_lock_refused_episodes": sum(r["stack_lock_refused_steps"] > 0 for r in rows)
+      / n,
+      "stack_base_moved_median_m": sorted(r["stack_base_moved_m"] for r in rows)[
+        len(rows) // 2
+      ]
+      if rows
+      else None,
+      "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows) / n,
+    }
+    armed = sorted(r["stack_lock_armed_steps"] for r in rows)
+    if armed and armed[-1] > 0:
+      out["stack_lock_armed_median_s"] = armed[len(armed) // 2] * STEP_DT_S
+    for k in self.NAMES:
+      vals = sorted(r[f"stack_release_{k}"] for r in released)
+      out[f"stack_release_{k}_median"] = vals[len(vals) // 2] if vals else None
+      out[f"stack_release_{k}_p90"] = vals[int(0.9 * (len(vals) - 1))] if vals else None
+    return out
+
+
+#: The control step, s (`tabletop_env_cfg.CONTROL_DT`), for the stack tally's lock times.
+STEP_DT_S = 0.02
+
+
 def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
   """The position controller's action: home pose, jaw open. ``zero`` (B, A) for an absolute
   action, whose 0 is the default pose; for plan S7-8's ``ACTION=delta`` the action moves the
@@ -1887,6 +2004,26 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
           f"max {v['max_m'] * 100:5.2f} cm  (n {v['n']})"
         )
 
+  if "stack_any_ok" in result:
+    print("\n  STACK (plan S9) ---------------------------------------------------")
+    print(
+      f"    episodes with a let-go   {result['stack_episodes_with_let_go']:6.1%}   last let-go OK "
+      f"{fmt(result['stack_let_go_ok'], '')}   any let-go OK {result['stack_any_ok']:6.1%}"
+    )
+    for k in StackTally.NAMES:
+      print(
+        f"    at the let-go {k:10s} median {fmt(result[f'stack_release_{k}_median'], '')}  "
+        f"p90 {fmt(result[f'stack_release_{k}_p90'], '')}"
+      )
+    print(
+      f"    lock refused an opening  {result['stack_lock_refused_episodes']:6.1%} of episodes; armed "
+      f"{fmt(result['stack_lock_armed_median_s'], 's')} (median)"
+    )
+    print(
+      f"    base moved               {fmt(result['stack_base_moved_median_m'], 'm')} (median); "
+      f"> 5 mm in {result['stack_base_moved_over_5mm']:6.1%}"
+    )
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -1918,6 +2055,7 @@ def main() -> None:
     raise SystemExit("--handoff-lift is written for absolute targets, not ACTION=delta")
   lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
+  stack = StackTally(env)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
@@ -1936,6 +2074,8 @@ def main() -> None:
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
       tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
+      if stack.active:
+        stack.step(env, flags["grasped"])
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
       jaw_thr = jaw_open_for(env)
       handed = retreat.step(
@@ -2013,6 +2153,8 @@ def main() -> None:
         )
         if occ.steps.any() or occ.done:
           occ.finish(finished)
+        if stack.active:
+          stack.finish(finished)
         if plant is not None:
           plant.finish(finished)
         for key, value in extras.get("log", {}).items():
@@ -2025,6 +2167,8 @@ def main() -> None:
   result.update(retreat.summarise(args.episodes))
   if occ.done:
     result.update(occ.summarise(args.episodes))
+  if stack.active:
+    result.update(stack.summarise(args.episodes))
   result["handoff"] = bool(args.handoff)
   if lift is not None:
     result.update(lift.summarise())
@@ -2056,11 +2200,12 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o}
-            for r, q, o in zip(
+            {**r, **q, **o, **st}
+            for r, q, o, st in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
+              stack.done[: args.episodes] or [{}] * args.episodes,
               strict=True,
             )
           ],
