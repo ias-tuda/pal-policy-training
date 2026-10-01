@@ -22,3 +22,13 @@ Two conventions of checkpoints trained before `fda9492` are written into every e
 `pick_place_profile.yaml` and applied by the node: `joint_signs` (arm 5 and 7 turn the other way
 than on PAL's URDF) and `base_in_obs_frame_*` (observations in the fixed-base root link, 0.9 m
 below `base_link`). Check both before exporting a policy trained on a different model.
+
+## S7 (RCTP) policies
+
+`export_for_pal_s7.py` is `export_for_pal.py` for the S7 family (baseline B, G20, C/T, W2): selectors instead of a
+run-directory name, no joint signs / observation offset (`5e09c30` ported `fda9492`), the 38-D actor, per-episode
+goals (`episodes_s7.json`), T's band and C's range in the profile, the pad gap against jaw angle, and
+`deployment_info.yaml` (every actuator's K / D / limits, defaults, timing, observation noise). `make_worlds.py --profile`
+builds the table at the model's height; `analyze_s7.py`, `analyze_hold_probe.py`, `compose_videos_s7.sh` and
+`write_deploy_notes.py` (-> `DEPLOYMENT.md`) read what the runs leave. The RCTP seed 3 test, its findings (G20's wrist
+damping is unstable in PAL's torque loop) and the files are in `../results/sim2sim/rctp_s3/`.
