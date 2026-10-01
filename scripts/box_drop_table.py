@@ -317,7 +317,7 @@ def summarise(cell, trials):
 
 def hand_checks(params) -> list[tuple[str, str, dict]]:
   sim = Sim()
-  I = np.eye(3)
+  eye3 = np.eye(3)
   # (name, box-frame centre, expectation, steps); expectation "inside", "not inside", "outside",
   # "on_rim". (b) balances the cube's centre over the 5 mm wall, a knife edge it can fall off
   # either way, so (b2) checks the on_rim label on a cube resting on the rim (one step, no time to
@@ -364,7 +364,7 @@ def hand_checks(params) -> list[tuple[str, str, dict]]:
     results = []
     for _label, mu, mass in sets:
       sim.set_cube_params(mu, mass)
-      feasible = sim.place(pos, I, 0.0)
+      feasible = sim.place(pos, eye3, 0.0)
       r = sim.run_and_classify(nstep)
       r["feasible"] = feasible
       results.append(r)
