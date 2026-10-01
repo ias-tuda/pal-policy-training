@@ -23,9 +23,15 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from pathlib import Path
 
 from mjlab.rl import RslRlOnPolicyRunnerCfg
 from mjlab.tasks.manipulation.rl.runner import ManipulationOnPolicyRunner
+
+from pal_mjlab.tasks.manipulation.deployment import (
+  write_deployment_start_config,
+  write_start_observation_distribution,
+)
 
 #: The single file `save_only_last` writes. Matches rsl_rl's default `load_checkpoint`
 #: regex `model_.*.pt`, so resuming needs no other change -- and matches it *uniquely*,
@@ -48,12 +54,33 @@ class ManipulationRunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 class ManipulationRunner(ManipulationOnPolicyRunner):
-  """`ManipulationOnPolicyRunner` that honours `save_only_last`, and resumes a run's reward
-  curriculum along with its policy.
+  """`ManipulationOnPolicyRunner` that honours `save_only_last`, resumes a run's reward
+  curriculum along with its policy, and writes the files a deployment checks the robot's
+  start against.
 
   Overriding `save` rather than `learn` covers both of rsl_rl's call sites -- the periodic
   save inside the loop and the final one after it -- without reimplementing the loop.
   """
+
+  def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
+    super().__init__(env, train_cfg, log_dir, device)
+    # `deployment_start_config.json` and `start_observation_distribution.json` beside the
+    # checkpoints, once per run (Claudius's fda9492 / a82fdf1, `origin/faster-moves`, which
+    # writes them from its own runner). Not on a play / eval runner (no log dir) and, under
+    # multi-GPU, only on rank 0. The distribution resets the env, so it is written before the
+    # first iteration. A failure here must not cost the run, so it is a warning; the
+    # `scripts/write_start_distribution.py` backfill makes the file from the run's selectors.
+    run_dir = self.logger.log_dir
+    if run_dir is None or (self.is_distributed and self.gpu_global_rank != 0):
+      return
+    try:
+      env = self.env.unwrapped
+      write_deployment_start_config(env, Path(run_dir) / "deployment_start_config.json")
+      write_start_observation_distribution(
+        env, Path(run_dir) / "start_observation_distribution.json"
+      )
+    except Exception as e:
+      print(f"[WARN] deployment start files not written (training continues): {e}")
 
   def learn(
     self, num_learning_iterations: int, init_at_random_ep_len: bool = False
