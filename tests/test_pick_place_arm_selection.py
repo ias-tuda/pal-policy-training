@@ -25,6 +25,7 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   NO_SUCCESS_TERMINATION,
   REQUIRE_LIFTED,
   REWARD_VARIANTS,
+  STACK_ONLY_ARMS,
 )
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES, manipulation_ppo_runner_cfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DR_LEVELS
@@ -43,6 +44,11 @@ def test_the_default_is_c1s_configuration(monkeypatch):
 @pytest.mark.parametrize("arm", sorted(REWARD_VARIANTS))
 def test_every_registered_arm_can_be_selected(arm, monkeypatch):
   monkeypatch.setenv(REWARD_ENV_VAR, arm)
+  if (
+    arm in STACK_ONLY_ARMS
+  ):  # plan S9's RG / SA read the base cube: the stack goal, in B's box
+    monkeypatch.setenv("GOAL", "stack")
+    monkeypatch.setenv("BASELINE", "B")
   cfg = kangaroo_pick_place_env_cfg()
   # Every arm resets the latch -- the eval reads it on all of them -- but only the strict
   # arms gate their success termination on it, and the S5.2 M1 arms have none at all.

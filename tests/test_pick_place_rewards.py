@@ -14,12 +14,14 @@ import torch
 from conftest import get_test_device
 from mjlab.envs import ManagerBasedRlEnv
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
+  BASELINES,
   make_pick_place_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
   REWARD_VARIANTS,
+  STACK_ONLY_ARMS,
   build_rewards,
 )
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
@@ -34,8 +36,12 @@ REGULARISERS = (
 
 
 def _cfg(variant: str, num_envs: int = 2):
+  # Plan S9's RG / SA read the base cube: they are built on the stack goal, which needs B's box.
+  stack = (
+    {"goal": "stack", "baseline": BASELINES["B"]} if variant in STACK_ONLY_ARMS else {}
+  )
   cfg = make_pick_place_env_cfg(
-    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=variant
+    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=variant, **stack
   )
   cfg.scene.num_envs = num_envs
   return cfg

@@ -35,10 +35,10 @@ from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
+  BASE_OBJECT,
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
   JAW_OPEN,
-  BASE_OBJECT,
   NO_SUCCESS_TERMINATION,
   REQUIRE_LIFTED,
   STACK_ONLY_ARMS,
@@ -565,7 +565,9 @@ def make_pick_place_env_cfg(
     if shape is not OBJECT_SHAPES["cube"]:
       raise ValueError("GOAL=stack stacks the 5 cm cube; SHAPE must be cube (plan S9)")
     if target_area is not None:
-      raise ValueError("GOAL=stack puts the base in the baseline's target box; TARGET must be B")
+      raise ValueError(
+        "GOAL=stack puts the base in the baseline's target box; TARGET must be B"
+      )
     if occlusion is not None:
       raise ValueError(
         "GOAL=stack with occlusion is not built: the line of sight knows one cube (plan S9)"
@@ -573,9 +575,13 @@ def make_pick_place_env_cfg(
     if baseline.target_half_xy <= 0.0:
       raise ValueError("GOAL=stack needs a baseline with a target box (BASELINE=B)")
   if gate == "stack" and not stack:
-    raise ValueError("GATE=stack is the release condition on the base cube; it needs GOAL=stack")
+    raise ValueError(
+      "GATE=stack is the release condition on the base cube; it needs GOAL=stack"
+    )
   if reward in STACK_ONLY_ARMS and not stack:
-    raise ValueError(f"{reward} grades the release on the base cube; it needs GOAL=stack")
+    raise ValueError(
+      f"{reward} grades the release on the base cube; it needs GOAL=stack"
+    )
   if occlusion is not None and shape is not OBJECT_SHAPES["cube"]:
     raise ValueError(
       "the occlusion model's line of sight is built for the 5 cm cube; SHAPE is not cube (plan S8)"

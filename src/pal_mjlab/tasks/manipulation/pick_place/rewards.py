@@ -876,9 +876,7 @@ _MODULE_ARMS = {
   **S9_ARMS,
 }
 #: Arms whose terms read the base cube (RG, SA): they need plan S9's `GOAL=stack`.
-STACK_ONLY_ARMS = frozenset(
-  n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m)
-)
+STACK_ONLY_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m))
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)
