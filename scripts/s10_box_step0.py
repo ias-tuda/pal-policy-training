@@ -32,7 +32,12 @@ def main() -> None:
   ap.add_argument("--json", type=pathlib.Path, required=True)
   ap.add_argument("--goal", default="box")
   ap.add_argument("--yaw-error", type=float, default=0.0, help="deg")
-  ap.add_argument("--pad-clearance", type=float, default=scripted.PAD_CLEARANCE)
+  ap.add_argument(
+    "--pad-clearance",
+    type=float,
+    default=0.05,
+    help="fingertips above the table before the close, m: 5 cm holds the cube at its middle (S10 step 0)",
+  )
   ap.add_argument("--spawns", type=int, default=9, help="W2 corner poses used (<= 9)")
   ap.add_argument("--boxes", type=int, default=5, help="box poses used (<= 5)")
   ap.add_argument("--dr", default="DR-scene")

@@ -11,7 +11,11 @@ an arm pressed by the table (the positive control plan S10 step 0 item 2 asks fo
 
 from __future__ import annotations
 
+import collections
+import importlib.util
 import math
+import pathlib
+import sys
 
 import pytest
 import torch
@@ -390,3 +394,112 @@ def test_arm_table_contact_fires_on_an_arm_pressed_by_the_table(monkeypatch):
   assert bool(found[0]) and not bool(found[1]), found
   assert float(cost[0]) == 1.0 and float(cost[1]) == 0.0
   env.close()
+
+
+# -- L5: the per-step reward rises along the task, into the box ---------------------------------
+
+_SCRIPT = pathlib.Path(__file__).parent.parent / "scripts/scripted_pick_place.py"
+_SPEC = importlib.util.spec_from_file_location("scripted_pick_place_s10", _SCRIPT)
+assert _SPEC and _SPEC.loader
+scripted = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = scripted
+_SPEC.loader.exec_module(scripted)
+
+ORDER = ("reach", "carry", "over_target", "held_on_target", "placed")
+#: c1a's hover height, as in the S5.2 / S8 ordering tests.
+CARRY_HEIGHT = 0.07
+VERTICAL_LOWERING = tuple(
+  step
+  for phase in scripted.PHASES
+  for step in (
+    (("lower", "retreat", True, 30), ("lower_down", "place", True, 40))
+    if phase[0] == "lower"
+    else (phase,)
+  )
+)
+#: The fingertip sites' height above the table before the jaw closes (`scripted_pick_place.PAD_CLEARANCE`
+#: is 1 cm). Closing drops them ~1 cm (the four-bar, S8's L16), so at 5 cm the cube is held at its
+#: middle and the tips stay above the rim with the cube on the box floor. At 1-3 cm they close at the
+#: table and end 1.4 cm below the rim in the box: the opening jaw presses them on the walls and the
+#: friction pins the hand -- the jaw stays at 0.35 rad and the arm cannot lift (S10 report, step 0).
+HIGH_GRASP = 0.05
+_TERMS = ("reach", "grasp", "lift", "goal", "goal_near", "release", "placed", "retreat")
+
+
+@pytest.fixture(scope="module")
+def box_episode():
+  """One scripted episode into the box under BX (`BS` + AC + ``GOAL=box``: G20, CTP, stack
+  speeds, B, W2), every reward term of the task recorded at every step for env 0, weighted: the
+  states are reached physically."""
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+  from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
+  from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+  from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
+  from pal_mjlab.tasks.manipulation.tabletop_env_cfg import LATENCY_MODELS
+
+  rec = collections.defaultdict(list)
+  terms: dict = {}
+
+  def hook(phase, env):
+    if not terms:
+      for name in env.reward_manager.active_terms:
+        terms[name] = env.reward_manager.get_term_cfg(name)
+    rec[phase].append(
+      {
+        name: float(cfg.weight * cfg.func(env, **cfg.params)[0])
+        for name, cfg in terms.items()
+        if name in _TERMS
+      }
+    )
+
+  saved = scripted.CLEAR_HEIGHT
+  scripted.CLEAR_HEIGHT = CARRY_HEIGHT
+  try:
+    rows = scripted.rollout(
+      num_envs=1,
+      device=get_test_device(),
+      reward=RCTP,
+      verbose=False,
+      hook=hook,
+      phases=VERTICAL_LOWERING,
+      robot=kangaroo_grippers_left_arm("G20", SPAWN_ROBOTS["W2"], arm_effort_scale=0.7),
+      baseline=pp.BASELINES["B"],
+      spawn_box=pp.SPAWN_BOXES["W2"],
+      dr="DR0",
+      effort=pp.EFFORT_BOUNDS["CTP"],
+      latency=LATENCY_MODELS["JS"],
+      stack_speed=True,
+      episode_length_s=120.0,
+      box_goal=bx.BOX_GOALS["box"],
+      arm_table=ARM_TABLE_CODES["AC"],
+      pad_clearance=HIGH_GRASP,
+    )
+  finally:
+    scripted.CLEAR_HEIGHT = saved
+  assert rows[0]["placed_and_lifted"] and rows[0]["in_box"], rows[0]
+  return rec
+
+
+def test_the_reward_rises_strictly_along_the_task_into_the_box(box_episode):
+  total = lambda step: sum(step.values())  # noqa: E731
+  # At the stack task's jaw speed (0.03 rad per step) and the jaw servo's lag the jaw passes J's
+  # 0.15 rad at the end of the 30-step `open` (on the table too): the first placed step after it.
+  after = box_episode["open"] + box_episode["retreat"]
+  placed = [t for t in after if t["placed"] > 0][:1]
+  assert placed, "the cube never counted as placed after the jaw opened"
+  totals = {
+    "reach": total(box_episode["descend"][-1]),
+    "carry": total(box_episode["lift"][-1]),
+    "over_target": total(box_episode["steady"][-1]),
+    "held_on_target": total(box_episode["hold"][-1]),
+    "placed": total(placed[-1]),
+  }
+  values = [totals[name] for name in ORDER]
+  assert all(a < b for a, b in zip(values, values[1:], strict=False)), totals
+
+
+def test_placed_keeps_paying_through_the_retreat_from_the_box(box_episode):
+  after = box_episode["open"] + box_episode["retreat"] + box_episode["settle"]
+  first = next(i for i, t in enumerate(after) if t["placed"] > 0)
+  paid = [t["placed"] > 0 for t in after[first:]]
+  assert sum(paid) / len(paid) > 0.9
