@@ -65,7 +65,7 @@ BS_ENV = {
   "LAG": "FP+JS",
   "ACTION": "abs",
   "CMD_OBS": "cmd",
-  "EPISODE_S": "55",
+  "EPISODE_S": "10",
 }
 
 
@@ -148,7 +148,7 @@ def test_the_shapes_are_named_and_unset_is_the_cube(monkeypatch):
     latency=tt.LATENCY_MODELS["FP+JS"],
     stack_speed=True,
     command_obs=True,
-    episode_length_s=55.0,
+    episode_length_s=10.0,
   )
   assert list(unset.events) == list(cube_env.events)
   assert list(unset.rewards) == list(cube_env.rewards)
