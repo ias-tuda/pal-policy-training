@@ -1,0 +1,157 @@
+{
+ "description": "Episode specs for S7-8 WC-ABS-c: a 4 x 3 stratified draw of the cube over the whole wide area (env frame x 0.40-0.60, y -0.04..0.26, yaw +-pi/4), the goal uniform in the same area at least 12 cm from the cube (>= 10 cm is the training's own bound), both 2 cm inside the edge. dx, dy, dyaw, goal_dx, goal_dy are from the area's centre (0.50, 0.11) for the node. Robot starts exactly at its default pose, table nominal. make_episodes_s78.py, seed 0.",
+ "spawn_center_env_xy": [
+  0.5,
+  0.11
+ ],
+ "goal_center_env_xy": [
+  0.5,
+  0.11
+ ],
+ "episodes": [
+  {
+   "id": 0,
+   "x": 0.4402,
+   "y": 0.0911,
+   "yaw": 0.4018,
+   "dx": -0.0598,
+   "dy": -0.0189,
+   "dyaw": 0.4018,
+   "goal_dx": 0.0656,
+   "goal_dy": 0.1255,
+   "cube_goal_distance": 0.1913
+  },
+  {
+   "id": 1,
+   "x": 0.5724,
+   "y": 0.0582,
+   "yaw": -0.2982,
+   "dx": 0.0724,
+   "dy": -0.0518,
+   "dyaw": -0.2982,
+   "goal_dx": 0.0368,
+   "goal_dy": 0.1037,
+   "cube_goal_distance": 0.1595
+  },
+  {
+   "id": 2,
+   "x": 0.5274,
+   "y": 0.1943,
+   "yaw": -0.6272,
+   "dx": 0.0274,
+   "dy": 0.0843,
+   "dyaw": -0.6272,
+   "goal_dx": 0.0078,
+   "goal_dy": -0.1263,
+   "cube_goal_distance": 0.2115
+  },
+  {
+   "id": 3,
+   "x": 0.4888,
+   "y": 0.1879,
+   "yaw": 0.5103,
+   "dx": -0.0112,
+   "dy": 0.0779,
+   "dyaw": 0.5103,
+   "goal_dx": 0.0269,
+   "goal_dy": -0.1297,
+   "cube_goal_distance": 0.2111
+  },
+  {
+   "id": 4,
+   "x": 0.5597,
+   "y": 0.1419,
+   "yaw": -0.4023,
+   "dx": 0.0597,
+   "dy": 0.0319,
+   "dyaw": -0.4023,
+   "goal_dx": -0.0418,
+   "goal_dy": 0.1216,
+   "cube_goal_distance": 0.1355
+  },
+  {
+   "id": 5,
+   "x": 0.4521,
+   "y": 0.1922,
+   "yaw": -0.659,
+   "dx": -0.0479,
+   "dy": 0.0822,
+   "dyaw": -0.659,
+   "goal_dx": 0.0693,
+   "goal_dy": -0.1016,
+   "cube_goal_distance": 0.2179
+  },
+  {
+   "id": 6,
+   "x": 0.4821,
+   "y": 0.0412,
+   "yaw": 0.0745,
+   "dx": -0.0179,
+   "dy": -0.0688,
+   "dyaw": 0.0745,
+   "goal_dx": 0.0742,
+   "goal_dy": 0.0268,
+   "cube_goal_distance": 0.1328
+  },
+  {
+   "id": 7,
+   "x": 0.5235,
+   "y": 0.1052,
+   "yaw": 0.1512,
+   "dx": 0.0235,
+   "dy": -0.0048,
+   "dyaw": 0.1512,
+   "goal_dx": 0.0603,
+   "goal_dy": 0.1101,
+   "cube_goal_distance": 0.1206
+  },
+  {
+   "id": 8,
+   "x": 0.4937,
+   "y": 0.1445,
+   "yaw": 0.6646,
+   "dx": -0.0063,
+   "dy": 0.0345,
+   "dyaw": 0.6646,
+   "goal_dx": 0.0469,
+   "goal_dy": -0.1086,
+   "cube_goal_distance": 0.1527
+  },
+  {
+   "id": 9,
+   "x": 0.4445,
+   "y": 0.0222,
+   "yaw": 0.2044,
+   "dx": -0.0555,
+   "dy": -0.0878,
+   "dyaw": 0.2044,
+   "goal_dx": -0.0447,
+   "goal_dy": 0.0766,
+   "cube_goal_distance": 0.1648
+  },
+  {
+   "id": 10,
+   "x": 0.5533,
+   "y": 0.224,
+   "yaw": -0.6274,
+   "dx": 0.0533,
+   "dy": 0.114,
+   "dyaw": -0.6274,
+   "goal_dx": -0.0566,
+   "goal_dy": 0.0514,
+   "cube_goal_distance": 0.1265
+  },
+  {
+   "id": 11,
+   "x": 0.5018,
+   "y": 0.0297,
+   "yaw": 0.6441,
+   "dx": 0.0018,
+   "dy": -0.0803,
+   "dyaw": 0.6441,
+   "goal_dx": 0.0055,
+   "goal_dy": 0.047,
+   "cube_goal_distance": 0.1273
+  }
+ ]
+}
