@@ -83,6 +83,7 @@ the policy was optimised for and the only one these rates mean anything against.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import pathlib
@@ -253,6 +254,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     metavar="H",
     help="with --handoff: the position controller first lifts the TCP straight up to H m over "
     "the cube's top (S7-5 report §8 item 1), then goes home; default: straight home",
+  )
+  p.add_argument(
+    "--obs-noise",
+    choices=("off", "on", "on-no-object"),
+    default="off",
+    help="plan S7-9's precision split: the actor's observation noise. off (default, every eval "
+    "before it: play mode turns corruption off); on (as trained: joint and cube-tracker bias and "
+    "jitter); on-no-object (as trained but the cube's position / yaw noise off). The tracker lag "
+    "is LAG's, not this flag's",
   )
   p.add_argument(
     "--trace",
@@ -863,6 +873,7 @@ class RetreatTally:
     self.rel_xy = torch.zeros(num_envs, 2, device=device)
     self.placed_j, self.placed_j_step = zb(), zl(-1)
     self.placed_jz, self.final_placed_jz, self.tilt_at_let_go = zb(), zb(), zf()
+    self.yaw_at_let_go = zf()
     self.clear_max = zf(float("-inf"))
     self.clear_run = zl()
     self.handed, self.hand_step, self.hand_by = zb(), zl(-1), zl()
@@ -886,6 +897,7 @@ class RetreatTally:
     placed_jz: torch.Tensor | None = None,
     tilt: torch.Tensor | None = None,
     jaw_open_below: float | torch.Tensor = JAW_OPEN,
+    yaw: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """One step's state -> the envs the position controller drives this step. (B,)
 
@@ -902,6 +914,8 @@ class RetreatTally:
     self.jaw_at_let_go = torch.where(let_go, jaw_q, self.jaw_at_let_go)
     if tilt is not None:
       self.tilt_at_let_go = torch.where(let_go, tilt, self.tilt_at_let_go)
+    if yaw is not None:
+      self.yaw_at_let_go = torch.where(let_go, yaw, self.yaw_at_let_go)
     self.let_go |= let_go
     # J's release: entering "jaw open and the pads off the cube" after the lift -- for a cube
     # held across an edge (the pads touch at ~0.10 rad) that is the let-go itself.
@@ -961,6 +975,7 @@ class RetreatTally:
         "tilt_at_let_go": float(self.tilt_at_let_go[i])
         if bool(self.let_go[i])
         else None,
+        "yaw_at_let_go": float(self.yaw_at_let_go[i]) if bool(self.let_go[i]) else None,
         "placed_j": bool(self.placed_j[i]),
         "placed_and_lifted_j": bool(self.placed_j[i]) and bool(self.lifted[i]),
         "lift_clear_max": float(self.clear_max[i]) if rel else None,
@@ -1411,6 +1426,19 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
   cfg.episode_length_s = load_env_cfg(args.task, play=False).episode_length_s
   cfg.scene.num_envs = args.num_envs
   cfg.seed = args.seed
+  noise = getattr(args, "obs_noise", "off")
+  if noise != "off":
+    # Plan S7-9's precision split: the noise the policy was trained with, back on -- with or
+    # without the cube's own (the terms keep their tracker lag either way).
+    actor = cfg.observations["actor"]
+    actor.enable_corruption = True
+    if noise == "on-no-object":
+      actor.terms = {
+        name: dataclasses.replace(term, noise=None)
+        if name in ("object_pos", "object_yaw")
+        else term
+        for name, term in actor.terms.items()
+      }
   if getattr(args, "plant", False):
     # The support sensor records contact only (`found`); the set-down read needs its force
     # too. A sensor field is read-only on the physics, and `found` -- what every other read
@@ -1480,6 +1508,12 @@ def tilt(env: ManagerBasedRlEnv) -> torch.Tensor:
     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
   )
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
+
+
+def yaw_mod90(yaw: torch.Tensor) -> torch.Tensor:
+  """A cube's yaw folded to [-pi/4, pi/4) (it looks the same every 90 deg), rad: plan S7-9's yaw
+  error against a box at yaw 0 (S10's drop table). (B,)"""
+  return torch.remainder(yaw + math.pi / 4, math.pi / 2) - math.pi / 4
 
 
 def pad_height_above_object(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -1950,6 +1984,7 @@ def main() -> None:
         placed_jz=flags["placed_and_lifted_z"] & (jaw_q < jaw_thr),
         tilt=tilt(env),
         jaw_open_below=jaw_thr,
+        yaw=yaw_mod90(obj_yaw),
       )
       if plant is not None:
         plant.measure_env(
