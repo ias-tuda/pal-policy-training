@@ -33,8 +33,17 @@ def surface_top_z(env: ManagerBasedRlEnv, surface_cfg: SceneEntityCfg) -> torch.
 
   Read out of physics data rather than from a config constant, so that height
   randomisation, mocap wrapping and env-origin offsets are all picked up for free.
+
+  The surface is the entity's first geom, unless ``surface_cfg`` names geoms: then it is the
+  highest top among them -- plan S10's box rim, its four walls (`scene.box_wall_geom_names`),
+  which BX-DR makes per world. Upright box geoms only: the half-size along z is read as the
+  half-height (the box is yawed, never tilted, at a reset).
   """
   surface: Entity = env.scene[surface_cfg.name]
+  if surface_cfg.geom_names is not None:
+    ids = surface.indexing.geom_ids[surface_cfg.geom_ids]
+    tops = env.sim.data.geom_xpos[:, ids, 2] + env.sim.model.geom_size[:, ids, 2]
+    return tops.amax(dim=-1)
   geom_id = surface.indexing.geom_ids[0]
   centre_z = env.sim.data.geom_xpos[:, geom_id, 2]
   half_z = env.sim.model.geom_size[:, geom_id, 2]
@@ -231,8 +240,12 @@ def reset_release_latch(
     latch.rel_on_table[env_ids] = False
     latch.rel_speed[env_ids] = 0.0
     latch.rel_dwell[env_ids] = 0
+    if latch.yaw is not None:
+      latch.yaw[env_ids] = 0.0
     # Plan S7-4's J state, when the latch defines a release by the jaw: a jaw closed at the
     # end of one episode must not "open" on the next one's first step, nor a let-go pending.
     if latch.jaw is not None:
       latch.jaw_closed[env_ids] = False
       latch.pend[env_ids] = False
+      if latch.pend_yaw is not None:
+        latch.pend_yaw[env_ids] = 0.0

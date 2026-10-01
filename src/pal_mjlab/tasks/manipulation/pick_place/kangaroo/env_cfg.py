@@ -51,6 +51,13 @@ drawn from one wide area -- Claudius's, or the part of it that plans -- >= 10 cm
 Plan S8 adds `SHAPE` (`cube` | `ball` | `ball-dr` | `mix`, `pick_place_env_cfg.OBJECT_SHAPES`): what is
 picked up -- the 5 cm cube of every run up to S7-8, a 6 cm ball, the ball with its size and rolling
 friction drawn, or a cube or a ball at random each episode. Unset is the cube.
+Plan S7-10 adds `ARM_TABLE` (`none` | `watch` | `AC` | `AH` | `AT`, `arm_table.ARM_TABLE_CODES`):
+the driven arm's links 1-6 against the table -- a sensor only (`watch`, for the eval), a contact
+penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (AT). Unset is
+`none`, every run up to S7-9.
+Plan S10 adds `GOAL` (`table` | `box` | `box-ny` | `box-rim` | `box-dr`, `box.BOX_GOALS`): the cube
+goes into an open box standing in baseline B's target box -- BX, without the yaw grade, with a rim
+penalty, with the box's size and mass drawn. Unset is `table`, every run before S10.
 """
 
 from __future__ import annotations
@@ -66,6 +73,8 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 )
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
+from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
@@ -110,6 +119,8 @@ CMD_OBS_ENV_VAR = "CMD_OBS"
 TARGET_ENV_VAR = "TARGET"
 EPISODE_ENV_VAR = "EPISODE_S"
 SHAPE_ENV_VAR = "SHAPE"
+ARM_TABLE_ENV_VAR = "ARM_TABLE"
+GOAL_ENV_VAR = "GOAL"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -127,6 +138,8 @@ DEFAULT_OBJ_OBS = "live"
 DEFAULT_ACTION = "abs"
 DEFAULT_TARGET = "B"
 DEFAULT_SHAPE = "cube"
+DEFAULT_ARM_TABLE = "none"
+DEFAULT_GOAL = "table"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -244,6 +257,10 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     action_mode=action,
     command_obs=_select_command_obs(action),
     shape=OBJECT_SHAPES[_select(SHAPE_ENV_VAR, DEFAULT_SHAPE, OBJECT_SHAPES)],
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    goal=BOX_GOALS[_select(GOAL_ENV_VAR, DEFAULT_GOAL, BOX_GOALS)],
   )
 
 

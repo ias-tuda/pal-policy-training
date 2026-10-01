@@ -50,6 +50,16 @@ Every episode's spawn pose, table offset from its nominal pose, target, release 
 and final cube position go into the JSON (``episodes_detail``): what plan S7-2's D5
 diagnosis and the W runs' placed rate by spawn distance are read from.
 
+Plan S7-10: the arm on the table (``ArmTally``)
+--------------------------------------------------------------------------------
+Per episode, the driven arm's links 1-6 against the table: whether any presses harder than
+`ARM_CONTACT_N` (1 N), on how many steps, the peak force, which link, and in which phase (before
+the first grasp, while held, after the let-go, other). The contact reads need the arm-table
+sensor, i.e. an env built with ``ARM_TABLE`` set (``ARM_TABLE=watch`` for a policy trained without
+it); without it they are left out. The clearance read needs no sensor: each link's lowest
+collision point above the table top, the episode's minimum, and the share of episodes that come
+within 1 / 2 / 3 cm -- the margin a real arm with tracking error needs.
+
 Plan S7-4: the release is the jaw opening, and the retreat (``RetreatTally``)
 --------------------------------------------------------------------------------
 Every read above keeps its old definition (a let-go = the pads losing the cube), so a number
@@ -71,6 +81,17 @@ Every placed rate is read under both goal tolerances, whatever the run trained o
 distance below `GOAL_THRESHOLD` (every run to S7-4) and S7-5's Z, `GOAL_TOL_XYZ` (xy < 2 cm and
 |dz| < 2 cm) -- ``*_z`` keys -- so an S7-5 number stays comparable with S7-4's. Beside them, the
 cube's tilt at the pads' let-go: the angle between the vertical and the nearest face normal.
+
+Plan S10: the box (``GOAL=box*``, `BoxTally`)
+--------------------------------------------------------------------------------
+When the scene has plan S10's box, beside every read above: the cube in the box at the end of
+the episode -- after the hand-off's return with ``--handoff`` (the headline, with
+``--handoff-lift 0.05``: the fingers go straight up out of the box before the arm turns home) --
+and S10's success (J-released after the lift, handed off, in the box at the end); bounce-outs
+(in the box at some step after the J-release, out at the end); the hand and the cube on a box wall
+while the cube is held; the box's displacement at the end; and the let-go's xy offset, height
+above the rim and yaw error (|yaw mod 90 deg|), from the reward's own release latch. Arm 1-6 on
+the table is plan S7-10's `ArmTally`.
 
 Horizon
 --------------------------------------------------------------------------------
@@ -836,6 +857,178 @@ class PlantTally:
     }
 
 
+#: Arm-table force above which a contact counts (N): plan S7-10's AC threshold.
+ARM_CONTACT_N = 1.0
+#: Phases an arm-table contact is filed under (plan S7-10 step 0).
+ARM_PHASES = ("before_grasp", "held", "after_let_go", "other")
+
+
+class ArmTally:
+  """Plan S7-10's reads, per episode, kept beside `Tally` and banked with it. Tensors in, like
+  `PlantTally`; `from_env` wires one to an env. ``force`` is (B, L) per link (None: no sensor),
+  ``clearance`` (B, L) per link, m (+inf: not over the table)."""
+
+  def __init__(self, num_envs: int, device: str, links: list[str]) -> None:
+    self.links = links
+    n = len(links)
+    self.contact_steps = torch.zeros(num_envs, n, dtype=torch.long, device=device)
+    self.phase_steps = torch.zeros(
+      num_envs, len(ARM_PHASES), dtype=torch.long, device=device
+    )
+    self.peak = torch.zeros(num_envs, device=device)
+    self.min_clear = torch.full((num_envs, n), float("inf"), device=device)
+    self.ever_grasped = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.has_force = False
+    self.done: list[dict] = []
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> ArmTally:
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+      ARM_TABLE_SENSOR,
+      arm_body_regex,
+    )
+
+    gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+    asset = SceneEntityCfg(ROBOT, body_names=(arm_body_regex(gripper),))
+    asset.resolve(env.scene)
+    robot = env.scene[ROBOT]
+    links = [robot.body_names[i] for i in asset.body_ids]
+    tally = cls(env.num_envs, env.device, links)
+    tally._env, tally._asset = env, asset
+    tally._sensor = None
+    try:
+      tally._sensor = env.scene[ARM_TABLE_SENSOR]
+    except KeyError:
+      pass
+    if tally._sensor is not None:
+      names = [n.split("/")[-1] for n in tally._sensor.primary_names]
+      if names != links:  # slot i must be link i for the per-link reads
+        raise RuntimeError(f"arm-table sensor primaries {names} are not {links}")
+      tally.has_force = True
+    return tally
+
+  def step_env(self, grasped: torch.Tensor, let_go: torch.Tensor) -> None:
+    """`step` from the env `from_env` was built on, at the current state."""
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.tabletop_env_cfg import TABLE
+
+    force = None
+    if self._sensor is not None:
+      hist = self._sensor.data.force_history  # (B, L, H, 3)
+      force = torch.norm(hist, dim=-1).amax(dim=-1)
+    clearance = mdp.arm_table_clearance(self._env, self._asset, SceneEntityCfg(TABLE))
+    self.step(force, clearance, grasped, let_go)
+
+  def step(
+    self,
+    force: torch.Tensor | None,
+    clearance: torch.Tensor,
+    grasped: torch.Tensor,
+    let_go: torch.Tensor,
+  ) -> None:
+    grasped, let_go = grasped.bool(), let_go.bool()
+    self.ever_grasped |= grasped
+    self.min_clear = torch.minimum(self.min_clear, clearance)
+    if force is None:
+      return
+    touch = force > ARM_CONTACT_N  # (B, L)
+    self.contact_steps += touch.long()
+    self.peak = torch.maximum(self.peak, force.amax(dim=-1))
+    any_touch = touch.any(dim=-1)
+    phase = torch.full_like(self.ever_grasped, 3, dtype=torch.long)  # other
+    phase = torch.where(grasped, torch.ones_like(phase), phase)
+    phase = torch.where(let_go & ~grasped, torch.full_like(phase, 2), phase)
+    phase = torch.where(~self.ever_grasped, torch.zeros_like(phase), phase)
+    self.phase_steps += torch.nn.functional.one_hot(
+      phase, len(ARM_PHASES)
+    ) * any_touch.unsqueeze(-1)
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      clear = self.min_clear[i].tolist()
+      row: dict = {
+        "arm_min_clearance_m": min(clear),
+        "arm_min_clearance_by_link_m": dict(zip(self.links, clear, strict=True)),
+      }
+      if self.has_force:
+        steps = self.contact_steps[i].tolist()
+        row.update(
+          {
+            "arm_table_contact": any(steps),
+            "arm_table_contact_steps": max(steps) if steps else 0,
+            "arm_table_peak_force_n": float(self.peak[i]),
+            "arm_table_contact_by_link": dict(zip(self.links, steps, strict=True)),
+            "arm_table_contact_by_phase": dict(
+              zip(ARM_PHASES, self.phase_steps[i].tolist(), strict=True)
+            ),
+          }
+        )
+      self.done.append(row)
+    self.contact_steps[env_ids] = 0
+    self.phase_steps[env_ids] = 0
+    self.peak[env_ids] = 0.0
+    self.min_clear[env_ids] = float("inf")
+    self.ever_grasped[env_ids] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    if not rows:
+      return {}
+    n = len(rows)
+    median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+    finite = [
+      r["arm_min_clearance_m"] for r in rows if math.isfinite(r["arm_min_clearance_m"])
+    ]
+    out: dict = {
+      "arm_min_clearance_median_m": median(finite),
+      "arm_min_clearance_min_m": min(finite, default=None),
+      "arm_min_clearance_median_by_link_m": {
+        link: median(
+          [
+            r["arm_min_clearance_by_link_m"][link]
+            for r in rows
+            if math.isfinite(r["arm_min_clearance_by_link_m"][link])
+          ]
+        )
+        for link in self.links
+      },
+      **{
+        f"arm_within_{cm}cm_share": sum(
+          r["arm_min_clearance_m"] < cm / 100 for r in rows
+        )
+        / n
+        for cm in (1, 2, 3)
+      },
+    }
+    if self.has_force:
+      touched = [r for r in rows if r["arm_table_contact"]]
+      out.update(
+        {
+          "arm_table_contact_share": len(touched) / n,
+          "arm_table_contact_share_by_link": {
+            link: sum(r["arm_table_contact_by_link"][link] > 0 for r in rows) / n
+            for link in self.links
+          },
+          "arm_table_contact_steps_by_phase": {
+            p: sum(r["arm_table_contact_by_phase"][p] for r in rows) for p in ARM_PHASES
+          },
+          "arm_table_peak_force_median_n": median(
+            [r["arm_table_peak_force_n"] for r in touched]
+          ),
+          "arm_table_peak_force_max_n": max(
+            (r["arm_table_peak_force_n"] for r in rows), default=None
+          ),
+          "arm_table_over_30n_share": sum(
+            r["arm_table_peak_force_n"] > 30.0 for r in rows
+          )
+          / n,
+        }
+      )
+    return out
+
+
 class RetreatTally:
   """Plan S7-4's reads, per episode, kept beside `Tally` and banked with it: the jaw release
   (module J), the retreat and the hand-off to the position controller. Tensors in, like
@@ -1378,6 +1571,104 @@ class OccTally:
     }
 
 
+class BoxTally:
+  """Plan S10's reads, per episode, beside `Tally` (see the module docstring). ``None`` from
+  `from_env` when the scene has no box."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> BoxTally | None:
+    from pal_mjlab.tasks.manipulation.pick_place.box import BOX
+
+    if BOX not in env.scene.entities:
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation.pick_place import box
+
+    self.box = box
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda: torch.zeros(n, device=dev)  # noqa: E731
+    self.in_box, self.in_box_after = zb(), zb()
+    self.hand_wall_held, self.cube_wall_held, self.hand_wall = zb(), zb(), zb()
+    self.displacement = zf()
+    self.rel_dxy, self.rel_height, self.rel_yaw, self.released = zf(), zf(), zf(), zb()
+    self.done: list[dict] = []
+
+  def step(
+    self, env: ManagerBasedRlEnv, grasped: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` is
+    `RetreatTally.released` (the jaw opened after the lift)."""
+    from pal_mjlab.tasks.manipulation import mdp
+
+    b = self.box
+    self.in_box = mdp.object_in_box_bool(env, OBJECT, b.BOX, b.BOX_WALLS)
+    self.in_box_after |= self.in_box & j_released
+    hit = lambda name: env.scene[name].data.found.bool().any(dim=-1)  # noqa: E731
+    hand, cube = hit(b.BOX_WALL_HAND_SENSOR), hit(b.BOX_WALL_OBJECT_SENSOR)
+    self.hand_wall |= hand
+    self.hand_wall_held |= hand & grasped
+    self.cube_wall_held |= cube & grasped
+    self.displacement = env.command_manager.get_term(COMMAND).box_displacement()
+    latch = getattr(env, "_pp_release", None)
+    if latch is not None and latch.yaw is not None:
+      self.released = latch.released.clone()
+      self.rel_dxy, self.rel_height = latch.dxy.clone(), latch.height.clone()
+      self.rel_yaw = latch.yaw.clone()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      row = {
+        "in_box_end": bool(self.in_box[i]),
+        "box_success": bool(self.in_box[i] & handed[i] & j_released[i]),
+        "bounce_out": bool(self.in_box_after[i] & ~self.in_box[i]),
+        "hand_wall_held": bool(self.hand_wall_held[i]),
+        "cube_wall_held": bool(self.cube_wall_held[i]),
+        "hand_wall_any": bool(self.hand_wall[i]),
+        "box_moved_mm": 1e3 * float(self.displacement[i]),
+        "latch_released": bool(self.released[i]),
+        "release_dxy_cm": 100 * float(self.rel_dxy[i]),
+        "release_above_rim_cm": 100 * float(self.rel_height[i]),
+        "release_yaw_deg": math.degrees(float(self.rel_yaw[i])),
+      }
+      self.done.append(row)
+      for t in (
+        self.in_box_after,
+        self.hand_wall_held,
+        self.cube_wall_held,
+        self.hand_wall,
+      ):
+        t[i] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k: sum(bool(r[k]) for r in rows) / n  # noqa: E731
+    rel = [r for r in rows if r["latch_released"]]
+    med = lambda k: float(np.median([r[k] for r in rel])) if rel else float("nan")  # noqa: E731
+    out = {
+      "box_in_box_end": share("in_box_end"),
+      "box_success": share("box_success"),
+      "box_bounce_out": share("bounce_out"),
+      "box_hand_wall_held": share("hand_wall_held"),
+      "box_cube_wall_held": share("cube_wall_held"),
+      "box_moved_mm_median": float(np.median([r["box_moved_mm"] for r in rows]))
+      if rows
+      else float("nan"),
+      "box_release_dxy_cm_median": med("release_dxy_cm"),
+      "box_release_above_rim_cm_median": med("release_above_rim_cm"),
+      "box_release_yaw_deg_median": med("release_yaw_deg"),
+      "box_release_yaw_under_10deg": (
+        sum(r["release_yaw_deg"] < 10 for r in rel) / len(rel) if rel else float("nan")
+      ),
+    }
+    return out
+
+
 def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
   """The position controller's action: home pose, jaw open. ``zero`` (B, A) for an absolute
   action, whose 0 is the default pose; for plan S7-8's ``ACTION=delta`` the action moves the
@@ -1887,6 +2178,35 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
           f"max {v['max_m'] * 100:5.2f} cm  (n {v['n']})"
         )
 
+  if "arm_min_clearance_median_m" in result:
+    print("\n  ARM VS TABLE, links 1-6 (plan S7-10) --------------------------------")
+    cm = lambda v: "   n/a" if v is None else f"{v * 100:6.2f} cm"  # noqa: E731
+    fmt3 = lambda v, u: "n/a" if v is None else f"{v:7.4f} {u}"  # noqa: E731
+    print(
+      f"    lowest point over table  {cm(result['arm_min_clearance_median_m'])}"
+      f"  (episode min, median; min {cm(result['arm_min_clearance_min_m'])})"
+    )
+    for link, v in result["arm_min_clearance_median_by_link_m"].items():
+      print(f"      {link:22s} {cm(v)}")
+    print(
+      "    within 1 / 2 / 3 cm      "
+      + " / ".join(f"{result[f'arm_within_{c}cm_share']:.0%}" for c in (1, 2, 3))
+    )
+    if "arm_table_contact_share" in result:
+      print(
+        f"    episodes with contact    {result['arm_table_contact_share']:.0%}"
+        f"  (> 30 N {result['arm_table_over_30n_share']:.0%}; peak median "
+        f"{fmt3(result['arm_table_peak_force_median_n'], 'N')}, max "
+        f"{fmt3(result['arm_table_peak_force_max_n'], 'N')})"
+      )
+      for link, v in result["arm_table_contact_share_by_link"].items():
+        print(f"      {link:22s} {v:.0%}")
+      print(
+        f"    contact steps by phase   {result['arm_table_contact_steps_by_phase']}"
+      )
+    else:
+      print("    contact: no arm-table sensor in this env (set ARM_TABLE=watch)")
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -1918,6 +2238,8 @@ def main() -> None:
     raise SystemExit("--handoff-lift is written for absolute targets, not ACTION=delta")
   lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
+  box = BoxTally.from_env(env)
+  arm = ArmTally.from_env(env)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
@@ -1951,12 +2273,15 @@ def main() -> None:
         tilt=tilt(env),
         jaw_open_below=jaw_thr,
       )
+      if box is not None:
+        box.step(env, flags["grasped"], retreat.released)
       if plant is not None:
         plant.measure_env(
           carrying=flags["lifted"],
           setdown=flags["grasped"] & (dxy < NEAR_XY),
           after_let_go=retreat.let_go,
         )
+      arm.step_env(flags["grasped"], retreat.let_go)
       sensors = getattr(env, "_pal_cube_sensors", None)
       if sensors and OBJECT in sensors:
         occ.step(
@@ -2007,6 +2332,8 @@ def main() -> None:
       finished = torch.nonzero(dones, as_tuple=False).flatten()
       if finished.numel():
         n_before = len(tally.done)
+        if box is not None:  # before `retreat.finish` clears its per-episode state
+          box.finish(finished, retreat.handed, retreat.released)
         tally.finish(finished)
         retreat.finish(
           finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
@@ -2015,6 +2342,7 @@ def main() -> None:
           occ.finish(finished)
         if plant is not None:
           plant.finish(finished)
+        arm.finish(finished)
         for key, value in extras.get("log", {}).items():
           if key.startswith("Episode_Reward/"):
             reward_sums.setdefault(key.removeprefix("Episode_Reward/"), []).append(
@@ -2030,6 +2358,10 @@ def main() -> None:
     result.update(lift.summarise())
   if plant is not None:
     result.update(plant.summarise(args.episodes))
+  result.update(arm.summarise(args.episodes))
+  if box is not None:
+    result.update(box.summarise(args.episodes))
+    print("\nplan S10 (box): " + json.dumps(box.summarise(args.episodes)))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
@@ -2056,11 +2388,14 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o}
-            for r, q, o in zip(
+            {**r, **q, **o, **a, **b}
+            for r, q, o, a, b in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
+              arm.done[: args.episodes],
+              (box.done[: args.episodes] if box is not None else None)
+              or [{}] * args.episodes,
               strict=True,
             )
           ],

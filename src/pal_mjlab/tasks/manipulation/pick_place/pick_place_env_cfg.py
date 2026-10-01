@@ -30,6 +30,11 @@ from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
 
 from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+  ArmTableCfg,
+  apply_arm_table,
+)
+from pal_mjlab.tasks.manipulation.pick_place.box import BoxGoal, apply_box_goal
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   DEFAULT_EPISODE_LENGTH_S,
@@ -411,6 +416,8 @@ def make_pick_place_env_cfg(
   action_mode: str = "abs",
   command_obs: bool = False,
   shape: ObjectShape = OBJECT_SHAPES["cube"],
+  arm_table: ArmTableCfg | None = None,
+  goal: BoxGoal | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -441,7 +448,21 @@ def make_pick_place_env_cfg(
       See `make_tabletop_env_cfg`.
     shape: plan S8's ``SHAPE`` -- the manipulated object (`OBJECT_SHAPES`): the 5 cm cube of every
       run up to S7-8, a 6 cm ball, the ball with its size and rolling friction drawn, or either.
+    arm_table: plan S7-10's ``ARM_TABLE`` -- the arm-table sensor and the terms on it. See
+      `arm_table.ARM_TABLE_CODES`; None is every run before S7-10.
+    goal: plan S10's ``GOAL`` -- put the cube into a box standing where the baseline's target box
+      is (`box.BOX_GOALS`, `box.apply_box_goal`); None is the goal on the table, every run before
+      S10.
   """
+  if goal is not None and (
+    shape is not OBJECT_SHAPES["cube"]
+    or target_area is not None
+    or occlusion is not None
+  ):
+    raise ValueError(
+      "plan S10's box is built for the 5 cm cube, baseline B's target box and no occlusion "
+      "model; SHAPE, TARGET or OCC is set"
+    )
   if occlusion is not None and shape is not OBJECT_SHAPES["cube"]:
     raise ValueError(
       "the occlusion model's line of sight is built for the 5 cm cube; SHAPE is not cube (plan S8)"
@@ -532,6 +553,20 @@ def make_pick_place_env_cfg(
     )
   # Not part of any arm's comparison: every variant carries the same trunk penalty.
   cfg.rewards.update(trunk_clearance_rewards(robot))
+  # Plan S7-10: the arm off the table. After the variant's dict, like the trunk penalty, so
+  # that the same code adds the same terms to every variant.
+  apply_arm_table(cfg, gripper, arm_table)
+  # Plan S10: the box, last of the reward edits, so that it sees every term reading the
+  # release latch.
+  apply_box_goal(
+    cfg,
+    gripper,
+    goal,
+    target_xy,
+    baseline.target_half_xy,
+    baseline.table_top_z,
+    GOAL_THRESHOLD,
+  )
   cfg.curriculum = reward_curriculum_cfg()
 
   success_params = {

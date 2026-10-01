@@ -35,6 +35,21 @@ from .actions import (
   ToolSpeedCappedJointPositionAction,
   ToolSpeedCappedJointPositionActionCfg,
 )
+from .box import (
+  BoxGoalCommand,
+  BoxGoalCommandCfg,
+  box_displacement_penalty,
+  box_goal_position_tracked_b,
+  box_inner_half,
+  box_rim_z,
+  contact_while_held,
+  object_in_box_bool,
+  object_position_biased_b,
+  reset_box_on_surface,
+  reset_tracker_bias,
+  set_box_geometry,
+  tracker_bias,
+)
 from .commands import (
   EntityOffsetCommand,
   EntityOffsetCommandCfg,
@@ -57,6 +72,7 @@ from .observations import (
   is_on_surface,
   object_position_b,
   object_yaw_b,
+  yaw_error_mod_90,
 )
 from .occlusion import (
   CubeSensor,
@@ -68,6 +84,7 @@ from .occlusion import (
 )
 from .rewards import (
   arm_effort_hinge,
+  arm_table_clearance,
   bring_object_after_lift,
   bring_object_when_lifted,
   contact_penalty,
@@ -91,6 +108,7 @@ from .rewards import (
   released_at_goal_graded,
   retreat_height,
   set_down_placed,
+  table_clearance_penalty,
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
@@ -111,6 +129,21 @@ from .terminations import (
 )
 
 __all__ = [
+  # Plan S10, the box.
+  "BoxGoalCommand",
+  "BoxGoalCommandCfg",
+  "box_displacement_penalty",
+  "box_goal_position_tracked_b",
+  "box_inner_half",
+  "box_rim_z",
+  "contact_while_held",
+  "object_in_box_bool",
+  "object_position_biased_b",
+  "reset_box_on_surface",
+  "reset_tracker_bias",
+  "set_box_geometry",
+  "tracker_bias",
+  "yaw_error_mod_90",
   "BySize",
   "PerShape",
   "ball_mask",
@@ -132,7 +165,9 @@ __all__ = [
   "ToolSpeedCappedJointPositionAction",
   "ToolSpeedCappedJointPositionActionCfg",
   "entity_out_of_reach",
+  "arm_table_clearance",
   "keepout_box_penalty",
+  "table_clearance_penalty",
   # mjlab manipulation terms, re-exported so a task needs one namespace.
   "bring_object_reward",
   "ee_to_object_distance",
