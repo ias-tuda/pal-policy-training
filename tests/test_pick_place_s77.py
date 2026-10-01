@@ -271,6 +271,10 @@ class Scene:
 
 
 def _env(occlusion: occ.OccCfg) -> ManagerBasedRlEnv:
+  # The scripted world hovers the cube, so a reset that draws it against the arm lets physics
+  # knock it off the script (the estimate follows the script, `Scene.live()` the knock). A fixed
+  # draw keeps this file's result independent of how many random numbers the tests before it used.
+  torch.manual_seed(2)
   return ManagerBasedRlEnv(cfg=_cfg(occlusion, N_ENVS), device=get_test_device())
 
 
