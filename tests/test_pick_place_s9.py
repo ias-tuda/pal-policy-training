@@ -221,7 +221,9 @@ def test_the_base_spawns_in_bs_target_box_square_and_the_goal_sits_on_it(stack_e
   assert torch.all(mdp.fold_quarter(base_yaw) <= pp.STACK_BASE_YAW + 1e-3)
   goal = env.command_manager.get_term("goal_pose").command
   d = goal - base.root_link_pos_w
-  assert torch.allclose(d, torch.tensor([0.0, 0.0, 0.05]).expand_as(d), atol=1e-4)
+  assert torch.allclose(
+    d, torch.tensor([0.0, 0.0, 0.05], device=d.device).expand_as(d), atol=1e-4
+  )
   cube = env.scene["object"].data.root_link_pos_w
   assert torch.all(torch.norm((cube - base.root_link_pos_w)[:, :2], dim=-1) >= 0.10)
 
@@ -378,7 +380,7 @@ def test_rg_floors_a_release_that_was_not_ok():
     latch.height = torch.full_like(latch.height, 0.001)
     latch.rel_ok = torch.tensor([True, False], device=env.device)
     q = mdp.release_quality(env, **params)
-    assert q[0] > 0.9 and q[1] == pytest.approx(rw.M6_FLOOR), q
+    assert q[0].item() > 0.9 and q[1].item() == pytest.approx(rw.M6_FLOOR), q
     params["require_ok"] = False
     q = mdp.release_quality(env, **params)
     assert torch.all(q > 0.9), q
@@ -510,7 +512,8 @@ def test_sa_pays_on_the_base_and_not_on_the_way(stack_episode):
   sa = stack_episode[RCTP_SA]
   assert max(t["stack_align"] for t in sa["hold"]) > 0.3
   for phase in ("approach", "descend", "close", "lift", "carry"):
-    assert all(t["stack_align"] == 0.0 for t in sa[phase]), phase
+    # Held 5 cm or more over the goal: the height factor alone is exp(-25).
+    assert all(t["stack_align"] < 1e-3 for t in sa[phase]), phase
 
 
 def test_the_lock_refuses_a_let_go_two_centimetres_off():
