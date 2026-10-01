@@ -34,6 +34,14 @@ from pal_mjlab.tasks.manipulation.mdp.shapes import (
   object_half_height,
   resolve,
 )
+from pal_mjlab.tasks.manipulation.mdp.stack import (
+  OK_DXY,
+  OK_HEIGHT,
+  OK_SPEED,
+  OK_TILT,
+  OK_YAW,
+  stack_state,
+)
 
 _ROBOT = SceneEntityCfg("robot")
 
@@ -297,6 +305,7 @@ def release_quality(
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
   jaw_open: float | BySize | PerShape | None = None,
+  require_ok: bool = False,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
@@ -308,6 +317,10 @@ def release_quality(
   With ``set_down_steps`` > 0 (plan S7-2, module M7) the grade is paid only for a set-down
   (`set_down_passed`), and is ``floor`` for any other release -- let go above the surface,
   while the object still moved, too soon after putting it down, or after dragging it in.
+
+  With ``require_ok`` (plan S9, module RG) the grade is paid only for a release on a stack goal
+  at which the release condition held (`stack.StackState.ok`: within 1 cm, 1 cm up, 10 deg of
+  tilt and of yaw, 5 cm/s), and is ``floor`` for any other.
   """
   latch = _release_latch(
     env,
@@ -325,6 +338,8 @@ def release_quality(
   paid = latch.released
   if set_down_steps > 0:
     paid = set_down_passed(latch, set_down_steps)
+  if require_ok:
+    paid = paid & latch.rel_ok
   return torch.where(paid, q, torch.full_like(q, floor))
 
 
@@ -343,6 +358,7 @@ def released_at_goal_graded(
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
   jaw_open: float | BySize | PerShape | None = None,
+  require_ok: bool = False,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -350,7 +366,7 @@ def released_at_goal_graded(
   target earns the same as one set down on it, sooner -- the late release two of three S5.2
   full-fix seeds converged to. Grading both by where the cube was let go makes the set-down
   pay more for the rest of the episode. ``set_down_steps`` > 0 pays the grade for a set-down
-  only (module M7, `release_quality`).
+  only (module M7, `release_quality`); ``require_ok`` only for an ``OK`` let-go (plan S9's RG).
   """
   released = released_at_goal(
     env,
@@ -376,6 +392,7 @@ def released_at_goal_graded(
     set_down_steps,
     jaw_cfg,
     jaw_open,
+    require_ok,
   )
 
 
@@ -395,10 +412,12 @@ def object_placed_graded(
   set_down_steps: int = 0,
   jaw_cfg: SceneEntityCfg | None = None,
   jaw_open: float | BySize | PerShape | None = None,
+  require_ok: bool = False,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
-  ``set_down_steps`` > 0 pays the grade for a set-down only (module M7, `release_quality`).
+  ``set_down_steps`` > 0 pays the grade for a set-down only (module M7, `release_quality`);
+  ``require_ok`` only for an ``OK`` let-go (plan S9's RG).
   """
   placed = object_placed(
     env,
@@ -425,6 +444,7 @@ def object_placed_graded(
     set_down_steps,
     jaw_cfg,
     jaw_open,
+    require_ok,
   )
 
 
@@ -612,6 +632,39 @@ def open_at_goal(
   hold, open_ = resolve(env, jaw_hold), resolve(env, jaw_open)
   opened = ((hold - q) / (hold - open_)).clamp(0.0, 1.0)
   return opened * (was_lifted & ~latch.released & near).float()
+
+
+def stack_alignment(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  reference_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  near: float = 0.03,
+) -> torch.Tensor:
+  """Plan S9's SA: how close the held cube is to the release condition ``OK``, as the product of
+  one Gaussian per quantity with its bound as the width, prod_i exp(-(x_i / bound_i)^2), paid
+  while the cube is held (both pads) after `was_lifted` and within ``near`` of the goal
+  horizontally. 1 at a perfect hold on the base; ~0.007 at the five bounds together. (B,)
+
+  The gradient towards ``OK`` beside the lock (ST-GA): with the lock alone the policy is paid
+  nothing until it happens to satisfy all five at once and can open.
+  """
+  state = stack_state(env, object_name, reference_name, command_name)
+  score = torch.exp(
+    -(
+      torch.square(state.dxy / OK_DXY)
+      + torch.square(state.height / OK_HEIGHT)
+      + torch.square(state.tilt / OK_TILT)
+      + torch.square(state.yaw / OK_YAW)
+      + torch.square(state.speed / OK_SPEED)
+    )
+  )
+  held = _grasped_bool(env, grasp_sensor_name) & _was_lifted_bool(
+    env, grasp_sensor_name, support_sensor_name
+  )
+  return score * (held & (state.dxy < near)).float()
 
 
 #: Attribute on the env caching `_joint_effort_caps`, keyed by the joints' global ids.

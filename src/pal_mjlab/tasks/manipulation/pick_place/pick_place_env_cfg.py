@@ -24,9 +24,12 @@ from mjlab.envs.mdp import (
   dr as dr_terms,
 )  # `dr` is make_pick_place_env_cfg's rung argument
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.manipulation.mdp import LiftingCommandCfg
+from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
+from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
@@ -35,8 +38,10 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
   JAW_OPEN,
+  BASE_OBJECT,
   NO_SUCCESS_TERMINATION,
   REQUIRE_LIFTED,
+  STACK_ONLY_ARMS,
   RewardContext,
   build_rewards,
   effort_hinge_reward,
@@ -298,6 +303,109 @@ OBJECT_SHAPES = {
 }
 
 
+# -- Plan S9: stack the cube on a second one ------------------------------------------------------
+#
+# `GOAL=stack` (`pick-place-v1-objects-plan.md`, *S9 revised again*, Siwei 2026-10-01 22:04-22:20):
+# a blue base cube is spawned where baseline B's target was -- its box (0.46, 0.08) +/-2 cm,
+# table-relative -- at yaw 0 +/-5 deg (unobserved: the actor sees the goal's position only, L19),
+# and the goal is the red cube resting on top of it (`mdp.EntityOffsetCommand` with
+# ``stack_on_top``, which follows the base every step). W2 is >= 10 cm from that box by
+# construction (its nearest corner (0.46, 0.20) to the box's (0.46, 0.10)), so the two never
+# spawn into each other. The base is scenery: knocking it is priced (`base_disturbance`, the old
+# stack cfg's -0.5 x planar speed^2) and dropping it off the table ends the episode.
+#
+# The actor's `target_pos` is the base's tracked pose plus the stacking height: on the robot it
+# comes from FoundationPose like the cube's. It gets a tracker error of its own, a per-episode
+# bias of +/-4 mm ("abs") and 1 mm of jitter -- the simple version of the plan's 6 mm shared +
+# 4 mm own split, with the cube's 8 mm bias as today. The critic keeps the live goal.
+#
+# `GATE=stack` is the jaw lock (`mdp.StackGateJointPositionAction`): no opening while the held
+# cube is not within the plan's release condition (`mdp.stack`).
+
+#: Half-range of the base cube's yaw about 0 (the table's axes), rad.
+STACK_BASE_YAW = math.radians(5.0)
+#: The tracker error on the actor's goal for a stack goal: per-episode bias, per-step jitter, m.
+STACK_TARGET_BIAS = 0.004
+STACK_TARGET_NOISE = 0.001
+#: The two cubes' colours: the carried one red (every run's), the base blue (the old stack's).
+BASE_RGBA = (0.2, 0.35, 0.8, 1.0)
+#: What the goal is (`GOAL`) and what may hold the jaw shut (`GATE`).
+GOALS = ("table", "stack")
+GATES = ("none", "stack")
+
+
+def _stack_command_cfg():
+  return mdp.EntityOffsetCommandCfg(
+    entity_name=OBJECT,
+    reference_name=BASE_OBJECT,
+    stack_on_top=True,
+    resampling_time_range=(1e9, 1e9),
+    success_threshold=GOAL_THRESHOLD,
+    debug_vis=True,
+  )
+
+
+def _apply_stack_goal(cfg: ManagerBasedRlEnvCfg, baseline: Baseline) -> None:
+  """Plan S9's `GOAL=stack` on a cfg built with both cubes: the red cube alone from the spawn
+  box, the base from the target box, its terms, and the actor's goal through a tracker."""
+  reset = cfg.events["reset_objects"]
+  reset.params["asset_cfgs"] = [SceneEntityCfg(OBJECT)]
+  (tx, ty), half = baseline.target_xy, baseline.target_half_xy
+  base_box = SpawnBox(
+    x=(tx - half, tx + half),
+    y=(ty - half, ty + half),
+    yaw=STACK_BASE_YAW,
+    widen_at_dr_scene=False,
+  )
+  events = {}
+  for name, term in cfg.events.items():
+    events[name] = term
+    if name == "reset_objects":
+      events["reset_base_object"] = EventTermCfg(
+        func=mdp.reset_objects_on_surface,
+        mode="reset",
+        params={
+          "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
+          "surface_cfg": SceneEntityCfg(TABLE),
+          "pose_range": _object_pose_range(base_box),
+        },
+      )
+  cfg.events = events
+  actor = cfg.observations["actor"]
+  actor.terms["target_pos"] = dataclasses.replace(
+    actor.terms["target_pos"],
+    noise=NoiseModelWithAdditiveBiasCfg(
+      noise_cfg=Unoise(n_min=-STACK_TARGET_NOISE, n_max=STACK_TARGET_NOISE),
+      bias_noise_cfg=Unoise(
+        n_min=-STACK_TARGET_BIAS, n_max=STACK_TARGET_BIAS, operation="abs"
+      ),
+    ),
+  )
+  cfg.terminations["base_dropped"] = TerminationTermCfg(
+    func=mdp.entity_below_height,
+    params={"entity_name": BASE_OBJECT, "min_height": baseline.table_top_z - 0.2},
+  )
+
+
+def _stack_gate_cfg(old, grasp_sensor: str, jaw_regex: str):
+  """Plan S9's `GATE=stack`: the absolute rate-limited action term ``old`` with the jaw lock."""
+  if type(old) is not mdp.RateLimitedJointPositionActionCfg:
+    raise ValueError(
+      "GATE=stack is built on the absolute rate-limited action without a tool speed cap; got "
+      f"{type(old).__name__} (ACTION=delta or TOOL_SPEED set?)"
+    )
+  fields = {f.name: getattr(old, f.name) for f in dataclasses.fields(old) if f.init}
+  return mdp.StackGateJointPositionActionCfg(
+    **fields,
+    gate_joints=(jaw_regex,),
+    object_name=OBJECT,
+    reference_name=BASE_OBJECT,
+    command_name=COMMAND,
+    grasp_sensor_name=grasp_sensor,
+    support_sensor_name=SUPPORT_SENSOR,
+  )
+
+
 def _object_pose_range(spawn: SpawnBox) -> dict[str, tuple[float, float]]:
   """Spawn box for ``mdp.reset_objects_on_surface``, which samples about the table centre.
 
@@ -411,6 +519,8 @@ def make_pick_place_env_cfg(
   action_mode: str = "abs",
   command_obs: bool = False,
   shape: ObjectShape = OBJECT_SHAPES["cube"],
+  goal: str = "table",
+  gate: str = "none",
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -441,7 +551,31 @@ def make_pick_place_env_cfg(
       See `make_tabletop_env_cfg`.
     shape: plan S8's ``SHAPE`` -- the manipulated object (`OBJECT_SHAPES`): the 5 cm cube of every
       run up to S7-8, a 6 cm ball, the ball with its size and rolling friction drawn, or either.
+    goal: plan S9's ``GOAL`` (`GOALS`): ``table`` -- a point on the table, every run up to S8 -- or
+      ``stack``, the cube on top of a base cube spawned in the baseline's target box.
+    gate: plan S9's ``GATE`` (`GATES`): ``stack`` locks the jaw shut while the held cube is not
+      within the release condition (`mdp.stack`); ``none`` is every run up to S8.
   """
+  if goal not in GOALS:
+    raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
+  if gate not in GATES:
+    raise ValueError(f"unknown gate {gate!r}; have {GATES}")
+  stack = goal == "stack"
+  if stack:
+    if shape is not OBJECT_SHAPES["cube"]:
+      raise ValueError("GOAL=stack stacks the 5 cm cube; SHAPE must be cube (plan S9)")
+    if target_area is not None:
+      raise ValueError("GOAL=stack puts the base in the baseline's target box; TARGET must be B")
+    if occlusion is not None:
+      raise ValueError(
+        "GOAL=stack with occlusion is not built: the line of sight knows one cube (plan S9)"
+      )
+    if baseline.target_half_xy <= 0.0:
+      raise ValueError("GOAL=stack needs a baseline with a target box (BASELINE=B)")
+  if gate == "stack" and not stack:
+    raise ValueError("GATE=stack is the release condition on the base cube; it needs GOAL=stack")
+  if reward in STACK_ONLY_ARMS and not stack:
+    raise ValueError(f"{reward} grades the release on the base cube; it needs GOAL=stack")
   if occlusion is not None and shape is not OBJECT_SHAPES["cube"]:
     raise ValueError(
       "the occlusion model's line of sight is built for the 5 cm cube; SHAPE is not cube (plan S8)"
@@ -451,7 +585,9 @@ def make_pick_place_env_cfg(
   cfg = make_tabletop_env_cfg(
     robot,
     gripper_name=gripper_name,
-    command_cfg=_command_cfg(
+    command_cfg=_stack_command_cfg()
+    if stack
+    else _command_cfg(
       target_xy, dr, baseline.table_top_z, baseline.target_half_xy, target_area
     ),
     object_pose_range=_object_pose_range(spawn),
@@ -473,9 +609,16 @@ def make_pick_place_env_cfg(
     action_mode=action_mode,
     command_obs=command_obs,
     goal_area=None if target_area is None else _goal_area(target_area),
-    objects=shape.objects,
+    objects={
+      OBJECT: scene.get_cube_cfg(name=OBJECT),
+      BASE_OBJECT: scene.get_cube_cfg(name=BASE_OBJECT, rgba=BASE_RGBA),
+    }
+    if stack
+    else shape.objects,
     object_geoms=shape.geoms,
   )
+  if stack:
+    _apply_stack_goal(cfg, baseline)
   if shape.ball_probability is not None:
     # Before `reset_objects`, which places the object at its half-height above the table, and
     # before the goal command resamples at the half-height of this episode's shape.
@@ -532,6 +675,15 @@ def make_pick_place_env_cfg(
     )
   # Not part of any arm's comparison: every variant carries the same trunk penalty.
   cfg.rewards.update(trunk_clearance_rewards(robot))
+  if stack:
+    # Plan S9: the base is scenery the arm must work around, not through (the old stack cfg's).
+    cfg.rewards["base_disturbance"] = RewardTermCfg(
+      func=mdp.entity_lin_vel_l2, weight=-0.5, params={"entity_name": BASE_OBJECT}
+    )
+  if gate == "stack":
+    cfg.actions["joint_pos"] = _stack_gate_cfg(
+      cfg.actions["joint_pos"], grasp_sensor, re.escape(gripper.finger_joint)
+    )
   cfg.curriculum = reward_curriculum_cfg()
 
   success_params = {

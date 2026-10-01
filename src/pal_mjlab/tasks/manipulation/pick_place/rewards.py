@@ -716,6 +716,53 @@ def _eq(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
+# -- S9: RG (pay the release grade only for an OK let-go) and SA (a gradient towards OK) --------
+#
+# Plan S9 revised again (Siwei, 2026-10-01 22:04-22:20): stack, and let go only when aligned and
+# slow. The release condition OK (`mdp.stack`) is within 1 cm of the goal on the base, at most 1 cm
+# above it, tilted and turned against the base by at most 10 deg, slower than 5 cm/s. Three ways
+# of enforcing it are compared: the lock (`GATE=stack`, the action term), RG and SA.
+#
+# RG pays M6's grade on `release` and `placed` only when OK held at the let-go
+# (`release_quality(require_ok=True)`, the release latch's ``rel_ok``); any other release is graded
+# at the floor (0.25), so a sloppy let-go that still lands on the base keeps `placed` x 0.25.
+#
+# SA pays prod_i G(x_i / bound_i) over the five OK quantities while the cube is held after the lift
+# within `SA_NEAR` of the goal horizontally (`mdp.stack_alignment`): 1 per step at a perfect hold on
+# the base. Weight 1, the order of one `grasp` step, and checked by the L5 ordering test: a hold on
+# the base must still earn less per step than the placed state.
+#: The base cube's entity name (the old `stack` task's; `pick_place_env_cfg.GOAL=stack`).
+BASE_OBJECT = "base_object"
+SA_WEIGHT = 1.0
+SA_NEAR = 0.03  # m, horizontal
+
+
+def _rg(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in ("release", "placed"):
+    term = rewards.get(name)
+    assert term is not None and "floor" in term.params, (
+      "RG pays M6's grade for an OK let-go only; apply M6 first"
+    )
+    rewards[name] = RewardTermCfg(
+      func=term.func, weight=term.weight, params={**term.params, "require_ok": True}
+    )
+
+
+def _sa(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["stack_align"] = RewardTermCfg(
+    func=mdp.stack_alignment,
+    weight=SA_WEIGHT,
+    params={
+      "command_name": COMMAND,
+      "object_name": OBJECT,
+      "reference_name": BASE_OBJECT,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "support_sensor_name": SUPPORT_SENSOR,
+      "near": SA_NEAR,
+    },
+  )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -730,6 +777,8 @@ _MODULES = {
   "O": _o,
   "Z": _z,
   "EQ": _eq,
+  "RG": _rg,
+  "SA": _sa,
 }
 
 
@@ -755,6 +804,10 @@ def _s52_arm(modules: tuple[str, ...]):
     )
   if "EQ" in modules and "M1" not in modules:
     raise ValueError("EQ is a term beside M1's; it needs M1 in the arm")
+  if "RG" in modules and "M6" not in modules[: modules.index("RG")]:
+    raise ValueError("RG pays M6's grade for an OK let-go only; it needs M6 before it")
+  if "SA" in modules and "M1" not in modules:
+    raise ValueError("SA is a term beside M1's; it needs M1 in the arm")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -806,7 +859,26 @@ S8_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+EQ": ("M1", "M2", "M3", "M6", "J", "M8", "EQ"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S8_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS, **S75_ARMS, **S8_ARMS}
+#: The S9 arms (plan S9 revised again, 2026-10-01 22:04-22:20): S7-4's RCTP + RG (ST-R) and RCTP + SA
+#: (ST-GA, with the lock). ST, ST-G and ST-GFT are RCTP itself on the stack goal (`GOAL`, `GATE`).
+S9_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+RG": ("M1", "M2", "M3", "M6", "J", "M8", "RG"),
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+SA": ("M1", "M2", "M3", "M6", "J", "M8", "SA"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S9_ARMS.items()})
+_MODULE_ARMS = {
+  **S52_ARMS,
+  **S7_ARMS,
+  **S72_ARMS,
+  **S74_ARMS,
+  **S75_ARMS,
+  **S8_ARMS,
+  **S9_ARMS,
+}
+#: Arms whose terms read the base cube (RG, SA): they need plan S9's `GOAL=stack`.
+STACK_ONLY_ARMS = frozenset(
+  n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m)
+)
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)

@@ -21,6 +21,10 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply, quat_inv, quat_mul
 
+from pal_mjlab.tasks.manipulation.mdp.stack import (
+  stack_command_reference,
+  stack_state,
+)
 from pal_mjlab.tasks.manipulation.mdp.shapes import (
   BySize,
   PerShape,
@@ -391,6 +395,11 @@ class ReleaseLatch:
   pend_on_table: torch.Tensor | None = None
   pend_speed: torch.Tensor | None = None
   pend_dwell: torch.Tensor | None = None
+  # Plan S9: on a stack goal (`EntityOffsetCommand` with ``stack_on_top``), whether the release
+  # condition `stack.StackState.ok` held at the let-go -- taken when the pads let go, like the
+  # other ``pend_*``, and committed with the release. Always False on a table goal.
+  rel_ok: torch.Tensor | None = None
+  pend_ok: torch.Tensor | None = None
 
 
 def _release_latch(
@@ -432,7 +441,9 @@ def _release_latch(
   after every step for the arms that have none.
 
   The resting height is the surface's top plus the object's half-height, read out of physics
-  the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table.
+  the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table. On a stack
+  goal (plan S9: `EntityOffsetCommand` with ``stack_on_top``) it is the goal's own z -- the cube
+  resting on the base -- and ``rel_ok`` records whether `stack.StackState.ok` held at the let-go.
 
   M7's set-down (plan S7-2): a *touchdown* is the first held-on-surface update after the held
   object was lifted `SET_DOWN_CLEARANCE` clear. The dwell counts only after a touchdown within
@@ -467,6 +478,8 @@ def _release_latch(
       rel_speed=zero.clone(),
       rel_dwell=count.clone(),
       jaw=jaw,
+      rel_ok=no.clone(),
+      pend_ok=no.clone(),
     )
     if jaw is not None:
       latch.jaw_closed = no.clone()
@@ -489,15 +502,20 @@ def _release_latch(
   obj: Entity = env.scene[object_name]
   goal = env.command_manager.get_term(command_name).command
   pos = obj.data.root_link_pos_w
-  half_z = object_half_height(env, object_name)
-  rest_z = surface_top_z(env, surface_cfg) + half_z
+  reference = stack_command_reference(env, command_name)
+  if reference is None:
+    rest_z = surface_top_z(env, surface_cfg) + object_half_height(env, object_name)
+    ok = torch.zeros_like(let_go)
+  else:
+    rest_z = goal[:, 2]
+    ok = stack_state(env, object_name, reference, command_name).ok
   dxy = torch.norm((pos - goal)[:, :2], dim=-1)
   speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
   on_table = _on_surface_bool(env, support_sensor_name)
   height = pos[:, 2] - rest_z
   if jaw is None:
     opened = let_go
-    now = (dxy, height, on_table, speed, latch.dwell)
+    now = (dxy, height, on_table, speed, latch.dwell, ok)
   else:
     assert jaw_cfg is not None and jaw_open is not None
     # The pads' let-go is held until the jaw opens; a jaw that opens with none pending (it
@@ -510,6 +528,7 @@ def _release_latch(
     latch.pend_on_table = w(on_table, latch.pend_on_table)
     latch.pend_speed = w(speed, latch.pend_speed)
     latch.pend_dwell = w(latch.dwell, latch.pend_dwell)
+    latch.pend_ok = w(ok, latch.pend_ok)
     latch.pend = latch.pend | let_go
     released_now = _jaw_open_bool(env, jaw_cfg, jaw_open) & ~grasped
     opened = latch.jaw_closed & released_now & was_lifted
@@ -520,6 +539,7 @@ def _release_latch(
       torch.where(p, latch.pend_on_table, on_table),
       torch.where(p, latch.pend_speed, speed),
       torch.where(p, latch.pend_dwell, latch.dwell),
+      torch.where(p, latch.pend_ok, ok),
     )
     latch.pend = latch.pend & ~opened
     latch.jaw_closed = ~released_now
@@ -528,6 +548,7 @@ def _release_latch(
   latch.rel_on_table = torch.where(opened, now[2], latch.rel_on_table)
   latch.rel_speed = torch.where(opened, now[3], latch.rel_speed)
   latch.rel_dwell = torch.where(opened, now[4], latch.rel_dwell)
+  latch.rel_ok = torch.where(opened, now[5], latch.rel_ok)
   latch.released |= opened
   latch.grasped = grasped
   # M7's dwell, after the release has been recorded with the count up to the last update.

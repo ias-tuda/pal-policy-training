@@ -32,6 +32,8 @@ from .actions import (
   DeltaRateLimitedJointPositionActionCfg,
   RateLimitedJointPositionAction,
   RateLimitedJointPositionActionCfg,
+  StackGateJointPositionAction,
+  StackGateJointPositionActionCfg,
   ToolSpeedCappedJointPositionAction,
   ToolSpeedCappedJointPositionActionCfg,
 )
@@ -91,6 +93,7 @@ from .rewards import (
   released_at_goal_graded,
   retreat_height,
   set_down_placed,
+  stack_alignment,
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
@@ -103,6 +106,7 @@ from .shapes import (
   set_object_shape,
   shape_kind,
 )
+from .stack import StackState, fold_quarter, stack_state
 from .terminations import (
   entity_below_height,
   entity_out_of_reach,
@@ -129,6 +133,12 @@ __all__ = [
   "DeltaRateLimitedJointPositionActionCfg",
   "RateLimitedJointPositionAction",
   "RateLimitedJointPositionActionCfg",
+  "StackGateJointPositionAction",
+  "StackGateJointPositionActionCfg",
+  "StackState",
+  "fold_quarter",
+  "stack_state",
+  "stack_alignment",
   "ToolSpeedCappedJointPositionAction",
   "ToolSpeedCappedJointPositionActionCfg",
   "entity_out_of_reach",
