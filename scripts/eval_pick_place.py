@@ -1443,8 +1443,6 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
     # The support sensor records contact only (`found`); the set-down read needs its force
     # too. A sensor field is read-only on the physics, and `found` -- what every other read
     # here uses -- is unchanged.
-    import dataclasses
-
     cfg.scene.sensors = tuple(
       dataclasses.replace(s, fields=(*s.fields, "force"))
       if s.name == SUPPORT_SENSOR and "force" not in s.fields
