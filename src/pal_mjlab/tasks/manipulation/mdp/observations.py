@@ -21,10 +21,6 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply, quat_inv, quat_mul
 
-from pal_mjlab.tasks.manipulation.mdp.stack import (
-  stack_command_reference,
-  stack_state,
-)
 from pal_mjlab.tasks.manipulation.mdp.shapes import (
   BySize,
   PerShape,
@@ -32,6 +28,10 @@ from pal_mjlab.tasks.manipulation.mdp.shapes import (
   object_half_height,
   resolve,
   shape_kind,
+)
+from pal_mjlab.tasks.manipulation.mdp.stack import (
+  stack_command_reference,
+  stack_state,
 )
 
 _ROBOT = SceneEntityCfg("robot")

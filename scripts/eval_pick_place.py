@@ -1472,14 +1472,17 @@ class StackTally:
       ),
       "stack_any_ok": sum(r["stack_any_ok"] for r in rows) / n,
       "stack_lock_armed_median_s": None,
-      "stack_lock_refused_episodes": sum(r["stack_lock_refused_steps"] > 0 for r in rows)
+      "stack_lock_refused_episodes": sum(
+        r["stack_lock_refused_steps"] > 0 for r in rows
+      )
       / n,
       "stack_base_moved_median_m": sorted(r["stack_base_moved_m"] for r in rows)[
         len(rows) // 2
       ]
       if rows
       else None,
-      "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows) / n,
+      "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows)
+      / n,
     }
     armed = sorted(r["stack_lock_armed_steps"] for r in rows)
     if armed and armed[-1] > 0:
@@ -1487,7 +1490,9 @@ class StackTally:
     for k in self.NAMES:
       vals = sorted(r[f"stack_release_{k}"] for r in released)
       out[f"stack_release_{k}_median"] = vals[len(vals) // 2] if vals else None
-      out[f"stack_release_{k}_p90"] = vals[int(0.9 * (len(vals) - 1))] if vals else None
+      out[f"stack_release_{k}_p90"] = (
+        vals[min(len(vals) - 1, round(0.9 * (len(vals) - 1)))] if vals else None
+      )
     return out
 
 

@@ -154,7 +154,12 @@ def test_combinations_that_are_not_built_raise(monkeypatch, changes, match):
 
 
 def test_the_stack_codes_build(monkeypatch):
-  for reward, gate in ((RCTP, None), (RCTP, "stack"), (RCTP_RG, None), (RCTP_SA, "stack")):
+  for reward, gate in (
+    (RCTP, None),
+    (RCTP, "stack"),
+    (RCTP_RG, None),
+    (RCTP_SA, "stack"),
+  ):
     _env_vars(monkeypatch, REWARD=reward, GOAL="stack", GATE=gate)
     s = _summary(kenv.kangaroo_pick_place_env_cfg())
     assert s["command"] == "EntityOffsetCommandCfg"
@@ -184,7 +189,9 @@ def test_rg_and_sa_need_m6_and_m1():
 
 @pytest.fixture(scope="module")
 def stack_env():
-  env = ManagerBasedRlEnv(cfg=_cfg(num_envs=16, reward=RCTP_SA), device=get_test_device())
+  env = ManagerBasedRlEnv(
+    cfg=_cfg(num_envs=16, reward=RCTP_SA), device=get_test_device()
+  )
   env.reset()
   zero = torch.zeros(env.action_space.shape, device=env.device)
   for _ in range(3):
@@ -207,7 +214,9 @@ def test_the_base_spawns_in_bs_target_box_square_and_the_goal_sits_on_it(stack_e
   assert torch.all((rel[:, 0] - (tx - cx)).abs() <= h + 1e-4), rel
   assert torch.all((rel[:, 1] - (ty - cy)).abs() <= h + 1e-4), rel
   top = mdp.surface_top_z(env, SceneEntityCfg("table"))
-  assert torch.allclose(base.root_link_pos_w[:, 2] - top, torch.full_like(top, 0.025), atol=2e-3)
+  assert torch.allclose(
+    base.root_link_pos_w[:, 2] - top, torch.full_like(top, 0.025), atol=2e-3
+  )
   _, base_yaw = mdp.stack._tilt_and_yaw(base.root_link_quat_w)
   assert torch.all(mdp.fold_quarter(base_yaw) <= pp.STACK_BASE_YAW + 1e-3)
   goal = env.command_manager.get_term("goal_pose").command
