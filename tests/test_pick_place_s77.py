@@ -546,3 +546,53 @@ def test_occ_tally_counts_closing_strokes_phases_and_the_held_rule():
   assert (
     out["occ_held_precision"] == 1.0 and out["occ_held_recall"] == 3 / 8
   )  # both envs pooled
+
+
+def test_jaw_tally_counts_reversals_closings_and_reapproaches_while_the_policy_drives():
+  ev = _eval_module()
+  tally = ev.JawTally(3, "cpu")
+  far = torch.tensor([0.0, 0.2, 0.0])
+  # env 0: one clean stroke closed, then open (no reversal, one closing).
+  # env 1: closes, reverses twice mid-stroke (jitter of 0.02 is ignored), opens away from the goal
+  #        after a lift and closes again (2 closings, a re-approach).
+  # env 2: the same as env 0, but the hand-off drives from step 4: its opening is not counted.
+  cmd = {
+    0: [0.0, 0.2, 0.4, 0.6, 0.6, 0.3, 0.0],
+    1: [0.0, 0.3, 0.3, 0.2, 0.1, 0.25, 0.4],
+    2: [0.0, 0.2, 0.4, 0.6, 0.6, 0.3, 0.0],
+  }
+  jaw = {
+    0: [0.0, 0.1, 0.3, 0.5, 0.6, 0.4, 0.1],
+    1: [0.0, 0.2, 0.3, 0.3, 0.1, 0.05, 0.3],
+    2: [0.0, 0.1, 0.3, 0.5, 0.6, 0.4, 0.1],
+  }
+  lifted = {0: [0] * 7, 1: [0, 0, 1, 1, 0, 0, 0], 2: [0] * 7}
+  handed = {0: [0] * 7, 1: [0] * 7, 2: [0, 0, 0, 0, 1, 1, 1]}
+  for t in range(7):
+    col = lambda d: torch.tensor([d[e][t] for e in range(3)])  # noqa: E731
+    tally.step(
+      col(jaw), col(cmd), col(lifted).bool(), far, ~col(handed).bool()
+    )
+  tally.finish(torch.tensor([0, 1, 2]))
+  a, b, c = tally.done
+  # A clean stroke (closes, then opens) is one change of direction; jitter below the threshold and the
+  # hand-off's opening (env 2) are not counted.
+  assert (a["jaw_reversals"], a["jaw_reversals_meas"], a["jaw_closings"]) == (1, 1, 1)
+  assert (b["jaw_reversals"], b["jaw_reversals_meas"], b["jaw_closings"]) == (2, 2, 2)
+  assert b["jaw_reopen_away"] == 1 and a["jaw_reopen_away"] == 0
+  assert (c["jaw_reversals"], c["jaw_reversals_meas"], c["jaw_closings"]) == (0, 0, 1)
+  out = tally.summarise(3)
+  assert out["jaw_reapproach"] == 1 / 3 and out["jaw_reopen_away_share"] == 1 / 3
+  assert out["jaw_reversals_mean"] == 1.0 and out["jaw_reversals_ge3"] == 0.0
+  assert out["jaw_reversals_median"] == 1
+
+
+def test_jaw_tally_ignores_a_jitter_under_the_reversal_threshold():
+  ev = _eval_module()
+  tally = ev.JawTally(1, "cpu")
+  on = torch.ones(1, dtype=torch.bool)
+  for x in [0.0, 0.3, 0.27, 0.31, 0.29, 0.3, 0.1, 0.12, 0.09]:
+    v = torch.tensor([x])
+    tally.step(v, v, on & False, torch.zeros(1), on)
+  tally.finish(torch.tensor([0]))
+  assert tally.done[0]["jaw_reversals"] == 1  # only the 0.3 -> 0.1 drop

@@ -165,6 +165,9 @@ def jaw_open_for(env: ManagerBasedRlEnv) -> float | torch.Tensor:
 
 #: ... and closed above this (a stroke is open -> closed, with hysteresis; S7-7's re-approach count).
 JAW_CLOSED = 0.25
+#: Plan S7-6's jaw reads: a reversal is a change of the jaw's direction after it moved at least this
+#: far (rad) in the old one, so a slew-limited step of noise is not one (the slew is 0.04 rad / step).
+JAW_REVERSAL_MIN = 0.05
 JAW_JOINT = "gripper_left_finger_joint"
 HANDOFF_CLEAR = 0.03
 HANDOFF_STEPS = 5
@@ -1389,6 +1392,115 @@ def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
   return ((home - term.commanded_target) / term._rate).clamp(-1.0, 1.0)
 
 
+class JawTally:
+  """Plan S7-6's two reads of what the real gripper showed (Claudius, 2026-09-29): the jaw reversing
+  direction without finishing a stroke, and the policy re-approaching (grasping again) or reopening
+  the jaw away from the goal after a lift. Per episode, on the steps the policy is in control (the
+  hand-off's position controller is excluded: its opening is designed):
+
+  * ``jaw_reversals``: changes of direction of the jaw's *command* (the action term's processed
+    target, what the gripper is asked for) after a move of at least `JAW_REVERSAL_MIN`;
+    ``jaw_reversals_meas`` the same on the measured angle.
+  * ``jaw_closings``: closing strokes (measured jaw from open, < `JAW_OPEN`, to closed, > `JAW_CLOSED`);
+    ``jaw_reapproach`` is more than one. ``jaw_reopen_away``: the jaw reopened after a lift while the
+    cube was > 3 cm from the goal.
+
+  Tensors in; call `step` once per control step at the top of the step, like `OccTally`, with the
+  jaw's measured angle and command."""
+
+  def __init__(self, num_envs: int, device: str) -> None:
+    n = num_envs
+    zf = lambda: torch.zeros(n, device=device)  # noqa: E731
+    zl = lambda: torch.zeros(n, dtype=torch.long, device=device)  # noqa: E731
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=device)  # noqa: E731
+    self.steps = zl()
+    self.closings = zl()
+    self.reopen_away = zl()
+    self.jaw_closed = zb()
+    self.prev_closed = zb()
+    self.was_lifted = zb()
+    # One (direction, extreme, reversals) tracker per signal: the command and the measured angle.
+    self.trk = {
+      k: {"dir": zl(), "ext": zf(), "set": zb(), "rev": zl()} for k in ("cmd", "meas")
+    }
+    self.done: list[dict] = []
+
+  @staticmethod
+  def _reversals(t: dict, x: torch.Tensor, live: torch.Tensor) -> None:
+    d, ext, delta = t["dir"], t["ext"], JAW_REVERSAL_MIN
+    first = live & ~t["set"]
+    ext[:] = torch.where(first, x, ext)
+    t["set"] |= first
+    live = live & ~first
+    up, down = (x - ext) >= delta, (ext - x) >= delta
+    # No direction yet: the first move of `delta` sets it (not a reversal).
+    free = live & (d == 0)
+    flip = live & ((d > 0) & down | (d < 0) & up)
+    t["rev"] += flip
+    new_d = torch.where(up, 1, torch.where(down, -1, d))
+    follow = live & ((d > 0) & (x > ext) | (d < 0) & (x < ext))
+    d[:] = torch.where(free | flip, new_d, d)
+    ext[:] = torch.where(free & (up | down) | flip | follow, x, ext)
+
+  def step(
+    self,
+    jaw_q: torch.Tensor,
+    jaw_cmd: torch.Tensor,
+    lifted: torch.Tensor,
+    dxy_goal: torch.Tensor,
+    policy_in_control: torch.Tensor,
+  ) -> None:
+    live = policy_in_control
+    self.steps += live
+    self._reversals(self.trk["cmd"], jaw_cmd, live)
+    self._reversals(self.trk["meas"], jaw_q, live)
+    closed = jaw_q >= JAW_OPEN
+    started = live & ~self.jaw_closed & (jaw_q > JAW_CLOSED)
+    self.closings += started
+    self.jaw_closed = (self.jaw_closed | started) & closed
+    self.was_lifted |= live & lifted
+    self.reopen_away += (
+      live & self.was_lifted & self.prev_closed & ~closed & (dxy_goal > 0.03)
+    )
+    self.prev_closed = torch.where(live, closed, self.prev_closed)
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      self.done.append(
+        {
+          "jaw_reversals": int(self.trk["cmd"]["rev"][i]),
+          "jaw_reversals_meas": int(self.trk["meas"]["rev"][i]),
+          "jaw_closings": int(self.closings[i]),
+          "jaw_reopen_away": int(self.reopen_away[i]),
+        }
+      )
+      for acc in (self.steps, self.closings, self.reopen_away):
+        acc[i] = 0
+      for flag in (self.jaw_closed, self.prev_closed, self.was_lifted):
+        flag[i] = False
+      for t in self.trk.values():
+        t["dir"][i], t["ext"][i], t["rev"][i] = 0, 0.0, 0
+        t["set"][i] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    mean = lambda k: sum(r[k] for r in rows) / n  # noqa: E731
+    share = lambda k, lo: sum(r[k] >= lo for r in rows) / n  # noqa: E731
+    rev = sorted(r["jaw_reversals"] for r in rows)
+    return {
+      "jaw_reversals_mean": mean("jaw_reversals"),
+      "jaw_reversals_median": rev[len(rev) // 2] if rev else None,
+      "jaw_reversals_p90": rev[min(int(0.9 * len(rev)), len(rev) - 1)] if rev else None,
+      "jaw_reversals_ge1": share("jaw_reversals", 1),
+      "jaw_reversals_ge3": share("jaw_reversals", 3),
+      "jaw_reversals_meas_mean": mean("jaw_reversals_meas"),
+      "jaw_closings_mean": mean("jaw_closings"),
+      "jaw_reapproach": share("jaw_closings", 2),
+      "jaw_reopen_away_share": share("jaw_reopen_away", 1),
+    }
+
+
 def retreat_state(
   env: ManagerBasedRlEnv, arm_ids: list[int], jaw_id: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1858,6 +1970,23 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"{result['tilt_at_let_go_over_10deg']:6.1%})"
     )
 
+  if "jaw_reversals_mean" in result:
+    print("\n  JAW REVERSALS AND RE-APPROACHES (plan S7-6) ------------------------")
+    print(
+      f"    jaw reversals / episode  {result['jaw_reversals_mean']:6.2f}   of the command "
+      f"(median {result['jaw_reversals_median']}, p90 {result['jaw_reversals_p90']}; "
+      f">= {JAW_REVERSAL_MIN} rad moves); measured {result['jaw_reversals_meas_mean']:.2f}"
+    )
+    print(
+      f"    episodes with >= 1 / >= 3 {result['jaw_reversals_ge1']:6.1%} / "
+      f"{result['jaw_reversals_ge3']:6.1%}"
+    )
+    print(
+      f"    re-approaches            {result['jaw_reapproach']:6.1%}   of episodes close the jaw more "
+      f"than once ({result['jaw_closings_mean']:.2f} closing strokes each); the jaw reopens away "
+      f"from the goal after a lift in {result['jaw_reopen_away_share']:6.1%}"
+    )
+
   if "occ_lost_share" in result:
     print("\n  OCCLUSION (plan S7-7) ---------------------------------------------")
     fmt_p = lambda v: "   n/a" if v is None else f"{v:6.1%}"  # noqa: E731
@@ -1918,6 +2047,9 @@ def main() -> None:
     raise SystemExit("--handoff-lift is written for absolute targets, not ACTION=delta")
   lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
+  jawt = JawTally(args.num_envs, args.device)
+  jaw_term = env.action_manager.get_term("joint_pos")
+  jaw_act = [n.split("/")[-1] for n in jaw_term._target_names].index(JAW_JOINT)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
@@ -1957,6 +2089,14 @@ def main() -> None:
           setdown=flags["grasped"] & (dxy < NEAR_XY),
           after_let_go=retreat.let_go,
         )
+      # The command read is the last step's; a fresh episode's first step has none of its own.
+      jawt.step(
+        jaw_q,
+        jaw_term._processed_actions[:, jaw_act],
+        flags["lifted"],
+        dxy,
+        ~handed & (env.episode_length_buf > 0),
+      )
       sensors = getattr(env, "_pal_cube_sensors", None)
       if sensors and OBJECT in sensors:
         occ.step(
@@ -2013,6 +2153,7 @@ def main() -> None:
         )
         if occ.steps.any() or occ.done:
           occ.finish(finished)
+        jawt.finish(finished)
         if plant is not None:
           plant.finish(finished)
         for key, value in extras.get("log", {}).items():
@@ -2023,6 +2164,7 @@ def main() -> None:
 
   result = summarise(tally, env.step_dt, args.episodes)
   result.update(retreat.summarise(args.episodes))
+  result.update(jawt.summarise(args.episodes))
   if occ.done:
     result.update(occ.summarise(args.episodes))
   result["handoff"] = bool(args.handoff)
@@ -2056,14 +2198,16 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o}
-            for r, q, o in zip(
+            {**r, **q, **o, **j}
+            for r, q, o, j in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
+              jawt.done[: args.episodes],
               strict=True,
             )
           ],
+
         },
         indent=2,
       )
