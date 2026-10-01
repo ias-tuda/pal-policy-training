@@ -131,6 +131,15 @@ if [ -n "${EPISODE_S:-}" ]; then
   S78_TAG="${S78_TAG},\"ep${EPISODE_S}\""
 fi
 
+# Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT -- arm 1-6 against
+# the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
+# contact). Unset is every run before S7-10; in the run name and the tags only when set.
+[ -n "${ARM_TABLE:-}" ] && export ARM_TABLE
+if [ -n "${ARM_TABLE:-}" ]; then
+  S78_NAME="${S78_NAME}_arm${ARM_TABLE}"
+  S78_TAG="${S78_TAG},\"arm${ARM_TABLE}\""
+fi
+
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -163,7 +172,7 @@ if ! uv run --extra cu128 python -c \
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
-    "EPISODE_S=${EPISODE_S:-(default)} did not validate." >&2
+    "EPISODE_S=${EPISODE_S:-(default)} ARM_TABLE=${ARM_TABLE:-(default)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -189,7 +198,7 @@ echo "ppo         $PPO"
 echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
-echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}"
+echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"

@@ -48,6 +48,10 @@ Plan S7-8 adds `SLEW=stack` (the stack task's speeds, per joint group, in place 
 what the actor's ``actions`` term shows -- the raw last action, or the commanded target; `delta`
 always shows the target), `SPAWN=WC` / `WCK` and `TARGET` (`B` | `WC` | `WCK`: the cube and the target
 drawn from one wide area -- Claudius's, or the part of it that plans -- >= 10 cm apart) and `EPISODE_S` (the episode length, s). Unset is S7-7's cfg exactly.
+Plan S7-10 adds `ARM_TABLE` (`none` | `watch` | `AC` | `AH` | `AT`, `arm_table.ARM_TABLE_CODES`):
+the driven arm's links 1-6 against the table -- a sensor only (`watch`, for the eval), a contact
+penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (AT). Unset is
+`none`, every run up to S7-9.
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 )
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
@@ -105,6 +110,7 @@ ACTION_ENV_VAR = "ACTION"
 CMD_OBS_ENV_VAR = "CMD_OBS"
 TARGET_ENV_VAR = "TARGET"
 EPISODE_ENV_VAR = "EPISODE_S"
+ARM_TABLE_ENV_VAR = "ARM_TABLE"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -121,6 +127,7 @@ DEFAULT_OCC = "none"
 DEFAULT_OBJ_OBS = "live"
 DEFAULT_ACTION = "abs"
 DEFAULT_TARGET = "B"
+DEFAULT_ARM_TABLE = "none"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -237,6 +244,9 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     stack_speed=stack_speed,
     action_mode=action,
     command_obs=_select_command_obs(action),
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
   )
 
 
