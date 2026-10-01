@@ -29,6 +29,7 @@ Literature behind the shapes, read before they were written:
 from __future__ import annotations
 
 import dataclasses
+import math
 
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -716,6 +717,61 @@ def _eq(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
+# -- S7-9: placing precision at the stack speed (PXY, PT; plan S7-9, designed 2026-10-01 13:20) --
+#
+# At the stack speeds ABS-a lets go 1.5-2.5 cm off the target, tilted 21-28 deg and at 0.07-0.19
+# m/s, and between 3 k and 5 k the release drifts out while M6's grade halves (S7-8 eval). The
+# table forgives it; a cube on a cube (S9) or in a box (S10) does not. Two reward modules, each
+# resumed from ABS-a's 3 k checkpoint against the unchanged control (P0):
+#
+# * PXY narrows the grade: M6's xy width 0.02 -> 0.01 m and M2's ``goal_near`` 0.03 -> 0.01 m.
+#   The lowering path over the target stays monotone (analytic check in
+#   `tests/test_pick_place_s79.py`), but is nearly flat between 3 and 5 cm up (+0.01).
+# * PT grades the let-go's tilt and speed as well: M6's graded part x G_10deg(tilt) x
+#   G_0.05(speed), both at the pads' let-go (`observations._release_latch`). Inside M6's
+#   ``(1 - floor)`` part, so a poor release keeps the floor (`mdp.release_quality_of`).
+#
+# Plan S7-9's other two codes are not reward modules: PQ is a critic input (`CRITIC_OBS=q`) and PV
+# a tool speed cap (`TOOL_SPEED=PV`).
+PXY_DIST_STD = 0.01  # m, M6's xy width (was M6_DIST_STD)
+PXY_NEAR_STD = 0.01  # m, M2's goal_near width (was M2_NEAR_STD)
+PT_TILT_STD = math.radians(10.0)  # rad
+PT_SPEED_STD = 0.05  # m/s, `observations.STILL_SPEED`
+
+
+def _graded_terms(rewards: dict[str, RewardTermCfg], module: str) -> list[str]:
+  names = [n for n in ("release", "placed") if n in rewards]
+  assert names and all("floor" in rewards[n].params for n in names), (
+    f"{module} changes M6's grade; apply M6 first"
+  )
+  return names
+
+
+def _pxy(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in _graded_terms(rewards, "PXY"):
+    term = rewards[name]
+    rewards[name] = RewardTermCfg(
+      func=term.func,
+      weight=term.weight,
+      params={**term.params, "dist_std": PXY_DIST_STD},
+    )
+  near = rewards.get("goal_near")
+  assert near is not None, "PXY narrows M2's goal_near; apply M2 first"
+  rewards["goal_near"] = RewardTermCfg(
+    func=near.func, weight=near.weight, params={**near.params, "std": PXY_NEAR_STD}
+  )
+
+
+def _pt(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in _graded_terms(rewards, "PT"):
+    term = rewards[name]
+    rewards[name] = RewardTermCfg(
+      func=term.func,
+      weight=term.weight,
+      params={**term.params, "tilt_std": PT_TILT_STD, "speed_std": PT_SPEED_STD},
+    )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -730,6 +786,8 @@ _MODULES = {
   "O": _o,
   "Z": _z,
   "EQ": _eq,
+  "PXY": _pxy,
+  "PT": _pt,
 }
 
 
@@ -755,6 +813,9 @@ def _s52_arm(modules: tuple[str, ...]):
     )
   if "EQ" in modules and "M1" not in modules:
     raise ValueError("EQ is a term beside M1's; it needs M1 in the arm")
+  for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",))):
+    if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
+      raise ValueError(f"{name} needs {' and '.join(needs)} before it")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -806,7 +867,22 @@ S8_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+EQ": ("M1", "M2", "M3", "M6", "J", "M8", "EQ"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S8_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS, **S75_ARMS, **S8_ARMS}
+#: The S7-9 arms (plan S7-9): S7-4's RCTP reward + one precision module. P0 (the control) and the
+#: other two codes, PQ (`CRITIC_OBS`) and PV (`TOOL_SPEED`), run RCTP itself.
+S79_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+PXY": ("M1", "M2", "M3", "M6", "J", "M8", "PXY"),
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+PT": ("M1", "M2", "M3", "M6", "J", "M8", "PT"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S79_ARMS.items()})
+_MODULE_ARMS = {
+  **S52_ARMS,
+  **S7_ARMS,
+  **S72_ARMS,
+  **S74_ARMS,
+  **S75_ARMS,
+  **S8_ARMS,
+  **S79_ARMS,
+}
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)
