@@ -131,7 +131,7 @@ if [ -n "${EPISODE_S:-}" ]; then
   S78_TAG="${S78_TAG},\"ep${EPISODE_S}\""
 fi
 
-# Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT -- arm 1-6 against
+# Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT | AH10 -- arm 1-6 against
 # the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
 # contact). Unset is every run before S7-10; in the run name and the tags only when set.
 [ -n "${ARM_TABLE:-}" ] && export ARM_TABLE
