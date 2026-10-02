@@ -18,6 +18,9 @@ The codes (plan S7-10), each on top of the reward variant named in `REWARD`:
   is warned before it touches -- the margin a real arm with tracking error needs;
 * ``AT`` -- AC + the termination `arm_table_force`: an arm-table force above 30 N ends the
   episode as a failure.
+* ``AH10`` -- AH with both weights x 10 (contact -10, clearance -5). Siwei, 2026-10-02, after
+  the first read: at AH's weights the two terms were 0.3-0.7 % of the `goal` reward and the
+  robot's policy (WC-ABS-c s1) kept its forearm ~1 cm above the table after +1 k iterations.
 
 None of them changes an observation or the action, so a policy trained without them resumes
 under any of them (plan S7-10 resumes S7-8's ABS-c).
@@ -73,6 +76,7 @@ ARM_TABLE_CODES: dict[str, ArmTableCfg | None] = {
   "AC": ArmTableCfg(contact_weight=-1.0),
   "AH": ArmTableCfg(contact_weight=-1.0, clearance_weight=-0.5),
   "AT": ArmTableCfg(contact_weight=-1.0, terminate_force=30.0),
+  "AH10": ArmTableCfg(contact_weight=-10.0, clearance_weight=-5.0),
 }
 
 

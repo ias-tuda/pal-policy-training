@@ -81,7 +81,7 @@ def test_unset_and_none_build_the_s78_cfg(monkeypatch):
   assert "arm_table_force" not in base.terminations
 
 
-@pytest.mark.parametrize("code", ["watch", "AC", "AH", "AT"])
+@pytest.mark.parametrize("code", ["watch", "AC", "AH", "AT", "AH10"])
 def test_each_code_adds_only_its_terms(monkeypatch, code):
   base = _cfg(monkeypatch, None)
   cfg = _cfg(monkeypatch, code)
@@ -98,11 +98,12 @@ def test_each_code_adds_only_its_terms(monkeypatch, code):
   if spec.contact_weight:
     want.add("arm_table_contact")
     term = cfg.rewards["arm_table_contact"]
-    assert term.weight == -1.0 and term.params["force_threshold"] == 1.0
+    assert term.weight == spec.contact_weight and term.params["force_threshold"] == 1.0
   if spec.clearance_weight:
     want.add("arm_table_clearance")
     term = cfg.rewards["arm_table_clearance"]
-    assert term.weight == -0.5 and term.params["margin"] == at.CLEARANCE_MARGIN
+    assert term.weight == spec.clearance_weight
+    assert term.params["margin"] == at.CLEARANCE_MARGIN
   assert added == want
   for name in base.rewards:
     assert cfg.rewards[name] == base.rewards[name], name
@@ -112,6 +113,22 @@ def test_each_code_adds_only_its_terms(monkeypatch, code):
     term = cfg.terminations["arm_table_force"]
     assert term.func is illegal_contact and term.params["force_threshold"] == 30.0
     assert not term.time_out  # a failure, not a truncation
+
+
+def test_the_codes_weights():
+  """The plan's weights, and AH10 = AH x 10 (Siwei, 2026-10-02)."""
+  codes = at.ARM_TABLE_CODES
+  assert (codes["AC"].contact_weight, codes["AC"].clearance_weight) == (-1.0, 0.0)
+  assert (codes["AH"].contact_weight, codes["AH"].clearance_weight) == (-1.0, -0.5)
+  assert (codes["AT"].contact_weight, codes["AT"].terminate_force) == (-1.0, 30.0)
+  ah, ah10 = codes["AH"], codes["AH10"]
+  assert ah10.contact_weight == 10 * ah.contact_weight
+  assert ah10.clearance_weight == 10 * ah.clearance_weight
+  assert (ah10.contact_force, ah10.clearance_margin, ah10.terminate_force) == (
+    ah.contact_force,
+    ah.clearance_margin,
+    None,
+  )
 
 
 def test_a_bad_code_raises(monkeypatch):
