@@ -276,6 +276,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     "the cube's top (S7-5 report §8 item 1), then goes home; default: straight home",
   )
   p.add_argument(
+    "--solver-iterations",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("ITER", "LS_ITER"),
+    help="evaluate with the constraint solver at ITER / LS_ITER iterations instead of the training "
+    "cfg's 10 / 20 (plan S10: 100 50 is converged for cube-on-box contacts, S7-9 step 0); eval only",
+  )
+  p.add_argument(
     "--trace",
     type=pathlib.Path,
     default=None,
@@ -1702,6 +1711,8 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
   cfg.episode_length_s = load_env_cfg(args.task, play=False).episode_length_s
   cfg.scene.num_envs = args.num_envs
   cfg.seed = args.seed
+  if getattr(args, "solver_iterations", None):
+    cfg.sim.mujoco.iterations, cfg.sim.mujoco.ls_iterations = args.solver_iterations
   if getattr(args, "plant", False):
     # The support sensor records contact only (`found`); the set-down read needs its force
     # too. A sensor field is read-only on the physics, and `found` -- what every other read
@@ -2385,6 +2396,7 @@ def main() -> None:
           "task": args.task,
           "num_envs": args.num_envs,
           "seed": args.seed,
+          "solver_iterations": args.solver_iterations,
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
