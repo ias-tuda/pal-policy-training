@@ -74,6 +74,7 @@ def _cfg(monkeypatch, goal: str | None, num_envs: int = 4, **changes):
       monkeypatch.delenv(var, raising=False)
   cfg = kangaroo_pick_place_env_cfg()
   cfg.scene.num_envs = num_envs
+  cfg.seed = 0  # the draws (DR-scene's table, the box, the cube) fixed: a control must not depend on them
   return cfg
 
 
@@ -144,7 +145,9 @@ def test_the_box_is_the_cad():
   mujoco.mj_forward(m, d)
   half = m.geom_size.copy()
   sphere = m.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE
-  half[sphere] = m.geom_size[sphere, :1]  # a sphere's extent is its radius on every axis
+  half[sphere] = m.geom_size[
+    sphere, :1
+  ]  # a sphere's extent is its radius on every axis
   lo = (d.geom_xpos - half).min(axis=0)
   hi = (d.geom_xpos + half).max(axis=0)
   assert hi[:2] == pytest.approx((0.045, 0.045), abs=1e-9)
@@ -374,28 +377,44 @@ def test_box_dr_draws_the_box_per_world(monkeypatch):
 
 
 def test_arm_table_contact_fires_on_an_arm_pressed_by_the_table(monkeypatch):
-  """Plan S10 step 0 item 2: AC must register a real arm-table contact. At the start pose arm
-  1-6 is behind the table's near edge (arm 5 at x ~0.06 m, the table from 0.25 m), so env 0's
-  table (DR-scene's per-world table pose) is moved 15 cm towards the robot and up until its top
-  is 1 cm above arm 5's link origin less 3 cm; env 1 keeps its table. Only env 0 is priced."""
+  """Plan S10 step 0 item 2: AC must register a real arm-table contact. As S7-10's own control
+  (`test_pick_place_s710.py`): env 0's table (DR-scene's per-world pose) is slid back until its
+  far edge is 3 cm past arm 6's origin -- between the forearm and the gripper -- and raised 2 cm
+  into the forearm's lowest collision point; env 1 keeps its table. One step: the sensor's force
+  over that step exceeds AC's 1 N in env 0 only, and AC prices env 0 only."""
+  from mjlab.utils.lab_api.math import quat_apply
+  from pal_mjlab.tasks.manipulation.mdp.rewards import _collision_points
   from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_SENSOR
 
   env = _env(monkeypatch, num_envs=2)
   robot = env.scene["robot"]
   table = env.scene["table"]
-  tid = table.indexing.body_ids[table.body_names.index("table")]
-  top = float(mdp.surface_top_z(env, SceneEntityCfg("table"))[0])
-  forearm = robot.body_names.index("arm_left_5_link")
-  low = float(robot.data.body_link_pos_w[0, forearm, 2]) - 0.03
-  env.sim.model.body_pos[0, tid, 0] -= 0.15
-  env.sim.model.body_pos[0, tid, 2] += low + 0.01 - top
-  env.sim.forward()
-  _hold(env, 10)
-  found = env.scene[ARM_TABLE_SENSOR].data.found.bool().any(dim=-1)
+  body = int(table.indexing.body_ids[table.body_names.index("table")])
+  geom = table.indexing.geom_ids[0]
+  arm5 = SceneEntityCfg("robot", body_names=("arm_left_5_link",))
+  arm5.resolve(env.scene)
+  i5 = arm5.body_ids[0]
+  pts = _collision_points(env, robot, arm5.body_ids)[0]
+  low = (
+    robot.data.body_link_pos_w[0, i5]
+    + quat_apply(robot.data.body_link_quat_w[0, i5].expand(len(pts), 4), pts)
+  )[:, 2].min()
+  x6 = robot.data.body_link_pos_w[0, robot.body_names.index("arm_left_6_link"), 0]
+  half_x = env.sim.model.geom_size[:, geom].expand(env.num_envs, 3)[0, 0]
+  centre_x = env.sim.data.geom_xpos[0, geom, 0]
+  top = mdp.surface_top_z(env, SceneEntityCfg("table"))[0]
+  env.sim.model.body_pos[0, body, 0] += (x6 + 0.03) - (centre_x + half_x)
+  env.sim.model.body_pos[0, body, 2] += low - top + 0.02
+  env.step(torch.zeros(env.action_space.shape, device=env.device))
+  peak = (
+    torch.norm(env.scene[ARM_TABLE_SENSOR].data.force_history, dim=-1)
+    .flatten(1)
+    .amax(-1)
+  )
   term = env.reward_manager.get_term_cfg("arm_table_contact")
   cost = term.func(env, **term.params)
-  assert bool(found[0]) and not bool(found[1]), found
-  assert float(cost[0]) == 1.0 and float(cost[1]) == 0.0
+  assert float(peak[0]) > 1.0 and float(peak[1]) == 0.0, peak
+  assert float(cost[0]) == 1.0 and float(cost[1]) == 0.0, cost
   env.close()
 
 
