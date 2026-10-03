@@ -131,15 +131,6 @@ if [ -n "${EPISODE_S:-}" ]; then
   S78_TAG="${S78_TAG},\"ep${EPISODE_S}\""
 fi
 
-# Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT -- arm 1-6 against
-# the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
-# contact). Unset is every run before S7-10; in the run name and the tags only when set.
-[ -n "${ARM_TABLE:-}" ] && export ARM_TABLE
-if [ -n "${ARM_TABLE:-}" ]; then
-  S78_NAME="${S78_NAME}_arm${ARM_TABLE}"
-  S78_TAG="${S78_TAG},\"arm${ARM_TABLE}\""
-fi
-
 # Plan S8 (`pick_place/kangaroo/env_cfg.py`, `pick_place_env_cfg.OBJECT_SHAPES`): SHAPE is what is picked up --
 # cube (every run up to S7-8) | ball (a 6 cm sphere) | ball-dr (the ball with its size and rolling friction
 # drawn) | mix (a cube or a ball, 50/50 per episode). In the run name and the tags only when set, so every
