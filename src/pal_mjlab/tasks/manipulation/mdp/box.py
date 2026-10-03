@@ -201,12 +201,15 @@ def set_box_geometry(
   floor: float,
   inner_range: tuple[float, float],
   height_range: tuple[float, float],
+  feet: tuple[str, ...] = (),
+  foot_inset: float = 0.0,
 ) -> None:
   """Startup event, plan S10's BX-DR: draw each world's box inner width and wall height
   (above the floor) uniformly, and rebuild the floor and the four walls (`scene.get_box_spec`'s
   layout: walls +x, -x, +y, -y, the y walls across the outer width) -- sizes, positions and the
-  bounds the broadphase reads. Wall and floor thickness stay. The mass is the DR of the box's
-  mass, a separate event."""
+  bounds the broadphase reads. Wall and floor thickness stay; ``feet`` (+x+y, +x-y, -x+y, -x-y,
+  `scene.box_foot_geom_names`) move to ``foot_inset`` inside the new outer corners. The mass is the
+  DR of the box's mass, a separate event."""
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device)
   n = len(env_ids)
@@ -231,6 +234,12 @@ def set_box_geometry(
     size[env_ids, gid, 2] = h / 2
   size[env_ids, floor_id, 0] = half_out
   size[env_ids, floor_id, 1] = half_out
+  if feet:
+    c = half_out - foot_inset
+    for name, (sx, sy) in zip(feet, ((1, 1), (1, -1), (-1, 1), (-1, -1)), strict=True):
+      gid = box.indexing.geom_ids[box.geom_names.index(name)]
+      pos[env_ids, gid, 0] = sx * c
+      pos[env_ids, gid, 1] = sy * c
   _recompute_geom_bounds(env, env_ids.to(dtype=torch.int), asset_cfg)
 
 

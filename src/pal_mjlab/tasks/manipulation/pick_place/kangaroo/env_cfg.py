@@ -68,6 +68,7 @@ penalty, with the box's size and mass drawn. One variable for S9's and S10's goa
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 
@@ -131,6 +132,7 @@ GOAL_ENV_VAR = "GOAL"
 GATE_ENV_VAR = "GATE"
 CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
+BOX_FEET_ENV_VAR = "BOX_FEET"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -285,11 +287,19 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 def _select_goal() -> tuple[str, BoxGoal | None]:
   """`GOAL`: plan S9's goal (`GOALS`: ``table`` | ``stack``) and plan S10's box (`box.BOX_GOALS`), one
-  variable for both. A box name is the table goal plus that box."""
+  variable for both. A box name is the table goal plus that box. ``BOX_FEET=0`` builds the box with the
+  flat floor every run of `0ba3f60` trained on (to re-read those runs on their own box); unset or 1 the
+  corner feet (S10 report §8)."""
   name = _select(GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS))
+  feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
+  if feet not in ("0", "1"):
+    raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
   if name in GOALS:
     return name, None
-  return DEFAULT_GOAL, BOX_GOALS[name]
+  box = BOX_GOALS[name]
+  if box is None or feet == "1":
+    return DEFAULT_GOAL, box
+  return DEFAULT_GOAL, dataclasses.replace(box, feet=False)
 
 
 def _critic_release() -> bool:

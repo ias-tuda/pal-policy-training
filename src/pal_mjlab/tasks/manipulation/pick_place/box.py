@@ -94,6 +94,10 @@ class BoxGoal:
   moved_scale: float = 0.02
   """The box displacement at which `box_moved` saturates, m."""
 
+  feet: bool = True
+  """The box stands on four corner feet (`scene.get_box_spec`); False is the flat floor every S10
+  run of `0ba3f60` trained on, which bobs once rocked (S10 report §8). ``BOX_FEET=0`` selects it."""
+
 
 #: The ``GOAL`` codes (plan S10's five experiments: BX, BX-FT -- BX resumed --, BX-NY, BX-RIM,
 #: BX-DR). ``table`` is every run before S10: the goal on the table, no box in the scene.
@@ -150,7 +154,10 @@ def apply_box_goal(
   goal tolerance the reward variant uses."""
   if code is None:
     return
-  cfg.scene.entities = {**cfg.scene.entities, BOX: scene.get_box_cfg(name=BOX)}
+  cfg.scene.entities = {
+    **cfg.scene.entities,
+    BOX: scene.get_box_cfg(name=BOX, feet=code.feet),
+  }
   table_cx, table_cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
   cfg.events["reset_box"] = EventTermCfg(
     func=mdp.reset_box_on_surface,
@@ -255,6 +262,8 @@ def apply_box_goal(
         "floor": scene.BOX_FLOOR,
         "inner_range": BOX_DR_INNER,
         "height_range": BOX_DR_WALL_HEIGHT,
+        "feet": scene.box_foot_geom_names(BOX) if code.feet else (),
+        "foot_inset": scene.BOX_FOOT_INSET,
       },
     )
     cfg.events["box_mass"] = EventTermCfg(
