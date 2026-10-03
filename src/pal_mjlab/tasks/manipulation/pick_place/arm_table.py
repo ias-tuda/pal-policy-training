@@ -37,7 +37,7 @@ from mjlab.tasks.manipulation.mdp import illegal_contact
 
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg
-from pal_mjlab.tasks.manipulation.tabletop_env_cfg import ROBOT, TABLE
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DECIMATION, ROBOT, TABLE
 
 #: The sensor's name: the driven arm's links 1-6 against the table.
 ARM_TABLE_SENSOR = "arm_table_contact"
@@ -88,9 +88,14 @@ def arm_body_regex(gripper: GripperCfg) -> str:
 
 
 def make_arm_table_sensor(gripper: GripperCfg) -> ContactSensorCfg:
-  """Arm 1-6 vs the table, one slot per link (its strongest contact), with a 4-substep force
-  history so that `illegal_contact`'s force threshold applies -- without a history it returns
-  ``found`` and ignores the threshold (mjlab ``terminations.py``)."""
+  """Arm 1-6 vs the table, one slot per link (its strongest contact), with a force history so
+  that `illegal_contact`'s force threshold applies -- without a history it returns ``found``
+  and ignores the threshold (mjlab ``terminations.py``).
+
+  The history is the whole control step (`DECIMATION` substeps), not the hand sensor's 4: with
+  4 of 10 substeps, a hard hit that pushes the arm clear in the step's first 6 substeps is not
+  seen by AC, AT or the eval (found by the positive control, which read 0 N on a forearm driven
+  2 cm into the table in 3 of 16 envs, and 600-15 000 N in the others)."""
   return ContactSensorCfg(
     name=ARM_TABLE_SENSOR,
     primary=ContactMatch(mode="body", pattern=arm_body_regex(gripper), entity=ROBOT),
@@ -98,7 +103,7 @@ def make_arm_table_sensor(gripper: GripperCfg) -> ContactSensorCfg:
     fields=("found", "force"),
     reduce="maxforce",
     num_slots=1,
-    history_length=4,
+    history_length=DECIMATION,
   )
 
 

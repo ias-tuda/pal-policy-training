@@ -23,6 +23,7 @@ from pal_mjlab.tasks.manipulation.pick_place import arm_table as at
 from pal_mjlab.tasks.manipulation.pick_place.kangaroo import env_cfg as kenv
 from pal_mjlab.tasks.manipulation.pick_place.rewards import S52_BASE
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DECIMATION
 
 #: S7-8's ABS-c, as `pick_place.sbatch` exported it (run log, jobs 160566-160569).
 ABS_C_ENV = {
@@ -54,6 +55,8 @@ def _cfg(monkeypatch, code: str | None, num_envs: int | None = None):
   cfg = kenv.kangaroo_pick_place_env_cfg()
   if num_envs is not None:
     cfg.scene.num_envs = num_envs
+    # An env test draws DR-scene's table shift from a fixed seed, not mjlab's random one.
+    cfg.seed = 0
   return cfg
 
 
@@ -120,6 +123,8 @@ def test_the_sensor_keeps_a_force_history():
   """Without one, `illegal_contact` returns ``found`` and ignores its force threshold."""
   sensor = at.make_arm_table_sensor(GRIPPER)
   assert sensor.history_length > 0 and "force" in sensor.fields
+  # Every substep of a control step: a hit early in the step must not be missed.
+  assert sensor.history_length == DECIMATION
   assert sensor.primary.pattern == r"arm_left_[1-6]_link"
 
 
@@ -261,8 +266,10 @@ def test_positive_control_a_table_moved_into_the_forearm(monkeypatch):
     # the forearm. Any of arm 1-6 is what the codes price.
     assert (peak.amax(dim=-1) > 1.0).all(), peak
     assert (mdp.contact_penalty(env, at.ARM_TABLE_SENSOR, 1.0) == 1.0).all()
+    # The contact pushes the arm back up within the step (to ~0.6 cm in one env at seed 0),
+    # so the term is inside the margin, not necessarily at its contact value of 1.
     assert (
-      mdp.table_clearance_penalty(env, at.CLEARANCE_MARGIN, ARM, TABLE) >= 1.0
+      mdp.table_clearance_penalty(env, at.CLEARANCE_MARGIN, ARM, TABLE) > 0.0
     ).all()
     ended = illegal_contact(env, at.ARM_TABLE_SENSOR, 30.0)
     assert torch.equal(ended, (peak > 30.0).any(dim=-1))
