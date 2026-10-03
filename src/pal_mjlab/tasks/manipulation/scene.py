@@ -223,6 +223,22 @@ BOX_MASS = 0.10
 BOX_FRICTION = 0.6
 
 
+#: The box stands on four small spheres at the corners of its bottom face (radius, inset from the
+#: outer edge, m), and its floor slab is raised `BOX_FOOT_GAP` off the surface. Found 2026-10-02 (S10
+#: report §8): a 5 mm floor slab lying flat on the table slab, once rocked -- a cube dropped in, a
+#: finger on a wall -- switches between corner contact sets (4 <-> 8 contacts) and keeps bobbing,
+#: 3-5 mm into the table every ~0.2 s, at 10 and at 100 solver iterations alike; on the feet it
+#: settles within 0.4 mm. A flat-bottomed box on a table bears at its rim anyway.
+BOX_FOOT_RADIUS = 0.003
+BOX_FOOT_INSET = 0.005
+BOX_FOOT_GAP = 0.001
+
+
+def box_foot_geom_names(name: str = "box") -> tuple[str, ...]:
+  """The four foot spheres of `get_box_spec`'s body (with ``feet``), +x+y, +x-y, -x+y, -x-y."""
+  return tuple(f"{name}_foot_{c}" for c in ("pp", "pm", "mp", "mm"))
+
+
 def box_wall_geom_names(name: str = "box") -> tuple[str, ...]:
   """The four wall geoms of `get_box_spec`'s body, +x, -x, +y, -y."""
   return tuple(f"{name}_wall_{side}" for side in ("px", "mx", "py", "my"))
@@ -236,6 +252,7 @@ def get_box_spec(
   wall_height: float = BOX_WALL_HEIGHT,
   mass: float = BOX_MASS,
   rgba: tuple[float, float, float, float] = (0.25, 0.55, 0.35, 1.0),
+  feet: bool = True,
 ) -> mujoco.MjSpec:
   """A free open-top box (plan S10): a floor and four walls, the body's origin at the centre of
   its bottom face (as `make_box.py`'s mesh), so it rests on a surface at the surface's height.
@@ -244,12 +261,23 @@ def get_box_spec(
   span the outer width and the two x walls the inner, so no two geoms overlap. A site
   ``{name}_floor`` marks the floor's top centre -- the goal's xy, and the cube's resting height
   minus its half-height. The walls are named (`box_wall_geom_names`) so that their top -- the rim --
-  and their inner faces can be read per world, which plan S10's BX-DR draws."""
+  and their inner faces can be read per world, which plan S10's BX-DR draws.
+
+  With ``feet`` (the default since 2026-10-02) the box stands on four spheres of radius
+  `BOX_FOOT_RADIUS` at the corners, their bottoms at the box's bottom face, and the floor slab
+  starts `BOX_FOOT_GAP` above it: the floor's top, the rim, the outer size and the mass are
+  unchanged. Without, the floor slab rests on the surface itself, which bobs once rocked (see
+  `BOX_FOOT_RADIUS`) -- every S10 run of `0ba3f60` trained on that."""
   half_in = inner / 2
   half_out = half_in + wall
   wall_z = floor + wall_height / 2
+  gap = BOX_FOOT_GAP if feet else 0.0
   geoms = [
-    (f"{name}_floor", (0.0, 0.0, floor / 2), (half_out, half_out, floor / 2)),
+    (
+      f"{name}_floor",
+      (0.0, 0.0, (floor + gap) / 2),
+      (half_out, half_out, (floor - gap) / 2),
+    ),
     (
       f"{name}_wall_px",
       (half_in + wall / 2, 0.0, wall_z),
@@ -271,7 +299,11 @@ def get_box_spec(
       (half_out, wall / 2, wall_height / 2),
     ),
   ]
+  r, c = BOX_FOOT_RADIUS, half_out - BOX_FOOT_INSET
+  foot_pos = [(c, c), (c, -c), (-c, c), (-c, -c)]
   volume = sum(8.0 * s[0] * s[1] * s[2] for _, _, s in geoms)
+  if feet:
+    volume += 4 * (4.0 / 3.0) * 3.141592653589793 * r**3
   spec = mujoco.MjSpec()
   body = spec.worldbody.add_body(name=name)
   body.add_freejoint(name=f"{name}_joint")
@@ -288,6 +320,20 @@ def get_box_spec(
       solref=(0.02, 1.0),
       solimp=(0.99, 0.995, 0.001, 0.5, 2),
     )
+  if feet:
+    for foot, (x, y) in zip(box_foot_geom_names(name), foot_pos, strict=True):
+      body.add_geom(
+        name=foot,
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        pos=(x, y, r),
+        size=(r, 0.0, 0.0),
+        density=mass / volume,
+        rgba=rgba,
+        condim=3,
+        friction=(BOX_FRICTION, 0.005, 0.0001),
+        solref=(0.02, 1.0),
+        solimp=(0.99, 0.995, 0.001, 0.5, 2),
+      )
   body.add_site(name=f"{name}_floor", pos=(0.0, 0.0, floor), size=(0.004, 0.0, 0.0))
   return spec
 

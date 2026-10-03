@@ -62,6 +62,7 @@ penalty, with the box's size and mass drawn. Unset is `table`, every run before 
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 
@@ -121,6 +122,7 @@ EPISODE_ENV_VAR = "EPISODE_S"
 SHAPE_ENV_VAR = "SHAPE"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
 GOAL_ENV_VAR = "GOAL"
+BOX_FEET_ENV_VAR = "BOX_FEET"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -260,8 +262,20 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     arm_table=ARM_TABLE_CODES[
       _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
     ],
-    goal=BOX_GOALS[_select(GOAL_ENV_VAR, DEFAULT_GOAL, BOX_GOALS)],
+    goal=_select_goal(),
   )
+
+
+def _select_goal():
+  """Plan S10's ``GOAL`` (`box.BOX_GOALS`); ``BOX_FEET=0`` builds the box with the flat floor every run
+  of `0ba3f60` trained on (to re-read those runs on their own box), unset or 1 the corner feet."""
+  goal = BOX_GOALS[_select(GOAL_ENV_VAR, DEFAULT_GOAL, BOX_GOALS)]
+  feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
+  if feet not in ("0", "1"):
+    raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
+  if goal is None or feet == "1":
+    return goal
+  return dataclasses.replace(goal, feet=False)
 
 
 def _select_occlusion() -> mdp.OccCfg | None:

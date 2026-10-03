@@ -142,8 +142,11 @@ def test_the_box_is_the_cad():
   m = scene.get_box_spec().compile()
   d = mujoco.MjData(m)
   mujoco.mj_forward(m, d)
-  lo = (d.geom_xpos - m.geom_size).min(axis=0)
-  hi = (d.geom_xpos + m.geom_size).max(axis=0)
+  half = m.geom_size.copy()
+  sphere = m.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE
+  half[sphere] = m.geom_size[sphere, :1]  # a sphere's extent is its radius on every axis
+  lo = (d.geom_xpos - half).min(axis=0)
+  hi = (d.geom_xpos + half).max(axis=0)
   assert hi[:2] == pytest.approx((0.045, 0.045), abs=1e-9)
   assert lo[:2] == pytest.approx((-0.045, -0.045), abs=1e-9)
   assert (lo[2], hi[2]) == pytest.approx((0.0, 0.030), abs=1e-9)
@@ -503,3 +506,38 @@ def test_placed_keeps_paying_through_the_retreat_from_the_box(box_episode):
   first = next(i for i, t in enumerate(after) if t["placed"] > 0)
   paid = [t["placed"] > 0 for t in after[first:]]
   assert sum(paid) / len(paid) > 0.9
+
+
+# -- The box on the table: no bobbing (S10 report §8) ---------------------------------------
+
+
+@pytest.mark.parametrize("feet", ["1", "0"])
+def test_a_rocked_box_settles_on_its_feet(monkeypatch, feet):
+  """A box with the cube resting in it, rocked once (1 rad/s about x, 0.5 about y, 5 cm/s down),
+  must settle on the table. On its corner feet it does (sinks < 1 mm, still within 1 s); the flat
+  floor every `0ba3f60` run trained on keeps bobbing 3-5 mm into the table -- kept here as the
+  positive control of the measurement."""
+  env = _env(monkeypatch, num_envs=16, BOX_FEET=feet)
+  _hold(env, 5)
+  _put_cube(env, (0.0, 0.0), 0.002)
+  _hold(env, 50)
+  box = env.scene[bx.BOX]
+  v = box.data.root_link_vel_w.clone()
+  v[:, 2], v[:, 3], v[:, 4] = -0.05, 1.0, 0.5
+  box.write_root_link_velocity_to_sim(v)
+  table = SceneEntityCfg("table")
+  heights, speeds = [], []
+  with torch.inference_mode():
+    for k in range(150):
+      env.step(torch.zeros(env.action_space.shape, device=env.device))
+      if k >= 50:
+        top = mdp.surface_top_z(env, table)
+        heights.append(box.data.root_link_pos_w[:, 2] - top)
+        speeds.append(box.data.root_link_lin_vel_w[:, 2].abs())
+  sink = -torch.stack(heights).min()
+  vz = torch.stack(speeds).max()
+  if feet == "1":
+    assert sink < 0.001 and vz < 0.02, (float(sink), float(vz))
+  else:
+    assert sink > 0.002 or vz > 0.05, (float(sink), float(vz))
+  env.close()
