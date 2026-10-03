@@ -291,6 +291,18 @@ def hand_x_for(kin: Kin, cube_yaw: float) -> np.ndarray:
   return np.array([math.cos(best), math.sin(best), 0.0])
 
 
+def box_place_hand_x(
+  kin: Kin, cube_yaw: float, box_yaw: float, yaw_error: float = 0.0
+) -> np.ndarray:
+  """Plan S10: the hand's +x for the carry and the place, turned from the grasp's
+  (`hand_x_for`) by the smallest angle that puts the held cube's faces on the box's axes, plus
+  ``yaw_error`` (rad; the finger-fit check's deliberate misalignment)."""
+  grasp_x = hand_x_for(kin, cube_yaw)
+  turn = math.remainder(box_yaw - cube_yaw, math.pi / 2) + yaw_error
+  a = math.atan2(grasp_x[1], grasp_x[0]) + turn
+  return np.array([math.cos(a), math.sin(a), 0.0])
+
+
 def ball_pad_clearance(offset: float | None = None) -> float:
   """Height of the pad sites' midpoint above the table at a ball's grasp (plan S8): the ball's
   radius (its centre) plus ``offset`` -- `pick_place.rewards.EQ_OFFSET`, the height above the
@@ -319,14 +331,16 @@ def waypoints(
   table_z: float | None = None,
   pad_clearance: float = PAD_CLEARANCE,
   carry_hand_x: np.ndarray | None = None,
+  place_dz: float = 0.0,
 ) -> dict[str, np.ndarray]:
   """Joint configurations for every phase, each IK seeded from the previous one so the
   sequence stays on one solution branch. Raises if any waypoint has no solution or puts
   the arm in contact. ``table_z`` is the table's top face (m); `scene.TABLE_TOP_Z` if None.
   ``pad_clearance`` is the height of the pad sites above the table at the grasp pose: 1 cm for
   the 5 cm cube; for plan S8's ball, `ball_pad_clearance` (the pad centre at the ball's equator
-  plus the bench's best offset). ``carry_hand_x`` (plan S9, `place_hand_x`) is the hand +x from the
-  carry on; the grasp's if None."""
+  plus the bench's best offset). ``carry_hand_x`` is the hand +x from the carry on (plan S9's
+  `place_hand_x`: the cube square to the base; plan S10's `box_place_hand_x`: its faces on the box's
+  walls); the grasp's if None. Plan S10: ``place_dz`` raises the place by the box floor."""
   from pal_mjlab.tasks.manipulation import scene
 
   if table_z is None:
@@ -334,23 +348,19 @@ def waypoints(
   z_grasp = table_z + kin.pad_offset() + pad_clearance
   z_high = z_grasp + CLEAR_HEIGHT
   hand_x = hand_x_for(kin, cube_yaw)
+  carry_x = hand_x if carry_hand_x is None else carry_hand_x
   goals = {
-    "pregrasp": (cube_xy, z_high),
-    "grasp": (cube_xy, z_grasp),
-    "lift": (cube_xy, z_high),
-    "carry": (target_xy, z_high),
-    "place": (target_xy, z_grasp),
-    "retreat": (target_xy, z_high),
+    "pregrasp": (cube_xy, z_high, hand_x),
+    "grasp": (cube_xy, z_grasp, hand_x),
+    "lift": (cube_xy, z_high, hand_x),
+    "carry": (target_xy, z_high + place_dz, carry_x),
+    "place": (target_xy, z_grasp + place_dz, carry_x),
+    "retreat": (target_xy, z_high + place_dz, carry_x),
   }
   out: dict[str, np.ndarray] = {}
   q = kin.q_default
-  for name, (xy, z) in goals.items():
+  for name, (xy, z, hx) in goals.items():
     goal = np.array([xy[0], xy[1], z])
-    hx = (
-      carry_hand_x
-      if carry_hand_x is not None and name in ("carry", "place", "retreat")
-      else hand_x
-    )
     sol = _solve(kin, name, goal, hx, q)
     # Only the free-space waypoints must be contact-free; at grasp/place the pads are
     # 1 cm off the table by construction and anything they touch is the (parked) cube.
@@ -667,6 +677,11 @@ def rollout(
   goal: str = "table",
   gate: str = "none",
   base_spawns: list[tuple[tuple[float, float], float]] | None = None,
+  box_goal=None,
+  arm_table=None,
+  pad_clearance: float = PAD_CLEARANCE,
+  yaw_errors: list[float] | None = None,
+  box_poses: list[tuple[tuple[float, float], float]] | None = None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -730,6 +745,15 @@ def rollout(
   arrives square to the base (`place_hand_x`), and ``base_spawns`` puts env ``i``'s base cube at
   ``base_spawns[i]`` = ((x, y), yaw) in the env frame (moved with the table, like a forced spawn).
   Rows carry ``gate_locked_steps`` (steps the lock refused an opening) and ``gate_armed_steps``.
+  Plan S10: ``box_goal`` (`box.BOX_GOALS`) puts the cube into the box: the wrist turns during the carry
+  so the cube's faces line up with the box (`box_place_hand_x`, + ``yaw_errors[i]`` rad for the
+  finger-fit check), the place is raised by the box floor, and the closed-loop corrections are
+  made with the cube's bottom above the rim. ``arm_table`` (`arm_table.ARM_TABLE_CODES`) adds
+  plan S7-10's sensor, so a hook can check that the script never lays arm 1-6 on the table.
+  ``pad_clearance`` is the pads' height above the table at the grasp (`PAD_CLEARANCE`). Rows gain
+  ``in_box``, the hand's and the cube's box-wall contact steps while held, and the box's
+  displacement. ``box_poses`` puts env ``i``'s box at ``box_poses[i]`` = ((x, y), yaw), env frame
+  for the table at its nominal place (it moves with the table), instead of the reset's draw.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -760,6 +784,8 @@ def rollout(
     **({} if shape is None else {"shape": shape}),
     goal=goal,
     gate=gate,
+    arm_table=arm_table,
+    box=box_goal,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -867,6 +893,22 @@ def rollout(
     if corners_first
     else None
   )
+  if box_poses is not None:
+    from pal_mjlab.tasks.manipulation.pick_place.box import BOX as _BOX
+
+    if box_goal is None or len(box_poses) != num_envs:
+      raise ValueError("box_poses needs box_goal and one pose per env")
+    box_e = env.scene[_BOX]
+    bpose = box_e.data.root_link_pose_w.clone()
+    for i, (xy, yaw) in enumerate(box_poses):
+      bpose[i, 0] = origins[i, 0] + float(xy[0]) + float(shift[i, 0])
+      bpose[i, 1] = origins[i, 1] + float(xy[1]) + float(shift[i, 1])
+      bpose[i, 3:7] = torch.tensor(
+        [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
+      )
+    box_e.write_root_link_pose_to_sim(bpose)
+    box_e.write_root_link_velocity_to_sim(torch.zeros_like(box_e.data.root_link_vel_w))
+    env.command_manager.get_term("goal_pose").box_start_xy[:] = bpose[:, :2]
   if base_spawns is not None and len(base_spawns) != num_envs:
     raise ValueError(f"{len(base_spawns)} base spawns for {num_envs} envs")
   stack = goal == "stack"
@@ -887,7 +929,7 @@ def rollout(
     entity.write_root_link_velocity_to_sim(
       torch.zeros_like(entity.data.root_link_vel_w)
     )
-  if forced is not None or base_spawns is not None:
+  if forced is not None or base_spawns is not None or box_poses is not None:
     # A teleport is not visible to the entity's data views until the sim has stepped; one
     # idle step (action 0 = hold the start pose) also lets the cube settle on the table.
     with torch.inference_mode():
@@ -910,6 +952,15 @@ def rollout(
   is_ball = ball_mask(env).cpu().numpy()
   base_quat = base.data.root_link_quat_w.cpu().numpy() if stack else None
   hand_yaw0 = math.atan2(kin.fk(kin.q_default)[1][1, 0], kin.fk(kin.q_default)[1][0, 0])
+  if box_goal is not None:
+    from pal_mjlab.tasks.manipulation import scene as _scene
+    from pal_mjlab.tasks.manipulation.pick_place.box import BOX
+
+    box_q = env.scene[BOX].data.root_link_quat_w.cpu().numpy()
+    box_yaws = [
+      math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) for w, x, y, z in box_q
+    ]
+    place_dz = _scene.BOX_FLOOR
   for i in range(num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
@@ -921,6 +972,9 @@ def rollout(
       base_yaw = math.atan2(2 * (bw * bz + bx * by), 1 - 2 * (by * by + bz * bz))
       carry_x = place_hand_x(hand_x_for(kin, yaw), yaw, base_yaw)
     kin.move_table(shift[i])
+    if box_goal is not None:
+      err = 0.0 if yaw_errors is None else float(yaw_errors[i])
+      carry_x = box_place_hand_x(kin, yaw, box_yaws[i], err)
     try:
       plans.append(
         waypoints(
@@ -931,8 +985,9 @@ def rollout(
           table_z=float(table_z[i]),
           pad_clearance=ball_pad_clearance(ball_offset)
           if is_ball[i]
-          else PAD_CLEARANCE,
+          else pad_clearance,
           carry_hand_x=carry_x,
+          place_dz=place_dz if box_goal is not None else 0.0,
         )
       )
     except RuntimeError as e:
@@ -1033,6 +1088,40 @@ def rollout(
 
   phase_list = phases if phases is not None else PHASES
   phase_now = ["start"]
+  # Plan S10: the corrections move the held cube sideways, so its bottom must be over the rim.
+  correction_lift = PLACE_CORRECTION_LIFT
+  box_rows: dict[str, np.ndarray] = {}
+  if box_goal is not None:
+    from pal_mjlab.tasks.manipulation.pick_place import box as _box
+
+    correction_lift = _scene.BOX_WALL_HEIGHT + 0.01
+    box_rows["hand_wall_held_steps"] = np.zeros(num_envs, int)
+    box_rows["cube_wall_held_steps"] = np.zeros(num_envs, int)
+    box_rows["hand_wall_steps"] = np.zeros(num_envs, int)
+
+    def _box_hook(phase: str, env_) -> None:
+      held = ev_grasped(env_)
+      for key, sensor in (
+        ("hand_wall", _box.BOX_WALL_HAND_SENSOR),
+        ("cube_wall", _box.BOX_WALL_OBJECT_SENSOR),
+      ):
+        hit = env_.scene[sensor].data.found.bool().any(dim=-1).cpu().numpy()
+        box_rows[f"{key}_held_steps"] += (hit & held).astype(int)
+        if key == "hand_wall":
+          box_rows["hand_wall_steps"] += hit.astype(int)
+
+    def ev_grasped(env_) -> np.ndarray:
+      from pal_mjlab.tasks.manipulation.mdp.observations import _grasped_bool
+
+      return _grasped_bool(env_, grasp_sensor).cpu().numpy()
+
+    user_hook = hook
+
+    def hook(phase: str, env_) -> None:  # noqa: F811
+      _box_hook(phase, env_)
+      if user_hook is not None:
+        user_hook(phase, env_)
+
   with torch.inference_mode():
     for phase, wp, closed, steps in phase_list:
       phase_now[0] = phase
@@ -1092,7 +1181,7 @@ def rollout(
         # Corrections are made with the cube lifted clear of the table: resting on it, the
         # cube's friction holds the hand against a centimetre-scale move (measured: a
         # correction at release height left the error unchanged).
-        lift = np.array([0.0, 0.0, PLACE_CORRECTION_LIFT])
+        lift = np.array([0.0, 0.0, correction_lift])
         ups = []
         for i, (pl, hx) in enumerate(zip(plans, hand_xs, strict=True)):
           kin.move_table(shift[i])
@@ -1149,6 +1238,17 @@ def rollout(
         diag["jaw_q"] = (
           robot.data.joint_pos[:, robot.joint_names.index(JAW_JOINT)].cpu().numpy()
         )
+    if box_goal is not None:
+      from pal_mjlab.tasks.manipulation.mdp import object_in_box_bool
+
+      diag["in_box"] = (
+        object_in_box_bool(env, pp.OBJECT, BOX, _box.BOX_WALLS).cpu().numpy()
+      )
+      diag["box_displacement_mm"] = (
+        1e3 * env.command_manager.get_term("goal_pose").box_displacement().cpu().numpy()
+      )
+      for key, v in box_rows.items():
+        diag[key] = v
     goal = env.command_manager.get_term("goal_pose").command
     d = obj.data.root_link_pos_w - goal
     diag["final_cube_to_goal_mm"] = 1e3 * torch.norm(d, dim=-1).cpu().numpy()

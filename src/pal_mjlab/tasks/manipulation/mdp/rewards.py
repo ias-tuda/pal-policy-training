@@ -266,6 +266,8 @@ def release_quality_of(
   tilt_std: float | None = None,
   speed: torch.Tensor | None = None,
   speed_std: float | None = None,
+  yaw: torch.Tensor | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """q = floor + (1 - floor) * G_dist_std(dxy) * G_height_std(max(height - height_free, 0)).
 
@@ -277,6 +279,10 @@ def release_quality_of(
   Plan S7-9's PT multiplies the graded part by G_tilt_std(tilt) * G_speed_std(speed), the
   object's tilt (rad) and speed (m/s) at the let-go, when ``tilt_std`` / ``speed_std`` are set.
   Inside the ``(1 - floor)`` part, so the floor still keeps a poor release worth something.
+
+  Plan S10's BX: with ``yaw_std``, also x G_yaw_std(yaw), ``yaw`` the object's |yaw mod 90 deg| at
+  the release (`observations.yaw_error_mod_90`) -- a cube let go turned 45 deg off the box's axes
+  has 4.6 mm to each wall instead of 15.
   """
   near = torch.exp(-torch.square(dxy / dist_std))
   low = torch.exp(-torch.square((height - height_free).clamp_min(0.0) / height_std))
@@ -287,6 +293,9 @@ def release_quality_of(
   if speed_std is not None:
     assert speed is not None
     graded = graded * torch.exp(-torch.square(speed / speed_std))
+  if yaw_std is not None:
+    assert yaw is not None, "a yaw grade needs the release's yaw"
+    graded = graded * torch.exp(-torch.square(yaw / yaw_std))
   return floor + (1.0 - floor) * graded
 
 
@@ -323,6 +332,7 @@ def release_quality(
   require_ok: bool = False,
   tilt_std: float | None = None,
   speed_std: float | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
@@ -362,6 +372,8 @@ def release_quality(
     tilt_std,
     latch.rel_speed,
     speed_std,
+    latch.yaw,
+    yaw_std,
   )
   paid = latch.released
   if set_down_steps > 0:
@@ -389,6 +401,7 @@ def released_at_goal_graded(
   require_ok: bool = False,
   tilt_std: float | None = None,
   speed_std: float | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -425,6 +438,7 @@ def released_at_goal_graded(
     require_ok,
     tilt_std,
     speed_std,
+    yaw_std,
   )
 
 
@@ -447,6 +461,7 @@ def object_placed_graded(
   require_ok: bool = False,
   tilt_std: float | None = None,
   speed_std: float | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -481,6 +496,7 @@ def object_placed_graded(
     require_ok,
     tilt_std,
     speed_std,
+    yaw_std,
   )
 
 

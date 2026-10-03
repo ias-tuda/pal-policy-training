@@ -81,6 +81,14 @@ def parse_args() -> argparse.Namespace:
     help="the goal: env frame, table at its nominal place (a SurfaceOffsetCommand goal)",
   )
   p.add_argument(
+    "--box",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "YAW_DEG"),
+    help="plan S10: the box's centre and yaw (env frame, table at its nominal place; it moves "
+    "with the table). Use --settle-steps >= 9 so the box's 5-8 step tracker reports it",
+  )
+  p.add_argument(
     "--table-offset",
     type=float,
     nargs=3,
@@ -174,6 +182,21 @@ def pin_start(env, ev, args: argparse.Namespace) -> dict[str, tuple[float, ...]]
       torch.tensor([0], device=env.device),
       torch.tensor([np.asarray(args.target) - table_xy0], dtype=torch.float32),
     )
+  if args.box is not None:
+    from pal_mjlab.tasks.manipulation.pick_place.box import BOX
+
+    x, y, yaw_deg = args.box
+    yaw = math.radians(yaw_deg)
+    box = env.scene[BOX]
+    bpose = box.data.root_link_pose_w.clone()
+    bpose[0, 0] = origin[0] + x + float(shift[0])
+    bpose[0, 1] = origin[1] + y + float(shift[1])
+    bpose[0, 3:7] = torch.tensor(
+      [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
+    )
+    box.write_root_link_pose_to_sim(bpose)
+    box.write_root_link_velocity_to_sim(torch.zeros_like(box.data.root_link_vel_w))
+    env.command_manager.get_term(ev.COMMAND).box_start_xy[0] = bpose[0, :2]
   obj = env.scene[ev.OBJECT]
   if args.spawn is not None:
     x, y, yaw_deg = args.spawn

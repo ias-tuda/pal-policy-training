@@ -37,6 +37,21 @@ from .actions import (
   ToolSpeedCappedJointPositionAction,
   ToolSpeedCappedJointPositionActionCfg,
 )
+from .box import (
+  BoxGoalCommand,
+  BoxGoalCommandCfg,
+  box_displacement_penalty,
+  box_goal_position_tracked_b,
+  box_inner_half,
+  box_rim_z,
+  contact_while_held,
+  object_in_box_bool,
+  object_position_biased_b,
+  reset_box_on_surface,
+  reset_tracker_bias,
+  set_box_geometry,
+  tracker_bias,
+)
 from .commands import (
   EntityOffsetCommand,
   EntityOffsetCommandCfg,
@@ -62,6 +77,7 @@ from .observations import (
   object_yaw_b,
   release_grade,
   release_latched,
+  yaw_error_mod_90,
 )
 from .occlusion import (
   CubeSensor,
@@ -120,6 +136,21 @@ from .terminations import (
 )
 
 __all__ = [
+  # Plan S10, the box.
+  "BoxGoalCommand",
+  "BoxGoalCommandCfg",
+  "box_displacement_penalty",
+  "box_goal_position_tracked_b",
+  "box_inner_half",
+  "box_rim_z",
+  "contact_while_held",
+  "object_in_box_bool",
+  "object_position_biased_b",
+  "reset_box_on_surface",
+  "reset_tracker_bias",
+  "set_box_geometry",
+  "tracker_bias",
+  "yaw_error_mod_90",
   "BySize",
   "PerShape",
   "ball_mask",

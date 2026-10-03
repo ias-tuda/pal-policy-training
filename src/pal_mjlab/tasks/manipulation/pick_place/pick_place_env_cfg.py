@@ -39,6 +39,7 @@ from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
   ArmTableCfg,
   apply_arm_table,
 )
+from pal_mjlab.tasks.manipulation.pick_place.box import BoxGoal, apply_box_goal
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
@@ -558,6 +559,7 @@ def make_pick_place_env_cfg(
   gate: str = "none",
   critic_release: bool = False,
   arm_table: ArmTableCfg | None = None,
+  box: BoxGoal | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -597,7 +599,20 @@ def make_pick_place_env_cfg(
       and so the exported policy, are unchanged). Needs a reward arm with M6.
     arm_table: plan S7-10's ``ARM_TABLE`` -- the arm-table sensor and the terms on it. See
       `arm_table.ARM_TABLE_CODES`; None is every run before S7-10.
+    box: plan S10's box goal (``GOAL=box`` | ``box-ny`` | ``box-rim`` | ``box-dr``, `box.BOX_GOALS`) --
+      put the cube into a box standing where the baseline's target box is (`box.apply_box_goal`);
+      None is the goal on the table, every run before S10. With it ``goal`` stays ``table``.
   """
+  if box is not None and (
+    shape is not OBJECT_SHAPES["cube"]
+    or target_area is not None
+    or occlusion is not None
+    or goal != "table"
+  ):
+    raise ValueError(
+      "plan S10's box is built for the 5 cm cube, baseline B's target box, no occlusion model and "
+      "no stack goal; SHAPE, TARGET, OCC or the stack GOAL is set"
+    )
   if goal not in GOALS:
     raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
   if gate not in GATES:
@@ -735,6 +750,17 @@ def make_pick_place_env_cfg(
   # Plan S7-10: the arm off the table. After the variant's dict, like the trunk penalty, so
   # that the same code adds the same terms to every variant.
   apply_arm_table(cfg, gripper, arm_table)
+  # Plan S10: the box, last of the reward edits, so that it sees every term reading the
+  # release latch.
+  apply_box_goal(
+    cfg,
+    gripper,
+    box,
+    target_xy,
+    baseline.target_half_xy,
+    baseline.table_top_z,
+    GOAL_THRESHOLD,
+  )
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)

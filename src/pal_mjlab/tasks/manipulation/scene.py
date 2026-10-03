@@ -206,3 +206,91 @@ def get_mixed_spec(
 
 def get_mixed_cfg(name: str = "object", **kwargs) -> EntityCfg:
   return EntityCfg(spec_fn=lambda: get_mixed_spec(name=name, **kwargs))
+
+
+#: Plan S10 (`pick-place-v1-objects-plan.md`, *The box*; built to these numbers, Siwei 2026-10-01 22:02):
+#: an open box for the 5 cm cube, `oppsie-data/cad/s10_box/make_box.py` geom for geom. Inner 8.0 x 8.0 cm
+#: (the cube + 3 cm), walls 5 mm thick and 2.5 cm above the floor (half the cube), floor 5 mm: outer
+#: 9.0 x 9.0 x 3.0 cm, so the rim is at the table + 3.0 cm and a cube resting inside has its centre there too.
+BOX_INNER = 0.08
+BOX_WALL = 0.005
+BOX_FLOOR = 0.005
+BOX_WALL_HEIGHT = 0.025
+#: The real box is not weighed yet (plan S10 step 0, item 1): ~ the solid volume (83 cm^3) in PLA until it is.
+BOX_MASS = 0.10
+#: Box-table sliding friction is the table's 0.8 (element-wise max, L10); this is the box's own, which
+#: decides nothing against the cube's 0.9 either -- kept for the record of the plan's "inside: 0.6".
+BOX_FRICTION = 0.6
+
+
+def box_wall_geom_names(name: str = "box") -> tuple[str, ...]:
+  """The four wall geoms of `get_box_spec`'s body, +x, -x, +y, -y."""
+  return tuple(f"{name}_wall_{side}" for side in ("px", "mx", "py", "my"))
+
+
+def get_box_spec(
+  name: str = "box",
+  inner: float = BOX_INNER,
+  wall: float = BOX_WALL,
+  floor: float = BOX_FLOOR,
+  wall_height: float = BOX_WALL_HEIGHT,
+  mass: float = BOX_MASS,
+  rgba: tuple[float, float, float, float] = (0.25, 0.55, 0.35, 1.0),
+) -> mujoco.MjSpec:
+  """A free open-top box (plan S10): a floor and four walls, the body's origin at the centre of
+  its bottom face (as `make_box.py`'s mesh), so it rests on a surface at the surface's height.
+
+  Five box geoms, condim 3, the mass spread over them by volume (one density). The two y walls
+  span the outer width and the two x walls the inner, so no two geoms overlap. A site
+  ``{name}_floor`` marks the floor's top centre -- the goal's xy, and the cube's resting height
+  minus its half-height. The walls are named (`box_wall_geom_names`) so that their top -- the rim --
+  and their inner faces can be read per world, which plan S10's BX-DR draws."""
+  half_in = inner / 2
+  half_out = half_in + wall
+  wall_z = floor + wall_height / 2
+  geoms = [
+    (f"{name}_floor", (0.0, 0.0, floor / 2), (half_out, half_out, floor / 2)),
+    (
+      f"{name}_wall_px",
+      (half_in + wall / 2, 0.0, wall_z),
+      (wall / 2, half_in, wall_height / 2),
+    ),
+    (
+      f"{name}_wall_mx",
+      (-half_in - wall / 2, 0.0, wall_z),
+      (wall / 2, half_in, wall_height / 2),
+    ),
+    (
+      f"{name}_wall_py",
+      (0.0, half_in + wall / 2, wall_z),
+      (half_out, wall / 2, wall_height / 2),
+    ),
+    (
+      f"{name}_wall_my",
+      (0.0, -half_in - wall / 2, wall_z),
+      (half_out, wall / 2, wall_height / 2),
+    ),
+  ]
+  volume = sum(8.0 * s[0] * s[1] * s[2] for _, _, s in geoms)
+  spec = mujoco.MjSpec()
+  body = spec.worldbody.add_body(name=name)
+  body.add_freejoint(name=f"{name}_joint")
+  for geom_name, pos, size in geoms:
+    body.add_geom(
+      name=geom_name,
+      type=mujoco.mjtGeom.mjGEOM_BOX,
+      pos=pos,
+      size=size,
+      density=mass / volume,
+      rgba=rgba,
+      condim=3,
+      friction=(BOX_FRICTION, 0.005, 0.0001),
+      solref=(0.02, 1.0),
+      solimp=(0.99, 0.995, 0.001, 0.5, 2),
+    )
+  body.add_site(name=f"{name}_floor", pos=(0.0, 0.0, floor), size=(0.004, 0.0, 0.0))
+  return spec
+
+
+def get_box_cfg(name: str = "box", **kwargs) -> EntityCfg:
+  return EntityCfg(spec_fn=lambda: get_box_spec(name=name, **kwargs))
