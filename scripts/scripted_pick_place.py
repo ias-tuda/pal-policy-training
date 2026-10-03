@@ -682,6 +682,8 @@ def rollout(
   pad_clearance: float = PAD_CLEARANCE,
   yaw_errors: list[float] | None = None,
   box_poses: list[tuple[tuple[float, float], float]] | None = None,
+  robot_target=None,
+  tracker: str = "B",
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -754,6 +756,10 @@ def rollout(
   ``in_box``, the hand's and the cube's box-wall contact steps while held, and the box's
   displacement. ``box_poses`` puts env ``i``'s box at ``box_poses[i]`` = ((x, y), yaw), env frame
   for the table at its nominal place (it moves with the table), instead of the reset's draw.
+
+  Plan S11: ``robot_target`` (`pick_place_env_cfg.ROBOT_TARGETS`, ``T11`` / ``T11W``) puts the goal --
+  or a stack goal's base -- at the meeting point T in the robot frame, and ``tracker`` is
+  `TRACKERS`'s name; the robot's right home comes with ``robot``.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -786,6 +792,8 @@ def rollout(
     gate=gate,
     arm_table=arm_table,
     box=box_goal,
+    robot_target=robot_target,
+    tracker=tracker,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -1412,8 +1420,13 @@ def parse_args() -> argparse.Namespace:
   r.add_argument(
     "--target",
     default="B",
-    help="TARGET_AREAS name (S7-8: WC, the goal from the spawn area)",
+    help="TARGET_AREAS name (S7-8: WC, the goal from the spawn area) or ROBOT_TARGETS name "
+    "(plan S11: T11, T11W -- T in the robot frame)",
   )
+  r.add_argument(
+    "--arm-home", default="default", help="ARM_HOMES name (plan S11: default | mirror)"
+  )
+  r.add_argument("--tracker", default="B", help="TRACKERS name (plan S11: B | split)")
   r.add_argument("--effort", default="none", help="EFFORT_BOUNDS name (CTP)")
   r.add_argument(
     "--shape",
@@ -1535,7 +1548,10 @@ def main() -> None:
   if args.gains is not None:
     effort = pp.EFFORT_BOUNDS[args.effort]
     robot = kangaroo_grippers_left_arm(
-      args.gains, robot, arm_effort_scale=effort.effort_scale
+      args.gains,
+      robot,
+      arm_effort_scale=effort.effort_scale,
+      right_home=args.arm_home,
     )
   rows = rollout(
     num_envs=args.num_envs,
@@ -1551,7 +1567,9 @@ def main() -> None:
     tool_speed_cap=pp.TOOL_SPEED_CAPS[args.tool_speed],
     effort=pp.EFFORT_BOUNDS[args.effort],
     latency=tt.LATENCY_MODELS[args.lag],
-    target_area=pp.TARGET_AREAS[args.target],
+    target_area=pp.TARGET_AREAS.get(args.target),
+    robot_target=pp.ROBOT_TARGETS.get(args.target),
+    tracker=args.tracker,
     stack_speed=args.stack_speed,
     action_mode=args.action,
     episode_length_s=args.episode_s,
