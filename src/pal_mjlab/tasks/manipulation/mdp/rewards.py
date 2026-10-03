@@ -262,6 +262,10 @@ def release_quality_of(
   height_free: float,
   height_std: float,
   floor: float,
+  tilt: torch.Tensor | None = None,
+  tilt_std: float | None = None,
+  speed: torch.Tensor | None = None,
+  speed_std: float | None = None,
 ) -> torch.Tensor:
   """q = floor + (1 - floor) * G_dist_std(dxy) * G_height_std(max(height - height_free, 0)).
 
@@ -269,10 +273,21 @@ def release_quality_of(
   horizontal distance it was let go at and with the height above ``height_free`` it was
   dropped from, down to ``floor`` -- which keeps placing worth something even when the
   release was poor.
+
+  Plan S7-9's PT multiplies the graded part by G_tilt_std(tilt) * G_speed_std(speed), the
+  object's tilt (rad) and speed (m/s) at the let-go, when ``tilt_std`` / ``speed_std`` are set.
+  Inside the ``(1 - floor)`` part, so the floor still keeps a poor release worth something.
   """
   near = torch.exp(-torch.square(dxy / dist_std))
   low = torch.exp(-torch.square((height - height_free).clamp_min(0.0) / height_std))
-  return floor + (1.0 - floor) * near * low
+  graded = near * low
+  if tilt_std is not None:
+    assert tilt is not None
+    graded = graded * torch.exp(-torch.square(tilt / tilt_std))
+  if speed_std is not None:
+    assert speed is not None
+    graded = graded * torch.exp(-torch.square(speed / speed_std))
+  return floor + (1.0 - floor) * graded
 
 
 def set_down_passed(latch, set_down_steps: int) -> torch.Tensor:
@@ -306,6 +321,8 @@ def release_quality(
   jaw_cfg: SceneEntityCfg | None = None,
   jaw_open: float | BySize | PerShape | None = None,
   require_ok: bool = False,
+  tilt_std: float | None = None,
+  speed_std: float | None = None,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
@@ -321,6 +338,8 @@ def release_quality(
   With ``require_ok`` (plan S9, module RG) the grade is paid only for a release on a stack goal
   at which the release condition held (`stack.StackState.ok`: within 1 cm, 1 cm up, 10 deg of
   tilt and of yaw, 5 cm/s), and is ``floor`` for any other.
+  ``tilt_std`` / ``speed_std`` (plan S7-9's PT): the grade also falls with the object's tilt and
+  speed at the let-go (`release_quality_of`).
   """
   latch = _release_latch(
     env,
@@ -333,7 +352,16 @@ def release_quality(
     jaw_open,
   )
   q = release_quality_of(
-    latch.dxy, latch.height, dist_std, height_free, height_std, floor
+    latch.dxy,
+    latch.height,
+    dist_std,
+    height_free,
+    height_std,
+    floor,
+    latch.tilt,
+    tilt_std,
+    latch.rel_speed,
+    speed_std,
   )
   paid = latch.released
   if set_down_steps > 0:
@@ -359,6 +387,8 @@ def released_at_goal_graded(
   jaw_cfg: SceneEntityCfg | None = None,
   jaw_open: float | BySize | PerShape | None = None,
   require_ok: bool = False,
+  tilt_std: float | None = None,
+  speed_std: float | None = None,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -393,6 +423,8 @@ def released_at_goal_graded(
     jaw_cfg,
     jaw_open,
     require_ok,
+    tilt_std,
+    speed_std,
   )
 
 
@@ -413,6 +445,8 @@ def object_placed_graded(
   jaw_cfg: SceneEntityCfg | None = None,
   jaw_open: float | BySize | PerShape | None = None,
   require_ok: bool = False,
+  tilt_std: float | None = None,
+  speed_std: float | None = None,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -445,6 +479,8 @@ def object_placed_graded(
     jaw_cfg,
     jaw_open,
     require_ok,
+    tilt_std,
+    speed_std,
   )
 
 

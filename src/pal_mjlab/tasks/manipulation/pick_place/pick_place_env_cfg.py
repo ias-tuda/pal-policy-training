@@ -14,6 +14,7 @@ map is an unlearnable task, not a hard one.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 import re
 from collections.abc import Mapping
@@ -24,6 +25,7 @@ from mjlab.envs.mdp import (
   dr as dr_terms,
 )  # `dr` is make_pick_place_env_cfg's rung argument
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
@@ -218,6 +220,12 @@ TOOL_SPEED_CAPS: dict[str, ToolSpeedCapCfg | None] = {
   "V": ToolSpeedCapCfg(speed=0.3, slow_speed=0.1, slow_zone=0.05),
   # Plan S7-4 (revision 5): V back at 0.5 m/s for R-CTPV; 0.3 took 3.0-3.6 s per place.
   "V0.5": ToolSpeedCapCfg(speed=0.5, slow_speed=0.1, slow_zone=0.05),
+  # Plan S7-9's PV: no carry cap, and 0.05 m/s (`observations.STILL_SPEED`, the set-down speed)
+  # while the held cube is within 5 cm of the target horizontally -- a hard slow approach and
+  # set-down at the target only; the lift-off at the spawn is not slowed.
+  "PV": ToolSpeedCapCfg(
+    speed=math.inf, slow_speed=0.05, slow_zone=0.05, slow_near_surface=False
+  ),
 }
 
 
@@ -499,6 +507,29 @@ def _command_cfg(
   )
 
 
+def _add_critic_release(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Plan S7-9's PQ: append M6's latched grade and the release latch to the critic.
+
+  Read with the graded ``placed`` term's own parameters, so the critic sees exactly the grade the
+  reward multiplies by (with PXY / PT, theirs). Appended last: a run resumed from a checkpoint
+  without them widens its critic's first layer with zero columns for exactly these two inputs
+  (`runner.ManipulationRunner.load`), which leaves the loaded value function unchanged.
+  """
+  placed = cfg.rewards.get("placed")
+  if placed is None or "floor" not in placed.params:
+    raise ValueError(
+      "CRITIC_OBS=q shows the critic M6's grade; the reward arm has no graded placed term (M6)"
+    )
+  wanted = inspect.signature(mdp.release_quality).parameters
+  params = {k: v for k, v in placed.params.items() if k in wanted}
+  critic = cfg.observations["critic"]
+  critic.terms = {
+    **critic.terms,
+    "release_grade": ObservationTermCfg(func=mdp.release_grade, params=params),
+    "release_latched": ObservationTermCfg(func=mdp.release_latched, params=params),
+  }
+
+
 def make_pick_place_env_cfg(
   robot: ManipulationRobotCfg,
   gripper_name: str | None = None,
@@ -521,6 +552,7 @@ def make_pick_place_env_cfg(
   shape: ObjectShape = OBJECT_SHAPES["cube"],
   goal: str = "table",
   gate: str = "none",
+  critic_release: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -555,6 +587,9 @@ def make_pick_place_env_cfg(
       ``stack``, the cube on top of a base cube spawned in the baseline's target box.
     gate: plan S9's ``GATE`` (`GATES`): ``stack`` locks the jaw shut while the held cube is not
       within the release condition (`mdp.stack`); ``none`` is every run up to S8.
+    critic_release: plan S7-9's PQ (``CRITIC_OBS=q``) -- the critic also observes M6's latched
+      grade and whether a release has been latched, appended after its other terms (the actor,
+      and so the exported policy, are unchanged). Needs a reward arm with M6.
   """
   if goal not in GOALS:
     raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
@@ -691,6 +726,8 @@ def make_pick_place_env_cfg(
       cfg.actions["joint_pos"], grasp_sensor, re.escape(gripper.finger_joint)
     )
   cfg.curriculum = reward_curriculum_cfg()
+  if critic_release:
+    _add_critic_release(cfg)
 
   success_params = {
     "command_name": COMMAND,

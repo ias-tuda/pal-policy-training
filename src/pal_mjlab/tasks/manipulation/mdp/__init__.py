@@ -58,7 +58,10 @@ from .observations import (
   is_grasped,
   is_on_surface,
   object_position_b,
+  object_tilt,
   object_yaw_b,
+  release_grade,
+  release_latched,
 )
 from .occlusion import (
   CubeSensor,
@@ -170,7 +173,10 @@ __all__ = [
   "is_grasped",
   "is_on_surface",
   "object_position_b",
+  "object_tilt",
   "object_yaw_b",
+  "release_grade",
+  "release_latched",
   # Rewards.
   "arm_effort_hinge",
   "bring_object_after_lift",

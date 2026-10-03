@@ -54,6 +54,9 @@ friction drawn, or a cube or a ball at random each episode. Unset is the cube.
 Plan S9 adds `GOAL` (`table` | `stack`, `pick_place_env_cfg.GOALS`: the cube on the table, or on top of a
 blue base cube spawned in baseline B's target box) and `GATE` (`none` | `stack`: the jaw lock that keeps
 the jaw shut while the held cube is not aligned, low and slow over the base). Unset is S8's cfg exactly.
+Plan S7-9 adds `CRITIC_OBS` (`base` | `q`: the critic also observes M6's latched grade and the release
+latch, PQ; the actor is unchanged, and a resume widens the loaded critic for the two inputs). Its other
+codes are a reward module (`REWARD=...+PXY` / `+PT`) and a tool cap (`TOOL_SPEED=PV`). Unset is `base`.
 """
 
 from __future__ import annotations
@@ -117,6 +120,7 @@ EPISODE_ENV_VAR = "EPISODE_S"
 SHAPE_ENV_VAR = "SHAPE"
 GOAL_ENV_VAR = "GOAL"
 GATE_ENV_VAR = "GATE"
+CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -136,6 +140,10 @@ DEFAULT_TARGET = "B"
 DEFAULT_SHAPE = "cube"
 DEFAULT_GOAL = "table"
 DEFAULT_GATE = "none"
+DEFAULT_CRITIC_OBS = "base"
+#: What `CRITIC_OBS` may be (plan S7-9): the critic as before, or with M6's grade and the release
+#: latch (PQ). Whether the critic gets the two extra inputs.
+CRITIC_OBS_NAMES = {"base": False, "q": True}
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -255,7 +263,15 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     shape=OBJECT_SHAPES[_select(SHAPE_ENV_VAR, DEFAULT_SHAPE, OBJECT_SHAPES)],
     goal=_select(GOAL_ENV_VAR, DEFAULT_GOAL, GOALS),
     gate=_select(GATE_ENV_VAR, DEFAULT_GATE, GATES),
+    critic_release=_critic_release(),
   )
+
+
+def _critic_release() -> bool:
+  """Plan S7-9's ``CRITIC_OBS``: whether the critic observes M6's grade and the release latch."""
+  return CRITIC_OBS_NAMES[
+    _select(CRITIC_OBS_ENV_VAR, DEFAULT_CRITIC_OBS, CRITIC_OBS_NAMES)
+  ]
 
 
 def _select_occlusion() -> mdp.OccCfg | None:
@@ -273,4 +289,7 @@ def _select_occlusion() -> mdp.OccCfg | None:
 def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
   recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
-  return PPO_RECIPES[recipe]("kangaroo_pick_place")
+  cfg = PPO_RECIPES[recipe]("kangaroo_pick_place")
+  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9).
+  cfg.widen_critic_on_resume = _critic_release()
+  return cfg
