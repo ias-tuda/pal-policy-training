@@ -437,3 +437,55 @@ def test_hh_reads_clear_at_home_and_registers_two_hands_driven_together(monkeypa
   with torch.inference_mode():
     env.step(act)
   assert bool(mdp.contact_penalty(env, bi.ARM_ARM_SENSOR, bi.HH_CONTACT_FORCE).all())
+
+
+def test_the_mirror_adapter_is_exact_on_mirrored_states(monkeypatch):
+  """Plan S11's `MIRROR=right` (`scripts/eval_chain.py`): on a state and its mirror image -- the right
+  arm at s * the left's joints and velocities, B at A's mirror image -- the right's adapted
+  observation is the left's, to the FK's mirror precision. (Closed loop the paths drift apart by
+  ~0.3 mm: the model's right arm links carry the left's centre-of-mass offsets, so its gravity
+  torques are not the mirror image -- not the adapter's error; report §4.1.)"""
+  import importlib.util
+  import pathlib
+  import sys
+
+  path = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "eval_chain.py"
+  spec = importlib.util.spec_from_file_location("eval_chain", path)
+  ec = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = ec
+  spec.loader.exec_module(ec)
+  env = _env(
+    monkeypatch, "BI-J", num_envs=4, DR="DR0", LAG="none", HANDOFF_TRAIN="none"
+  )
+  ad = ec.MirrorAdapter(env)
+  robot = env.scene["robot"]
+  s = torch.tensor(ARM_MIRROR_SIGNS, device=env.device)
+  left = [robot.joint_names.index(f"arm_left_{i}_joint") for i in range(1, 8)]
+  right = [robot.joint_names.index(f"arm_right_{i}_joint") for i in range(1, 8)]
+  lim = robot.data.joint_pos_limits[0]
+  g = torch.Generator().manual_seed(0)
+  q = robot.data.joint_pos.clone()
+  qd = torch.zeros_like(q)
+  for k in range(env.num_envs):
+    ql = lim[left, 0] + (lim[left, 1] - lim[left, 0]) * torch.rand(7, generator=g).to(
+      env.device
+    )
+    vl = (torch.rand(7, generator=g) - 0.5).to(env.device)
+    q[k, left], q[k, right] = ql, s * ql
+    qd[k, left], qd[k, right] = vl, s * vl
+  robot.write_joint_state_to_sim(q, qd)
+  a, b = env.scene["object"], env.scene[bi.CUBE_B]
+  pose = a.data.root_link_pose_w.clone()
+  o = env.scene.env_origins
+  rel = pose[:, :3] - o
+  rel[:, 1] = -rel[:, 1]
+  w, x, y, z = pose[:, 3:7].unbind(-1)
+  b.write_root_link_pose_to_sim(
+    torch.cat([rel + o, torch.stack([w, -x, y, -z], -1)], -1)
+  )
+  env.sim.forward()
+  t = ad.terms({"critic": env.observation_manager.compute_group("critic")}, "critic")
+  goal = t["target_pos"] * torch.tensor([1.0, -1.0, 1.0], device=env.device)
+  goal[:, 2] -= 0.05
+  diff = (ad.left(t) - ad.right({**t, "goal": goal}, base_term="goal")).abs()
+  assert float(diff.max()) < 1e-4, diff.amax(0)
