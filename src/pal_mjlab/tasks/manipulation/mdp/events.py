@@ -233,6 +233,8 @@ def reset_release_latch(
     latch.rel_dwell[env_ids] = 0
     latch.rel_ok[env_ids] = False
     latch.pend_ok[env_ids] = False
+    if latch.tilt is not None:
+      latch.tilt[env_ids] = 0.0
     # Plan S7-4's J state, when the latch defines a release by the jaw: a jaw closed at the
     # end of one episode must not "open" on the next one's first step, nor a let-go pending.
     if latch.jaw is not None:
