@@ -64,6 +64,13 @@ penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (
 Plan S10 adds the box goals to `GOAL` (`box` | `box-ny` | `box-rim` | `box-dr`, `box.BOX_GOALS`): the
 cube goes into an open box standing in baseline B's target box -- BX, without the yaw grade, with a rim
 penalty, with the box's size and mass drawn. One variable for S9's and S10's goals; unset is `table`.
+Plan S11 (two arms) adds `ARM_HOME` (`default` | `mirror`: the right arm's home, Claudius's or the
+left home's mirror image), `TARGET=T11` | `T11W` (the meeting point T in the robot frame: L-T's goal,
+or R-ST's / R-ST-W's base with `GOAL=stack`), `TRACKER` (`B` | `split`: the 6 + 4 mm bias split, the
+base through its own tracker), `HANDOFF_ROUTE` (`none` | `up-out`: the up-out-home controller in the
+action term, for the eval to start) and `ARMS` (`left` | `both`): `both` is JOINT, one policy for
+both arms (`pick_place/bimanual.py`), with `HANDOFF_TRAIN` (`none` | `left`) and `START` (`scratch` |
+`mixed`). Unset is every run before S11.
 """
 
 from __future__ import annotations
@@ -80,6 +87,16 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
 from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  EPISODE_S as BIMANUAL_EPISODE_S,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  STARTS as BIMANUAL_STARTS,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  handoff_arm,
+  make_bimanual_env_cfg,
+)
 from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BoxGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
@@ -87,14 +104,17 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   GATES,
   GOALS,
   OBJECT_SHAPES,
+  ROBOT_TARGETS,
   SPAWN_BOXES,
   TARGET_AREAS,
   TOOL_SPEED_CAPS,
+  TRACKERS,
   make_pick_place_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
+  ARM_HOMES,
   KANGAROO_GRIPPERS_LEFT_ARM,
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
   KANGAROO_GRIPPERS_LEFT_ARM_WCK,
@@ -131,6 +151,12 @@ GOAL_ENV_VAR = "GOAL"
 GATE_ENV_VAR = "GATE"
 CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
+ARM_HOME_ENV_VAR = "ARM_HOME"
+TRACKER_ENV_VAR = "TRACKER"
+HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
+ARMS_ENV_VAR = "ARMS"
+HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
+START_ENV_VAR = "START"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -155,6 +181,33 @@ DEFAULT_CRITIC_OBS = "base"
 #: latch (PQ). Whether the critic gets the two extra inputs.
 CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
+DEFAULT_ARM_HOME = "default"
+DEFAULT_TRACKER = "B"
+#: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
+HANDOFF_ROUTES = ("none", "up-out")
+ARMS_NAMES = ("left", "both")
+HANDOFF_TRAINS = ("none", "left")
+#: The reward name JOINT's runs carry (`REWARD`): its two halves are fixed, L-T's and R-ST's
+#: (`bimanual.LEFT_REWARD` / `RIGHT_REWARD`), so the name only labels the run.
+BIMANUAL_REWARD = "S11-BI"
+#: What JOINT is built on (BS11, plan S11); every other selector must be unset or this.
+BIMANUAL_FIXED = {
+  "SLEW": "stack",
+  "BASELINE": "B",
+  "SPAWN": "W2",
+  "ACTION": "abs",
+  "CMD_OBS": "act",
+  "TOOL_SPEED": "none",
+  "OCC": "none",
+  "SHAPE": "cube",
+  "GOAL": "table",
+  "GATE": "none",
+  "TARGET": "T11",
+  "TRACKER": "split",
+  "ARM_HOME": "mirror",
+  "CRITIC_OBS": "q",
+  "HANDOFF_ROUTE": "up-out",
+}
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -243,6 +296,8 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   plant is the `GAINS` code's, with the `EFFORT` code's arm effort limit; G0 with no effort
   bound is exactly the spawn box's arm.
   """
+  if _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both":
+    return _bimanual_env_cfg(play)
   spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
   tool_speed = _select(TOOL_SPEED_ENV_VAR, DEFAULT_TOOL_SPEED, TOOL_SPEED_CAPS)
@@ -250,11 +305,16 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   slew, stack_speed = _select_slew()
   action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
   goal, box = _select_goal()
-  return make_pick_place_env_cfg(
+  target = _select(TARGET_ENV_VAR, DEFAULT_TARGET, (*TARGET_AREAS, *ROBOT_TARGETS))
+  for name in (HANDOFF_TRAIN_ENV_VAR, START_ENV_VAR):
+    if os.environ.get(name) is not None:
+      raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
+  cfg = make_pick_place_env_cfg(
     kangaroo_grippers_left_arm(
       _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
       SPAWN_ROBOTS[spawn],
       arm_effort_scale=effort.effort_scale,
+      right_home=_select(ARM_HOME_ENV_VAR, DEFAULT_ARM_HOME, ARM_HOMES),
     ),
     gripper_name="left",
     spawn=SPAWN_BOXES[spawn],
@@ -267,7 +327,9 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     effort=effort,
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
     occlusion=_select_occlusion(),
-    target_area=TARGET_AREAS[_select(TARGET_ENV_VAR, DEFAULT_TARGET, TARGET_AREAS)],
+    target_area=TARGET_AREAS.get(target),
+    robot_target=ROBOT_TARGETS.get(target),
+    tracker=_select(TRACKER_ENV_VAR, DEFAULT_TRACKER, TRACKERS),
     episode_length_s=_select_episode(),
     stack_speed=stack_speed,
     action_mode=action,
@@ -280,6 +342,43 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
     ],
     box=box,
+  )
+  if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
+    # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
+    left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+    cfg.actions["joint_pos"] = mdp.with_handoff(
+      cfg.actions["joint_pos"], arms=(handoff_arm(left, +1.0, None),)
+    )
+  return cfg
+
+
+def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
+  """Plan S11's JOINT (`ARMS=both`, `pick_place/bimanual.py`). Its plant, DR, latency, arm-table
+  code and episode come from `GAINS`, `EFFORT`, `DR`, `LAG`, `ARM_TABLE` and `EPISODE_S` (15 s if
+  unset); everything else is fixed by BS11 (`BIMANUAL_FIXED`), and a variable set to anything else
+  raises rather than train something the run's name does not say."""
+  reward = os.environ.get(REWARD_ENV_VAR)
+  if reward not in (None, BIMANUAL_REWARD):
+    raise ValueError(
+      f"{REWARD_ENV_VAR}={reward!r}: JOINT's reward is fixed (L-T's and R-ST's halves); set "
+      f"{BIMANUAL_REWARD!r} or unset it"
+    )
+  for name, value in BIMANUAL_FIXED.items():
+    got = os.environ.get(name)
+    if got is not None and got != value:
+      raise ValueError(f"{ARMS_ENV_VAR}=both is built on {name}={value}; got {got!r}")
+  return make_bimanual_env_cfg(
+    gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
+    effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
+    latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
+    episode_length_s=_select_episode() or BIMANUAL_EPISODE_S,
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    handoff_train=_select(HANDOFF_TRAIN_ENV_VAR, "left", HANDOFF_TRAINS) == "left",
+    start=_select(START_ENV_VAR, "scratch", BIMANUAL_STARTS),
+    play=play,
   )
 
 
@@ -315,6 +414,8 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
   recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
   cfg = PPO_RECIPES[recipe]("kangaroo_pick_place")
-  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9).
-  cfg.widen_critic_on_resume = _critic_release()
+  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9). JOINT trains from
+  # scratch (plan S11).
+  both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
+  cfg.widen_critic_on_resume = False if both else _critic_release()
   return cfg

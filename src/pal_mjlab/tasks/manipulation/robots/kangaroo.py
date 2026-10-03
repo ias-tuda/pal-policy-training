@@ -12,6 +12,7 @@ import functools
 
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
   DEFAULT_TABLETOP_GAINS,
+  MANIPULATION_INIT_STATE,
   TABLETOP_GAINS,
   get_kangaroo_grippers_tabletop_robot_cfg,
 )
@@ -217,10 +218,107 @@ KANGAROO_GRIPPERS_LEFT_ARM_WCK = dataclasses.replace(
 )
 
 
+# -- Plan S11: two arms -----------------------------------------------------------------------
+#
+# The right arm is the left arm's mirror image through the robot's sagittal plane (y -> -y): with
+# q_right = ARM_MIRROR_SIGNS x q_left on arm 1-7 the right TCP is the left TCP with y negated, and
+# the right hand's frame the mirrored left frame turned 180 deg about the approach axis, which a
+# parallel jaw cannot tell apart (plan S11 *Measured today*, 2026-10-02: <= 2.4e-5 m over 200 random
+# poses; `tests/test_pick_place_s11.py` re-measures it on the tabletop spec). The jaw keeps its sign.
+ARM_MIRROR_SIGNS = (-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0)
+
+#: The right arm's home by name (`ARM_HOME`): ``default`` is Claudius's pose, every run before S11;
+#: ``mirror`` is mirror(left home) -- up to 0.076 rad (arm 5) off it -- which makes the whole scene
+#: symmetric about y = 0 but for the torso camera (plan S11, Open item 4, as proposed).
+ARM_HOMES = ("default", "mirror")
+
+
+def mirrored_right_home() -> dict[str, float]:
+  """The right arm's joint positions that mirror the left arm's home (`ARM_MIRROR_SIGNS`)."""
+  left = {
+    k: v
+    for k, v in MANIPULATION_INIT_STATE.joint_pos.items()
+    if k.startswith("arm_left_")
+  }
+  return {
+    f"arm_right_{i}_joint": ARM_MIRROR_SIGNS[i - 1] * left[f"arm_left_{i}_joint"]
+    for i in range(1, 8)
+  }
+
+
+def _with_right_home(entity_cfg_fn, home: str):
+  """``entity_cfg_fn`` with the right arm's start pose -- the action origin and the parked arm's
+  hold -- set to ``home`` (`ARM_HOMES`)."""
+  if home not in ARM_HOMES:
+    raise ValueError(f"unknown right-arm home {home!r}; have {ARM_HOMES}")
+  if home == "default":
+    return entity_cfg_fn
+
+  def build():
+    cfg = entity_cfg_fn()
+    joint_pos = {**cfg.init_state.joint_pos, **mirrored_right_home()}
+    return dataclasses.replace(
+      cfg, init_state=dataclasses.replace(cfg.init_state, joint_pos=joint_pos)
+    )
+
+  return build
+
+
+#: Plan S11's JOINT: both arms and both jaws in the action space, 16-D, each arm at the W2 action
+#: scales (the right's are the left's: a scale is a half-width about the home, the same for the
+#: mirror image), both jaws clipped open-to-closed.
+KANGAROO_GRIPPERS_BOTH_ARMS_WIDE = dataclasses.replace(
+  KANGAROO_GRIPPERS,
+  action_joint_regex=(
+    r"arm_left_[1-7]_joint",
+    r"gripper_left_finger_joint",
+    r"arm_right_[1-7]_joint",
+    r"gripper_right_finger_joint",
+  ),
+  action_scale={
+    **KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale,
+    **{
+      k.replace("left", "right"): v
+      for k, v in KANGAROO_GRIPPERS_LEFT_ARM_WIDE.action_scale.items()
+    },
+  },
+  action_clip={
+    r"gripper_left_finger_joint": (_JAW_OPEN, _JAW_CLOSED),
+    r"gripper_right_finger_joint": (_JAW_OPEN, _JAW_CLOSED),
+  },
+)
+
+
+def kangaroo_grippers_both_arms(
+  gains: str = DEFAULT_TABLETOP_GAINS,
+  arm_effort_scale: float | None = None,
+  right_home: str = "mirror",
+) -> ManipulationRobotCfg:
+  """`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE` on gain code ``gains``, with plan S7-4's T on both arms
+  (``arm_effort_scale``) and the right arm's home ``right_home`` (plan S11: ``mirror``)."""
+  if gains not in TABLETOP_GAINS:
+    raise ValueError(
+      f"unknown tabletop gain code {gains!r}; have {tuple(TABLETOP_GAINS)}"
+    )
+  return dataclasses.replace(
+    KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
+    entity_cfg_fn=_with_right_home(
+      functools.partial(
+        get_kangaroo_grippers_tabletop_robot_cfg,
+        gains=gains,
+        left_arm_effort_scale=arm_effort_scale,
+        right_arm_effort_scale=arm_effort_scale,
+      ),
+      right_home,
+    ),
+  )
+
+
 def kangaroo_grippers_left_arm(
   gains: str = DEFAULT_TABLETOP_GAINS,
   base: ManipulationRobotCfg = KANGAROO_GRIPPERS_LEFT_ARM,
   arm_effort_scale: float | None = None,
+  right_home: str = "default",
 ) -> ManipulationRobotCfg:
   """``base`` on the plant of plan-S8 gain code ``gains``.
 
@@ -232,6 +330,9 @@ def kangaroo_grippers_left_arm(
 
   ``arm_effort_scale`` lowers the driven (left) arm's effort limit to that fraction of its
   effort -- plan S7-4's module T, 0.7: 35 N.m on arm 1-2, 17.5 on arm 3-7. None keeps it.
+
+  ``right_home`` is where the parked right arm is held (`ARM_HOMES`; plan S11's ``ARM_HOME``):
+  ``default`` is every run before S11, ``mirror`` the left home's mirror image.
   """
   if gains not in TABLETOP_GAINS:
     raise ValueError(
@@ -246,9 +347,12 @@ def kangaroo_grippers_left_arm(
     )
   return dataclasses.replace(
     base,
-    entity_cfg_fn=functools.partial(
-      get_kangaroo_grippers_tabletop_robot_cfg,
-      gains=gains,
-      left_arm_effort_scale=arm_effort_scale,
+    entity_cfg_fn=_with_right_home(
+      functools.partial(
+        get_kangaroo_grippers_tabletop_robot_cfg,
+        gains=gains,
+        left_arm_effort_scale=arm_effort_scale,
+      ),
+      right_home,
     ),
   )

@@ -819,6 +819,24 @@ def _pt(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
     )
 
 
+# -- S11: YG, the yaw grade on the let-go (plan S11's L-T: A's yaw) -----------------------------
+#
+# Plan S11 (Siwei 2026-10-02): the left arm puts cube A down at T for the right to stack on, so A's
+# yaw matters to the right (its SA pays alignment against A). L-T grades it as S10's BX graded the
+# cube into the box: M6's graded part x G(|yaw mod 90 deg|, 10 deg) at the let-go
+# (`observations.yaw_error_mod_90`, the release latch's ``yaw``). In S10 it put 50-73 % of let-gos
+# within 10 deg at no cost in success (S10 report §7).
+YG_YAW_STD = math.radians(10.0)
+
+
+def _yg(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in _graded_terms(rewards, "YG"):
+    term = rewards[name]
+    rewards[name] = RewardTermCfg(
+      func=term.func, weight=term.weight, params={**term.params, "yaw_std": YG_YAW_STD}
+    )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -837,6 +855,7 @@ _MODULES = {
   "SA": _sa,
   "PXY": _pxy,
   "PT": _pt,
+  "YG": _yg,
 }
 
 
@@ -866,7 +885,7 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("RG pays M6's grade for an OK let-go only; it needs M6 before it")
   if "SA" in modules and "M1" not in modules:
     raise ValueError("SA is a term beside M1's; it needs M1 in the arm")
-  for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",))):
+  for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",)), ("YG", ("M6",))):
     if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
       raise ValueError(f"{name} needs {' and '.join(needs)} before it")
 
@@ -934,6 +953,12 @@ S79_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+PT": ("M1", "M2", "M3", "M6", "J", "M8", "PT"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S79_ARMS.items()})
+#: The S11 arm (plan S11's L-T): S7-4's RCTP + YG, A's yaw graded at the let-go. R-ST / R-ST-W run
+#: S9's RCTP + SA on a stack goal at T (`TARGET=T11*`); JOINT builds its own (`pick_place/bimanual.py`).
+S11_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+YG": ("M1", "M2", "M3", "M6", "J", "M8", "YG"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S11_ARMS.items()})
 _MODULE_ARMS = {
   **S52_ARMS,
   **S7_ARMS,
@@ -943,6 +968,7 @@ _MODULE_ARMS = {
   **S8_ARMS,
   **S9_ARMS,
   **S79_ARMS,
+  **S11_ARMS,
 }
 #: Arms whose terms read the base cube (RG, SA): they need plan S9's `GOAL=stack`.
 STACK_ONLY_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m))

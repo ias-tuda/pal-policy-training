@@ -435,6 +435,16 @@ _LEFT_ARM_EFFORT = {
   r"arm_left_[12]_joint": 50.0,
   r"arm_left_[3-7]_joint": 25.0,
 }
+#: ... and the right arm's, the same efforts (plan S11: both arms driven, T on each).
+_RIGHT_ARM_EFFORT = {
+  r"arm_right_[12]_joint": 50.0,
+  r"arm_right_[3-7]_joint": 25.0,
+}
+
+
+def _cap_right_arm_effort(spec: mujoco.MjSpec, scale: float) -> None:
+  """`_cap_left_arm_effort` on the right arm (plan S11's JOINT drives both arms)."""
+  _cap_arm_effort(spec, scale, _RIGHT_ARM_EFFORT, "right")
 
 
 def _cap_left_arm_effort(spec: mujoco.MjSpec, scale: float) -> None:
@@ -447,12 +457,18 @@ def _cap_left_arm_effort(spec: mujoco.MjSpec, scale: float) -> None:
   eval's saturation read) carries the lowered cap. The actuator's own ``forcerange`` stays the
   full effort and no longer binds.
   """
+  _cap_arm_effort(spec, scale, _LEFT_ARM_EFFORT, "left")
+
+
+def _cap_arm_effort(
+  spec: mujoco.MjSpec, scale: float, efforts: dict[str, float], side: str
+) -> None:
   if not 0.0 < scale <= 1.0:
-    raise ValueError(f"left-arm effort scale {scale} is outside (0, 1]")
+    raise ValueError(f"{side}-arm effort scale {scale} is outside (0, 1]")
   matched = 0
   for joint in spec.joints:
     effort = next(
-      (e for rx, e in _LEFT_ARM_EFFORT.items() if re.fullmatch(rx, joint.name)), None
+      (e for rx, e in efforts.items() if re.fullmatch(rx, joint.name)), None
     )
     if effort is None:
       continue
@@ -460,11 +476,13 @@ def _cap_left_arm_effort(spec: mujoco.MjSpec, scale: float) -> None:
     joint.actfrcrange = (-scale * effort, scale * effort)
     matched += 1
   if matched != 7:
-    raise ValueError(f"expected the 7 left-arm joints, matched {matched}")
+    raise ValueError(f"expected the 7 {side}-arm joints, matched {matched}")
 
 
 def get_kangaroo_grippers_tabletop_spec(
-  gravcomp: bool = True, left_arm_effort_scale: float | None = None
+  gravcomp: bool = True,
+  left_arm_effort_scale: float | None = None,
+  right_arm_effort_scale: float | None = None,
 ) -> mujoco.MjSpec:
   """The grippers model with a collision set a tabletop task can trust.
 
@@ -490,6 +508,8 @@ def get_kangaroo_grippers_tabletop_spec(
 
   ``left_arm_effort_scale`` lowers the left arm's effort limit to that fraction of its effort
   (plan S7-4's T, `_cap_left_arm_effort`); None leaves it at the actuators' own.
+  ``right_arm_effort_scale`` does the same for the right arm (plan S11's JOINT); None, every
+  run before S11, leaves it.
   """
   spec = _load_spec(KANGAROO_GRIPPERS_XML)
 
@@ -505,6 +525,8 @@ def get_kangaroo_grippers_tabletop_spec(
 
   if left_arm_effort_scale is not None:
     _cap_left_arm_effort(spec, left_arm_effort_scale)
+  if right_arm_effort_scale is not None:
+    _cap_right_arm_effort(spec, right_arm_effort_scale)
 
   for body_a, body_b in _TABLETOP_CONTACT_EXCLUDES:
     spec.add_exclude(name=f"{body_a}__{body_b}", bodyname1=body_a, bodyname2=body_b)
@@ -862,6 +884,7 @@ def get_kangaroo_grippers_tabletop_robot_cfg(
   gravcomp: bool | None = None,
   gains: str = DEFAULT_TABLETOP_GAINS,
   left_arm_effort_scale: float | None = None,
+  right_arm_effort_scale: float | None = None,
 ) -> EntityCfg:
   """The grippers variant for tabletop manipulation.
 
@@ -875,6 +898,8 @@ def get_kangaroo_grippers_tabletop_robot_cfg(
   compensation. ``gravcomp`` defaults to the code's own; `gravcomp=False` on G0 reproduces
   the plant before S4, for measuring against. ``left_arm_effort_scale`` is plan S7-4's
   lowered arm effort limit (`get_kangaroo_grippers_tabletop_spec`); None is every run before.
+  ``right_arm_effort_scale`` is the same for the right arm (plan S11's JOINT); None is every run
+  before S11.
   """
   if gains not in TABLETOP_GAINS:
     raise ValueError(
@@ -886,11 +911,17 @@ def get_kangaroo_grippers_tabletop_robot_cfg(
   cfg = _make_robot_cfg("grippers_tabletop", MANIPULATION_INIT_STATE)
   if gains != DEFAULT_TABLETOP_GAINS:
     cfg = dataclasses.replace(cfg, articulation=_tabletop_articulation(code))
-  if not gravcomp or left_arm_effort_scale is not None:
+  if (
+    not gravcomp
+    or left_arm_effort_scale is not None
+    or right_arm_effort_scale is not None
+  ):
     cfg = dataclasses.replace(
       cfg,
       spec_fn=lambda: get_kangaroo_grippers_tabletop_spec(
-        gravcomp=gravcomp, left_arm_effort_scale=left_arm_effort_scale
+        gravcomp=gravcomp,
+        left_arm_effort_scale=left_arm_effort_scale,
+        right_arm_effort_scale=right_arm_effort_scale,
       ),
     )
   return cfg

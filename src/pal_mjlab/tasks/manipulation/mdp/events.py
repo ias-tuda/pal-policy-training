@@ -20,7 +20,11 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
 
-from pal_mjlab.tasks.manipulation.mdp.observations import _RELEASE, _WAS_LIFTED
+from pal_mjlab.tasks.manipulation.mdp.observations import (
+  _RELEASE,
+  _WAS_LIFTED,
+  latch_attrs,
+)
 from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
 
 #: Same module-level singleton the observation terms use: a SceneEntityCfg built in an
@@ -84,6 +88,11 @@ def hold_nominal_targets(
   )
 
 
+#: What a spawn range is relative to (`reset_objects_on_surface`'s ``frame``): the surface's centre
+#: (every task before plan S11) or the env origin, the robot frame (plan S11's T).
+SPAWN_FRAMES = ("surface", "env")
+
+
 def reset_objects_on_surface(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,
@@ -93,6 +102,7 @@ def reset_objects_on_surface(
   min_separation: float = 0.0,
   max_attempts: int = 10,
   goal_area: dict | None = None,
+  frame: str = "surface",
 ) -> None:
   """Place free objects upright on a surface, clear of one another.
 
@@ -112,14 +122,25 @@ def reset_objects_on_surface(
   vectorised rejection, and a straggler goes to a random corner of the goal area. Without it a cube
   near the centre of a small area has no valid goal at all (12 x 10 cm: every point is within
   7.8 cm of the centre), and the command would have to break the distance it promises.
+
+  ``frame="env"`` (plan S11's T, `pick_place_env_cfg.ROBOT_TARGETS`) reads ``pose_range``'s x and y
+  about the env origin -- the robot frame, ``base_link`` at the origin -- instead of the surface's
+  centre: the object lands at the same place relative to the robot wherever DR-scene has put the
+  table. Its height is still the surface's top.
   """
   if not asset_cfgs:
     return
+  if frame not in SPAWN_FRAMES:
+    raise ValueError(f"unknown frame {frame!r}; have {SPAWN_FRAMES}")
 
   n = len(env_ids)
   device = env.device
   top_z = surface_top_z(env, surface_cfg)[env_ids]
-  centre_xy = _surface_centre_xy(env, surface_cfg)[env_ids]
+  centre_xy = (
+    _surface_centre_xy(env, surface_cfg)[env_ids]
+    if frame == "surface"
+    else env.scene.env_origins[env_ids, :2]
+  )
 
   x_range = pose_range.get("x", (0.0, 0.0))
   y_range = pose_range.get("y", (0.0, 0.0))
@@ -213,9 +234,8 @@ def reset_was_lifted(
   Without this the latch is set once and never falls, so every episode after the first in a
   given world would count a slide as a pick.
   """
-  latch = getattr(env, _WAS_LIFTED, None)
-  if latch is not None:
-    latch[env_ids] = False
+  for attr in latch_attrs(env, _WAS_LIFTED):
+    getattr(env, attr)[env_ids] = False
 
 
 def reset_release_latch(
@@ -228,7 +248,11 @@ def reset_release_latch(
   the grasp "open" on the next one's first step. So is M7's set-down state, or a dwell built
   at the end of one episode would count towards the first release of the next.
   """
-  latch = getattr(env, _RELEASE, None)
+  for attr in latch_attrs(env, _RELEASE):
+    _clear_release_latch(getattr(env, attr), env_ids)
+
+
+def _clear_release_latch(latch, env_ids: Sequence[int] | torch.Tensor) -> None:
   if latch is not None:
     latch.grasped[env_ids] = False
     latch.released[env_ids] = False

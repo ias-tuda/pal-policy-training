@@ -586,10 +586,9 @@ def make_tabletop_env_cfg(
     "actor": ObservationGroupCfg(dict(actor_terms), enable_corruption=True),
     "critic": ObservationGroupCfg(dict(actor_terms), enable_corruption=False),
   }
-  # The arm's joints: the action joints but the jaw.
-  arm_regex = tuple(
-    p for p in robot.action_joint_regex if not re.fullmatch(p, gripper.finger_joint)
-  )
+  # The arm's joints: the action joints but the jaws.
+  jaw_joints = action_jaw_joints(robot, gripper)
+  arm_regex = arm_joint_regex(robot, gripper)
   if observation_set == "B":
     observations = _deployable_observations(
       action_joints,
@@ -638,14 +637,16 @@ def make_tabletop_env_cfg(
     if robot.joint_velocity_limits is None:
       raise ValueError("stack_speed needs the robot's joint_velocity_limits")
     rate_limit = stack_arm_rate_limit(robot.joint_velocity_limits)
-    rate_limit[re.escape(gripper.finger_joint)] = STACK_JAW_STEP
+    for jaw in jaw_joints:
+      rate_limit[re.escape(jaw)] = STACK_JAW_STEP
   else:
     rate_limit = {
       pattern: limit * CONTROL_DT * action_slew_rate_scale
       for pattern, limit in (robot.joint_velocity_limits or {}).items()
     }
     if jaw_slew_rate is not None:
-      rate_limit[re.escape(gripper.finger_joint)] = jaw_slew_rate
+      for jaw in jaw_joints:
+        rate_limit[re.escape(jaw)] = jaw_slew_rate
   # Plan S7-4's bounds on the arm's final target (C, T); `mdp.RateLimitedJointPositionAction`.
   bounds = {}
   if arm_range_clip:
@@ -653,7 +654,7 @@ def make_tabletop_env_cfg(
   if arm_effort_band:
     bounds["effort_band_joints"] = arm_regex
   if latency.jaw_servo:
-    bounds["servo_joints"] = (re.escape(gripper.finger_joint),)
+    bounds["servo_joints"] = tuple(re.escape(jaw) for jaw in jaw_joints)
     bounds["servo_tau"] = JAW_SERVO_TAU
     bounds["servo_max_vel"] = JAW_SERVO_MAX_VEL
   if bounds and not rate_limit:
@@ -943,6 +944,29 @@ def make_tabletop_env_cfg(
   if occlusion is not None:
     _apply_occlusion(cfg, occlusion, latency, tcp, gripper.finger_joint)
   return cfg
+
+
+def action_jaw_joints(
+  robot: ManipulationRobotCfg, gripper: GripperCfg
+) -> tuple[str, ...]:
+  """The jaws the policy drives: every gripper's finger joint the action space names (plan S11's
+  JOINT drives both; a one-arm task, one), else ``gripper``'s alone."""
+  jaws = tuple(
+    g.finger_joint
+    for g in robot.grippers
+    if any(re.fullmatch(p, g.finger_joint) for p in robot.action_joint_regex)
+  )
+  return jaws or (gripper.finger_joint,)
+
+
+def arm_joint_regex(
+  robot: ManipulationRobotCfg, gripper: GripperCfg
+) -> tuple[str, ...]:
+  """The action joint patterns but the jaws' (`action_jaw_joints`): the driven arms' joints."""
+  jaws = action_jaw_joints(robot, gripper)
+  return tuple(
+    p for p in robot.action_joint_regex if not any(re.fullmatch(p, jaw) for jaw in jaws)
+  )
 
 
 def trunk_clearance_rewards(
