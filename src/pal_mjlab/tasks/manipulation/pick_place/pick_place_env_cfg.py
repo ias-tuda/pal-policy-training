@@ -35,6 +35,10 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.mdp.shapes import PerShape
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+  ArmTableCfg,
+  apply_arm_table,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
@@ -553,6 +557,7 @@ def make_pick_place_env_cfg(
   goal: str = "table",
   gate: str = "none",
   critic_release: bool = False,
+  arm_table: ArmTableCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -590,6 +595,8 @@ def make_pick_place_env_cfg(
     critic_release: plan S7-9's PQ (``CRITIC_OBS=q``) -- the critic also observes M6's latched
       grade and whether a release has been latched, appended after its other terms (the actor,
       and so the exported policy, are unchanged). Needs a reward arm with M6.
+    arm_table: plan S7-10's ``ARM_TABLE`` -- the arm-table sensor and the terms on it. See
+      `arm_table.ARM_TABLE_CODES`; None is every run before S7-10.
   """
   if goal not in GOALS:
     raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
@@ -725,6 +732,9 @@ def make_pick_place_env_cfg(
     cfg.actions["joint_pos"] = _stack_gate_cfg(
       cfg.actions["joint_pos"], grasp_sensor, re.escape(gripper.finger_joint)
     )
+  # Plan S7-10: the arm off the table. After the variant's dict, like the trunk penalty, so
+  # that the same code adds the same terms to every variant.
+  apply_arm_table(cfg, gripper, arm_table)
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)

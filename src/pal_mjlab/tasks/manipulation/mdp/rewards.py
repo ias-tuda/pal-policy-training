@@ -909,3 +909,124 @@ def keepout_box_penalty(
   # Euclidean distance from the box surface, zero anywhere inside it.
   outside = torch.norm(offset.clamp_min(0.0), dim=-1)
   return torch.sum((1.0 - outside / margin).clamp(0.0, 1.0), dim=-1)
+
+
+#: Attribute on the env caching `_collision_points`, keyed by the bodies' global ids.
+_COLLISION_POINTS = "_pp_collision_points"
+
+#: Points kept per body for `arm_table_clearance` (farthest-point sample of its collision
+#: mesh's convex hull, 400-1150 vertices on Kangaroo's arm 1-6). Over 2000 random orientations
+#: the sample's lowest point is <= 1.5 mm above the hull's on every link (128: <= 3.6 mm).
+CLEARANCE_POINTS_PER_BODY = 256
+
+
+def _farthest_points(points, n: int):
+  """``n`` rows of ``points`` (N, 3), spread out greedily; all of them if N <= n."""
+  import numpy as np
+
+  if len(points) <= n:
+    return np.concatenate([points, points[: n - len(points)]])  # padded by repetition
+  chosen = [int(np.argmin(points[:, 2]))]  # start at the lowest vertex
+  dist = np.linalg.norm(points - points[chosen[0]], axis=1)
+  for _ in range(n - 1):
+    i = int(np.argmax(dist))
+    chosen.append(i)
+    dist = np.minimum(dist, np.linalg.norm(points - points[i], axis=1))
+  return points[chosen]
+
+
+def _collision_points(env: ManagerBasedRlEnv, robot: Entity, body_ids) -> torch.Tensor:
+  """Surface points of each body's colliding mesh geoms, in the body frame, cached. (L, n, 3)
+
+  Read off the compiled model: a geom with contype and conaffinity both 0 is not a collider
+  (`CollisionCfg` zeroes them), so it is skipped; a colliding geom that is not a mesh raises,
+  since a primitive's surface is not in ``mesh_vert``."""
+  import mujoco
+  import numpy as np
+
+  global_ids = tuple(robot.indexing.body_ids[body_ids].tolist())
+  cache = getattr(env, _COLLISION_POINTS, None)
+  if cache is None:
+    cache = {}
+    setattr(env, _COLLISION_POINTS, cache)
+  if global_ids not in cache:
+    mj = env.sim.mj_model
+    per_body = []
+    for body in global_ids:
+      verts = []
+      for g in np.flatnonzero(mj.geom_bodyid == body):
+        if not (mj.geom_contype[g] or mj.geom_conaffinity[g]):
+          continue
+        if mj.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
+          raise ValueError(
+            f"geom {mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_GEOM, g)!r} collides but is "
+            "not a mesh; arm_table_clearance reads mesh vertices only"
+          )
+        mesh = mj.geom_dataid[g]
+        adr, num = mj.mesh_vertadr[mesh], mj.mesh_vertnum[mesh]
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, mj.geom_quat[g])
+        verts.append(
+          mj.mesh_vert[adr : adr + num] @ rot.reshape(3, 3).T + mj.geom_pos[g]
+        )
+      if not verts:
+        name = mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_BODY, body)
+        raise ValueError(f"body {name!r} has no colliding geom")
+      pts = np.concatenate(verts).astype(np.float64)
+      try:
+        from scipy.spatial import ConvexHull
+
+        pts = pts[ConvexHull(pts).vertices]
+      except Exception:  # noqa: BLE001 -- no scipy, or a degenerate mesh: use every vertex
+        pass
+      per_body.append(_farthest_points(pts, CLEARANCE_POINTS_PER_BODY))
+    cache[global_ids] = torch.tensor(
+      np.stack(per_body), dtype=torch.float32, device=env.device
+    )
+  return cache[global_ids]
+
+
+def arm_table_clearance(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  surface_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Per watched body, its lowest collision point's height above the surface's top face,
+  over the points above the surface's footprint; +inf for a body with none there. (B, L)
+
+  Negative is a point inside the slab (penetration). The surface is its first geom, a box,
+  read out of physics per env, so DR-scene's table shift is followed; the footprint is
+  axis-aligned, which holds because DR-scene moves the table without turning it
+  (`tabletop_env_cfg`, ``table_pose``: axes x, y, z)."""
+  from mjlab.utils.lab_api.math import quat_apply
+
+  robot: Entity = env.scene[asset_cfg.name]
+  pts = _collision_points(env, robot, asset_cfg.body_ids)  # (L, n, 3)
+  pos = robot.data.body_link_pos_w[:, asset_cfg.body_ids]  # (B, L, 3)
+  quat = robot.data.body_link_quat_w[:, asset_cfg.body_ids]  # (B, L, 4)
+  b, nb, n = pos.shape[0], pts.shape[0], pts.shape[1]
+  world = pos.unsqueeze(2) + quat_apply(
+    quat.unsqueeze(2).expand(b, nb, n, 4), pts.unsqueeze(0).expand(b, nb, n, 3)
+  )  # (B, L, n, 3)
+  surface: Entity = env.scene[surface_cfg.name]
+  geom_id = surface.indexing.geom_ids[0]
+  centre = env.sim.data.geom_xpos[:, geom_id].reshape(b, 1, 1, 3)
+  half = env.sim.model.geom_size[:, geom_id].expand(b, 3).reshape(b, 1, 1, 3)
+  rel = world - centre
+  inside = (rel[..., 0].abs() <= half[..., 0]) & (rel[..., 1].abs() <= half[..., 1])
+  height = rel[..., 2] - half[..., 2]
+  inf = torch.full_like(height, float("inf"))
+  return torch.where(inside, height, inf).amin(dim=-1)
+
+
+def table_clearance_penalty(
+  env: ManagerBasedRlEnv,
+  margin: float,
+  asset_cfg: SceneEntityCfg,
+  surface_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Plan S7-10's AH: per watched body, 0 while its lowest point over the table is more than
+  ``margin`` above the top, rising linearly to 1 at contact (and 1 below it), summed over the
+  bodies. Positive; weight it negative. (B,)"""
+  clearance = arm_table_clearance(env, asset_cfg, surface_cfg)
+  return (1.0 - clearance / margin).clamp(0.0, 1.0).sum(dim=-1)
