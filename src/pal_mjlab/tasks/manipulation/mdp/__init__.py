@@ -73,6 +73,7 @@ from .occlusion import (
 )
 from .rewards import (
   arm_effort_hinge,
+  arm_table_clearance,
   bring_object_after_lift,
   bring_object_when_lifted,
   contact_penalty,
@@ -97,6 +98,7 @@ from .rewards import (
   retreat_height,
   set_down_placed,
   stack_alignment,
+  table_clearance_penalty,
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
@@ -145,7 +147,9 @@ __all__ = [
   "ToolSpeedCappedJointPositionAction",
   "ToolSpeedCappedJointPositionActionCfg",
   "entity_out_of_reach",
+  "arm_table_clearance",
   "keepout_box_penalty",
+  "table_clearance_penalty",
   # mjlab manipulation terms, re-exported so a task needs one namespace.
   "bring_object_reward",
   "ee_to_object_distance",

@@ -57,6 +57,10 @@ the jaw shut while the held cube is not aligned, low and slow over the base). Un
 Plan S7-9 adds `CRITIC_OBS` (`base` | `q`: the critic also observes M6's latched grade and the release
 latch, PQ; the actor is unchanged, and a resume widens the loaded critic for the two inputs). Its other
 codes are a reward module (`REWARD=...+PXY` / `+PT`) and a tool cap (`TOOL_SPEED=PV`). Unset is `base`.
+Plan S7-10 adds `ARM_TABLE` (`none` | `watch` | `AC` | `AH` | `AT`, `arm_table.ARM_TABLE_CODES`):
+the driven arm's links 1-6 against the table -- a sensor only (`watch`, for the eval), a contact
+penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (AT). Unset is
+`none`, every run up to S7-9.
 """
 
 from __future__ import annotations
@@ -72,6 +76,7 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 )
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
@@ -121,6 +126,7 @@ SHAPE_ENV_VAR = "SHAPE"
 GOAL_ENV_VAR = "GOAL"
 GATE_ENV_VAR = "GATE"
 CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
+ARM_TABLE_ENV_VAR = "ARM_TABLE"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -144,6 +150,7 @@ DEFAULT_CRITIC_OBS = "base"
 #: What `CRITIC_OBS` may be (plan S7-9): the critic as before, or with M6's grade and the release
 #: latch (PQ). Whether the critic gets the two extra inputs.
 CRITIC_OBS_NAMES = {"base": False, "q": True}
+DEFAULT_ARM_TABLE = "none"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -264,6 +271,9 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     goal=_select(GOAL_ENV_VAR, DEFAULT_GOAL, GOALS),
     gate=_select(GATE_ENV_VAR, DEFAULT_GATE, GATES),
     critic_release=_critic_release(),
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
   )
 
 
