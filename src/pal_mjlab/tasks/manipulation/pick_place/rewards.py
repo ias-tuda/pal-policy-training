@@ -841,13 +841,17 @@ def _yg(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
 #
 # SA was dead (L15): it paid 0.0000 per episode in DEP1 STSA-c's eval sums and ~2e-5 in R-ST's
 # training logs, because its Gaussians have the `OK` bounds as widths and the policies let go far
-# outside them (1.1-1.4 cm, tilt 14-22 deg, ~0.1 m/s). SAW widens them to 2 cm (xy), 2 cm
-# (height), 20 deg (tilt) and 0.10 m/s (speed) and drops the yaw (the base's yaw is not observed
-# in SC-SAw). Its weight is set so that it pays >= 1 % of the return (plan S9.1 step 0 item 4,
-# measured on DEP1 STSA-c s1 @ 3000's eval sums) while a hold over the base still earns less per
-# step than the placed state (the L5 ordering test).
-SAW_WIDTHS = (0.02, 0.02, math.radians(20.0), None, 0.10)
-SAW_WEIGHT = 1.0
+# outside them. SAW widens them and drops the yaw (the base's yaw is not observed in SC-SAw). The
+# widths and the weight are plan S9.1 step 0 item 4's, measured on DEP1 STSA-c s1 @ 3000 at T11W
+# (`results/S9.1-stack/step0/saw_diag.py`, 16 episodes): it holds the cube within 3 cm of the goal
+# ~9 steps per episode, 2.5 cm up, tilted 22 deg, at 12 cm/s, 1.9 cm off. The plan's first widths
+# (2 cm, 2 cm, 20 deg, 0.10 m/s) paid 0.12 per episode there -- weight 20 for 1 % of the return,
+# past the L5 cap -- so, as the plan says, widened again: 3 cm (xy), 3 cm (height), 30 deg (tilt),
+# 0.15 m/s (speed) pay 0.87 per episode at weight 1, and weight 6 is ~2 % of that policy's 20 s
+# eval return (251). A hold over the base still earns less per step than the placed state (the
+# scripted stack: 11.96 + 6 < 24.66; `tests/test_pick_place_s91.py`).
+SAW_WIDTHS = (0.03, 0.03, math.radians(30.0), None, 0.15)
+SAW_WEIGHT = 6.0
 
 
 def _saw(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:

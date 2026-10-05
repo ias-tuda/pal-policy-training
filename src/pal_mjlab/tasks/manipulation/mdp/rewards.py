@@ -705,8 +705,8 @@ def stack_alignment(
   nothing until it happens to satisfy all five at once and can open.
 
   ``widths`` (dxy m, height m, tilt rad, yaw rad or None to drop it, speed m/s) replaces the
-  ``OK`` bounds as the Gaussians' widths: plan S9.1's SC-SAw, whose let-gos sit far outside
-  ``OK`` (S9 and DEP1 measured SA at ~0 per episode, L15).
+  ``OK`` bounds as the Gaussians' widths: plan S9.1's SC-SAw (`pick_place.rewards.SAW_WIDTHS`), whose
+  let-gos sit far outside ``OK`` (S9 and DEP1 measured SA at ~0 per episode, L15).
   """
   state = stack_state(env, object_name, reference_name, command_name)
   w_dxy, w_height, w_tilt, w_yaw, w_speed = widths or (
