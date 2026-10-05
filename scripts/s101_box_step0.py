@@ -9,7 +9,10 @@ DR-scene, ``ARM_TABLE=AH10``) with ``GOAL=box-rim`` on ``TARGET=WC``.
 per phase, the steps on which the hand (the `arm_left_7_link` subtree: palm, fingers, pads) or the
 cube touches a box wall. `BOX_MIN_SEPARATION` = the least distance with no touch + 2 cm.
 
-``reach`` (items 3 and 4): the whole pick-into-box -- 12 forced box poses (the area's corners, edge
+``place`` (item 3's gate and item 4, by IK alone): for each forced box pose x cube yaw, the whole plan from a
+spawn the script grasps from; the waypoint without contact-free IK, and |action| per joint on the WC arm.
+
+``reach`` (items 3 and 4, simulated): the whole pick-into-box -- 12 forced box poses (the area's corners, edge
 midpoints, middle, two at y < 0, one near the torso) at yaw 0 and 45 deg, the cube at the area corner
 farthest from the box, plus ``--random`` episodes of the reset's own draws. Per env: plan errors (the
 gate: IK must reach the place pose at every forced pose), clipped action steps (item 4: 0), in the box,
@@ -244,6 +247,98 @@ def reach(args: argparse.Namespace) -> dict:
   return results
 
 
+#: Spawns the place check plans from: inside the part of WC the script grasps from (W2-like, S7-8 step 0),
+#: tried in order until one is >= `box.BOX_MIN_SEPARATION` from the box and its grasp plans.
+PLACE_SPAWNS = ((0.44, 0.22), (0.40, 0.26), (0.52, 0.24), (0.46, 0.14), (0.42, 0.16), (0.56, 0.18))
+GRASP_WAYPOINTS = ("pregrasp", "grasp", "lift")
+
+
+def place(args: argparse.Namespace) -> dict:
+  """Items 3 (the gate) and 4 by IK alone, no simulation: for each forced box pose x cube yaw 0 / 30 / 45
+  deg, plan the whole pick-into-box from a spawn the script can grasp from (`PLACE_SPAWNS`) and record
+  which waypoint has no contact-free IK; for every full plan, |action| per arm joint at each waypoint on
+  the WC arm (> 1 is clipped)."""
+  import torch
+  from mjlab.envs import ManagerBasedRlEnv
+
+  from pal_mjlab.tasks.manipulation import scene
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+  from pal_mjlab.tasks.manipulation.pick_place.box import BOX_MIN_SEPARATION
+
+  c = _common(args)
+  cfg = pp.make_pick_place_env_cfg(
+    c["robot"],
+    gripper_name="left",
+    reward=c["reward"],
+    spawn=c["spawn_box"],
+    dr="DR0",
+    baseline=c["baseline"],
+    effort=c["effort"],
+    latency=c["latency"],
+    target_area=c["target_area"],
+    stack_speed=True,
+    box=c["box_goal"],
+    arm_table=c["arm_table"],
+  )
+  cfg.scene.num_envs = 1
+  env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
+  kin = scripted.Kin.from_model(env.sim.mj_model)
+  term = env.action_manager.get_term("joint_pos")
+  names = [n.split("/", 1)[-1] for n in term.target_names]
+  arm = [names.index(j) for j in scripted.ARM_JOINTS]
+  offset = term.offset[0, arm].cpu().numpy()
+  scale = (
+    term.scale[0, arm].cpu().numpy()
+    if isinstance(term.scale, torch.Tensor)
+    else np.full(len(arm), float(term.scale))
+  )
+  env.close()
+  table_z = c["baseline"].table_top_z
+  rows = []
+  for bxy, byaw in ((b, y) for y in (0.0, 45.0) for b in FORCED_BOXES):
+    for cyaw in (0.0, 30.0, 45.0):
+      carry_x = scripted.box_place_hand_x(kin, math.radians(cyaw), math.radians(byaw))
+      tried, row = [], None
+      for sp in PLACE_SPAWNS:
+        if math.hypot(sp[0] - bxy[0], sp[1] - bxy[1]) < BOX_MIN_SEPARATION:
+          continue
+        try:
+          plan = scripted.waypoints(
+            kin,
+            np.asarray(sp),
+            math.radians(cyaw),
+            np.asarray(bxy),
+            table_z=table_z,
+            pad_clearance=args.pad_clearance,
+            carry_hand_x=carry_x,
+            place_dz=scene.BOX_FLOOR,
+          )
+        except RuntimeError as e:
+          msg = str(e)
+          wp = next((w for w in scripted.WAYPOINT_NAMES if f" {w} at" in f" {msg}"), "?")
+          tried.append((sp, wp, msg[:90]))
+          if wp in GRASP_WAYPOINTS:
+            continue  # this spawn's grasp; try the next spawn
+          row = {"ok": False, "fails_at": wp, "error": msg[:120], "spawn": sp}
+          break
+        excursion = {
+          w: (np.abs(plan[w] - offset) / scale).round(3).tolist()
+          for w in scripted.WAYPOINT_NAMES
+        }
+        worst = np.max(np.stack([np.asarray(v) for v in excursion.values()]), axis=0)
+        row = {
+          "ok": True,
+          "spawn": sp,
+          "max_abs_action_per_joint": worst.round(3).tolist(),
+          "clipped_joints": [scripted.ARM_JOINTS[j] for j in np.nonzero(worst > 1.0)[0]],
+        }
+        break
+      if row is None:
+        row = {"ok": None, "fails_at": "no spawn grasps", "tried": tried}
+      rows.append({"box": [*bxy, byaw], "cube_yaw": cyaw, "bin": _bin(*bxy), **row})
+  return {"place": rows}
+
+
 def _row(r: dict) -> dict:
   keep = (
     "env",
@@ -284,7 +379,7 @@ def _print_reach(res: dict) -> None:
 
 def main() -> None:
   ap = argparse.ArgumentParser()
-  ap.add_argument("mode", choices=("clearance", "reach"))
+  ap.add_argument("mode", choices=("clearance", "reach", "place"))
   ap.add_argument("--json", type=pathlib.Path, required=True)
   ap.add_argument("--device", default="cuda:0")
   ap.add_argument("--dr", default="DR-scene")
@@ -300,12 +395,28 @@ def main() -> None:
   )
   ap.add_argument("--random", type=int, default=64)
   args = ap.parse_args()
-  res = clearance(args) if args.mode == "clearance" else reach(args)
+  res = {"clearance": clearance, "reach": reach, "place": place}[args.mode](args)
   if args.mode == "clearance":
     print(json.dumps(res["summary"], indent=1))
     print("least distance with no wall touch:", res["least_clear_distance"])
-  else:
+  elif args.mode == "reach":
     _print_reach(res)
+  else:
+    for r in res["place"]:
+      print(
+        f"box {r['box']} [{r['bin']}] cube yaw {r['cube_yaw']:4.0f}: "
+        + (
+          f"ok from {r['spawn']}, max |a| {r['max_abs_action_per_joint']} clipped {r['clipped_joints']}"
+          if r["ok"]
+          else f"FAILS at {r['fails_at']}: {r.get('error', '')[:70]}"
+        )
+      )
+    ok = [r for r in res["place"] if r["ok"]]
+    print(
+      f"place reachable {len(ok)} / {len(res['place'])}; clipped in "
+      f"{sum(bool(r['clipped_joints']) for r in ok)}; worst |a| per joint "
+      f"{np.max([r['max_abs_action_per_joint'] for r in ok], axis=0).round(3).tolist() if ok else None}"
+    )
   args.json.parent.mkdir(parents=True, exist_ok=True)
   args.json.write_text(
     json.dumps({"args": vars(args) | {"json": str(args.json)}, **res}, indent=1, default=str)
