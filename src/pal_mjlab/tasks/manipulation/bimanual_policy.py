@@ -166,15 +166,15 @@ def layout_of(env) -> dict:
 
 
 def prepare_train_cfg(env, train_cfg: dict) -> None:
-  """Before rsl_rl builds the models: the env's layout into a factored actor's cfg, the action names into
-  `JointPPO`'s. A no-op for every other recipe."""
+  """Before rsl_rl builds the models: the action names into `JointPPO`'s cfg and, for a factored actor, the env's
+  layout into the actor's. A no-op for every other recipe."""
   alg = train_cfg.get("algorithm", {})
   if alg.get("class_name") != PPO_CLASS:
     return
-  layout = layout_of(env)
-  alg["action_names"] = layout["action_names"]
+  term = env.action_manager.get_term("joint_pos")
+  alg["action_names"] = [n.split("/")[-1] for n in term.target_names]
   if train_cfg.get("actor", {}).get("class_name") == MODEL_CLASS:
-    train_cfg["actor"]["layout"] = layout
+    train_cfg["actor"]["layout"] = layout_of(env)
 
 
 def mirror_quat(q: torch.Tensor) -> torch.Tensor:
