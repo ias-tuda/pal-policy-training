@@ -200,7 +200,14 @@ def test_the_window_holds_wc_c_grasps(s_env):
     assert torch.allclose(
       pg.cube_in_tcp(s_env, p, TCP), torch.tensor([x, y, z]) / 100, atol=1e-5
     )
-  for off in ((0.0, 0.0, 0.10), (0.0, 0.0, 0.02), (0.03, 0.0, 0.05), (0.0, 0.03, 0.05)):
+  # The scripted grasp's (step 0): the cube at z ~0.5 cm.
+  assert pg.in_grasp_window(s_env, _tcp_point(s_env, (0.0, 0.0, 0.005)), TCP).all()
+  for off in (
+    (0.0, 0.0, 0.10),
+    (0.0, 0.0, -0.01),
+    (0.03, 0.0, 0.05),
+    (0.0, 0.035, 0.05),
+  ):
     assert not pg.in_grasp_window(s_env, _tcp_point(s_env, off), TCP).any(), off
 
 
