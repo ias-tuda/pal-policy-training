@@ -39,6 +39,10 @@ from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
   ArmTableCfg,
   apply_arm_table,
 )
+from pal_mjlab.tasks.manipulation.pick_place.pregrasp import (
+  PregraspCfg,
+  apply_pregrasp,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
@@ -558,6 +562,7 @@ def make_pick_place_env_cfg(
   gate: str = "none",
   critic_release: bool = False,
   arm_table: ArmTableCfg | None = None,
+  pregrasp: PregraspCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -597,6 +602,8 @@ def make_pick_place_env_cfg(
       and so the exported policy, are unchanged). Needs a reward arm with M6.
     arm_table: plan S7-10's ``ARM_TABLE`` -- the arm-table sensor and the terms on it. See
       `arm_table.ARM_TABLE_CODES`; None is every run before S7-10.
+    pregrasp: plan S7-11's ``PREGRASP`` -- the jaw open before the grasp (NP, JO, G, S, OVR). See
+      `pregrasp.PREGRASP_CODES`; None is every run before S7-11.
   """
   if goal not in GOALS:
     raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
@@ -735,6 +742,10 @@ def make_pick_place_env_cfg(
   # Plan S7-10: the arm off the table. After the variant's dict, like the trunk penalty, so
   # that the same code adds the same terms to every variant.
   apply_arm_table(cfg, gripper, arm_table)
+  # Plan S7-11: the jaw open before the grasp. After the variant's dict, like the arm table.
+  if pregrasp is not None and pregrasp.gate_cap is not None and gate != "none":
+    raise ValueError("PREGRASP's gate and GATE=stack are two action terms; pick one")
+  apply_pregrasp(cfg, gripper, pregrasp)
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)
