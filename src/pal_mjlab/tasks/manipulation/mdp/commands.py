@@ -261,6 +261,11 @@ class EntityOffsetCommandCfg(LiftingCommandCfg):
   stack_on_top: bool = False
   """Replace the offset's z with the resting height of the object on the reference."""
 
+  yaw_reference: str | None = None
+  """Plan S9.1's SC-Y: the entity M6's yaw grade measures the object's yaw against (the base, which
+  stands at +/- 45 deg there), read by the release latch (`observations._release_latch`) as
+  S10.1's `BoxGoalCommandCfg.yaw_reference`; None measures it against the world's axes."""
+
   # Placement belongs to a reset event, not to the command.
   object_pose_range: LiftingCommandCfg.ObjectPoseRangeCfg | None = None
   difficulty: Literal["fixed", "dynamic"] = "dynamic"

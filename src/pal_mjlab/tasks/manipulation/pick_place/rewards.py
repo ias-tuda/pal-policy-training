@@ -837,6 +837,29 @@ def _yg(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
     )
 
 
+# -- S9.1: SAW, SA with widths a let-go can reach (plan S9.1's SC-SAw) ---------------------------
+#
+# SA was dead (L15): it paid 0.0000 per episode in DEP1 STSA-c's eval sums and ~2e-5 in R-ST's
+# training logs, because its Gaussians have the `OK` bounds as widths and the policies let go far
+# outside them (1.1-1.4 cm, tilt 14-22 deg, ~0.1 m/s). SAW widens them to 2 cm (xy), 2 cm
+# (height), 20 deg (tilt) and 0.10 m/s (speed) and drops the yaw (the base's yaw is not observed
+# in SC-SAw). Its weight is set so that it pays >= 1 % of the return (plan S9.1 step 0 item 4,
+# measured on DEP1 STSA-c s1 @ 3000's eval sums) while a hold over the base still earns less per
+# step than the placed state (the L5 ordering test).
+SAW_WIDTHS = (0.02, 0.02, math.radians(20.0), None, 0.10)
+SAW_WEIGHT = 1.0
+
+
+def _saw(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  _sa(rewards, ctx)
+  term = rewards["stack_align"]
+  rewards["stack_align"] = RewardTermCfg(
+    func=term.func,
+    weight=SAW_WEIGHT,
+    params={**term.params, "widths": SAW_WIDTHS},
+  )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -856,6 +879,7 @@ _MODULES = {
   "PXY": _pxy,
   "PT": _pt,
   "YG": _yg,
+  "SAW": _saw,
 }
 
 
@@ -883,8 +907,11 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("EQ is a term beside M1's; it needs M1 in the arm")
   if "RG" in modules and "M6" not in modules[: modules.index("RG")]:
     raise ValueError("RG pays M6's grade for an OK let-go only; it needs M6 before it")
-  if "SA" in modules and "M1" not in modules:
-    raise ValueError("SA is a term beside M1's; it needs M1 in the arm")
+  for name in ("SA", "SAW"):
+    if name in modules and "M1" not in modules:
+      raise ValueError(f"{name} is a term beside M1's; it needs M1 in the arm")
+  if "SA" in modules and "SAW" in modules:
+    raise ValueError("SAW is SA with other widths; pick one")
   for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",)), ("YG", ("M6",))):
     if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
       raise ValueError(f"{name} needs {' and '.join(needs)} before it")
@@ -959,6 +986,12 @@ S11_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+YG": ("M1", "M2", "M3", "M6", "J", "M8", "YG"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S11_ARMS.items()})
+#: The S9.1 arm (plan S9.1's SC-SAw): S7-4's RCTP + SAW. SC and SC-FT run RCTP itself on the stack goal
+#: at T; SC-Y runs S11's RCTP + YG there with the base's yaw observed (`BASE_OBS=pose`).
+S91_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+SAW": ("M1", "M2", "M3", "M6", "J", "M8", "SAW"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S91_ARMS.items()})
 _MODULE_ARMS = {
   **S52_ARMS,
   **S7_ARMS,
@@ -969,9 +1002,14 @@ _MODULE_ARMS = {
   **S9_ARMS,
   **S79_ARMS,
   **S11_ARMS,
+  **S91_ARMS,
 }
-#: Arms whose terms read the base cube (RG, SA): they need plan S9's `GOAL=stack`.
-STACK_ONLY_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m))
+#: Arms whose terms read the base cube (RG, SA, SAW): they need plan S9's `GOAL=stack`.
+STACK_ONLY_ARMS = frozenset(
+  n for n, m in _MODULE_ARMS.items() if {"RG", "SA", "SAW"} & set(m)
+)
+#: Arms that grade the let-go's yaw (YG): on a stack goal, against the base (plan S9.1's SC-Y).
+YAW_GRADED_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if "YG" in m)
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)

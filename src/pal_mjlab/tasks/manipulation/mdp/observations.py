@@ -464,13 +464,32 @@ def object_tilt(env: ManagerBasedRlEnv, object_name: str) -> torch.Tensor:
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
 
 
-def yaw_error_mod_90(quat_w: torch.Tensor) -> torch.Tensor:
+def yaw_error_mod_90(
+  quat_w: torch.Tensor, reference_quat_w: torch.Tensor | None = None
+) -> torch.Tensor:
   """|yaw mod 90 deg| of a world orientation, rad in [0, pi/4]: how far a cube's faces are turned
   off the world's axes (plan S10: the box sits at yaw 0 +/- 5 deg, unobserved, so alignment is
-  paid against the axes the actor does observe). (B,)"""
+  paid against the axes the actor does observe) -- or, given ``reference_quat_w``, off that
+  orientation's axes: |wrap_90(psi - psi_ref)| (plan S10.1: against the box, which stands at any
+  yaw). (B,)"""
   _, _, yaw = euler_xyz_from_quat(quat_w)
+  if reference_quat_w is not None:
+    _, _, ref = euler_xyz_from_quat(reference_quat_w)
+    yaw = yaw - ref
   quarter = torch.pi / 2
   return torch.abs(yaw - quarter * torch.round(yaw / quarter))
+
+
+def yaw_reference_quat(
+  env: ManagerBasedRlEnv, command_name: str
+) -> torch.Tensor | None:
+  """The world orientation M6's yaw grade measures against: the entity the goal command names in
+  its cfg's ``yaw_reference`` (plan S10.1, `box.BoxGoalCommandCfg`), or None for the world's axes. (B, 4)"""
+  term = env.command_manager.get_term(command_name)
+  name = getattr(term.cfg, "yaw_reference", None)
+  if name is None:
+    return None
+  return env.scene[name].data.root_link_quat_w
 
 
 def _release_latch(
@@ -604,7 +623,9 @@ def _release_latch(
   on_table = _on_surface_bool(env, support_sensor_name)
   height = pos[:, 2] - rest_z
   tilt = object_tilt(env, object_name)
-  yaw = yaw_error_mod_90(obj.data.root_link_quat_w)
+  yaw = yaw_error_mod_90(
+    obj.data.root_link_quat_w, yaw_reference_quat(env, command_name)
+  )
   if jaw is None:
     opened = let_go
     now = (dxy, height, on_table, speed, latch.dwell, ok, tilt, yaw)

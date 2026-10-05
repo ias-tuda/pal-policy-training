@@ -24,13 +24,17 @@ from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.manipulation.mdp.commands import LiftingCommand, LiftingCommandCfg
 from mjlab.utils.lab_api.math import (
+  euler_xyz_from_quat,
   quat_apply,
   quat_from_euler_xyz,
+  quat_inv,
+  quat_mul,
   sample_uniform,
 )
 
 from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy, surface_top_z
 from pal_mjlab.tasks.manipulation.mdp.observations import (
+  _base_pose,
   _grasped_bool,
   _object_pose_w,
   _to_base_frame,
@@ -319,6 +323,67 @@ def box_goal_position_tracked_b(
   if _corrupted(env):
     goal_b = goal_b + tracker_bias(env, bias_key)
   return goal_b
+
+
+#: Attribute on the env holding the per-episode yaw biases of the tracked objects, rad, per env.
+_TRACKER_YAW_BIAS = "_pal_tracker_yaw_bias"
+
+
+def reset_tracker_yaw_bias(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  half: float,
+  keys: tuple[str, ...],
+) -> None:
+  """Plan S10.1: draw this episode's tracker yaw bias for each object in ``keys``, uniform in
+  +/- ``half`` rad -- the box's own draw, as baseline B's cube yaw bias (0.03 rad). A fresh draw
+  per reset, not an accumulation."""
+  bias = getattr(env, _TRACKER_YAW_BIAS, None)
+  if bias is None:
+    bias = {}
+    setattr(env, _TRACKER_YAW_BIAS, bias)
+  for key in keys:
+    if key not in bias:
+      bias[key] = torch.zeros(env.num_envs, device=env.device)
+    bias[key][env_ids] = sample_uniform(-half, half, (len(env_ids),), device=env.device)
+
+
+def tracker_yaw_bias(env: ManagerBasedRlEnv, key: str) -> torch.Tensor:
+  """The yaw bias the tracker puts on object ``key`` this episode, rad; zero before the first
+  reset. (B,)"""
+  bias = getattr(env, _TRACKER_YAW_BIAS, {})
+  return bias.get(key, torch.zeros(env.num_envs, device=env.device))
+
+
+def yaw_relative_to_base(env: ManagerBasedRlEnv, quat_w: torch.Tensor) -> torch.Tensor:
+  """The yaw of a world orientation relative to the robot's `base_link`, rad. (B,)"""
+  _, base_q = _base_pose(env.scene[_ROBOT.name])
+  _, _, yaw = euler_xyz_from_quat(quat_mul(quat_inv(base_q), quat_w))
+  return yaw
+
+
+def box_yaw_b(
+  env: ManagerBasedRlEnv,
+  box_name: str,
+  bias_key: str | None = None,
+  noise: float = 0.0,
+  fold: int = 4,
+  lag: tuple[int, int] | None = None,
+) -> torch.Tensor:
+  """Plan S10.1's ``box_yaw``: the box's yaw psi relative to the robot base, as (cos fold psi,
+  sin fold psi) -- the same for psi and psi + 90 deg, as FoundationPose on the 4-fold symmetric box
+  may report either, and continuous across +/- 45 deg. From the box's tracker (``lag`` steps late;
+  None for the live pose); while the actor is corrupted psi carries the episode's yaw bias on
+  ``bias_key`` (`reset_tracker_yaw_bias`) and a per-step jitter uniform in +/- ``noise`` rad, both on
+  the angle, not on the encoding. (B, 2)"""
+  _, quat_w = _object_pose_w(env, box_name, lag)
+  psi = yaw_relative_to_base(env, quat_w)
+  if _corrupted(env):
+    if bias_key is not None:
+      psi = psi + tracker_yaw_bias(env, bias_key)
+    if noise > 0.0:
+      psi = psi + (2.0 * torch.rand_like(psi) - 1.0) * noise
+  return torch.stack([torch.cos(fold * psi), torch.sin(fold * psi)], dim=-1)
 
 
 def box_displacement_penalty(

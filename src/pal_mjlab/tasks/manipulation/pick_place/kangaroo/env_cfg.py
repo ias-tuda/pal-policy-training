@@ -71,6 +71,12 @@ base through its own tracker), `HANDOFF_ROUTE` (`none` | `up-out`: the up-out-ho
 action term, for the eval to start) and `ARMS` (`left` | `both`): `both` is JOINT, one policy for
 both arms (`pick_place/bimanual.py`), with `HANDOFF_TRAIN` (`none` | `left`) and `START` (`scratch` |
 `mixed`). Unset is every run before S11.
+Plan S9.1 adds `BASE_OBS` (`goal` | `pose`, `pick_place_env_cfg.BASE_OBS_NAMES`): on a stack goal the actor
+sees the goal on the base (every run before S9.1) or also the base's yaw, with M6's yaw grade taken
+against the base. And `CONTACT` (`box` | `ccd`, `CONTACT_FLAGS`), the one selector whose unset value
+is not the old one: ``box`` sends box-box pairs to mujoco_warp's ``box_box`` collider (decision 0003,
+`tabletop_env_cfg.SIM_DISABLE_FLAGS`); ``ccd`` gives back the GJK/EPA path every run before S9.1
+trained on, to re-read those runs on their own physics.
 """
 
 from __future__ import annotations
@@ -99,6 +105,7 @@ from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
 )
 from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BoxGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
+  BASE_OBS_NAMES,
   BASELINES,
   EFFORT_BOUNDS,
   GATES,
@@ -157,6 +164,8 @@ HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
 ARMS_ENV_VAR = "ARMS"
 HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
+BASE_OBS_ENV_VAR = "BASE_OBS"
+CONTACT_ENV_VAR = "CONTACT"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -183,6 +192,12 @@ CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
 DEFAULT_ARM_HOME = "default"
 DEFAULT_TRACKER = "B"
+DEFAULT_BASE_OBS = "goal"
+#: What `CONTACT` may be, and the disable flags each keeps out of `SIM_DISABLE_FLAGS` (decision 0003):
+#: ``box`` the tabletop default, ``ccd`` mujoco_warp's own default (nativeccd on) -- every run before
+#: plan S9.1.
+CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
+DEFAULT_CONTACT = "box"
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
@@ -297,7 +312,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   bound is exactly the spawn box's arm.
   """
   if _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both":
-    return _bimanual_env_cfg(play)
+    return _apply_contact(_bimanual_env_cfg(play))
   spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
   tool_speed = _select(TOOL_SPEED_ENV_VAR, DEFAULT_TOOL_SPEED, TOOL_SPEED_CAPS)
@@ -342,13 +357,24 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
     ],
     box=box,
+    base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
   )
+  _apply_contact(cfg)
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
     left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
     cfg.actions["joint_pos"] = mdp.with_handoff(
       cfg.actions["joint_pos"], arms=(handoff_arm(left, +1.0, None),)
     )
+  return cfg
+
+
+def _apply_contact(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
+  """`CONTACT`: drop the disable flags the named contact model keeps on (decision 0003)."""
+  keep_on = CONTACT_FLAGS[_select(CONTACT_ENV_VAR, DEFAULT_CONTACT, CONTACT_FLAGS)]
+  cfg.sim.mujoco.disableflags = tuple(
+    f for f in cfg.sim.mujoco.disableflags if f not in keep_on
+  )
   return cfg
 
 

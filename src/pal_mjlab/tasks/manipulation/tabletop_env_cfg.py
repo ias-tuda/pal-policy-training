@@ -141,6 +141,16 @@ SIM_TIMESTEP = 0.002
 DECIMATION = 10
 CONTROL_DT = SIM_TIMESTEP * DECIMATION
 
+#: MuJoCo disable flags of every tabletop task. ``nativeccd`` off is what sends box-box pairs (the
+#: cubes, the table top and legs, the box's walls) to mujoco_warp's dedicated ``box_box`` collider,
+#: as CPU MuJoCo does; with it on (mujoco_warp's default, every run before plan S9.1) they go through
+#: GJK/EPA + multicontact, which under a pressing hand returns one contact where CPU MuJoCo returns
+#: four, and a cube held down on a cube sank 1.1-1.7 cm into it, the base 1.5-2.6 cm into the table
+#: (CPU MuJoCo on the same model, state and controls: 1.3 / 2.2 mm; 100 solver iterations, impratio 1
+#: or a pyramidal cone did not help). In mujoco_warp the flag changes only box-box pairs; the pads,
+#: arm and torso are meshes and capsules. Measured 2026-10-05 on the S9 stack renders (decision 0003).
+SIM_DISABLE_FLAGS = ("nativeccd",)
+
 #: Plan S7-8's stack-task speeds (`SLEW=stack`): the arm at a fraction of the URDF speed
 #: (`robots.kangaroo.KANGAROO_GRIPPERS`' `joint_velocity_limits`) per joint group, the jaw at
 #: 0.03 rad per control step (1.5 rad/s). Claudius's recipe (`origin/faster-moves` b236d62,
@@ -926,6 +936,7 @@ def make_tabletop_env_cfg(
         ls_iterations=20,
         impratio=10,
         cone="elliptic",
+        disableflags=SIM_DISABLE_FLAGS,
       ),
     ),
     decimation=DECIMATION,
