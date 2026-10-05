@@ -389,6 +389,10 @@ def _put_a_at_t(
 
 
 _BANK_CACHE = "_pp_hold_bank"
+#: A hold start keeps B where the snapshot had it, in the hand, and puts A on this episode's table, so B's gap over A
+#: moves by the table's height change (DR-scene: +/- 1 cm). Rows are drawn until the gap lands in this range, m.
+HOLD_GAP = (0.01, 0.07)
+HOLD_DRAWS = 16
 
 
 def load_hold_bank(env: ManagerBasedRlEnv, path: str) -> dict:
@@ -409,6 +413,25 @@ def load_hold_bank(env: ManagerBasedRlEnv, path: str) -> dict:
     raise ValueError(f"{path}: an empty bank")
   setattr(env, _BANK_CACHE, raw)
   return raw
+
+
+def _pick_rows(
+  env: ManagerBasedRlEnv, ids: torch.Tensor, bank: dict, surface_cfg: SceneEntityCfg
+) -> torch.Tensor:
+  """A bank row per env of ``ids`` whose B-over-A gap stays in `HOLD_GAP` on this episode's table: `HOLD_DRAWS`
+  random candidates each, the first that fits, else the candidate with the gap nearest the range. (N,)"""
+  from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+
+  device = env.device
+  top = surface_top_z(env, surface_cfg)[ids] - env.scene.env_origins[ids, 2]
+  cand = torch.randint(0, len(bank["step"]), (len(ids), HOLD_DRAWS), device=device)
+  # A rests at top + its half-height; B's bottom stays where it was.
+  gap = (bank["b_pos"][cand, 2] - 0.025) - (top.unsqueeze(-1) + 0.05)
+  lo, hi = HOLD_GAP
+  fits = (gap >= lo) & (gap <= hi)
+  miss = (lo - gap).clamp_min(0.0) + (gap - hi).clamp_min(0.0)
+  first = torch.where(fits.any(-1), fits.float().argmax(-1), miss.argmin(-1))
+  return cand.gather(1, first.unsqueeze(-1)).squeeze(-1)
 
 
 def hold_start(
@@ -485,7 +508,7 @@ def hold_start(
   if len(ids) == 0:
     return
   bank = load_hold_bank(env, bank_path)
-  rows = torch.randint(0, len(bank["step"]), (len(ids),), device=device)
+  rows = _pick_rows(env, ids, bank, surface_cfg)
   robot = env.scene[ROBOT]
   robot.write_joint_state_to_sim(bank["q"][rows], bank["qd"][rows], env_ids=ids)
   origin = env.scene.env_origins[ids]

@@ -29,7 +29,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-EVERY = 10
+EVERY = 2
 OVER = 0.03
 GAP = (0.02, 0.06)
 A_AT_T = 0.01
