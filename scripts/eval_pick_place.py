@@ -93,6 +93,11 @@ while the cube is held; the box's displacement at the end; and the let-go's xy o
 above the rim and yaw error (|yaw mod 90 deg|), from the reward's own release latch. Arm 1-6 on
 the table is plan S7-10's `ArmTally`.
 
+Plan S10.1 (the box on the wide area, at any yaw): the let-go's yaw error is against the box
+(|wrap_90(psi_cube - psi_box)|, the latch's own), and S10's success is also binned by where the box
+stood (`BOX_POSITION_BINS`), its yaw (`BOX_YAW_BINS_DEG`) and the carry from the cube's spawn to the
+box (`BOX_CARRY_BINS_CM`): ``box_by_position`` / ``box_by_yaw`` / ``box_by_carry``.
+
 Horizon
 --------------------------------------------------------------------------------
 Not the `--play` cfg as-is: `apply_play_overrides` sets `episode_length_s` to 1e9, so
@@ -1713,6 +1718,18 @@ class StackTally:
     return out
 
 
+#: Plan S10.1's box bins, env frame, m: near the torso, far, across the centre line (overlapping
+#: filters, each with its own n), and the rest; the box's yaw folded to +/- 45 deg; the carry, cube
+#: spawn to box centre (>= `box.BOX_MIN_SEPARATION`).
+BOX_POSITION_BINS = {
+  "near_torso": lambda x, y: x < 0.45 and y < 0.10,
+  "far": lambda x, y: x > 0.55,
+  "across_centre": lambda x, y: y < 0.0,
+  "other": lambda x, y: not (x < 0.45 and y < 0.10) and x <= 0.55 and y >= 0.0,
+}
+BOX_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+BOX_CARRY_BINS_CM = ((0, 16), (16, 20), (20, 30), (30, 99))
+
 #: The control step, s (`tabletop_env_cfg.CONTROL_DT`), for the stack tally's lock times.
 STEP_DT_S = 0.02
 
@@ -1740,6 +1757,8 @@ class BoxTally:
     self.hand_wall_held, self.cube_wall_held, self.hand_wall = zb(), zb(), zb()
     self.displacement = zf()
     self.rel_dxy, self.rel_height, self.rel_yaw, self.released = zf(), zf(), zf(), zb()
+    #: Plan S10.1: each episode's box (x, y, env frame; yaw, rad) and cube spawn (x, y) at its start.
+    self.start = torch.zeros(n, 5, device=dev)
     self.done: list[dict] = []
 
   def step(
@@ -1750,6 +1769,23 @@ class BoxTally:
     from pal_mjlab.tasks.manipulation import mdp
 
     b = self.box
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      origin = env.scene.env_origins[:, :2]
+      box_e = env.scene[b.BOX]
+      q = box_e.data.root_link_quat_w
+      yaw = torch.atan2(
+        2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+      )
+      now = torch.cat(
+        [
+          box_e.data.root_link_pos_w[:, :2] - origin,
+          yaw_mod90(yaw).unsqueeze(-1),
+          env.scene[OBJECT].data.root_link_pos_w[:, :2] - origin,
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
     self.in_box = mdp.object_in_box_bool(env, OBJECT, b.BOX, b.BOX_WALLS)
     self.in_box_after |= self.in_box & j_released
     hit = lambda name: env.scene[name].data.found.bool().any(dim=-1)  # noqa: E731
@@ -1781,6 +1817,13 @@ class BoxTally:
         "release_above_rim_cm": 100 * float(self.rel_height[i]),
         "release_yaw_deg": math.degrees(float(self.rel_yaw[i])),
       }
+      bx_, by_, byaw, cx_, cy_ = self.start[i].tolist()
+      row.update(
+        box_x=bx_,
+        box_y=by_,
+        box_yaw_deg=math.degrees(byaw),
+        box_carry_cm=100 * math.hypot(bx_ - cx_, by_ - cy_),
+      )
       self.done.append(row)
       for t in (
         self.in_box_after,
@@ -1812,6 +1855,35 @@ class BoxTally:
         sum(r["release_yaw_deg"] < 10 for r in rel) / len(rel) if rel else float("nan")
       ),
     }
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {
+          "n": len(g),
+          "box_success": sum(r["box_success"] for r in g) / len(g) if g else None,
+        }
+        for name, g in groups.items()
+      }
+
+    # Plan S10.1's bins (env frame): by where the box is, by its yaw, by how far the cube is carried.
+    out["box_by_position"] = bins(
+      {
+        name: [r for r in rows if test(r["box_x"], r["box_y"])]
+        for name, test in BOX_POSITION_BINS.items()
+      }
+    )
+    out["box_by_yaw"] = bins(
+      {
+        f"{lo}-{hi}deg": [r for r in rows if lo <= abs(r["box_yaw_deg"]) < hi]
+        for lo, hi in BOX_YAW_BINS_DEG
+      }
+    )
+    out["box_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["box_carry_cm"] < hi]
+        for lo, hi in BOX_CARRY_BINS_CM
+      }
+    )
     return out
 
 
@@ -1930,6 +2002,19 @@ def tilt(env: ManagerBasedRlEnv) -> torch.Tensor:
     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
   )
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
+
+
+def reference_yaw(env: ManagerBasedRlEnv) -> torch.Tensor | float:
+  """The world yaw the let-go's yaw is read against: the box's on plan S10.1's wide area (the goal
+  command's ``yaw_reference``), else 0 -- the world's axes, every earlier read. (B,) or 0"""
+  from pal_mjlab.tasks.manipulation.mdp import yaw_reference_quat
+
+  q = yaw_reference_quat(env, COMMAND)
+  if q is None:
+    return 0.0
+  return torch.atan2(
+    2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+  )
 
 
 def yaw_mod90(yaw: torch.Tensor) -> torch.Tensor:
@@ -2459,7 +2544,7 @@ def main() -> None:
         placed_jz=flags["placed_and_lifted_z"] & (jaw_q < jaw_thr),
         tilt=tilt(env),
         jaw_open_below=jaw_thr,
-        yaw=yaw_mod90(obj_yaw),
+        yaw=yaw_mod90(obj_yaw - reference_yaw(env)),
       )
       if box is not None:
         box.step(env, flags["grasped"], retreat.released)

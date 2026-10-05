@@ -283,10 +283,12 @@ def main() -> None:
   fps = round(1.0 / env.step_dt)
 
   pinned = None
-  if args.spawn is not None or args.target is not None or args.table_offset is not None:
+  if any(
+    v is not None for v in (args.spawn, args.target, args.table_offset, args.box)
+  ):
     if args.episodes != 1:
       raise ValueError(
-        "--spawn, --target and --table-offset pin one episode: --episodes 1"
+        "--spawn, --target, --box and --table-offset pin one episode: --episodes 1"
       )
     pinned = pin_start(env, ev, args)
     print(
