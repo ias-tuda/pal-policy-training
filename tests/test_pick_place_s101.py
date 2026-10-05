@@ -69,7 +69,7 @@ def _set_env(monkeypatch, **changes) -> None:
       monkeypatch.delenv(var, raising=False)
     else:
       monkeypatch.setenv(var, value)
-  for var in ("SHAPE", "OCC", "OBJ_OBS", "GATE", "BOX_FEET"):
+  for var in ("SHAPE", "OCC", "OBJ_OBS", "GATE", "BOX_FEET", "CKPT_SPAWN"):
     if var not in changes:
       monkeypatch.delenv(var, raising=False)
 
