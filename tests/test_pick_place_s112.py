@@ -153,11 +153,10 @@ def test_s12_bi_replaces_the_task_terms_and_keeps_the_rest(monkeypatch):
   assert s12.rewards["left_ladder"].weight == ladder.LADDER_SCALE
   assert list(s12.events)[0] == "reset_ladder_state"
   assert "a_latched" in s12.observations["critic"].terms
-  # The right hands off on its own trigger in training, with no time-out.
+  # The right hands off on its own trigger in training, or at decision 5's 14 s safety net.
   arms = {a.name: a for a in s12.actions["joint_pos"].arms}
-  assert arms["right"].trigger is not None and arms["right"].trigger.timeout_s == float(
-    "inf"
-  )
+  assert arms["right"].trigger is not None
+  assert arms["right"].trigger.timeout_s == bi.RIGHT_HANDOFF_TIMEOUT_S == 14.0
   assert arms["right"].trigger.object_name == bi.CUBE_B
 
 
@@ -331,9 +330,6 @@ def test_bi_f_at_iteration_0_is_the_seq_pair(monkeypatch, tmp_path):
   the gated goal) to 1e-5, the other hand's TCP not mattering yet."""
   from eval_chain import MirrorAdapter, OneArmActor
 
-  # TF32 matmuls (which an earlier test or import may switch on) differ from fp32 by ~1e-4 here.
-  monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-  monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
   lt, rst = tmp_path / "lt.pt", tmp_path / "rst.pt"
   _fake_one_arm_checkpoint(lt, 1)
   _fake_one_arm_checkpoint(rst, 2)
@@ -363,17 +359,20 @@ def test_bi_f_at_iteration_0_is_the_seq_pair(monkeypatch, tmp_path):
     init_lt=str(lt),
     init_rst=str(rst),
     layout=layout,
-  ).to(env.device)
+  )
   ad = MirrorAdapter(env)
   t = ad.terms(obs, "actor")
   # eval_chain's right goal is A's tracked top; give it the gated one the factored actor reads.
   t2 = dict(t)
   t2["goal_base"] = t["right_target"].clone()
   t2["goal_base"][:, 2] -= 0.05
-  want_l = OneArmActor(lt, env.device)(ad.left(t))
-  want_r = OneArmActor(rst, env.device)(ad.right(t2, base_term="goal_base")) * ad.s8
+  # Both sides on the CPU in fp32: a GPU may run the matmuls in TF32 (~1e-4 here).
   with torch.no_grad():
-    got = model.mean_of(obs["actor"])
+    want_l = OneArmActor(lt, "cpu")(ad.left(t).cpu())
+    want_r = (
+      OneArmActor(rst, "cpu")(ad.right(t2, base_term="goal_base").cpu()) * ad.s8.cpu()
+    )
+    got = model.mean_of(obs["actor"].cpu())
   assert float((got[:, layout["left_cols"]] - want_l).abs().max()) < 1e-5
   assert float((got[:, layout["right_cols"]] - want_r).abs().max()) < 1e-5
   # The std starts at the sources'.
@@ -403,21 +402,24 @@ def test_a_timed_out_right_hand_off_freezes_the_right_ladder(monkeypatch):
   term = env.action_manager.get_term("joint_pos")
   k = term.arm_index("right")
   idx = list(env.reward_manager.active_terms).index("right_ladder")
-  env.episode_length_buf[:] = round(bi.RIGHT_HANDOFF_TIMEOUT_S / env.step_dt)
-  _step(env, 1)
-  assert bool(term.by_timeout[:, k].all()) and bool((term.phase[:, k] > 0).all())
-  frozen = env.reward_manager._step_reward[:, idx].clone()
-  # Whatever happens to B now, the right's income stays where the time-out found it.
-  b = env.scene[bi.CUBE_B]
-  pose = b.data.root_link_pose_w.clone()
-  pose[:, :3] = env.scene["object"].data.root_link_pos_w + torch.tensor(
-    [0.0, 0.0, 0.05], device=env.device
-  )
-  b.write_root_link_pose_to_sim(pose)
-  _step(env, 3)
-  assert torch.allclose(env.reward_manager._step_reward[:, idx], frozen)
-  # A hand-off by release and lift is not a time-out.
-  env.reset()
+  with (
+    torch.inference_mode()
+  ):  # the env's buffers are inference tensors once it has stepped
+    env.episode_length_buf[:] = round(bi.RIGHT_HANDOFF_TIMEOUT_S / env.step_dt)
+    _step(env, 1)
+    assert bool(term.by_timeout[:, k].all()) and bool((term.phase[:, k] > 0).all())
+    frozen = env.reward_manager._step_reward[:, idx].clone()
+    # Whatever happens to B now, the right's income stays where the time-out found it.
+    b = env.scene[bi.CUBE_B]
+    pose = b.data.root_link_pose_w.clone()
+    pose[:, :3] = env.scene["object"].data.root_link_pos_w + torch.tensor(
+      [0.0, 0.0, 0.05], device=env.device
+    )
+    b.write_root_link_pose_to_sim(pose)
+    _step(env, 3)
+    assert torch.allclose(env.reward_manager._step_reward[:, idx], frozen)
+    # A reset clears the record.
+    env.reset()
   assert not bool(term.by_timeout.any())
 
 
