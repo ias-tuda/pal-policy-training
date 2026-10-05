@@ -52,13 +52,17 @@ _ROBOT = SceneEntityCfg("robot")
 class GraspWindow:
   """Where the cube's centre must be in the TCP frame to count as "in the grasp", m.
 
-  From WC-c s1 @ 5500's `grasp_calibration.json` (12 MuJoCo reference grasps, cube in TCP at
-  the jaw's onset: x -0.7..0.6 cm, y -0.9..1.9 cm, z 3.4..6.7 cm, median z 4.9 cm), widened as
-  the plan says: x +/-2 cm, y +/-2.5 cm, z 3-7.5 cm."""
+  The plan took x +/-2, y +/-2.5, z 3-7.5 cm from WC-c s1 @ 5500's `grasp_calibration.json` (12
+  MuJoCo reference grasps). Step 0 (2026-10-05, IAS) measured it in this sim instead: WC-c s1 @
+  5500's first two-pad contact over 192 eval episodes has the cube at x -0.9..0.9, y -1.7..3.8
+  (p99 3.0), z 0.3..7.2 cm (p01 1.3, median 5.0), and the scripted grasp at z 0.4-0.6 cm -- which
+  the plan's z >= 3 cm locked out (G held the script's jaw open through its whole close phase).
+  So: x +/-2, y +/-3, z 0-7.5 cm. The upper z is the plan's: the jaw may close from ~2.5 cm above
+  the policy's usual grasp height, no earlier."""
 
   x: float = 0.02
-  y: float = 0.025
-  z: tuple[float, float] = (0.03, 0.075)
+  y: float = 0.03
+  z: tuple[float, float] = (0.0, 0.075)
 
 
 GRASP_WINDOW = GraspWindow()
