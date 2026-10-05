@@ -5,7 +5,7 @@
 * each code adds what it says and nothing else -- no observation or command changes, and the
   action keeps its width, which is what lets WC-c s1 @ 5500 resume under it;
 * the grasp window is in the TCP frame, and holds the cube at WC-c's own grasps;
-* NP: a cube slid 3 cm before any grasp costs the full penalty, a reset clears it;
+* NP: a cube slid 3.5 cm before any grasp costs the full penalty, a reset clears it;
 * JO: a closed jaw away from the cube costs its angle;
 * G / OVR: the jaw command is capped while the observed cube is outside the window, free inside.
 
@@ -133,7 +133,7 @@ def test_each_code_adds_only_its_terms(monkeypatch, code):
 
 def test_the_codes_weights():
   c = pre.PREGRASP_CODES
-  assert (c["NP"].push_weight, pre.NP_DEADBAND, pre.NP_SPAN) == (-2.0, 0.008, 0.02)
+  assert (c["NP"].push_weight, pre.NP_DEADBAND, pre.NP_SPAN) == (-2.0, 0.010, 0.02)
   assert c["JO"].open_weight == -1.0
   assert c["G"].gate_cap == 0.03 and c["OVR"].gate_cap == 0.0
   s = c["S"]
@@ -237,11 +237,11 @@ def test_np_prices_a_slid_cube_and_a_reset_clears_it(s_env):
   assert (st.push < 0.002).all(), st.push
   push = env.reward_manager.get_term_cfg("pregrasp_push")
   assert (push.func(env, **push.params) == 0).all()
-  _move_cube(env, (0.03, 0.0))
+  _move_cube(env, (0.035, 0.0))
   env.sim.forward()
   env.step(_zero(env))
   got = push.func(env, **push.params)
-  assert (st.push > 0.025).all(), st.push
+  assert (st.push > 0.03).all(), st.push
   assert (got == 1.0).all(), got
   env.reset()
   env.step(_zero(env))
