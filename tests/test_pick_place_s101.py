@@ -214,7 +214,8 @@ def test_every_box_is_in_the_area_clear_of_the_cube_at_any_yaw(monkeypatch):
   yaws = []
   for episode in range(3):
     if episode:
-      env.reset()
+      with torch.inference_mode():
+        env.reset()
     _hold(env, 2)
     centre = mdp.events._surface_centre_xy(env, table)
     rel = box.data.root_link_pos_w[:, :2] - centre
