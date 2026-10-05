@@ -135,6 +135,9 @@ HH_CONTACT_FORCE = 1.0
 
 #: The left's hand-off in training: the eval's trigger, or this far into the episode (s).
 LEFT_HANDOFF_TIMEOUT_S = 9.0
+#: Plan S11.2 decision 5: the right's training hand-off (``HANDOFF_TRAIN=both``) on its own release and lift, or at this
+#: time-out -- a safety net that pays no release, leave or success level (`mdp.right_ladder`).
+RIGHT_HANDOFF_TIMEOUT_S = 14.0
 #: BI-JM's placed-A start: the share of episodes, A about T (+/- m, the T draw's own +/- 1 cm keeps
 #: |A - T| inside the 2.5 cm "at T"), its yaw (+/- rad; the plan's placeholder before step 0's
 #: L-T measurement).
@@ -702,7 +705,8 @@ def make_bimanual_env_cfg(
   critic_terms["left_handed_off"] = ObservationTermCfg(
     func=mdp.handoff_active, params={"arm": "left"}
   )
-  if reward == "S12-BI":
+  if reward == "S12-BI" or right_target == "gated":
+    # A_latched for the critic; with INIT=seq also the KL mask of the right half (`bimanual_policy.JointPPO`).
     critic_terms["a_latched"] = ObservationTermCfg(
       func=mdp.a_latched, params={"gate": _gate_dict(gate)}
     )
@@ -741,14 +745,24 @@ def make_bimanual_env_cfg(
   )
   left_placed = cfg.rewards["placed"]
   right_placed = right_rewards["placed"]
+  rp = right_placed.params
+  right_gate = {
+    "command_name": rp["command_name"],
+    "object_name": rp["object_name"],
+    "grasp_sensor_name": rp["grasp_sensor_name"],
+    "support_sensor_name": rp["support_sensor_name"],
+    "jaw_cfg": rp["jaw_cfg"],
+    "jaw_open": rp["jaw_open"],
+    "threshold": rp["threshold"],
+    "velocity_threshold": 0.05,
+  }
   if reward == "S12-BI":
     _apply_ladders(cfg, left, right, left_placed, gate)
 
   # -- The hand-off controller on both arms; the left's own trigger in training (and the right's). --
   p = left_placed.params
   trigger = _trigger(p, LEFT_HANDOFF_TIMEOUT_S)
-  # The right's has no time-out: in training it hands off once it has let go and lifted clear, or never.
-  right_trigger = _trigger(right_placed.params, math.inf)
+  right_trigger = _trigger(right_placed.params, RIGHT_HANDOFF_TIMEOUT_S)
   cfg.actions["joint_pos"] = with_handoff(
     cfg.actions["joint_pos"],
     arms=(
@@ -808,10 +822,23 @@ def make_bimanual_env_cfg(
       cfg.metrics[f"start_{kind}"] = MetricsTermCfg(
         func=mdp.start_kind_is, params={"kind": k}, reduce="last"
       )
-      if reward == "S12-BI":
-        cfg.metrics[f"tower_{kind}"] = MetricsTermCfg(
-          func=mdp.tower_of_start, params={"kind": k}, reduce="last"
-        )
+      cfg.metrics[f"tower_{kind}"] = MetricsTermCfg(
+        func=mdp.tower_of_start,
+        params={"kind": k, "gate": _gate_dict(gate), "right_gate": right_gate},
+        reduce="last",
+      )
+  if (
+    reward == "S12-BI"
+    or start == "hold"
+    or right_target == "gated"
+    or handoff_train == "both"
+  ):
+    # Plan S11.2: every code logs the tower (both returns' state) as its episodes end, whatever its reward.
+    cfg.metrics["tower_standing"] = MetricsTermCfg(
+      func=mdp.tower_standing,
+      params={"gate": _gate_dict(gate), "right_gate": right_gate},
+      reduce="last",
+    )
   if play:
     from pal_mjlab.tasks.manipulation.tabletop_env_cfg import apply_play_overrides
 

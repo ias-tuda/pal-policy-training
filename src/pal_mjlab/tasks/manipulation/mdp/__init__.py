@@ -94,6 +94,7 @@ from .ladder import (
   right_target_gated,
   start_kind_is,
   tower_of_start,
+  tower_standing,
 )
 from .observations import (
   commanded_target_rel,
@@ -191,6 +192,7 @@ __all__ = [
   "right_target_gated",
   "start_kind_is",
   "tower_of_start",
+  "tower_standing",
   # Plan S10, the box.
   "BoxGoalCommand",
   "BoxGoalCommandCfg",

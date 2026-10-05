@@ -11,9 +11,11 @@ its critic warm-up and KL to the SEQ pair, and a per-dimension std log for every
   and the action std starts at the sources' (not PPO-stack's 0.35).
 * `JointPPO` -- rsl_rl 5.4.2's PPO with: a critic warm-up (the first ``critic_warmup_iterations`` updates
   train the value function only, the actor and the adaptive learning rate frozen); a KL term
-  ``lambda_k KL(pi_SEQ || pi)`` on the batch, ``lambda_k`` falling linearly from ``kl_coef`` to 0 over
-  ``kl_anneal_iterations`` (Kickstarting), the teacher being the factored actor as initialised (= SEQ); and
-  every action dimension's std in the loss log (``std/<joint>``).
+  ``lambda_k KL(pi_SEQ || pi)`` on the batch, ``lambda_k`` at ``kl_coef`` for ``kl_hold_iterations`` updates and
+  then linearly to 0 at ``kl_anneal_iterations`` (Kickstarting; plan S11.2 decision 3: 1 until 250, 0 at 1 k), the
+  teacher being the factored actor as initialised (= SEQ) -- the left half always, the right half only on samples
+  where A is latched and the left handed off (before that SEQ's right waits at home, and pulling towards it would
+  stop the right fetching B early); and every action dimension's std in the loss log (``std/<joint>``).
 * `prepare_train_cfg` -- called by `runner.ManipulationRunner` before rsl_rl builds the models: reads the
   actor observation's layout and the action columns off the env and puts them into the cfg.
 
@@ -83,14 +85,21 @@ class JointPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   class_name: str = PPO_CLASS
   kl_coef: float = 0.0
   """lambda_0 of the KL to the SEQ teacher; 0: none (every code but BI-F / BI-FS)."""
+  kl_hold_iterations: int = 0
+  """The KL weight stays at ``kl_coef`` this many updates, then falls linearly to 0 at ``kl_anneal_iterations``."""
   kl_anneal_iterations: int = 0
   critic_warmup_iterations: int = 0
   action_names: list | None = None
   """Filled by `prepare_train_cfg`: the action term's target names, for the std log."""
+  kl_layout: dict | None = None
+  """Filled by `prepare_train_cfg` for a KL run: the two halves' action columns and the critic slices of
+  ``a_latched`` and ``left_handed_off`` (the right's KL counts only once both hold, decision 3)."""
 
 
-#: BI-F's schedule (plan S11.2): 50 iterations of critic only, the KL from 1 to 0 over 1000.
+#: BI-F's schedule (plan S11.2 decision 3): 50 iterations of critic only; the KL weight 1 until iteration 250, then
+#: linearly to 0 at 1000; the left towards L-T throughout, the right only once A is latched and the left handed off.
 SEQ_KL_COEF = 1.0
+SEQ_KL_HOLD = 250
 SEQ_KL_ANNEAL = 1000
 SEQ_CRITIC_WARMUP = 50
 
@@ -106,6 +115,7 @@ def apply_joint_rl_cfg(cfg, init: str, init_lt: str | None, init_rst: str | None
     actor.pop("class_name", None)
     cfg.actor = FactoredModelCfg(**actor, init_lt=init_lt, init_rst=init_rst)
     cfg.algorithm.kl_coef = SEQ_KL_COEF
+    cfg.algorithm.kl_hold_iterations = SEQ_KL_HOLD
     cfg.algorithm.kl_anneal_iterations = SEQ_KL_ANNEAL
     cfg.algorithm.critic_warmup_iterations = SEQ_CRITIC_WARMUP
   return cfg
@@ -174,7 +184,25 @@ def prepare_train_cfg(env, train_cfg: dict) -> None:
   term = env.action_manager.get_term("joint_pos")
   alg["action_names"] = [n.split("/")[-1] for n in term.target_names]
   if train_cfg.get("actor", {}).get("class_name") == MODEL_CLASS:
-    train_cfg["actor"]["layout"] = layout_of(env)
+    layout = layout_of(env)
+    train_cfg["actor"]["layout"] = layout
+    mgr = env.observation_manager
+    critic, i = {}, 0
+    for name, shape in zip(
+      mgr.active_terms["critic"], mgr.group_obs_term_dim["critic"], strict=True
+    ):
+      w = int(torch.tensor(shape).prod())
+      critic[name] = [i, i + w]
+      i += w
+    missing = [t for t in ("a_latched", "left_handed_off") if t not in critic]
+    if missing:
+      raise ValueError(f"the KL mask needs critic terms {missing}")
+    alg["kl_layout"] = {
+      "left_cols": layout["left_cols"],
+      "right_cols": layout["right_cols"],
+      "a_latched": critic["a_latched"],
+      "left_handed_off": critic["left_handed_off"],
+    }
 
 
 def mirror_quat(q: torch.Tensor) -> torch.Tensor:
@@ -385,13 +413,13 @@ class _OnnxFactored(nn.Module):
     return ["actions"]
 
 
-def _gaussian_kl(mu_t, std_t, mu_s, std_s) -> torch.Tensor:
-  """KL(N(mu_t, std_t) || N(mu_s, std_s)) summed over the action dimensions. (B,)"""
+def _gaussian_kl_dims(mu_t, std_t, mu_s, std_s) -> torch.Tensor:
+  """KL(N(mu_t, std_t) || N(mu_s, std_s)) per action dimension. (B, A)"""
   return (
     torch.log(std_s / std_t)
     + (std_t.square() + (mu_t - mu_s).square()) / (2.0 * std_s.square())
     - 0.5
-  ).sum(-1)
+  )
 
 
 class JointPPO(PPO):
@@ -403,9 +431,11 @@ class JointPPO(PPO):
     critic,
     storage,
     kl_coef: float = 0.0,
+    kl_hold_iterations: int = 0,
     kl_anneal_iterations: int = 0,
     critic_warmup_iterations: int = 0,
     action_names: list | None = None,
+    kl_layout: dict | None = None,
     **kwargs: Any,
   ) -> None:
     if kwargs.get("rnd_cfg") or kwargs.get("symmetry_cfg"):
@@ -414,23 +444,45 @@ class JointPPO(PPO):
     if actor.is_recurrent or critic.is_recurrent:
       raise ValueError("JointPPO is for feed-forward models")
     self.kl_coef = float(kl_coef)
+    self.kl_hold_iterations = int(kl_hold_iterations)
     self.kl_anneal_iterations = int(kl_anneal_iterations)
+    self.kl_layout = kl_layout
     self.critic_warmup_iterations = int(critic_warmup_iterations)
     self.action_names = list(action_names or [])
     self.updates_done = 0
     self.teacher = None
     if self.kl_coef > 0.0:
+      if kl_layout is None:
+        raise ValueError("the KL to SEQ needs kl_layout (prepare_train_cfg)")
       # The actor as initialised: for BI-F that is the SEQ pair exactly.
       self.teacher = copy.deepcopy(self._raw_actor).eval()
       for p in self.teacher.parameters():
         p.requires_grad_(False)
 
   def kl_weight(self) -> float:
+    """``kl_coef`` until ``kl_hold_iterations`` updates, then linearly to 0 at ``kl_anneal_iterations``."""
     if self.teacher is None:
       return 0.0
-    if self.kl_anneal_iterations <= 0:
+    u, hold, end = self.updates_done, self.kl_hold_iterations, self.kl_anneal_iterations
+    if u < hold:
       return self.kl_coef
-    return self.kl_coef * max(0.0, 1.0 - self.updates_done / self.kl_anneal_iterations)
+    if end <= hold:
+      return self.kl_coef if end <= 0 else 0.0
+    return self.kl_coef * max(0.0, 1.0 - (u - hold) / (end - hold))
+
+  def kl_to_teacher(
+    self, critic_obs: torch.Tensor, mu_t, std_t, mu_s, std_s
+  ) -> torch.Tensor:
+    """Decision 3's KL, per sample: the left half always, the right half only where A is latched and the left
+    handed off (read from the critic's inputs). (B,)"""
+    kl = _gaussian_kl_dims(mu_t, std_t, mu_s, std_s)
+    lay = self.kl_layout
+    a0, a1 = lay["a_latched"]
+    h0, h1 = lay["left_handed_off"]
+    mask = (critic_obs[:, a0:a1] > 0.5).all(-1) & (critic_obs[:, h0:h1] > 0.5).all(-1)
+    return kl[:, lay["left_cols"]].sum(-1) + mask.float() * kl[
+      :, lay["right_cols"]
+    ].sum(-1)
 
   def update(self) -> dict[str, float]:
     warm = self.updates_done < self.critic_warmup_iterations
@@ -497,8 +549,12 @@ class JointPPO(PPO):
         with torch.no_grad():
           self.teacher(batch.observations, stochastic_output=True)
           mu_t, std_t = self.teacher.output_mean, self.teacher.output_std
-        kl_seq = _gaussian_kl(
-          mu_t, std_t, self.actor.output_mean, self.actor.output_std
+        kl_seq = self.kl_to_teacher(
+          batch.observations["critic"],
+          mu_t,
+          std_t,
+          self.actor.output_mean,
+          self.actor.output_std,
         ).mean()
 
       loss = self.value_loss_coef * value_loss

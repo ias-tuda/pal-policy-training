@@ -128,7 +128,8 @@ def test_every_level_of_each_ladder_beats_every_lower_one():
   # The plan's hover ceiling 2.45 < stacked floor 4 < released floor 6 < success 8.
   assert ladder.RIGHT_FLOORS[2] + ladder.SHAPE == pytest.approx(2.45)
   assert ladder.RIGHT_FLOORS[3:] == (4.0, 6.0, 8.0)
-  # Knocking A once never costs more than w_A, and w_A is below one step's gap R2 -> R3, x the ladder's scale.
+  # Decision 1: each stacking gap (2 floors x the scale) >= 2 x the ledger's p99 right-side penalty (5.6); w_A ~ one gap.
+  assert 2.0 * ladder.LADDER_SCALE >= 2 * 5.6
   assert -ladder.A_MOVED_WEIGHT == pytest.approx(2.0 * ladder.LADDER_SCALE)
 
 
@@ -391,3 +392,56 @@ def test_the_mirror_quaternion_is_the_frame_map():
   want = quat_from_matrix(m @ matrix_from_quat(q) @ f @ m)
   want = torch.where(want[:, :1] < 0, -want, want)
   assert torch.allclose(bp.mirror_quat(q), want, atol=1e-5)
+
+
+def test_a_timed_out_right_hand_off_freezes_the_right_ladder(monkeypatch):
+  """Decision 5: the right's 14 s time-out is a safety net -- the jaw it opens pays no release, leave or success."""
+  env = _env(monkeypatch, "BI-S", num_envs=2)
+  term = env.action_manager.get_term("joint_pos")
+  k = term.arm_index("right")
+  idx = list(env.reward_manager.active_terms).index("right_ladder")
+  env.episode_length_buf[:] = round(bi.RIGHT_HANDOFF_TIMEOUT_S / env.step_dt)
+  _step(env, 1)
+  assert bool(term.by_timeout[:, k].all()) and bool((term.phase[:, k] > 0).all())
+  frozen = env.reward_manager._step_reward[:, idx].clone()
+  # Whatever happens to B now, the right's income stays where the time-out found it.
+  b = env.scene[bi.CUBE_B]
+  pose = b.data.root_link_pose_w.clone()
+  pose[:, :3] = env.scene["object"].data.root_link_pos_w + torch.tensor(
+    [0.0, 0.0, 0.05], device=env.device
+  )
+  b.write_root_link_pose_to_sim(pose)
+  _step(env, 3)
+  assert torch.allclose(env.reward_manager._step_reward[:, idx], frozen)
+  # A hand-off by release and lift is not a time-out.
+  env.reset()
+  assert not bool(term.by_timeout.any())
+
+
+def test_the_kl_holds_then_anneals_and_the_right_waits_for_the_latch():
+  """Decision 3: weight 1 to update 250, linear to 0 at 1000; the right's KL only where A is latched and the left
+  handed off."""
+  ppo = bp.JointPPO.__new__(bp.JointPPO)
+  ppo.teacher = object()
+  ppo.kl_coef, ppo.kl_hold_iterations, ppo.kl_anneal_iterations = 1.0, 250, 1000
+  for u, w in ((0, 1.0), (249, 1.0), (250, 1.0), (625, 0.5), (1000, 0.0), (2000, 0.0)):
+    ppo.updates_done = u
+    assert ppo.kl_weight() == pytest.approx(w)
+  ppo.kl_layout = {
+    "left_cols": [0],
+    "right_cols": [1],
+    "a_latched": [0, 1],
+    "left_handed_off": [1, 2],
+  }
+  mu_t = torch.zeros(4, 2)
+  std = torch.ones(4, 2)
+  mu_s = torch.ones(4, 2)  # each dimension's KL = 0.5
+  critic = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+  kl = ppo.kl_to_teacher(critic, mu_t, std, mu_s, std)
+  assert kl.tolist() == [0.5, 0.5, 0.5, 1.0]
+
+
+def test_every_s112_code_logs_the_tower(monkeypatch):
+  for code, changes in (("BI-S", {}), ("BI-J", {"HANDOFF_TRAIN": "both"})):
+    cfg = _cfg(monkeypatch, code, **changes)
+    assert cfg.metrics["tower_standing"].reduce == "last"

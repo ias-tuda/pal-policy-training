@@ -42,11 +42,13 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
-#: The ladders' weight: plan S11.2's floors (2.45 / 4 / 6 / 8) scaled to the units the rest of the reward is in.
-#: Step 0's ledger: the SEQ chain's right half earns 10-22 per step (x dt) under S11-BI between the hover and
-#: the return home; x 2.5 puts R5 (20) at that level, so the regularisers, P, AH10 and HH keep their weight.
-LADDER_SCALE = 2.5
-#: w_A, the one-off cost of pushing A off its latched pose, in ladder units (plan: 2), x `LADDER_SCALE`.
+#: The ladders' weight (plan S11.2 decision 1: every gap between adjacent levels >= 2 x the largest per-step
+#: penalty the right takes while stacking, as step 0's ledger measures it). Ledger (SEQ chain, 64 episodes, S11-BI,
+#: 11 160 steps with the right driven and not handed off; reward per step / dt): the right-side penalties sum to
+#: p99 5.6 (HH clearance 5.0 in 24 % of the steps, the effort hinge up to 12.1 in 1 %). The stacking levels
+#: R2 -> R5 are 2 floors apart, so x 6 makes each gap 12 >= 2 x 5.6 (and >= the largest effort spike).
+LADDER_SCALE = 6.0
+#: w_A, the one-off cost of pushing A off its latched pose: one level gap (decision 1), 2 floors x `LADDER_SCALE`.
 A_MOVED_WEIGHT = -2.0 * LADDER_SCALE
 #: A pushed this far from its reference is one displacement event, m.
 A_MOVED = 0.01
@@ -83,6 +85,7 @@ _A_LATCHED = "_pp_a_latched"
 _A_REF = "_pp_a_ref"
 _A_STEP = "_pp_a_latch_step"
 _LEFT_FROZEN = "_pp_left_frozen"
+_RIGHT_FROZEN = "_pp_right_frozen"
 _LEFT_VALUE = "_pp_left_frozen_value"
 _LEVEL = "_pp_ladder_level"
 
@@ -276,10 +279,23 @@ def right_levels(
 
 
 def right_ladder(env: ManagerBasedRlEnv, **params) -> torch.Tensor:
-  """The right's ladder (`right_levels`); keeps the level per env for the metrics. (B,)"""
+  """The right's ladder (`right_levels`); keeps the level per env for the metrics. A hand-off started by the right's
+  time-out (decision 5: a safety net) freezes the ladder at the level and value reached then, so the jaw it opens
+  pays no release, leave or success. (B,)"""
   level, reward = right_levels(env, **params)
-  _levels(env)["right"] = level
-  return reward
+  term = env.action_manager.get_term("joint_pos")
+  timed_out = term.by_timeout[:, term.arm_index("right")]
+  frozen = _buf(
+    env, _RIGHT_FROZEN, torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  )
+  value = _buf(env, "_pp_right_frozen_value", reward)
+  frozen_level = _buf(env, "_pp_right_frozen_level", level)
+  fresh = timed_out & ~frozen
+  value[fresh] = reward[fresh]
+  frozen_level[fresh] = level[fresh]
+  frozen |= fresh
+  _levels(env)["right"] = torch.where(frozen, frozen_level, level)
+  return torch.where(frozen, value, reward)
 
 
 def left_levels(
@@ -386,7 +402,7 @@ def arm_arm_clearance_before_left_handoff(
 def reset_ladder_state(env: ManagerBasedRlEnv, env_ids: torch.Tensor) -> None:
   """Reset event: clear A_latched, its reference and the left's freeze. Must run before any start event that
   sets them (`bimanual.hold_start`)."""
-  for name in (_A_LATCHED, _LEFT_FROZEN):
+  for name in (_A_LATCHED, _LEFT_FROZEN, _RIGHT_FROZEN):
     buf = getattr(env, name, None)
     if buf is not None:
       buf[env_ids] = False
@@ -429,7 +445,21 @@ def start_kind_is(env: ManagerBasedRlEnv, kind: int) -> torch.Tensor:
   return (k == kind).float()
 
 
-def tower_of_start(env: ManagerBasedRlEnv, kind: int) -> torch.Tensor:
-  """1 while the right's ladder is at R5 (the tower stands, both hands away) in an episode that started as
-  ``kind``; with ``reduce="last"`` the share of such episodes that end with a tower, among all. (B,)"""
-  return ladder_level_is(env, "right", 5) * start_kind_is(env, kind)
+def tower_standing(
+  env: ManagerBasedRlEnv, gate: dict, right_gate: dict
+) -> torch.Tensor:
+  """1 while the tower stands with both hands handed off -- A placed at T (the left's gate), B placed on A (the
+  right's J-placed predicate on its stack goal, `eval_bimanual`'s right gate) and both arms past the policy phase --
+  whatever the reward; a metric (``reduce="last"``: the share of episodes that end with it). (B,)"""
+  from pal_mjlab.tasks.manipulation.mdp.bimanual import base_placed_bool
+
+  a = base_placed_bool(env, **_resolve(env, gate))
+  b = base_placed_bool(env, **_resolve(env, right_gate))
+  return (a & b & (_phase(env, "left") > 0) & (_phase(env, "right") > 0)).float()
+
+
+def tower_of_start(
+  env: ManagerBasedRlEnv, kind: int, gate: dict, right_gate: dict
+) -> torch.Tensor:
+  """`tower_standing` in an episode that started as ``kind`` (hold starts reported apart). (B,)"""
+  return tower_standing(env, gate, right_gate) * start_kind_is(env, kind)

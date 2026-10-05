@@ -146,6 +146,9 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
     n, k = self.num_envs, len(self._arms)
     self.phase = torch.zeros(n, k, dtype=torch.long, device=self.device)
     self.handed_step = torch.full((n, k), -1, dtype=torch.long, device=self.device)
+    #: Whether an arm's hand-off was started by its trigger's time-out rather than its release and lift (plan S11.2:
+    #: a timed-out hand-off pays no release, leave or success level).
+    self.by_timeout = torch.zeros(n, k, dtype=torch.bool, device=self.device)
     self._leg_steps = torch.zeros(n, k, dtype=torch.long, device=self.device)
     self._clear_steps = torch.zeros(n, k, dtype=torch.long, device=self.device)
     self._hold_pos = torch.zeros(n, k, 3, device=self.device)
@@ -225,6 +228,8 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
       )
       by_lift = self._clear_steps[:, k] >= HANDOFF_CLEAR_STEPS
       by_time = env.episode_length_buf.float() * env.step_dt >= t.timeout_s
+      fresh = (by_lift | by_time) & (self.phase[:, k] == POLICY)
+      self.by_timeout[:, k] |= fresh & ~by_lift
       self.start_handoff(k, by_lift | by_time)
 
   def _jacobian(self, k: int) -> torch.Tensor:
@@ -329,6 +334,7 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
       env_ids = slice(None)
     self.phase[env_ids] = POLICY
     self.handed_step[env_ids] = -1
+    self.by_timeout[env_ids] = False
     self._leg_steps[env_ids] = 0
     self._clear_steps[env_ids] = 0
     state = getattr(self._env, START_STATE, None)
