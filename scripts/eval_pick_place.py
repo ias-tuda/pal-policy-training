@@ -1063,6 +1063,7 @@ class PregraspTally:
     zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
     zl = lambda: torch.zeros(n, dtype=torch.long, device=dev)  # noqa: E731
     self.spawn = torch.zeros(n, 2, device=dev)
+    self.cube_tcp = torch.zeros(n, 3, device=dev)
     self.push, self.jaw_arrival, self.rel_yaw = zf(), zf(), zf()
     self.grasped, self.arrived, self.prev_high = zb(), zb(), zb()
     self.attempts, self.t_grasp, self.capped, self.armed = zl(), zl(), zl(), zl()
@@ -1091,6 +1092,9 @@ class PregraspTally:
     self.t_grasp = torch.where(onset, env.episode_length_buf.long(), self.t_grasp)
     yaw = pg.grasp_relative_yaw(env, OBJECT, self._tcp)
     self.rel_yaw = torch.where(onset, yaw, self.rel_yaw)
+    self.cube_tcp = torch.where(
+      onset.unsqueeze(-1), pg.cube_in_tcp(env, pos, self._tcp), self.cube_tcp
+    )
     self.grasped |= grasped
     if self._gate is not None:
       self.capped += self._gate.capped.long()
@@ -1109,12 +1113,13 @@ class PregraspTally:
           "first_try_grasp": g and int(self.attempts[i]) <= 1,
           "t_grasp_s": int(self.t_grasp[i]) * step_dt if g else None,
           "grasp_rel_yaw_deg": math.degrees(float(self.rel_yaw[i])) if g else None,
+          "cube_in_tcp_at_grasp_cm": (self.cube_tcp[i] * 100).tolist() if g else None,
           "stall": not g,
           "pregrasp_gate_capped_steps": int(self.capped[i]),
           "pregrasp_gate_armed_steps": int(self.armed[i]),
         }
       )
-    for t in (self.push, self.jaw_arrival, self.rel_yaw):
+    for t in (self.push, self.jaw_arrival, self.rel_yaw, self.cube_tcp):
       t[env_ids] = 0.0
     for t in (self.grasped, self.arrived, self.prev_high):
       t[env_ids] = False
