@@ -95,6 +95,7 @@ def _buf(env: ManagerBasedRlEnv, name: str, like: torch.Tensor) -> torch.Tensor:
   return value
 
 
+_ROBOT = SceneEntityCfg("robot")
 _RESOLVED: set[int] = set()
 
 
@@ -112,7 +113,9 @@ def _g(x: torch.Tensor, std: float) -> torch.Tensor:
   return torch.exp(-torch.square(x / std))
 
 
-def _open(env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float) -> torch.Tensor:
+def _open(
+  env: ManagerBasedRlEnv, jaw_cfg: SceneEntityCfg, jaw_open: float
+) -> torch.Tensor:
   q = env.scene[jaw_cfg.name].data.joint_pos[:, jaw_cfg.joint_ids][:, 0]
   return ((OPEN_HOLD - q) / (OPEN_HOLD - jaw_open)).clamp(0.0, 1.0)
 
@@ -140,14 +143,18 @@ def _fetch(
   return 0.9 * (reach + grasp + 2.0 * lift) / 4.0
 
 
-def update_a_latch(env: ManagerBasedRlEnv, gate: dict) -> tuple[torch.Tensor, torch.Tensor]:
+def update_a_latch(
+  env: ManagerBasedRlEnv, gate: dict
+) -> tuple[torch.Tensor, torch.Tensor]:
   """A_latched and the displacement event of this step: (latched (B,), moved (B,)). Updated once per env step
   (the first reader of the step; `common_step_counter` guards a second read), so every term sees the same
   latch. ``gate`` is `bimanual.base_placed_bool`'s parameters."""
   from pal_mjlab.tasks.manipulation.mdp.bimanual import base_placed_bool
 
   a = env.scene[gate["object_name"]].data.root_link_pos_w
-  latched = _buf(env, _A_LATCHED, torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+  latched = _buf(
+    env, _A_LATCHED, torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  )
   ref = _buf(env, _A_REF, a)
   step = getattr(env, _A_STEP, None)
   moved_attr = "_pp_a_moved"
@@ -251,7 +258,9 @@ def right_levels(
     [
       _fetch(env, object_name, tcp_cfg, grasp_sensor_name, surface_cfg),
       0.5 * _g(torch.norm(tcp - wait, dim=-1), WAIT_STD),
-      SHAPE * 0.5 * (
+      SHAPE
+      * 0.5
+      * (
         _g(torch.norm(torch.stack([st.dxy, geo["dz"]], -1), dim=-1), NEAR_STD)
         + _g(st.tilt, ALIGN_STD) * _g(st.yaw, ALIGN_STD)
       ),
@@ -317,8 +326,11 @@ def left_levels(
       _fetch(env, object_name, tcp_cfg, grasp_sensor_name, surface_cfg),
       SHAPE * _g(torch.norm(d, dim=-1), CARRY_STD),
       SHAPE * _open(env, jaw_cfg, jaw_open),
-      SHAPE * 0.5 * (
-        (above / RETREAT_HEIGHT).clamp(0.0, 1.0) + ((q - floor) / (1.0 - floor)).clamp(0.0, 1.0)
+      SHAPE
+      * 0.5
+      * (
+        (above / RETREAT_HEIGHT).clamp(0.0, 1.0)
+        + ((q - floor) / (1.0 - floor)).clamp(0.0, 1.0)
       ),
     ],
     dim=-1,
@@ -331,7 +343,9 @@ def left_levels(
 def left_ladder(env: ManagerBasedRlEnv, **params) -> torch.Tensor:
   """The left's ladder, frozen at its value on the step the left's hand-off starts (phase > policy). (B,)"""
   level, reward = left_levels(env, **params)
-  frozen = _buf(env, _LEFT_FROZEN, torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+  frozen = _buf(
+    env, _LEFT_FROZEN, torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  )
   value = _buf(env, _LEFT_VALUE, reward)
   frozen_level = _buf(env, "_pp_left_frozen_level", level)
   fresh = (_phase(env, "left") > 0) & ~frozen
@@ -359,7 +373,9 @@ def ladder_level_is(env: ManagerBasedRlEnv, arm: str, level: int) -> torch.Tenso
   return (lv == level).float()
 
 
-def arm_arm_clearance_before_left_handoff(env: ManagerBasedRlEnv, margin: float) -> torch.Tensor:
+def arm_arm_clearance_before_left_handoff(
+  env: ManagerBasedRlEnv, margin: float
+) -> torch.Tensor:
   """S11's HH clearance penalty until the left's hand-off starts, 0 after (plan S11.2: the contact term only,
   so the margin cannot hold the right above the tower). (B,)"""
   from pal_mjlab.tasks.manipulation.mdp.bimanual import arm_arm_clearance_penalty
@@ -385,7 +401,7 @@ def right_target_gated(
   lag: tuple[int, int] | None,
   target_command_name: str,
   gate: dict,
-  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  asset_cfg: SceneEntityCfg = _ROBOT,
 ) -> torch.Tensor:
   """Plan S11.2's BI-F: the right's goal as the actor sees it, gated on A_latched -- the wait point (T +
   `WAIT_OFFSET`) before, A's tracked top after (R-ST's own `target_pos`, `stack_goal_position_tracked_b`),
@@ -394,7 +410,9 @@ def right_target_gated(
   from pal_mjlab.tasks.manipulation.mdp.observations import _to_base_frame
 
   latched, _ = update_a_latch(env, gate)
-  stack = stack_goal_position_tracked_b(env, base_name, object_name, bias_key, asset_cfg, lag)
+  stack = stack_goal_position_tracked_b(
+    env, base_name, object_name, bias_key, asset_cfg, lag
+  )
   wait_w = env.command_manager.get_term(target_command_name).command + torch.tensor(
     WAIT_OFFSET, device=env.device
   )

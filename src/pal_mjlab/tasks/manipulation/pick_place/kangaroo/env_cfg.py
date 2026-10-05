@@ -97,16 +97,14 @@ from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
 )
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   HANDOFF_TRAINS,
+  handoff_arm,
+  make_bimanual_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   REWARDS as BIMANUAL_REWARDS,
 )
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   STARTS as BIMANUAL_STARTS,
-)
-from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
-  handoff_arm,
-  make_bimanual_env_cfg,
 )
 from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BoxGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
@@ -471,8 +469,12 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
     init = _select(INIT_ENV_VAR, "scratch", INITS)
     paths = {k: os.environ.get(k) for k in (INIT_LT_ENV_VAR, INIT_RST_ENV_VAR)}
     if init == "seq" and not all(paths.values()):
-      raise ValueError(f"{INIT_ENV_VAR}=seq needs {INIT_LT_ENV_VAR} and {INIT_RST_ENV_VAR}")
+      raise ValueError(
+        f"{INIT_ENV_VAR}=seq needs {INIT_LT_ENV_VAR} and {INIT_RST_ENV_VAR}"
+      )
     if init == "scratch" and any(paths.values()):
-      raise ValueError(f"{INIT_LT_ENV_VAR} / {INIT_RST_ENV_VAR} are {INIT_ENV_VAR}=seq's")
+      raise ValueError(
+        f"{INIT_LT_ENV_VAR} / {INIT_RST_ENV_VAR} are {INIT_ENV_VAR}=seq's"
+      )
     cfg = apply_joint_rl_cfg(cfg, init, paths[INIT_LT_ENV_VAR], paths[INIT_RST_ENV_VAR])
   return cfg

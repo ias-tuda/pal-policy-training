@@ -158,7 +158,16 @@ PLACED_SHARE = 0.2
 START_KINDS = {"scratch": 0, "placed": 1, "hold": 2}
 #: The terms `S12-BI` replaces by the ladders: each half's task terms (the left's, and the right's with
 #: `right_`), and SA.
-LADDER_REPLACES = ("reach", "grasp", "lift", "goal", "goal_near", "release", "placed", "retreat")
+LADDER_REPLACES = (
+  "reach",
+  "grasp",
+  "lift",
+  "goal",
+  "goal_near",
+  "release",
+  "placed",
+  "retreat",
+)
 
 
 def _rename(value, mapping: dict[str, str]):
@@ -284,7 +293,9 @@ def place_a_at_t(
   )  # fmt: skip
 
 
-def _start_home(env: ManagerBasedRlEnv, arm: str, env_ids: torch.Tensor, pick: torch.Tensor) -> None:
+def _start_home(
+  env: ManagerBasedRlEnv, arm: str, env_ids: torch.Tensor, pick: torch.Tensor
+) -> None:
   """Mark ``env_ids[pick]`` to start with ``arm`` handed off at home (`handoff.START_HOME`), the rest not."""
   start = getattr(env, START_HOME, None)
   if start is None:
@@ -433,19 +444,33 @@ def hold_start(
   kind = getattr(env, "_pp_start_kind", None)
   if kind is None:
     kind = torch.zeros(env.num_envs, dtype=torch.long, device=device)
-    setattr(env, "_pp_start_kind", kind)
+    env._pp_start_kind = kind
   kind[env_ids] = torch.where(
-    hold, START_KINDS["hold"], torch.where(placed, START_KINDS["placed"], START_KINDS["scratch"])
+    hold,
+    START_KINDS["hold"],
+    torch.where(placed, START_KINDS["placed"], START_KINDS["scratch"]),
   )
   _start_home(env, "left", env_ids, hold | placed)
-  latch_params = (command_name, object_name, grasp_sensor_name, support_sensor_name, surface_cfg, jaw_cfg, jaw_open)
+  latch_params = (
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
   if bool(placed.any()):
     _put_a_at_t(env, env_ids[placed], half_xy, yaw, None, None, latch_params)
 
   state = getattr(env, START_STATE, None)
   term = env.action_manager.get_term("joint_pos")
   if state is None:
-    servo = term._servo if term._servo_idx is not None else torch.zeros(env.num_envs, 0, device=device)
+    servo = (
+      term._servo
+      if term._servo_idx is not None
+      else torch.zeros(env.num_envs, 0, device=device)
+    )
     state = {
       "mask": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
       "target": torch.zeros_like(term._last_target),
@@ -464,7 +489,9 @@ def hold_start(
   robot = env.scene[ROBOT]
   robot.write_joint_state_to_sim(bank["q"][rows], bank["qd"][rows], env_ids=ids)
   origin = env.scene.env_origins[ids]
-  _put_a_at_t(env, ids, 0.0, 0.0, bank["a_pos"][rows, :2], bank["a_quat"][rows], latch_params)
+  _put_a_at_t(
+    env, ids, 0.0, 0.0, bank["a_pos"][rows, :2], bank["a_quat"][rows], latch_params
+  )
   b = env.scene[CUBE_B]
   b.write_root_link_pose_to_sim(
     torch.cat([origin + bank["b_pos"][rows], bank["b_quat"][rows]], dim=-1), env_ids=ids
@@ -797,7 +824,11 @@ def _apply_ladders(cfg, left, right, left_placed: RewardTermCfg, gate: dict) -> 
   contact stay as they are."""
   from pal_mjlab.tasks.manipulation.mdp import ladder
 
-  drop = {*LADDER_REPLACES, *(f"right_{n}" for n in LADDER_REPLACES), "right_stack_align"}
+  drop = {
+    *LADDER_REPLACES,
+    *(f"right_{n}" for n in LADDER_REPLACES),
+    "right_stack_align",
+  }
   missing = sorted(n for n in drop if n not in cfg.rewards)
   if missing:
     raise ValueError(f"S12-BI replaces terms this cfg does not have: {missing}")

@@ -62,19 +62,6 @@ from .box import (
   set_box_geometry,
   tracker_bias,
 )
-from .ladder import (
-  a_displaced,
-  a_latched,
-  a_latched_flag,
-  arm_arm_clearance_before_left_handoff,
-  ladder_level_is,
-  left_ladder,
-  reset_ladder_state,
-  right_ladder,
-  right_target_gated,
-  start_kind_is,
-  tower_of_start,
-)
 from .commands import (
   EntityOffsetCommand,
   EntityOffsetCommandCfg,
@@ -94,6 +81,19 @@ from .handoff import (
   HandoffJointPositionActionCfg,
   HandoffTriggerCfg,
   with_handoff,
+)
+from .ladder import (
+  a_displaced,
+  a_latched,
+  a_latched_flag,
+  arm_arm_clearance_before_left_handoff,
+  ladder_level_is,
+  left_ladder,
+  reset_ladder_state,
+  right_ladder,
+  right_target_gated,
+  start_kind_is,
+  tower_of_start,
 )
 from .observations import (
   commanded_target_rel,
@@ -179,6 +179,18 @@ __all__ = [
   "when_base_placed",
   "reference_displacement_penalty",
   "stack_goal_position_tracked_b",
+  # Plan S11.2, the ladders (S12-BI).
+  "a_displaced",
+  "a_latched",
+  "a_latched_flag",
+  "arm_arm_clearance_before_left_handoff",
+  "ladder_level_is",
+  "left_ladder",
+  "reset_ladder_state",
+  "right_ladder",
+  "right_target_gated",
+  "start_kind_is",
+  "tower_of_start",
   # Plan S10, the box.
   "BoxGoalCommand",
   "BoxGoalCommandCfg",

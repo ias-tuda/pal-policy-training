@@ -36,7 +36,16 @@ from rsl_rl.modules import MLP, EmpiricalNormalization
 from rsl_rl.utils import resolve_callable
 
 #: The actor terms each half reads (the one-arm 38-D order, `eval_chain.ONE_ARM_TERMS`), and its extra term.
-LEFT_TERMS = ("joint_pos", "joint_vel", "actions", "tcp_pos", "tcp_quat", "object_pos", "object_yaw", "target_pos")
+LEFT_TERMS = (
+  "joint_pos",
+  "joint_vel",
+  "actions",
+  "tcp_pos",
+  "tcp_quat",
+  "object_pos",
+  "object_yaw",
+  "target_pos",
+)
 RIGHT_TERMS = (
   "joint_pos",
   "joint_vel",
@@ -103,7 +112,9 @@ def apply_joint_rl_cfg(cfg, init: str, init_lt: str | None, init_rst: str | None
 
 
 def _term_joints(env, term: str) -> list[str]:
-  cfg = dataclasses.replace(env.cfg.observations["actor"].terms[term].params["asset_cfg"])
+  cfg = dataclasses.replace(
+    env.cfg.observations["actor"].terms[term].params["asset_cfg"]
+  )
   cfg.resolve(env.scene)
   robot = env.scene["robot"]
   ids = cfg.joint_ids
@@ -118,7 +129,9 @@ def layout_of(env) -> dict:
 
   mgr = env.observation_manager
   slices, i = {}, 0
-  for name, shape in zip(mgr.active_terms["actor"], mgr.group_obs_term_dim["actor"], strict=True):
+  for name, shape in zip(
+    mgr.active_terms["actor"], mgr.group_obs_term_dim["actor"], strict=True
+  ):
     w = int(torch.tensor(shape).prod())
     slices[name] = [i, i + w]
     i += w
@@ -146,7 +159,9 @@ def layout_of(env) -> dict:
   }
   missing = [t for t in (*LEFT_TERMS, *RIGHT_TERMS) if t not in slices]
   if missing:
-    raise ValueError(f"the factored actor needs actor terms {missing} (INIT=seq builds right_target)")
+    raise ValueError(
+      f"the factored actor needs actor terms {missing} (INIT=seq builds right_target)"
+    )
   return out
 
 
@@ -247,12 +262,18 @@ class FactoredArmModel(MLPModel):
   ) -> None:
     nn.Module.__init__(self)
     if layout is None:
-      raise ValueError("FactoredArmModel needs the env's layout (runner.ManipulationRunner fills it)")
+      raise ValueError(
+        "FactoredArmModel needs the env's layout (runner.ManipulationRunner fills it)"
+      )
     if output_dim != 16 or distribution_cfg is None or not obs_normalization:
-      raise ValueError("FactoredArmModel is JOINT's 16-D stochastic actor with normalisation")
+      raise ValueError(
+        "FactoredArmModel is JOINT's 16-D stochastic actor with normalisation"
+      )
     self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
     if self.obs_dim != layout["obs_dim"]:
-      raise ValueError(f"actor observation {self.obs_dim}-D, layout {layout['obs_dim']}-D")
+      raise ValueError(
+        f"actor observation {self.obs_dim}-D, layout {layout['obs_dim']}-D"
+      )
     self.obs_normalization = True
     self.obs_normalizer = nn.Identity()  # each half normalises its own input
     self.halves = _Halves(layout)
@@ -270,7 +291,11 @@ class FactoredArmModel(MLPModel):
     """Copy each source actor into its half: the first layer widened by the zero-weighted other-TCP columns,
     the normaliser's statistics (new columns mean 0 / var 1) and count, the std into the half's action
     columns."""
-    log_std = self.distribution.log_std_param if hasattr(self.distribution, "log_std_param") else None
+    log_std = (
+      self.distribution.log_std_param
+      if hasattr(self.distribution, "log_std_param")
+      else None
+    )
     if log_std is None:
       raise ValueError("FactoredArmModel expects PPO-stack's log-space std")
     for path, mlp, norm, cols in (
@@ -301,7 +326,9 @@ class FactoredArmModel(MLPModel):
   def get_latent(self, obs, masks=None, hidden_state=None) -> torch.Tensor:
     return torch.cat([obs[g] for g in self.obs_groups], dim=-1)
 
-  def forward(self, obs, masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
+  def forward(
+    self, obs, masks=None, hidden_state=None, stochastic_output: bool = False
+  ) -> torch.Tensor:
     x = self.get_latent(obs, masks, hidden_state)
     mean = self.mean_of(x)
     if stochastic_output:
@@ -409,22 +436,37 @@ class JointPPO(PPO):
     warm = self.updates_done < self.critic_warmup_iterations
     lam_kl = self.kl_weight()
     mean_value_loss = mean_surrogate_loss = mean_entropy = mean_kl_seq = 0.0
-    generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+    generator = self.storage.mini_batch_generator(
+      self.num_mini_batches, self.num_learning_epochs
+    )
     for batch in generator:
       original_batch_size = batch.observations.batch_size[0]
       if self.normalize_advantage_per_mini_batch:
         with torch.no_grad():
-          batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
-      self.actor(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[0], stochastic_output=True)
+          batch.advantages = (batch.advantages - batch.advantages.mean()) / (
+            batch.advantages.std() + 1e-8
+          )
+      self.actor(
+        batch.observations,
+        masks=batch.masks,
+        hidden_state=batch.hidden_states[0],
+        stochastic_output=True,
+      )
       actions_log_prob = self.actor.get_output_log_prob(batch.actions)
-      values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-      distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+      values = self.critic(
+        batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
+      )
+      distribution_params = tuple(
+        p[:original_batch_size] for p in self.actor.output_distribution_params
+      )
       entropy = self.actor.output_entropy[:original_batch_size]
 
       # The adaptive learning rate reads the actor's KL; while the actor is frozen it would only grow.
       if self.desired_kl is not None and self.schedule == "adaptive" and not warm:
         with torch.inference_mode():
-          kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)
+          kl = self.actor.get_kl_divergence(
+            batch.old_distribution_params, distribution_params
+          )
           kl_mean = torch.mean(kl)
           if kl_mean > self.desired_kl * 2.0:
             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -441,7 +483,9 @@ class JointPPO(PPO):
       surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
       if self.use_clipped_value_loss:
-        value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+        value_clipped = batch.values + (values - batch.values).clamp(
+          -self.clip_param, self.clip_param
+        )
         value_losses = (values - batch.returns).pow(2)
         value_losses_clipped = (value_clipped - batch.returns).pow(2)
         value_loss = torch.max(value_losses, value_losses_clipped).mean()
@@ -453,11 +497,15 @@ class JointPPO(PPO):
         with torch.no_grad():
           self.teacher(batch.observations, stochastic_output=True)
           mu_t, std_t = self.teacher.output_mean, self.teacher.output_std
-        kl_seq = _gaussian_kl(mu_t, std_t, self.actor.output_mean, self.actor.output_std).mean()
+        kl_seq = _gaussian_kl(
+          mu_t, std_t, self.actor.output_mean, self.actor.output_std
+        ).mean()
 
       loss = self.value_loss_coef * value_loss
       if not warm:
-        loss = loss + surrogate_loss - self.entropy_coef * entropy.mean() + lam_kl * kl_seq
+        loss = (
+          loss + surrogate_loss - self.entropy_coef * entropy.mean() + lam_kl * kl_seq
+        )
 
       self.optimizer.zero_grad()
       loss.backward()

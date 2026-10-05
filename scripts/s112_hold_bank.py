@@ -56,12 +56,11 @@ def main(argv=None) -> None:
   args = parse_args(argv)
   from eval_bimanual import Reads, build_env
   from eval_chain import MirrorAdapter, OneArmActor
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
   from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
   from pal_mjlab.tasks.manipulation.mdp.handoff import HOME, OUT
   from pal_mjlab.tasks.manipulation.mdp.observations import _grasped_bool
   from pal_mjlab.tasks.manipulation.pick_place import bimanual as bi
-
-  from mjlab.managers.scene_entity_config import SceneEntityCfg
 
   env = build_env(args)
   ad = MirrorAdapter(env)
@@ -77,7 +76,8 @@ def main(argv=None) -> None:
   right_timeout = round(args.right_timeout / env.step_dt)
   k_left = term.arm_index("left")
   rows: dict[str, list] = {
-    k: [] for k in "q qd a_pos a_quat b_pos b_quat b_vel target servo step goal_offset table_z".split()
+    k: []
+    for k in "q qd a_pos a_quat b_pos b_quat b_vel target servo step goal_offset table_z".split()
   }
   finished = 0
   obs, _ = env.reset()
@@ -115,11 +115,19 @@ def main(argv=None) -> None:
           rows["b_quat"].append(b_ent.data.root_link_quat_w[ids].clone())
           rows["b_vel"].append(b_ent.data.root_link_vel_w[ids].clone())
           rows["target"].append(term._last_target[ids].clone())
-          servo = term._servo if term._servo_idx is not None else torch.zeros(env.num_envs, 0, device=env.device)
+          servo = (
+            term._servo
+            if term._servo_idx is not None
+            else torch.zeros(env.num_envs, 0, device=env.device)
+          )
           rows["servo"].append(servo[ids].clone())
           rows["step"].append(step[ids].clone())
-          rows["goal_offset"].append((goal.command[:, :2] - origins[:, :2])[ids].clone())
-          rows["table_z"].append((surface_top_z(env, table) - origins[:, 2])[ids].clone())
+          rows["goal_offset"].append(
+            (goal.command[:, :2] - origins[:, :2])[ids].clone()
+          )
+          rows["table_z"].append(
+            (surface_top_z(env, table) - origins[:, 2])[ids].clone()
+          )
       obs, _, term_done, trunc, _ = env.step(ad.actions(a_l, a_r))
       done = torch.nonzero(term_done | trunc, as_tuple=False).flatten()
       if done.numel():
@@ -128,20 +136,36 @@ def main(argv=None) -> None:
   bank = {k: torch.cat(v).cpu() if v else torch.zeros(0) for k, v in rows.items()}
   bank["joint_names"] = list(robot.joint_names)
   bank["target_names"] = [n.split("/")[-1] for n in term.target_names]
-  bank["source"] = {"lt": str(args.lt), "rst": str(args.rst), "episodes": finished, "seed": args.seed, "every": EVERY}
+  bank["source"] = {
+    "lt": str(args.lt),
+    "rst": str(args.rst),
+    "episodes": finished,
+    "seed": args.seed,
+    "every": EVERY,
+  }
   n = len(bank["step"])
   gaps = (bank["b_pos"][:, 2] - bank["a_pos"][:, 2] - 0.05) if n else torch.zeros(0)
   summary = {
     "snapshots": n,
     "episodes": finished,
-    "step_min_median_max": [int(bank["step"].min()), int(bank["step"].median()), int(bank["step"].max())] if n else None,
+    "step_min_median_max": [
+      int(bank["step"].min()),
+      int(bank["step"].median()),
+      int(bank["step"].max()),
+    ]
+    if n
+    else None,
     "gap_cm_median": float(gaps.median() * 100) if n else None,
-    "table_z_spread_mm": float((bank["table_z"].max() - bank["table_z"].min()) * 1000) if n else None,
+    "table_z_spread_mm": float((bank["table_z"].max() - bank["table_z"].min()) * 1000)
+    if n
+    else None,
   }
   bank["summary"] = summary
   args.out.parent.mkdir(parents=True, exist_ok=True)
   torch.save(bank, args.out)
-  (args.out.with_suffix(".json")).write_text(json.dumps({**summary, "source": bank["source"]}, indent=1))
+  (args.out.with_suffix(".json")).write_text(
+    json.dumps({**summary, "source": bank["source"]}, indent=1)
+  )
   print(json.dumps(summary, indent=1))
   env.close()
 

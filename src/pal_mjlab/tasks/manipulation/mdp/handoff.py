@@ -317,7 +317,9 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
     self._pending = None
     self._env.episode_length_buf[ids] = clock
     self.handed_step[ids] = torch.where(
-      self.handed_step[ids] >= 0, clock.unsqueeze(-1).expand_as(self.handed_step[ids]), -1
+      self.handed_step[ids] >= 0,
+      clock.unsqueeze(-1).expand_as(self.handed_step[ids]),
+      -1,
     )
     self._env.command_manager.get_term(command).set_offsets(ids, offsets)
 
@@ -337,7 +339,12 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
         self._last_target[ids] = state["target"][ids]
         if self._servo_idx is not None:
           self._servo[ids] = state["servo"][ids]
-        self._pending = (ids, state["clock"][ids], state["goal_offset"][ids], state["command"])
+        self._pending = (
+          ids,
+          state["clock"][ids],
+          state["goal_offset"][ids],
+          state["command"],
+        )
     start = getattr(self._env, START_HOME, None) or {}
     for k, arm in enumerate(self._arms):
       home = start.get(arm["cfg"].name)

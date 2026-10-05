@@ -87,7 +87,9 @@ class GateParts:
       & _jaw_open_bool(env, p["jaw_cfg"], p["jaw_open"]),
       "a_still": torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
       < p.get("velocity_threshold", 0.05),
-      "was_lifted": _was_lifted_bool(env, p["grasp_sensor_name"], p["support_sensor_name"]),
+      "was_lifted": _was_lifted_bool(
+        env, p["grasp_sensor_name"], p["support_sensor_name"]
+      ),
       "no_left_pad": ~_pad_contact_any(env, p["grasp_sensor_name"]),
     }
     gate = torch.ones_like(parts["at_t"])
@@ -219,7 +221,10 @@ def ledger(args) -> dict:
       }
     flick = None
     if mom["touch"] is not None:
-      lo, hi = max(mom["touch"] - GATE_WINDOW, 0), min(mom["touch"] + GATE_WINDOW + 1, end)
+      lo, hi = (
+        max(mom["touch"] - GATE_WINDOW, 0),
+        min(mom["touch"] + GATE_WINDOW + 1, end),
+      )
       g = L["gate"][k, lo:hi]
       drops = np.flatnonzero(g[:-1] & ~g[1:])
       causes = []
@@ -232,13 +237,24 @@ def ledger(args) -> dict:
         "steps_off": int((~g).sum()),
         "causes": causes,
       }
-    per_ep.append({"id": k, "moments": mom, "income": income, "gate_at_touch": flick, "success": rows[k]["success"]})
+    per_ep.append(
+      {
+        "id": k,
+        "moments": mom,
+        "income": income,
+        "gate_at_touch": flick,
+        "success": rows[k]["success"],
+      }
+    )
 
   def med(m, g):
     v = [e["income"][m][g] for e in per_ep if m in e["income"]]
     return (statistics.median(v), len(v)) if v else (None, 0)
 
-  table = {m: {g: med(m, g) for g in ("right", "left", "shared", "hh", "total")} for m in MOMENTS}
+  table = {
+    m: {g: med(m, g) for g in ("right", "left", "shared", "hh", "total")}
+    for m in MOMENTS
+  }
   # The right's terms at each moment, median over the episodes that reach it.
   term_table = {}
   for m in MOMENTS:
@@ -280,7 +296,9 @@ def joint(args) -> dict:
 
   args.episode_s = args.episode_s or 25.0
   args.right_timeout = args.right_timeout or 19.0
-  sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)["actor_state_dict"]
+  sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)[
+    "actor_state_dict"
+  ]
   std_key = next(k for k in sd if k.startswith("distribution.") and "std" in k)
   std = sd[std_key].float()
   if "log_std" in std_key:
@@ -290,7 +308,6 @@ def joint(args) -> dict:
   term = env.action_manager.get_term("joint_pos")
   tnames = [x.split("/")[-1] for x in term.target_names]
   reads = Reads(env)
-  robot = env.scene["robot"]
   a_ent, b_ent = env.scene["object"], env.scene[bi.CUBE_B]
   right_timeout = round(args.right_timeout / env.step_dt)
   n = env.num_envs
@@ -318,7 +335,9 @@ def joint(args) -> dict:
       over = torch.norm((b - a)[:, :2], dim=-1) < 0.03
       ph_l = term.phase[:, term.arm_index("left")]
       a_placed = reads._last["a_placed"]
-      for i in torch.nonzero((cmin < CLOSE) & (done_at < 0), as_tuple=False).flatten().tolist():
+      for i in (
+        torch.nonzero((cmin < CLOSE) & (done_at < 0), as_tuple=False).flatten().tolist()
+      ):
         if ph_l[i] == 0 and not bool(a_placed[i]):
           label = "left placing A"
         elif ph_l[i] > 0 and ph_l[i] < 3:
@@ -330,7 +349,9 @@ def joint(args) -> dict:
         else:
           label = "other"
         k = int(arg[i])
-        close_log.append((i, t_step, float(cmin[i]), f"L-{cap[k // m]} / R-{cap[k % m]}", label))
+        close_log.append(
+          (i, t_step, float(cmin[i]), f"L-{cap[k // m]} / R-{cap[k % m]}", label)
+        )
       actions = policy(obs)
       obs, _, dones, _ = wrapped.step(actions)
       done = dones.bool() & (done_at < 0)
@@ -370,8 +391,18 @@ def main(argv=None) -> None:
   args.num_envs = args.episodes
   args.out.mkdir(parents=True, exist_ok=True)
   out = ledger(args) if args.mode == "ledger" else joint(args)
-  name = "ledger.json" if args.mode == "ledger" else f"joint_{args.checkpoint.parent.name[-6:]}_{args.checkpoint.stem}.json"
-  (args.out / name).write_text(json.dumps(out, indent=1, default=lambda o: None if isinstance(o, float) and math.isnan(o) else str(o)))
+  name = (
+    "ledger.json"
+    if args.mode == "ledger"
+    else f"joint_{args.checkpoint.parent.name[-6:]}_{args.checkpoint.stem}.json"
+  )
+  (args.out / name).write_text(
+    json.dumps(
+      out,
+      indent=1,
+      default=lambda o: None if isinstance(o, float) and math.isnan(o) else str(o),
+    )
+  )
   slim = {k: v for k, v in out.items() if k not in ("episodes",)}
   print(json.dumps(slim, indent=1, default=str)[:12000])
 
