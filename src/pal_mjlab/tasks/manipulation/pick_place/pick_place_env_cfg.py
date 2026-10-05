@@ -778,7 +778,8 @@ def make_pick_place_env_cfg(
     baseline.target_half_xy,
     baseline.table_top_z,
     GOAL_THRESHOLD,
-    area=None if target_area is None else (target_area.x, target_area.y),
+    # The target area is the box's only with a box; without one it is S7-8's goal area, built above.
+    area=None if target_area is None or box is None else (target_area.x, target_area.y),
     pose_obs=box_obs == "pose",
   )
   cfg.curriculum = reward_curriculum_cfg()

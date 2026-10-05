@@ -192,6 +192,15 @@ def test_target_b_with_the_s10_observation_is_bx_c(monkeypatch):
   assert not rl.widen_actor_on_resume and rl.widen_critic_on_resume
 
 
+def test_the_wide_area_table_task_is_unchanged(monkeypatch):
+  """``TARGET=WC`` with the table goal (DEP1's WC-c) builds S7-8's goal command, no box."""
+  cfg = _cfg(monkeypatch, GOAL=None, BOX_OBS=None)
+  assert "box" not in cfg.scene.entities
+  assert cfg.commands["goal_pose"].min_object_distance == pytest.approx(0.10)
+  assert cfg.events["reset_objects"].params["goal_area"]["distance"] == pytest.approx(0.10)
+  assert list(cfg.observations["actor"].terms)[-1] == "target_pos"
+
+
 def test_the_combinations_not_built_are_refused(monkeypatch):
   with pytest.raises(ValueError, match="cannot keep a box"):
     _cfg(monkeypatch, SPAWN="WCK", TARGET="WCK")
