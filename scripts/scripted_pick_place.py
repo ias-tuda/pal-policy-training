@@ -667,6 +667,7 @@ def rollout(
   goal: str = "table",
   gate: str = "none",
   base_spawns: list[tuple[tuple[float, float], float]] | None = None,
+  pregrasp=None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -730,6 +731,9 @@ def rollout(
   arrives square to the base (`place_hand_x`), and ``base_spawns`` puts env ``i``'s base cube at
   ``base_spawns[i]`` = ((x, y), yaw) in the env frame (moved with the table, like a forced spawn).
   Rows carry ``gate_locked_steps`` (steps the lock refused an opening) and ``gate_armed_steps``.
+
+  Plan S7-11: ``pregrasp`` (`pregrasp.PREGRASP_CODES` entry, None for none) builds the env with a
+  ``PREGRASP`` code -- G's gate must let the script's grasp through.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -760,6 +764,7 @@ def rollout(
     **({} if shape is None else {"shape": shape}),
     goal=goal,
     gate=gate,
+    pregrasp=pregrasp,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -1343,6 +1348,11 @@ def parse_args() -> argparse.Namespace:
     action="store_true",
     help="plan S7-10: arm 1-6's lowest point over the table, per phase and link",
   )
+  r.add_argument(
+    "--pregrasp",
+    default="none",
+    help="PREGRASP_CODES name (plan S7-11: none | watch | NP | JO | G | S | OVR)",
+  )
   r.add_argument("--json", type=pathlib.Path, default=None)
   m = sub.add_parser(
     "map", help="action-space reach map over a spawn grid (plan S7 P2)"
@@ -1428,6 +1438,7 @@ def main() -> None:
   from pal_mjlab.tasks.manipulation import tabletop_env_cfg as tt
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
   from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+  from pal_mjlab.tasks.manipulation.pick_place.pregrasp import PREGRASP_CODES
   from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
 
   arm_hook = ArmClearanceHook() if args.arm_clearance else None
@@ -1463,6 +1474,7 @@ def main() -> None:
     if args.base_corners
     else None,
     hook=arm_hook,
+    pregrasp=PREGRASP_CODES[args.pregrasp],
   )
   if arm_hook is not None:
     arm_hook.report(rows)

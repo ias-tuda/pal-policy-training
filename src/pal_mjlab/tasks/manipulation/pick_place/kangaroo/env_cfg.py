@@ -61,6 +61,10 @@ Plan S7-10 adds `ARM_TABLE` (`none` | `watch` | `AC` | `AH` | `AT`, `arm_table.A
 the driven arm's links 1-6 against the table -- a sensor only (`watch`, for the eval), a contact
 penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (AT). Unset is
 `none`, every run up to S7-9.
+Plan S7-11 adds `PREGRASP` (`none` | `watch` | `NP` | `JO` | `G` | `S` | `OVR`,
+`pregrasp.PREGRASP_CODES`): the jaw open before the grasp -- a push penalty (NP), the jaw angle
+priced on the approach (JO), a cap on the commanded jaw outside the grasp window (G; OVR is the
+deployer's eval-only version), or NP + JO + the grasp's yaw alignment (S). Unset is `none`.
 """
 
 from __future__ import annotations
@@ -88,6 +92,7 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   TOOL_SPEED_CAPS,
   make_pick_place_env_cfg,
 )
+from pal_mjlab.tasks.manipulation.pick_place.pregrasp import PREGRASP_CODES
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
@@ -127,6 +132,7 @@ GOAL_ENV_VAR = "GOAL"
 GATE_ENV_VAR = "GATE"
 CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
+PREGRASP_ENV_VAR = "PREGRASP"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -151,6 +157,7 @@ DEFAULT_CRITIC_OBS = "base"
 #: latch (PQ). Whether the critic gets the two extra inputs.
 CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
+DEFAULT_PREGRASP = "none"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -273,6 +280,9 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     critic_release=_critic_release(),
     arm_table=ARM_TABLE_CODES[
       _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    pregrasp=PREGRASP_CODES[
+      _select(PREGRASP_ENV_VAR, DEFAULT_PREGRASP, PREGRASP_CODES)
     ],
   )
 
