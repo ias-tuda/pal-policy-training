@@ -184,6 +184,16 @@ if [ "$CRITIC_OBS" != "base" ]; then
   S79_NAME="_critic${CRITIC_OBS}"
   S79_TAG=",\"critic${CRITIC_OBS}\""
 fi
+# Plan S10.1 (`pick_place/box.py`): BOX_OBS is what the actor sees of the box -- goal (the goal point
+# computed from the box, every S10 / DEP1 run) | pose (the box's position and its yaw as (cos 4psi,
+# sin 4psi); a resume widens the loaded actor and critic). The box on the wide area is TARGET=WC with a
+# box GOAL. In the run name and the tags only when set.
+BOX_OBS="${BOX_OBS:-goal}"
+export BOX_OBS
+if [ "$BOX_OBS" != "goal" ]; then
+  S79_NAME="${S79_NAME}_boxobs${BOX_OBS}"
+  S79_TAG="${S79_TAG},\"boxobs${BOX_OBS}\""
+fi
 
 # Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT | AH10 -- arm 1-6 against
 # the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
@@ -226,7 +236,7 @@ if ! uv run --extra cu128 python -c \
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
-    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} did not validate." >&2
+    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} BOX_OBS=$BOX_OBS did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -253,7 +263,7 @@ echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
-echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
+echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"

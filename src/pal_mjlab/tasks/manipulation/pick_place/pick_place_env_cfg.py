@@ -39,7 +39,13 @@ from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
   ArmTableCfg,
   apply_arm_table,
 )
-from pal_mjlab.tasks.manipulation.pick_place.box import BoxGoal, apply_box_goal
+from pal_mjlab.tasks.manipulation.pick_place.box import (
+  BOX_MIN_SEPARATION,
+  BOX_OBS_NAMES,
+  BoxGoal,
+  append_critic_box_yaw,
+  apply_box_goal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
@@ -434,14 +440,15 @@ def _object_pose_range(spawn: SpawnBox) -> dict[str, tuple[float, float]]:
   }
 
 
-def _goal_area(area: SpawnBox) -> dict:
+def _goal_area(area: SpawnBox, distance: float = TARGET_MIN_SEPARATION) -> dict:
   """``reset_objects_on_surface``'s ``goal_area`` for a target area: its x and y about the table
-  centre, and `TARGET_MIN_SEPARATION`."""
+  centre, and the distance the goal keeps from the cube (`TARGET_MIN_SEPARATION`; plan S10.1's box,
+  `box.BOX_MIN_SEPARATION`)."""
   cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
   return {
     "x": (area.x[0] - cx, area.x[1] - cx),
     "y": (area.y[0] - cy, area.y[1] - cy),
-    "distance": TARGET_MIN_SEPARATION,
+    "distance": distance,
   }
 
 
@@ -560,6 +567,7 @@ def make_pick_place_env_cfg(
   critic_release: bool = False,
   arm_table: ArmTableCfg | None = None,
   box: BoxGoal | None = None,
+  box_obs: str = "goal",
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -602,16 +610,22 @@ def make_pick_place_env_cfg(
     box: plan S10's box goal (``GOAL=box`` | ``box-ny`` | ``box-rim`` | ``box-dr``, `box.BOX_GOALS`) --
       put the cube into a box standing where the baseline's target box is (`box.apply_box_goal`);
       None is the goal on the table, every run before S10. With it ``goal`` stays ``table``.
+      Plan S10.1: with a ``target_area`` the box is drawn from that area at any yaw, at least
+      `box.BOX_MIN_SEPARATION` from the cube, and the let-go's yaw is graded against the box.
+    box_obs: plan S10.1's ``BOX_OBS`` (`box.BOX_OBS_NAMES`): ``goal`` -- the actor sees the goal point
+      computed from the box, S10 -- or ``pose``: the box's own position in that slot and its yaw
+      (cos 4 psi, sin 4 psi) appended, actor and critic. Needs ``box``.
   """
+  if box_obs not in BOX_OBS_NAMES:
+    raise ValueError(f"unknown box observation {box_obs!r}; have {BOX_OBS_NAMES}")
+  if box_obs != "goal" and box is None:
+    raise ValueError("BOX_OBS=pose observes the box; it needs a box GOAL (plan S10.1)")
   if box is not None and (
-    shape is not OBJECT_SHAPES["cube"]
-    or target_area is not None
-    or occlusion is not None
-    or goal != "table"
+    shape is not OBJECT_SHAPES["cube"] or occlusion is not None or goal != "table"
   ):
     raise ValueError(
-      "plan S10's box is built for the 5 cm cube, baseline B's target box, no occlusion model and "
-      "no stack goal; SHAPE, TARGET, OCC or the stack GOAL is set"
+      "plan S10's box is built for the 5 cm cube, no occlusion model and no stack goal; SHAPE, "
+      "OCC or the stack GOAL is set"
     )
   if goal not in GOALS:
     raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
@@ -671,7 +685,11 @@ def make_pick_place_env_cfg(
     stack_speed=stack_speed,
     action_mode=action_mode,
     command_obs=command_obs,
-    goal_area=None if target_area is None else _goal_area(target_area),
+    goal_area=None
+    if target_area is None
+    else _goal_area(
+      target_area, TARGET_MIN_SEPARATION if box is None else BOX_MIN_SEPARATION
+    ),
     objects={
       OBJECT: scene.get_cube_cfg(name=OBJECT),
       BASE_OBJECT: scene.get_cube_cfg(name=BASE_OBJECT, rgba=BASE_RGBA),
@@ -760,10 +778,15 @@ def make_pick_place_env_cfg(
     baseline.target_half_xy,
     baseline.table_top_z,
     GOAL_THRESHOLD,
+    area=None if target_area is None else (target_area.x, target_area.y),
+    pose_obs=box_obs == "pose",
   )
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)
+  if box_obs == "pose":
+    # Plan S10.1: last, after PQ's inputs (`box.append_critic_box_yaw`).
+    append_critic_box_yaw(cfg)
 
   success_params = {
     "command_name": COMMAND,

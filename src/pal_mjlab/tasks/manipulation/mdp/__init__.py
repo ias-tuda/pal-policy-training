@@ -44,13 +44,18 @@ from .box import (
   box_goal_position_tracked_b,
   box_inner_half,
   box_rim_z,
+  box_yaw_b,
   contact_while_held,
   object_in_box_bool,
   object_position_biased_b,
+  reset_box_in_area,
   reset_box_on_surface,
   reset_tracker_bias,
+  reset_tracker_yaw_bias,
   set_box_geometry,
   tracker_bias,
+  tracker_yaw_bias,
+  yaw_relative_to_base,
 )
 from .commands import (
   EntityOffsetCommand,
@@ -78,6 +83,7 @@ from .observations import (
   release_grade,
   release_latched,
   yaw_error_mod_90,
+  yaw_reference_quat,
 )
 from .occlusion import (
   CubeSensor,
@@ -151,6 +157,13 @@ __all__ = [
   "set_box_geometry",
   "tracker_bias",
   "yaw_error_mod_90",
+  # Plan S10.1, the box on the wide area at any yaw.
+  "box_yaw_b",
+  "reset_box_in_area",
+  "reset_tracker_yaw_bias",
+  "tracker_yaw_bias",
+  "yaw_reference_quat",
+  "yaw_relative_to_base",
   "BySize",
   "PerShape",
   "ball_mask",

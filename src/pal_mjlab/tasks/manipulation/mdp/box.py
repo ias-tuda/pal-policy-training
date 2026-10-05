@@ -10,6 +10,12 @@ The actor sees the goal through the box's own tracker (`box_goal_position_tracke
 box's pose as FoundationPose reports it, lagged like the cube's, and both poses carry a tracker
 bias split into a part shared by every object in the episode (the camera) and a part of each
 object's own (`reset_tracker_bias`; plan S9/S10: 6 + 4 mm). The critic keeps the live goal.
+
+Plan S10.1 (the box on the wide area, at any yaw): `reset_box_in_area` draws the box from an area
+of the table at least a distance from the cube, at a yaw in +/- 45 deg; with ``BOX_OBS=pose`` the
+actor sees the box itself -- its tracked position (`object_position_biased_b` on the box) and its
+yaw as (cos 4 psi, sin 4 psi) (`box_yaw_b`, 4-fold symmetric like the box) -- instead of the goal
+point; and M6's yaw grade is taken against the box (`BoxGoalCommandCfg.yaw_reference`).
 """
 
 from __future__ import annotations
@@ -24,13 +30,17 @@ from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.manipulation.mdp.commands import LiftingCommand, LiftingCommandCfg
 from mjlab.utils.lab_api.math import (
+  euler_xyz_from_quat,
   quat_apply,
   quat_from_euler_xyz,
+  quat_inv,
+  quat_mul,
   sample_uniform,
 )
 
 from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy, surface_top_z
 from pal_mjlab.tasks.manipulation.mdp.observations import (
+  _base_pose,
   _grasped_bool,
   _object_pose_w,
   _to_base_frame,
@@ -150,6 +160,11 @@ class BoxGoalCommandCfg(LiftingCommandCfg):
   """Thickness of the box floor, m (`scene.BOX_FLOOR`): its top is this far above the box's
   origin, the centre of its bottom face."""
 
+  yaw_reference: str | None = None
+  """Plan S10.1: the entity M6's yaw grade measures the object's yaw against (the box, which
+  stands at any yaw there), read by the release latch (`observations._release_latch`); None
+  measures it against the world's axes, as every S10 / DEP1 run did (box at 0 +/- 5 deg)."""
+
   # Placement belongs to a reset event, not to the command -- as for `SurfaceOffsetCommandCfg`.
   object_pose_range: LiftingCommandCfg.ObjectPoseRangeCfg | None = None
 
@@ -186,6 +201,65 @@ def reset_box_on_surface(
     zeros, zeros, sample_uniform(-yaw, yaw, (n,), device=device)
   )
   pose = torch.cat([xy, top.unsqueeze(-1), quat], dim=-1)
+  box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+  box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+
+#: Rounds of redrawing in `reset_box_in_area` before the stragglers take the area's farthest corner.
+BOX_AREA_REDRAWS = 32
+
+
+def reset_box_in_area(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  asset_cfg: SceneEntityCfg,
+  surface_cfg: SceneEntityCfg,
+  object_name: str,
+  area_x: tuple[float, float],
+  area_y: tuple[float, float],
+  yaw: float,
+  min_distance: float,
+) -> None:
+  """Plan S10.1: put the box down on the surface, its centre drawn uniformly from the area
+  (``area_x`` x ``area_y``, relative to the surface centre -- table-relative, so DR-scene's table
+  shift moves it), at least ``min_distance`` (xy, centre to centre) from the object, at a yaw drawn
+  in +/- ``yaw``, at rest.
+
+  Runs after the object's reset event and reads the object from its free joint's ``qpos`` (the
+  derived ``xpos`` is stale until the next ``forward()``, S7-8). Vectorised rejection as
+  `SurfaceOffsetCommand._draw_clear_of_object`: each round redraws only the envs still too close;
+  after `BOX_AREA_REDRAWS` rounds the stragglers take the area's corner farthest from the object,
+  which is at least ``min_distance`` away when the object was drawn where one is
+  (`events.reset_objects_on_surface`'s ``goal_area``)."""
+  n = len(env_ids)
+  device = env.device
+  box: Entity = env.scene[asset_cfg.name]
+  centre = _surface_centre_xy(env, surface_cfg)[env_ids]
+  top = surface_top_z(env, surface_cfg)[env_ids]
+  cube, _ = _free_pose(env.scene[object_name])
+  cube = cube[env_ids, :2]
+  lo = torch.tensor([area_x[0], area_y[0]], device=device)
+  hi = torch.tensor([area_x[1], area_y[1]], device=device)
+  offsets = sample_uniform(lo, hi, (n, 2), device=device)
+  for _ in range(BOX_AREA_REDRAWS):
+    too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
+    if not bool(too_close.any()):
+      break
+    redraw = sample_uniform(lo, hi, (n, 2), device=device)
+    offsets = torch.where(too_close.unsqueeze(-1), redraw, offsets)
+  too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
+  if bool(too_close.any()):
+    corners = torch.tensor(
+      [[area_x[0], area_y[0]], [area_x[0], area_y[1]], [area_x[1], area_y[0]], [area_x[1], area_y[1]]],
+      device=device,
+    )
+    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(-1)
+    offsets = torch.where(too_close.unsqueeze(-1), corners[far], offsets)
+  zeros = torch.zeros(n, device=device)
+  quat = quat_from_euler_xyz(
+    zeros, zeros, sample_uniform(-yaw, yaw, (n,), device=device)
+  )
+  pose = torch.cat([centre + offsets, top.unsqueeze(-1), quat], dim=-1)
   box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
   box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
 
@@ -328,6 +402,67 @@ def box_goal_position_tracked_b(
   if _corrupted(env):
     goal_b = goal_b + tracker_bias(env, bias_key)
   return goal_b
+
+
+#: Attribute on the env holding the per-episode yaw biases of the tracked objects, rad, per env.
+_TRACKER_YAW_BIAS = "_pal_tracker_yaw_bias"
+
+
+def reset_tracker_yaw_bias(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  half: float,
+  keys: tuple[str, ...],
+) -> None:
+  """Plan S10.1: draw this episode's tracker yaw bias for each object in ``keys``, uniform in
+  +/- ``half`` rad -- the box's own draw, as baseline B's cube yaw bias (0.03 rad). A fresh draw
+  per reset, not an accumulation."""
+  bias = getattr(env, _TRACKER_YAW_BIAS, None)
+  if bias is None:
+    bias = {}
+    setattr(env, _TRACKER_YAW_BIAS, bias)
+  for key in keys:
+    if key not in bias:
+      bias[key] = torch.zeros(env.num_envs, device=env.device)
+    bias[key][env_ids] = sample_uniform(-half, half, (len(env_ids),), device=env.device)
+
+
+def tracker_yaw_bias(env: ManagerBasedRlEnv, key: str) -> torch.Tensor:
+  """The yaw bias the tracker puts on object ``key`` this episode, rad; zero before the first
+  reset. (B,)"""
+  bias = getattr(env, _TRACKER_YAW_BIAS, {})
+  return bias.get(key, torch.zeros(env.num_envs, device=env.device))
+
+
+def yaw_relative_to_base(env: ManagerBasedRlEnv, quat_w: torch.Tensor) -> torch.Tensor:
+  """The yaw of a world orientation relative to the robot's `base_link`, rad. (B,)"""
+  _, base_q = _base_pose(env.scene[_ROBOT.name])
+  _, _, yaw = euler_xyz_from_quat(quat_mul(quat_inv(base_q), quat_w))
+  return yaw
+
+
+def box_yaw_b(
+  env: ManagerBasedRlEnv,
+  box_name: str,
+  bias_key: str | None = None,
+  noise: float = 0.0,
+  fold: int = 4,
+  lag: tuple[int, int] | None = None,
+) -> torch.Tensor:
+  """Plan S10.1's ``box_yaw``: the box's yaw psi relative to the robot base, as (cos fold psi,
+  sin fold psi) -- the same for psi and psi + 90 deg, as FoundationPose on the 4-fold symmetric box
+  may report either, and continuous across +/- 45 deg. From the box's tracker (``lag`` steps late;
+  None for the live pose); while the actor is corrupted psi carries the episode's yaw bias on
+  ``bias_key`` (`reset_tracker_yaw_bias`) and a per-step jitter uniform in +/- ``noise`` rad, both on
+  the angle, not on the encoding. (B, 2)"""
+  _, quat_w = _object_pose_w(env, box_name, lag)
+  psi = yaw_relative_to_base(env, quat_w)
+  if _corrupted(env):
+    if bias_key is not None:
+      psi = psi + tracker_yaw_bias(env, bias_key)
+    if noise > 0.0:
+      psi = psi + (2.0 * torch.rand_like(psi) - 1.0) * noise
+  return torch.stack([torch.cos(fold * psi), torch.sin(fold * psi)], dim=-1)
 
 
 def box_displacement_penalty(

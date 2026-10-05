@@ -64,6 +64,10 @@ penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (
 Plan S10 adds the box goals to `GOAL` (`box` | `box-ny` | `box-rim` | `box-dr`, `box.BOX_GOALS`): the
 cube goes into an open box standing in baseline B's target box -- BX, without the yaw grade, with a rim
 penalty, with the box's size and mass drawn. One variable for S9's and S10's goals; unset is `table`.
+Plan S10.1 puts the box on an area (`TARGET=WC` with a box `GOAL`: the box drawn from the area at any yaw,
+clear of the cube) and adds `BOX_OBS` (`goal` | `pose`, `box.BOX_OBS_NAMES`): the actor sees the goal point
+computed from the box (S10's, unset) or the box's own position and yaw; a resume widens the loaded actor
+and critic for the appended yaw.
 """
 
 from __future__ import annotations
@@ -81,7 +85,7 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
 from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
-from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BoxGoal
+from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BOX_OBS_NAMES, BoxGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
@@ -133,6 +137,7 @@ GATE_ENV_VAR = "GATE"
 CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
 BOX_FEET_ENV_VAR = "BOX_FEET"
+BOX_OBS_ENV_VAR = "BOX_OBS"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -157,6 +162,7 @@ DEFAULT_CRITIC_OBS = "base"
 #: latch (PQ). Whether the critic gets the two extra inputs.
 CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
+DEFAULT_BOX_OBS = "goal"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -282,7 +288,13 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
     ],
     box=box,
+    box_obs=_select_box_obs(),
   )
+
+
+def _select_box_obs() -> str:
+  """Plan S10.1's ``BOX_OBS``: what the actor observes of the box (`box.BOX_OBS_NAMES`)."""
+  return _select(BOX_OBS_ENV_VAR, DEFAULT_BOX_OBS, BOX_OBS_NAMES)
 
 
 def _select_goal() -> tuple[str, BoxGoal | None]:
@@ -325,6 +337,9 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
   recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
   cfg = PPO_RECIPES[recipe]("kangaroo_pick_place")
-  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9).
-  cfg.widen_critic_on_resume = _critic_release()
+  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9); plan S10.1's box pose
+  # from W2 box checkpoints without the box's yaw (actor and critic) and, from BX-RIM, without PQ.
+  box_pose = _select_box_obs() == "pose"
+  cfg.widen_critic_on_resume = _critic_release() or box_pose
+  cfg.widen_actor_on_resume = box_pose
   return cfg

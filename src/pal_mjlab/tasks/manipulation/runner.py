@@ -17,6 +17,8 @@ process would otherwise start at 0 (plan S7, "5 k plus a resume").
 `widen_critic_on_resume` (plan S7-9's PQ) lets a resume load a checkpoint whose critic had fewer
 inputs: the critic's new inputs are appended last, and the loaded critic gets zero weights (and an
 identity normaliser) for them, so the value function it resumes with is the checkpoint's.
+`widen_actor_on_resume` (plan S10.1's box yaw) does the same for the actor, so the policy it
+resumes with computes exactly the checkpoint's actions.
 
 These pieces live here rather than as edits to mjlab or rsl_rl, which are read-mostly
 dependencies (CLAUDE.md, *External Dependencies*): a cfg subclass that adds the field and a
@@ -62,40 +64,52 @@ class ManipulationRunnerCfg(RslRlOnPolicyRunnerCfg):
   """Let `load` widen a checkpoint's critic for inputs appended since it was saved (plan S7-9's PQ,
   `widen_critic_input`). Off by default: an unexpected shape mismatch should still fail."""
 
+  widen_actor_on_resume: bool = False
+  """The same for the actor (plan S10.1's box yaw, `widen_input`). Off by default."""
 
-def widen_critic_input(loaded: dict, critic: torch.nn.Module, params: list) -> int:
-  """Widen ``loaded``'s critic, in place, to ``critic``'s input width; returns the inputs added.
 
-  The new inputs are the last ones (`pick_place_env_cfg._add_critic_release` appends them). The
-  first linear layer gets zero columns for them and the observation normaliser mean 0 and std 1,
-  so the widened critic computes exactly what the saved one did. The optimiser's Adam moments of
-  that layer are padded with zeros the same way. ``params`` is the optimiser's parameter list in
-  its order (`state` is keyed by the index into it). Any other shape difference raises.
+def widen_input(
+  loaded: dict, key: str, model: torch.nn.Module, params: list
+) -> int:
+  """Widen ``loaded[key]`` (``"critic_state_dict"`` or ``"actor_state_dict"``), in place, to
+  ``model``'s input width; returns the inputs added.
+
+  The new inputs are the last ones (`pick_place_env_cfg._add_critic_release`, plan S10.1's
+  `box.append_critic_box_yaw` / ``box_yaw`` append them). The first linear layer gets zero columns
+  for them and the observation normaliser mean 0 and std 1, so the widened model computes exactly
+  what the saved one did. The optimiser's Adam moments of that layer are padded with zeros the same
+  way -- only ``model``'s own: the actor and the critic share one optimiser and may widen by
+  different amounts. ``params`` is the optimiser's parameter list in its order (`state` is keyed
+  by the index into it). Any other shape difference raises.
   """
-  saved = loaded["critic_state_dict"]
-  want = critic.state_dict()
+  what = key.removesuffix("_state_dict")
+  saved = loaded[key]
+  want = model.state_dict()
   added = None
-  for key, value in want.items():
-    old = saved[key]
+  for name, value in want.items():
+    old = saved[name]
     if old.shape == value.shape:
       continue
     if (
       old.dim() != 2 or old.shape[0] != value.shape[0] or old.shape[1] > value.shape[1]
     ):
       raise ValueError(
-        f"critic {key}: {tuple(old.shape)} cannot widen to {tuple(value.shape)}"
+        f"{what} {name}: {tuple(old.shape)} cannot widen to {tuple(value.shape)}"
       )
     extra = value.shape[1] - old.shape[1]
     if added not in (None, extra):
-      raise ValueError(f"critic {key}: widened by {extra}, another tensor by {added}")
+      raise ValueError(f"{what} {name}: widened by {extra}, another tensor by {added}")
     added = extra
-    fill = 1.0 if key.endswith(("_var", "_std")) else 0.0
+    fill = 1.0 if name.endswith(("_var", "_std")) else 0.0
     pad = torch.full((old.shape[0], extra), fill, dtype=old.dtype, device=old.device)
-    saved[key] = torch.cat([old, pad], dim=1)
+    saved[name] = torch.cat([old, pad], dim=1)
   if not added:
     return 0
+  own = {id(p) for p in model.parameters()}
   state = loaded["optimizer_state_dict"]["state"]
   for i, p in enumerate(params):
+    if id(p) not in own:
+      continue
     for name, moment in state.get(i, {}).items():
       if torch.is_tensor(moment) and moment.dim() == 2 and moment.shape != p.shape:
         assert moment.shape[0] == p.shape[0] and moment.shape[1] + added == p.shape[1]
@@ -105,6 +119,11 @@ def widen_critic_input(loaded: dict, critic: torch.nn.Module, params: list) -> i
         # A new dict: `Optimizer.state_dict` shares the inner ones with the live optimiser.
         state[i] = {**state[i], name: torch.cat([moment, pad], dim=1)}
   return added
+
+
+def widen_critic_input(loaded: dict, critic: torch.nn.Module, params: list) -> int:
+  """`widen_input` on the critic (plan S7-9's PQ)."""
+  return widen_input(loaded, "critic_state_dict", critic, params)
 
 
 class ManipulationRunner(ManipulationOnPolicyRunner):
@@ -158,16 +177,27 @@ class ManipulationRunner(ManipulationOnPolicyRunner):
     strict: bool = True,
     map_location: str | None = None,
   ) -> dict:
-    if not self.cfg.get("widen_critic_on_resume", False):
+    widen = [
+      (key, model)
+      for flag, key, model in (
+        ("widen_actor_on_resume", "actor_state_dict", self.alg._raw_actor),
+        ("widen_critic_on_resume", "critic_state_dict", self.alg._raw_critic),
+      )
+      if self.cfg.get(flag, False)
+    ]
+    if not widen:
       return super().load(path, load_cfg, strict, map_location)
     loaded = torch.load(path, map_location=map_location, weights_only=False)
     params = [p for g in self.alg.optimizer.param_groups for p in g["params"]]
-    added = widen_critic_input(loaded, self.alg._raw_critic, params)
-    if not added:
+    added = {key: widen_input(loaded, key, model, params) for key, model in widen}
+    if not any(added.values()):
       return super().load(path, load_cfg, strict, map_location)
-    print(
-      f"[INFO]: widened the critic of {path} by {added} inputs (zero weights; plan S7-9 PQ)"
-    )
+    for key, n in added.items():
+      if n:
+        print(
+          f"[INFO]: widened the {key.removesuffix('_state_dict')} of {path} by {n} inputs "
+          "(zero weights; plan S7-9 PQ / S10.1 box pose)"
+        )
     with tempfile.TemporaryDirectory() as tmp:
       widened = os.path.join(tmp, os.path.basename(path))
       torch.save(loaded, widened)
