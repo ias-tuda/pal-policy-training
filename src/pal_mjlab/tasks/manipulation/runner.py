@@ -121,7 +121,7 @@ class ManipulationRunner(ManipulationOnPolicyRunner):
     # the models (`bimanual_policy.prepare_train_cfg`; a no-op for every other recipe).
     from pal_mjlab.tasks.manipulation.bimanual_policy import prepare_train_cfg
 
-    prepare_train_cfg(env.unwrapped, train_cfg)
+    prepare_train_cfg(env, train_cfg)
     super().__init__(env, train_cfg, log_dir, device)
     # `deployment_start_config.json` and `start_observation_distribution.json` beside the
     # checkpoints, once per run (Claudius's fda9492 / a82fdf1, `origin/faster-moves`, which

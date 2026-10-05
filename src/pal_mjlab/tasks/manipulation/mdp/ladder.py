@@ -99,16 +99,15 @@ def _buf(env: ManagerBasedRlEnv, name: str, like: torch.Tensor) -> torch.Tensor:
 
 
 _ROBOT = SceneEntityCfg("robot")
-_RESOLVED: set[int] = set()
 
 
 def _resolve(env: ManagerBasedRlEnv, params: dict) -> dict:
   """Resolve the entity cfgs inside a nested parameter dict (``gate``, ``grade``): the managers resolve
-  top-level ones only. Idempotent; done once per cfg object."""
+  top-level ones only. Every call -- resolving is idempotent and cheap, and a cache keyed on the object would
+  outlive it (a freed cfg's ``id`` is reused)."""
   for v in params.values():
-    if isinstance(v, SceneEntityCfg) and id(v) not in _RESOLVED:
+    if isinstance(v, SceneEntityCfg):
       v.resolve(env.scene)
-      _RESOLVED.add(id(v))
   return params
 
 

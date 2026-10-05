@@ -181,6 +181,7 @@ def prepare_train_cfg(env, train_cfg: dict) -> None:
   alg = train_cfg.get("algorithm", {})
   if alg.get("class_name") != PPO_CLASS:
     return
+  env = env.unwrapped
   term = env.action_manager.get_term("joint_pos")
   alg["action_names"] = [n.split("/")[-1] for n in term.target_names]
   if train_cfg.get("actor", {}).get("class_name") == MODEL_CLASS:

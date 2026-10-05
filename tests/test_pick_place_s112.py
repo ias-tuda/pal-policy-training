@@ -331,6 +331,9 @@ def test_bi_f_at_iteration_0_is_the_seq_pair(monkeypatch, tmp_path):
   the gated goal) to 1e-5, the other hand's TCP not mattering yet."""
   from eval_chain import MirrorAdapter, OneArmActor
 
+  # TF32 matmuls (which an earlier test or import may switch on) differ from fp32 by ~1e-4 here.
+  monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+  monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
   lt, rst = tmp_path / "lt.pt", tmp_path / "rst.pt"
   _fake_one_arm_checkpoint(lt, 1)
   _fake_one_arm_checkpoint(rst, 2)
