@@ -1,5 +1,5 @@
 {
-"about": "Plan S9.1 / decision 0003: the red cube's pose in the blue base cube's frame (x, y, z m; qw, qx, qy, qz) at control steps 202-259 of S9 ST-GA s2 @ 3000 (render seed 0), while the closed jaw pressed it onto the base. Recorded on devbox (RTX 4080, mujoco_warp) 2026-10-05 by pen_diag.py, siwei-s9-stack @ 5510ee3. In that run mujoco_warp's GJK/EPA path gave 1-2 red-blue contacts at every one of these poses where CPU MuJoCo gives 4-6, and the cube sank 11-17 mm into the base.",
+"about": "Plan S9.1 / decision 0004: the red cube's pose in the blue base cube's frame (x, y, z m; qw, qx, qy, qz) at control steps 202-259 of S9 ST-GA s2 @ 3000 (render seed 0), while the closed jaw pressed it onto the base. Recorded on devbox (RTX 4080, mujoco_warp) 2026-10-05 by pen_diag.py, siwei-s9-stack @ 5510ee3. In that run mujoco_warp's GJK/EPA path gave 1-2 red-blue contacts at every one of these poses where CPU MuJoCo gives 4-6, and the cube sank 11-17 mm into the base.",
 "poses": [
 [
 -0.0099029,

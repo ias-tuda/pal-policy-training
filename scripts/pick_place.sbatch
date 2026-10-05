@@ -204,7 +204,7 @@ for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRA
 done
 
 # Plan S9.1 (`pick_place/kangaroo/env_cfg.py`): BASE_OBS (goal | pose: SC-Y, the stack base's yaw on the actor and
-# the yaw grade against the base) and CONTACT (box | ccd, decision 0003: unset is box-box through mujoco_warp's
+# the yaw grade against the base) and CONTACT (box | ccd, decision 0004: unset is box-box through mujoco_warp's
 # box_box collider; ccd gives back the GJK/EPA path every run before S9.1 trained on). Exported when set; in the
 # run name and the tags only when set.
 S91_NAME=""

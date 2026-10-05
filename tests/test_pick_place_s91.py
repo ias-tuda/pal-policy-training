@@ -1,7 +1,7 @@
 """Plan S9.1 (`pick-place-v1-objects-plan.md`, *S9.1*): step 0 item 3's build and tests, and decision
 0003's box-box contact.
 
-* Decision 0003: every tabletop task sends box-box pairs to mujoco_warp's ``box_box`` collider
+* Decision 0004: every tabletop task sends box-box pairs to mujoco_warp's ``box_box`` collider
   (``nativeccd`` off, `tabletop_env_cfg.SIM_DISABLE_FLAGS`); ``CONTACT=ccd`` gives back the GJK/EPA
   path every run before S9.1 trained on. The regression takes the red cube's poses on the base from a
   recorded press (S9 ST-GA s2's closed jaw pushing it 0.1-17 mm into the base,
@@ -102,7 +102,7 @@ def _cfg(monkeypatch, code: str = "SC", num_envs: int = 4, **changes):
   return cfg
 
 
-# -- Decision 0003: box-box contact ------------------------------------------------------------
+# -- Decision 0004: box-box contact ------------------------------------------------------------
 
 
 def test_the_tabletop_default_sends_box_pairs_to_box_box(monkeypatch):
@@ -162,7 +162,7 @@ def _manifolds(model: mujoco.MjModel, poses) -> list[tuple[int, float, int, floa
 
 
 def test_box_pairs_get_cpu_mujocos_contacts(monkeypatch):
-  """Decision 0003's regression. At the 58 poses of a recorded press (the closed jaw pushing the red
+  """Decision 0004's regression. At the 58 poses of a recorded press (the closed jaw pushing the red
   cube 0.1-17 mm into the base) mujoco_warp under the task's options returns CPU MuJoCo's contacts:
   the same number at the same depth. Positive control: GJK/EPA (``CONTACT=ccd``) does not, at any of
   them -- with the two cubes alone it returns 2-8 contacts (measured 2026-10-05, 58 / 58 differ); in

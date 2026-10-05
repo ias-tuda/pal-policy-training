@@ -148,7 +148,7 @@ CONTROL_DT = SIM_TIMESTEP * DECIMATION
 #: four, and a cube held down on a cube sank 1.1-1.7 cm into it, the base 1.5-2.6 cm into the table
 #: (CPU MuJoCo on the same model, state and controls: 1.3 / 2.2 mm; 100 solver iterations, impratio 1
 #: or a pyramidal cone did not help). In mujoco_warp the flag changes only box-box pairs; the pads,
-#: arm and torso are meshes and capsules. Measured 2026-10-05 on the S9 stack renders (decision 0003).
+#: arm and torso are meshes and capsules. Measured 2026-10-05 on the S9 stack renders (decision 0004).
 SIM_DISABLE_FLAGS = ("nativeccd",)
 
 #: Plan S7-8's stack-task speeds (`SLEW=stack`): the arm at a fraction of the URDF speed

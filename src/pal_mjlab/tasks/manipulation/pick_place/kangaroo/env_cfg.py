@@ -74,7 +74,7 @@ both arms (`pick_place/bimanual.py`), with `HANDOFF_TRAIN` (`none` | `left`) and
 Plan S9.1 adds `BASE_OBS` (`goal` | `pose`, `pick_place_env_cfg.BASE_OBS_NAMES`): on a stack goal the actor
 sees the goal on the base (every run before S9.1) or also the base's yaw, with M6's yaw grade taken
 against the base. And `CONTACT` (`box` | `ccd`, `CONTACT_FLAGS`), the one selector whose unset value
-is not the old one: ``box`` sends box-box pairs to mujoco_warp's ``box_box`` collider (decision 0003,
+is not the old one: ``box`` sends box-box pairs to mujoco_warp's ``box_box`` collider (decision 0004,
 `tabletop_env_cfg.SIM_DISABLE_FLAGS`); ``ccd`` gives back the GJK/EPA path every run before S9.1
 trained on, to re-read those runs on their own physics.
 """
@@ -193,7 +193,7 @@ DEFAULT_ARM_TABLE = "none"
 DEFAULT_ARM_HOME = "default"
 DEFAULT_TRACKER = "B"
 DEFAULT_BASE_OBS = "goal"
-#: What `CONTACT` may be, and the disable flags each keeps out of `SIM_DISABLE_FLAGS` (decision 0003):
+#: What `CONTACT` may be, and the disable flags each keeps out of `SIM_DISABLE_FLAGS` (decision 0004):
 #: ``box`` the tabletop default, ``ccd`` mujoco_warp's own default (nativeccd on) -- every run before
 #: plan S9.1.
 CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
@@ -370,7 +370,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 
 def _apply_contact(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
-  """`CONTACT`: drop the disable flags the named contact model keeps on (decision 0003)."""
+  """`CONTACT`: drop the disable flags the named contact model keeps on (decision 0004)."""
   keep_on = CONTACT_FLAGS[_select(CONTACT_ENV_VAR, DEFAULT_CONTACT, CONTACT_FLAGS)]
   cfg.sim.mujoco.disableflags = tuple(
     f for f in cfg.sim.mujoco.disableflags if f not in keep_on
