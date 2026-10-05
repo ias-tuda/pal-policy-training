@@ -7,7 +7,7 @@ reward variant (`mdp.pregrasp` has the terms):
 * ``none`` -- unset; the cfg is exactly what it was before S7-11;
 * ``watch`` -- only the per-episode state's reset event, so that the eval reads the push and
   the grasp onset the same way for every policy. Rewards and action unchanged;
-* ``NP`` -- no push: -2 x clip((d - 8 mm) / 2 cm, 0, 1) per step to the episode's end, d the
+* ``NP`` -- no push: -2 x clip((d - 10 mm) / 2 cm, 0, 1) per step to the episode's end, d the
   cube's largest horizontal displacement from its spawn before the first grasp;
 * ``JO`` -- jaw open on the approach: -1 x the jaw's angle per step while before the grasp and
   the cube is outside the grasp window (`mdp.pregrasp.GRASP_WINDOW`);
@@ -37,10 +37,13 @@ from pal_mjlab.tasks.manipulation.mdp import pregrasp as pg
 from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import OBJECT, ROBOT, SUPPORT_SENSOR
 
-#: NP (plan S7-11 section 3): the dead band covers the cube being squared up by a closing jaw
-#: (step 0 item 3 measures it; 8 mm is the plan's assumption), full penalty 2 cm past it.
+#: NP (plan S7-11 section 3): the dead band covers the cube being squared up by a closing jaw.
+#: The plan assumed 8 mm; step 0 item 3 (2026-10-05, IAS, scripted open and aligned grasps on
+#: WC-c's plant) moved the cube 1.6-10.2 mm before the two-pad contact in 10 of 12 clean grasps
+#: (median 7.7 mm; the other two 26 and 29 mm, the script's own fingers on the cube), so 10 mm --
+#: also the bar's "pushed > 1 cm". Full penalty 2 cm past it.
 NP_WEIGHT = -2.0
-NP_DEADBAND = 0.008
+NP_DEADBAND = 0.010
 NP_SPAN = 0.02
 #: JO: per step, x the jaw angle in rad (plan: w = 1, to be checked against the term sizes at
 #: +500 iterations, L15).
