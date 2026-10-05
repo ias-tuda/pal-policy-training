@@ -36,7 +36,7 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   GOAL_THRESHOLD,
   SPAWN_BOXES,
 )
-from pal_mjlab.tasks.manipulation.runner import widen_input
+from pal_mjlab.tasks.manipulation.runner import rescale_actions, widen_input
 
 RCTP = "R-C-strict+M1+M2+M3+M6+J+M8"
 #: Plan S10.1's codes: `BS2` + box-rim on the wide area, the box pose observed (WX-c).
@@ -472,3 +472,59 @@ def test_the_actor_and_the_critic_widen_exactly_with_one_optimiser():
     new_opt.state[new_c.mlp[0].weight]["exp_avg"][:, :39],
     opt.state[old_c.mlp[0].weight]["exp_avg"],
   )
+
+
+def test_a_w2_actor_rescaled_to_the_wc_arm_commands_the_same_targets():
+  """``CKPT_SPAWN=W2`` on ``SPAWN=WC``: arm 1 and arm 4 scales 0.90 -> 2.35 and 0.80 -> 1.79. The
+  converted actor's mean action times the new scales is the old one's times the old scales, its
+  noise in target space is the same, and under ``act`` its last-action inputs are read in the new
+  units."""
+  from tensordict import TensorDict
+
+  torch.manual_seed(1)
+  old_scale = torch.tensor([0.90, 0.85, 0.65, 0.80, 1.55, 2.40, 1.20, 0.5])
+  new_scale = torch.tensor([2.35, 0.85, 0.65, 1.79, 1.55, 2.40, 1.20, 0.5])
+  ratio = old_scale / new_scale
+  cols = list(range(15, 23))  # the actor's `actions` term (after joint_pos 8, joint_vel 7)
+  old_a, new_a, old_c = _model(38, "policy"), _model(38, "policy"), _model(39, "critic")
+  # An 8-action actor: `_model` makes 3 outputs, so rebuild the last layer.
+  from rsl_rl.models import MLPModel
+
+  obs = TensorDict({"policy": torch.zeros(4, 38)}, batch_size=[4])
+  old_a = MLPModel(obs, {"policy": ["policy"]}, "policy", 8, (16, 8), "elu", True)
+  new_a = MLPModel(obs, {"policy": ["policy"]}, "policy", 8, (16, 8), "elu", True)
+  old_a.train()
+  old_a.obs_normalizer.update(0.3 * torch.randn(256, 38))
+  sd = {k: v.clone() for k, v in old_a.state_dict().items()}
+  sd["distribution.log_std_param"] = torch.full((8,), -1.5)
+  loaded = {
+    "actor_state_dict": sd,
+    "critic_state_dict": {k: v.clone() for k, v in old_c.state_dict().items()},
+    "optimizer_state_dict": {"state": {}},
+  }
+  rescale_actions(loaded, ratio, cols, new_a, list(new_a.parameters()))
+  log_std = loaded["actor_state_dict"].pop("distribution.log_std_param")
+  new_a.load_state_dict(loaded["actor_state_dict"])
+  old_a.eval()
+  new_a.eval()
+  x = torch.randn(32, 38)
+  x_new = x.clone()
+  x_new[:, cols] = x[:, cols] * ratio
+  with torch.no_grad():
+    a_old = old_a(TensorDict({"policy": x}, batch_size=[32]))
+    a_new = new_a(TensorDict({"policy": x_new}, batch_size=[32]))
+  assert torch.allclose(a_new * new_scale, a_old * old_scale, atol=1e-5)
+  assert torch.allclose(torch.exp(log_std) * new_scale, torch.exp(torch.full((8,), -1.5)) * old_scale)
+  crit = loaded["critic_state_dict"]["obs_normalizer._mean"]
+  assert torch.allclose(crit[:, cols], old_c.state_dict()["obs_normalizer._mean"][:, cols] * ratio)
+
+
+def test_ckpt_spawn_names_the_ratios(monkeypatch):
+  _set_env(monkeypatch, CKPT_SPAWN="W2")
+  ratio = kangaroo_pick_place_rl_cfg().rescale_actions_on_load
+  assert ratio == {
+    "arm_left_1_joint": pytest.approx(0.90 / 2.35),
+    "arm_left_4_joint": pytest.approx(0.80 / 1.79),
+  }
+  _set_env(monkeypatch)
+  assert kangaroo_pick_place_rl_cfg().rescale_actions_on_load is None

@@ -20,6 +20,13 @@ identity normaliser) for them, so the value function it resumes with is the chec
 `widen_actor_on_resume` (plan S10.1's box yaw) does the same for the actor, so the policy it
 resumes with computes exactly the checkpoint's actions.
 
+`rescale_actions_on_load` (plan S10.1: W2 box checkpoints on the WC arm, whose arm 1 and arm 4
+action scales are 2.6x and 2.2x W2's) converts a loaded actor to the env's action scales: the action
+is an absolute target ``default + scale * a``, so the output layer, the action noise and -- where
+the actor observes its raw last action -- that input's normaliser are multiplied by old / new scale
+per joint, and the loaded policy commands exactly the targets it commanded before
+(`rescale_actions`). Applied on every load, the resume's and an eval's alike.
+
 These pieces live here rather than as edits to mjlab or rsl_rl, which are read-mostly
 dependencies (CLAUDE.md, *External Dependencies*): a cfg subclass that adds the field and a
 runner subclass that acts on it, in the one place the manipulation tasks already share.
@@ -66,6 +73,10 @@ class ManipulationRunnerCfg(RslRlOnPolicyRunnerCfg):
 
   widen_actor_on_resume: bool = False
   """The same for the actor (plan S10.1's box yaw, `widen_input`). Off by default."""
+
+  rescale_actions_on_load: dict[str, float] | None = None
+  """Joint regex -> (the checkpoint's action scale / this env's) for the joints whose scales
+  differ (plan S10.1's ``CKPT_SPAWN``, `rescale_actions`); None loads the actor as saved."""
 
 
 def widen_input(
@@ -119,6 +130,75 @@ def widen_input(
         # A new dict: `Optimizer.state_dict` shares the inner ones with the live optimiser.
         state[i] = {**state[i], name: torch.cat([moment, pad], dim=1)}
   return added
+
+
+def rescale_actions(
+  loaded: dict,
+  ratio: torch.Tensor,
+  action_cols: list[int] | None,
+  actor: torch.nn.Module,
+  params: list,
+) -> None:
+  """Convert ``loaded``'s actor, in place, to new action scales: ``ratio`` (A,) is old scale /
+  new scale per action. An absolute action ``a`` on the old scales is the target
+  ``default + old * a`` = ``default + new * (ratio * a)``, so the actor's last linear layer (its
+  rows) and the Gaussian's std are multiplied by ``ratio`` (a log-std shifted by log ratio): the
+  mean action, the target it commands and the exploration noise in target space are unchanged.
+  ``action_cols`` are the actor's (and, at the same columns, the critic's) inputs that observe the
+  raw last action (``CMD_OBS=act``; None for ``cmd``, which observes the commanded target in rad):
+  their normaliser mean and std are multiplied by ``ratio`` too, so the normalised input is
+  unchanged. The Adam moments of the rescaled rows are scaled with them (first by ``ratio``, second
+  by ``ratio**2``). ``params`` as for `widen_input`."""
+  sd = loaded["actor_state_dict"]
+  layers = sorted(
+    (int(k.split(".")[1]), k)
+    for k in sd
+    if k.startswith("mlp.") and k.endswith(".weight")
+  )
+  w_key = layers[-1][1]
+  b_key = w_key.removesuffix("weight") + "bias"
+  if sd[w_key].shape[0] != ratio.numel():
+    raise ValueError(
+      f"actor output {tuple(sd[w_key].shape)} does not match {ratio.numel()} action scales"
+    )
+  r = ratio.to(sd[w_key])
+  scaled = {w_key: r.unsqueeze(-1), b_key: r}
+  sd[w_key] = sd[w_key] * r.unsqueeze(-1)
+  sd[b_key] = sd[b_key] * r
+  if "distribution.log_std_param" in sd:
+    sd["distribution.log_std_param"] = sd["distribution.log_std_param"] + torch.log(r)
+  elif "distribution.std_param" in sd:
+    sd["distribution.std_param"] = sd["distribution.std_param"] * r
+    scaled["distribution.std_param"] = r
+  else:
+    raise ValueError("the actor has no Gaussian std parameter to rescale")
+  if action_cols is not None:
+    cols = torch.as_tensor(action_cols, device=r.device)
+    for key in ("actor_state_dict", "critic_state_dict"):
+      norm = loaded[key]
+      for name, power in (
+        ("obs_normalizer._mean", 1),
+        ("obs_normalizer._std", 1),
+        ("obs_normalizer._var", 2),
+      ):
+        t = norm[name].clone()
+        t[:, cols] = t[:, cols] * r.to(t) ** power
+        norm[name] = t
+  by_id = {id(p): name for name, p in actor.named_parameters()}
+  state = loaded["optimizer_state_dict"]["state"]
+  for i, p in enumerate(params):
+    name = by_id.get(id(p))
+    if name not in scaled or i not in state:
+      continue
+    f = scaled[name]
+    state[i] = {
+      **state[i],
+      **{
+        k: v * (f if k == "exp_avg" else f * f)
+        for k, v in state[i].items()
+        if k in ("exp_avg", "exp_avg_sq") and torch.is_tensor(v)
+      },
+    }
 
 
 def widen_critic_input(loaded: dict, critic: torch.nn.Module, params: list) -> int:
@@ -185,23 +265,61 @@ class ManipulationRunner(ManipulationOnPolicyRunner):
       )
       if self.cfg.get(flag, False)
     ]
-    if not widen:
+    rescale = self.cfg.get("rescale_actions_on_load")
+    if not widen and not rescale:
       return super().load(path, load_cfg, strict, map_location)
     loaded = torch.load(path, map_location=map_location, weights_only=False)
     params = [p for g in self.alg.optimizer.param_groups for p in g["params"]]
     added = {key: widen_input(loaded, key, model, params) for key, model in widen}
-    if not any(added.values()):
-      return super().load(path, load_cfg, strict, map_location)
     for key, n in added.items():
       if n:
         print(
           f"[INFO]: widened the {key.removesuffix('_state_dict')} of {path} by {n} inputs "
           "(zero weights; plan S7-9 PQ / S10.1 box pose)"
         )
+    if rescale:
+      ratio, cols = self._action_rescale(rescale)
+      rescale_actions(loaded, ratio, cols, self.alg._raw_actor, params)
+      print(
+        f"[INFO]: rescaled the actor of {path} to this env's action scales, x "
+        f"{[round(float(x), 4) for x in ratio]} (plan S10.1 CKPT_SPAWN); last-action inputs "
+        f"{'rescaled' if cols is not None else 'not observed'}"
+      )
+    elif not any(added.values()):
+      return super().load(path, load_cfg, strict, map_location)
     with tempfile.TemporaryDirectory() as tmp:
       widened = os.path.join(tmp, os.path.basename(path))
       torch.save(loaded, widened)
       return super().load(widened, load_cfg, strict, map_location)
+
+  def _action_rescale(self, regex_ratio: dict) -> tuple[torch.Tensor, list[int] | None]:
+    """(old / new scale per action, in the action term's order; the actor's columns of the raw
+    last action, or None when it observes the commanded target) for `rescale_actions`."""
+    import re
+
+    from pal_mjlab.tasks.manipulation import mdp
+
+    env = self.env.unwrapped
+    term = env.action_manager.get_term("joint_pos")
+    names = [n.split("/", 1)[-1] for n in term.target_names]
+    ratio = torch.ones(len(names))
+    for i, n in enumerate(names):
+      for pattern, r in regex_ratio.items():
+        if re.fullmatch(pattern, n):
+          ratio[i] = float(r)
+    om = env.observation_manager
+    cols, offset = None, 0
+    for name, cfg, dim in zip(
+      om._group_obs_term_names["actor"],
+      om._group_obs_term_cfgs["actor"],
+      om._group_obs_term_dim["actor"],
+      strict=True,
+    ):
+      width = int(torch.tensor(dim).prod())
+      if name == "actions" and cfg.func is mdp.last_action:
+        cols = list(range(offset, offset + width))
+      offset += width
+    return ratio, cols
 
   def save(self, path: str, infos: dict | None = None) -> None:
     # `self.cfg` is the agent cfg as a plain dict (`asdict`, in mjlab's train script), so a

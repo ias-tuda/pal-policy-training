@@ -194,6 +194,14 @@ if [ "$BOX_OBS" != "goal" ]; then
   S79_NAME="${S79_NAME}_boxobs${BOX_OBS}"
   S79_TAG="${S79_TAG},\"boxobs${BOX_OBS}\""
 fi
+# Plan S10.1: CKPT_SPAWN names the spawn whose arm the RESUME checkpoint was trained with when its action
+# scales are not this run's (W2 box checkpoints on SPAWN=WC): the loaded actor is converted to this run's
+# scales (`runner.rescale_actions`). In the run name and the tags only when set.
+if [ -n "${CKPT_SPAWN:-}" ]; then
+  export CKPT_SPAWN
+  S79_NAME="${S79_NAME}_ckpt${CKPT_SPAWN}"
+  S79_TAG="${S79_TAG},\"ckpt${CKPT_SPAWN}\""
+fi
 
 # Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT | AH10 -- arm 1-6 against
 # the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
@@ -263,7 +271,7 @@ echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
-echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}"
+echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"

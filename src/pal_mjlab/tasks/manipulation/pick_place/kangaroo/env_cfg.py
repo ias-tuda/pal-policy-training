@@ -67,7 +67,9 @@ penalty, with the box's size and mass drawn. One variable for S9's and S10's goa
 Plan S10.1 puts the box on an area (`TARGET=WC` with a box `GOAL`: the box drawn from the area at any yaw,
 clear of the cube) and adds `BOX_OBS` (`goal` | `pose`, `box.BOX_OBS_NAMES`): the actor sees the goal point
 computed from the box (S10's, unset) or the box's own position and yaw; a resume widens the loaded actor
-and critic for the appended yaw.
+and critic for the appended yaw. `CKPT_SPAWN` names the spawn whose arm a checkpoint was trained with when it
+is not this run's (`W2` for a W2 box checkpoint on `SPAWN=WC`, whose arm 1 / arm 4 action scales differ): every
+load -- a resume's, an eval's -- then converts the actor to this env's scales (`runner.rescale_actions`).
 """
 
 from __future__ import annotations
@@ -138,6 +140,7 @@ CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
 BOX_FEET_ENV_VAR = "BOX_FEET"
 BOX_OBS_ENV_VAR = "BOX_OBS"
+CKPT_SPAWN_ENV_VAR = "CKPT_SPAWN"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -342,4 +345,20 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   box_pose = _select_box_obs() == "pose"
   cfg.widen_critic_on_resume = _critic_release() or box_pose
   cfg.widen_actor_on_resume = box_pose
+  cfg.rescale_actions_on_load = _ckpt_action_ratio()
   return cfg
+
+
+def _ckpt_action_ratio() -> dict[str, float] | None:
+  """Plan S10.1's ``CKPT_SPAWN``: joint regex -> (the checkpoint's arm's action scale / this run's), for
+  the joints whose scales differ; None when unset or the same arm."""
+  ckpt = os.environ.get(CKPT_SPAWN_ENV_VAR)
+  if ckpt is None:
+    return None
+  ckpt = _select(CKPT_SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
+  spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
+  old, new = SPAWN_ROBOTS[ckpt].action_scale, SPAWN_ROBOTS[spawn].action_scale
+  if set(old) != set(new):
+    raise ValueError(f"CKPT_SPAWN={ckpt} and SPAWN={spawn} scale different joints")
+  ratio = {k: old[k] / new[k] for k in new if old[k] != new[k]}
+  return ratio or None
