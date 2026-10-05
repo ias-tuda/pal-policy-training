@@ -71,6 +71,11 @@ base through its own tracker), `HANDOFF_ROUTE` (`none` | `up-out`: the up-out-ho
 action term, for the eval to start) and `ARMS` (`left` | `both`): `both` is JOINT, one policy for
 both arms (`pick_place/bimanual.py`), with `HANDOFF_TRAIN` (`none` | `left`) and `START` (`scratch` |
 `mixed`). Unset is every run before S11.
+Plan S11.2 (JOINT redesign) adds `REWARD=S12-BI` (the stage-replacing ladders, `mdp.ladder`),
+`HANDOFF_TRAIN=both` (the right hands off in training too), `START=hold` with `HOLD_BANK` (a path: the SEQ
+snapshot bank, `scripts/s112_hold_bank.py`) and `INIT` (`scratch` | `seq`: the factored policy initialised
+from the SEQ pair named by `INIT_LT` / `INIT_RST`, with the right's gated goal in the actor,
+`tasks/manipulation/bimanual_policy.py`). Unset is S11's JOINT exactly.
 """
 
 from __future__ import annotations
@@ -89,6 +94,12 @@ from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, 
 from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   EPISODE_S as BIMANUAL_EPISODE_S,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  HANDOFF_TRAINS,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  REWARDS as BIMANUAL_REWARDS,
 )
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   STARTS as BIMANUAL_STARTS,
@@ -157,6 +168,10 @@ HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
 ARMS_ENV_VAR = "ARMS"
 HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
+HOLD_BANK_ENV_VAR = "HOLD_BANK"
+INIT_ENV_VAR = "INIT"
+INIT_LT_ENV_VAR = "INIT_LT"
+INIT_RST_ENV_VAR = "INIT_RST"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -186,10 +201,11 @@ DEFAULT_TRACKER = "B"
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
-HANDOFF_TRAINS = ("none", "left")
-#: The reward name JOINT's runs carry (`REWARD`): its two halves are fixed, L-T's and R-ST's
-#: (`bimanual.LEFT_REWARD` / `RIGHT_REWARD`), so the name only labels the run.
+#: The reward name JOINT's runs carry (`REWARD`): S11's two halves, L-T's and R-ST's
+#: (`bimanual.LEFT_REWARD` / `RIGHT_REWARD`), or plan S11.2's ladders (`bimanual.REWARDS`).
 BIMANUAL_REWARD = "S11-BI"
+#: Plan S11.2's ``INIT``: the JOINT policy from scratch, or the factored SEQ-initialised one (BI-F).
+INITS = ("scratch", "seq")
 #: What JOINT is built on (BS11, plan S11); every other selector must be unset or this.
 BIMANUAL_FIXED = {
   "SLEW": "stack",
@@ -306,7 +322,14 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
   goal, box = _select_goal()
   target = _select(TARGET_ENV_VAR, DEFAULT_TARGET, (*TARGET_AREAS, *ROBOT_TARGETS))
-  for name in (HANDOFF_TRAIN_ENV_VAR, START_ENV_VAR):
+  for name in (
+    HANDOFF_TRAIN_ENV_VAR,
+    START_ENV_VAR,
+    HOLD_BANK_ENV_VAR,
+    INIT_ENV_VAR,
+    INIT_LT_ENV_VAR,
+    INIT_RST_ENV_VAR,
+  ):
     if os.environ.get(name) is not None:
       raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
   cfg = make_pick_place_env_cfg(
@@ -357,12 +380,21 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
   code and episode come from `GAINS`, `EFFORT`, `DR`, `LAG`, `ARM_TABLE` and `EPISODE_S` (15 s if
   unset); everything else is fixed by BS11 (`BIMANUAL_FIXED`), and a variable set to anything else
   raises rather than train something the run's name does not say."""
-  reward = os.environ.get(REWARD_ENV_VAR)
-  if reward not in (None, BIMANUAL_REWARD):
+  reward = os.environ.get(REWARD_ENV_VAR, BIMANUAL_REWARD)
+  if reward not in BIMANUAL_REWARDS:
     raise ValueError(
-      f"{REWARD_ENV_VAR}={reward!r}: JOINT's reward is fixed (L-T's and R-ST's halves); set "
-      f"{BIMANUAL_REWARD!r} or unset it"
+      f"{REWARD_ENV_VAR}={reward!r}: JOINT's reward is S11's (L-T's and R-ST's halves) or plan S11.2's "
+      f"ladders; set one of {BIMANUAL_REWARDS} or unset it"
     )
+  start = _select(START_ENV_VAR, "scratch", BIMANUAL_STARTS)
+  bank = os.environ.get(HOLD_BANK_ENV_VAR)
+  if (start == "hold") != (bank is not None):
+    raise ValueError(
+      f"{START_ENV_VAR}=hold needs {HOLD_BANK_ENV_VAR} (the SEQ snapshot bank), and only it does"
+    )
+  if bank is not None and not os.path.isfile(bank):
+    raise ValueError(f"{HOLD_BANK_ENV_VAR}={bank!r} is not a file")
+  init = _select(INIT_ENV_VAR, "scratch", INITS)
   for name, value in BIMANUAL_FIXED.items():
     got = os.environ.get(name)
     if got is not None and got != value:
@@ -376,9 +408,12 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
     arm_table=ARM_TABLE_CODES[
       _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
     ],
-    handoff_train=_select(HANDOFF_TRAIN_ENV_VAR, "left", HANDOFF_TRAINS) == "left",
-    start=_select(START_ENV_VAR, "scratch", BIMANUAL_STARTS),
+    handoff_train=_select(HANDOFF_TRAIN_ENV_VAR, "left", HANDOFF_TRAINS),
+    start=start,
     play=play,
+    reward=reward,
+    hold_bank=bank,
+    right_target="gated" if init == "seq" else "plain",
   )
 
 
@@ -418,4 +453,26 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   # scratch (plan S11).
   both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
   cfg.widen_critic_on_resume = False if both else _critic_release()
+  s112 = any(
+    os.environ.get(k, d) != d
+    for k, d in (
+      (REWARD_ENV_VAR, BIMANUAL_REWARD),
+      (HANDOFF_TRAIN_ENV_VAR, "left"),
+      (START_ENV_VAR, "scratch"),
+      (INIT_ENV_VAR, "scratch"),
+    )
+  )
+  if both and s112:
+    # Plan S11.2: its JOINT runs log each action dimension's std; INIT=seq is BI-F's factored policy, its
+    # critic warm-up and its KL to the SEQ pair (`tasks.manipulation.bimanual_policy`). S11's BI-J / BI-JM
+    # (no S11.2 selector set) keep rsl_rl's PPO.
+    from pal_mjlab.tasks.manipulation.bimanual_policy import apply_joint_rl_cfg
+
+    init = _select(INIT_ENV_VAR, "scratch", INITS)
+    paths = {k: os.environ.get(k) for k in (INIT_LT_ENV_VAR, INIT_RST_ENV_VAR)}
+    if init == "seq" and not all(paths.values()):
+      raise ValueError(f"{INIT_ENV_VAR}=seq needs {INIT_LT_ENV_VAR} and {INIT_RST_ENV_VAR}")
+    if init == "scratch" and any(paths.values()):
+      raise ValueError(f"{INIT_LT_ENV_VAR} / {INIT_RST_ENV_VAR} are {INIT_ENV_VAR}=seq's")
+    cfg = apply_joint_rl_cfg(cfg, init, paths[INIT_LT_ENV_VAR], paths[INIT_RST_ENV_VAR])
   return cfg

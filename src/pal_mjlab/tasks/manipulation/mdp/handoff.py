@@ -66,6 +66,13 @@ POLICY, UP, OUT, HOME = 0, 1, 2, 3
 #: handed off and home (B,) -- set by a reset event (plan S11's BI-JM), read by the term's reset,
 #: which mjlab runs after the reset events.
 START_HOME = "_pp_handoff_start_home"
+#: Attribute on the env: plan S11.2's hold starts (`bimanual.hold_start`), set by a reset event --
+#: ``mask`` (B,) the envs that start from a snapshot, ``target`` (B, n) the action term's last target and
+#: ``servo`` (B, n_servo) its jaw servos there, ``clock`` (B,) the episode step to resume at and
+#: ``goal_offset`` (B, 2) T's offset from the env origin then. The term's reset puts the targets back (it runs
+#: after the events); the clock and T are set on the first step after the reset, because mjlab zeroes
+#: ``episode_length_buf`` and the command manager redraws T after every term's reset.
+START_STATE = "_pp_handoff_start_state"
 
 
 @dataclass(frozen=True)
@@ -296,9 +303,23 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
     return self._scale[:, idx] if isinstance(self._scale, torch.Tensor) else self._scale
 
   def process_actions(self, actions: torch.Tensor) -> None:
+    self._resume_started()
     if any(a["cfg"].trigger is not None for a in self._arms):
       self._auto_trigger()
     super().process_actions(self._route(actions))
+
+  def _resume_started(self) -> None:
+    """The first step after a hold start's reset: the episode clock and T as they were in the snapshot."""
+    pending = getattr(self, "_pending", None)
+    if pending is None:
+      return
+    ids, clock, offsets, command = pending
+    self._pending = None
+    self._env.episode_length_buf[ids] = clock
+    self.handed_step[ids] = torch.where(
+      self.handed_step[ids] >= 0, clock.unsqueeze(-1).expand_as(self.handed_step[ids]), -1
+    )
+    self._env.command_manager.get_term(command).set_offsets(ids, offsets)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     super().reset(env_ids)
@@ -308,6 +329,15 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
     self.handed_step[env_ids] = -1
     self._leg_steps[env_ids] = 0
     self._clear_steps[env_ids] = 0
+    state = getattr(self._env, START_STATE, None)
+    if state is not None:
+      ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+      ids = ids[state["mask"][ids]]
+      if len(ids):
+        self._last_target[ids] = state["target"][ids]
+        if self._servo_idx is not None:
+          self._servo[ids] = state["servo"][ids]
+        self._pending = (ids, state["clock"][ids], state["goal_offset"][ids], state["command"])
     start = getattr(self._env, START_HOME, None) or {}
     for k, arm in enumerate(self._arms):
       home = start.get(arm["cfg"].name)
