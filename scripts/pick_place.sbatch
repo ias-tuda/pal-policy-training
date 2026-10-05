@@ -192,7 +192,9 @@ fi
 # (above). Exported when set; in the run name and the tags only when set.
 S11_NAME=""
 S11_TAG=""
-for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRAIN:hot START:start; do
+# Plan S11.2 (JOINT redesign): REWARD=S12-BI, HANDOFF_TRAIN=both, START=hold with HOLD_BANK (a path) and INIT
+# (scratch | seq) with INIT_LT / INIT_RST (paths); INIT is in the name, the paths are exported and echoed only.
+for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRAIN:hot START:start INIT:init; do
   _var=${_pair%%:*}
   _short=${_pair##*:}
   _val="${!_var:-}"
@@ -200,6 +202,13 @@ for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRA
     export "${_var?}"
     S11_NAME="${S11_NAME}_${_short}${_val}"
     S11_TAG="${S11_TAG},\"${_short}${_val}\""
+  fi
+done
+
+for _var in HOLD_BANK INIT_LT INIT_RST; do
+  if [ -n "${!_var:-}" ]; then
+    [ -f "${!_var}" ] || { echo "$_var=${!_var} is not a file" >&2; exit 1; }
+    export "${_var?}"
   fi
 done
 
@@ -265,6 +274,10 @@ echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_O
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
 echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}"
+echo "s11.2       init ${INIT:-(default)}   hold_bank ${HOLD_BANK:-(none)}   init_lt ${INIT_LT:-(none)}   init_rst ${INIT_RST:-(none)}"
+[ -n "${HOLD_BANK:-}" ] && echo "hold_bank   sha256 $(sha256sum "$HOLD_BANK" | cut -c1-16)"
+[ -n "${INIT_LT:-}" ] && echo "init_lt     sha256 $(sha256sum "$INIT_LT" | cut -c1-16)"
+[ -n "${INIT_RST:-}" ] && echo "init_rst    sha256 $(sha256sum "$INIT_RST" | cut -c1-16)"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
