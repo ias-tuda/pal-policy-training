@@ -132,23 +132,43 @@ def widen_input(
   return added
 
 
+def _scale_moments(state: dict, i: int, factor: torch.Tensor) -> None:
+  """Scale optimiser state ``i``'s Adam moments as their parameter was: first by ``factor``,
+  second by ``factor ** 2``."""
+  if i not in state:
+    return
+  state[i] = {
+    **state[i],
+    **{
+      k: v * (factor if k == "exp_avg" else factor * factor)
+      for k, v in state[i].items()
+      if k in ("exp_avg", "exp_avg_sq") and torch.is_tensor(v)
+    },
+  }
+
+
 def rescale_actions(
   loaded: dict,
   ratio: torch.Tensor,
   action_cols: list[int] | None,
-  actor: torch.nn.Module,
+  models: dict[str, torch.nn.Module],
   params: list,
+  eps: float = 1e-2,
 ) -> None:
   """Convert ``loaded``'s actor, in place, to new action scales: ``ratio`` (A,) is old scale /
   new scale per action. An absolute action ``a`` on the old scales is the target
   ``default + old * a`` = ``default + new * (ratio * a)``, so the actor's last linear layer (its
   rows) and the Gaussian's std are multiplied by ``ratio`` (a log-std shifted by log ratio): the
   mean action, the target it commands and the exploration noise in target space are unchanged.
-  ``action_cols`` are the actor's (and, at the same columns, the critic's) inputs that observe the
-  raw last action (``CMD_OBS=act``; None for ``cmd``, which observes the commanded target in rad):
-  their normaliser mean and std are multiplied by ``ratio`` too, so the normalised input is
-  unchanged. The Adam moments of the rescaled rows are scaled with them (first by ``ratio``, second
-  by ``ratio**2``). ``params`` as for `widen_input`."""
+
+  ``action_cols`` are the inputs that observe the raw last action (``CMD_OBS=act``; None for
+  ``cmd``, which observes the commanded target in rad), at the same columns in the actor and the
+  critic: their values are now ``ratio`` times the old ones, so their normaliser statistics are
+  carried into the new units (mean and std x ratio, var x ratio**2) and, since rsl_rl normalises by
+  ``std + eps``, the first layer's columns by (ratio s + eps) / (ratio (s + eps)) -- the first
+  layer then sees exactly what it saw. ``models`` maps ``"actor_state_dict"`` /
+  ``"critic_state_dict"`` to the live models (for the optimiser's moments, scaled with their
+  parameters); ``params`` as for `widen_input`; ``eps`` the normaliser's."""
   sd = loaded["actor_state_dict"]
   layers = sorted(
     (int(k.split(".")[1]), k)
@@ -162,43 +182,53 @@ def rescale_actions(
       f"actor output {tuple(sd[w_key].shape)} does not match {ratio.numel()} action scales"
     )
   r = ratio.to(sd[w_key])
-  scaled = {w_key: r.unsqueeze(-1), b_key: r}
+  # (state-dict key, parameter name, factor) of every parameter scaled, for the moments.
+  scaled = [
+    ("actor_state_dict", w_key, r.unsqueeze(-1)),
+    ("actor_state_dict", b_key, r),
+  ]
   sd[w_key] = sd[w_key] * r.unsqueeze(-1)
   sd[b_key] = sd[b_key] * r
   if "distribution.log_std_param" in sd:
     sd["distribution.log_std_param"] = sd["distribution.log_std_param"] + torch.log(r)
   elif "distribution.std_param" in sd:
     sd["distribution.std_param"] = sd["distribution.std_param"] * r
-    scaled["distribution.std_param"] = r
+    scaled.append(("actor_state_dict", "distribution.std_param", r))
   else:
     raise ValueError("the actor has no Gaussian std parameter to rescale")
   if action_cols is not None:
     cols = torch.as_tensor(action_cols, device=r.device)
     for key in ("actor_state_dict", "critic_state_dict"):
-      norm = loaded[key]
+      net = loaded[key]
+      first = sorted(
+        (int(k.split(".")[1]), k)
+        for k in net
+        if k.startswith("mlp.") and k.endswith(".weight")
+      )[0][1]
+      s_old = net["obs_normalizer._std"][0, cols]
+      col_factor = torch.ones(net[first].shape[1], dtype=r.dtype, device=r.device)
+      col_factor[cols] = (r * s_old + eps) / (r * (s_old + eps))
+      net[first] = net[first] * col_factor
+      scaled.append((key, first, col_factor))
       for name, power in (
         ("obs_normalizer._mean", 1),
         ("obs_normalizer._std", 1),
         ("obs_normalizer._var", 2),
       ):
-        t = norm[name].clone()
+        t = net[name].clone()
         t[:, cols] = t[:, cols] * r.to(t) ** power
-        norm[name] = t
-  by_id = {id(p): name for name, p in actor.named_parameters()}
+        net[name] = t
+  by_id = {
+    id(p): (key, name)
+    for key, model in models.items()
+    for name, p in model.named_parameters()
+  }
   state = loaded["optimizer_state_dict"]["state"]
   for i, p in enumerate(params):
-    name = by_id.get(id(p))
-    if name not in scaled or i not in state:
-      continue
-    f = scaled[name]
-    state[i] = {
-      **state[i],
-      **{
-        k: v * (f if k == "exp_avg" else f * f)
-        for k, v in state[i].items()
-        if k in ("exp_avg", "exp_avg_sq") and torch.is_tensor(v)
-      },
-    }
+    where = by_id.get(id(p))
+    for key, name, factor in scaled:
+      if where == (key, name):
+        _scale_moments(state, i, factor)
 
 
 def widen_critic_input(loaded: dict, critic: torch.nn.Module, params: list) -> int:
@@ -279,7 +309,12 @@ class ManipulationRunner(ManipulationOnPolicyRunner):
         )
     if rescale:
       ratio, cols = self._action_rescale(rescale)
-      rescale_actions(loaded, ratio, cols, self.alg._raw_actor, params)
+      models = {
+        "actor_state_dict": self.alg._raw_actor,
+        "critic_state_dict": self.alg._raw_critic,
+      }
+      eps = float(getattr(self.alg._raw_actor.obs_normalizer, "eps", 1e-2))
+      rescale_actions(loaded, ratio, cols, models, params, eps)
       print(
         f"[INFO]: rescaled the actor of {path} to this env's action scales, x "
         f"{[round(float(x), 4) for x in ratio]} (plan S10.1 CKPT_SPAWN); last-action inputs "

@@ -495,6 +495,8 @@ def test_a_w2_actor_rescaled_to_the_wc_arm_commands_the_same_targets():
   new_a = MLPModel(obs, {"policy": ["policy"]}, "policy", 8, (16, 8), "elu", True)
   old_a.train()
   old_a.obs_normalizer.update(0.3 * torch.randn(256, 38))
+  old_c.train()
+  old_c.obs_normalizer.update(0.02 + 0.3 * torch.randn(256, 39))
   sd = {k: v.clone() for k, v in old_a.state_dict().items()}
   sd["distribution.log_std_param"] = torch.full((8,), -1.5)
   loaded = {
@@ -502,7 +504,9 @@ def test_a_w2_actor_rescaled_to_the_wc_arm_commands_the_same_targets():
     "critic_state_dict": {k: v.clone() for k, v in old_c.state_dict().items()},
     "optimizer_state_dict": {"state": {}},
   }
-  rescale_actions(loaded, ratio, cols, new_a, list(new_a.parameters()))
+  rescale_actions(
+    loaded, ratio, cols, {"actor_state_dict": new_a}, list(new_a.parameters())
+  )
   log_std = loaded["actor_state_dict"].pop("distribution.log_std_param")
   new_a.load_state_dict(loaded["actor_state_dict"])
   old_a.eval()
@@ -517,6 +521,20 @@ def test_a_w2_actor_rescaled_to_the_wc_arm_commands_the_same_targets():
   assert torch.allclose(torch.exp(log_std) * new_scale, torch.exp(torch.full((8,), -1.5)) * old_scale)
   crit = loaded["critic_state_dict"]["obs_normalizer._mean"]
   assert torch.allclose(crit[:, cols], old_c.state_dict()["obs_normalizer._mean"][:, cols] * ratio)
+  # The critic computes the same value on the new-unit inputs.
+  new_c = _model(39, "critic")
+  new_c.load_state_dict(loaded["critic_state_dict"])
+  old_c.eval()
+  new_c.eval()
+  xc = torch.randn(32, 39)
+  xc_new = xc.clone()
+  xc_new[:, cols] = xc[:, cols] * ratio
+  with torch.no_grad():
+    assert torch.allclose(
+      new_c(TensorDict({"critic": xc_new}, batch_size=[32])),
+      old_c(TensorDict({"critic": xc}, batch_size=[32])),
+      atol=1e-5,
+    )
 
 
 def test_ckpt_spawn_names_the_ratios(monkeypatch):
