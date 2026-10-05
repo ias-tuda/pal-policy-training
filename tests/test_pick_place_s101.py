@@ -261,7 +261,9 @@ def test_the_goal_follows_a_pushed_and_turned_box(monkeypatch):
 def test_the_observed_box_is_the_true_box_with_the_noise_off(monkeypatch):
   env = _env(monkeypatch, corrupt=False)
   _put_box(env, math.radians(-35))
-  _hold(env, 10)  # past the tracker's 8-step lag
+  # Past the tracker's 8-step lag, and the box settled on its feet after the teleport (it bobs
+  # ~0.1 mm in the first 10 steps, which the lagged reading then trails).
+  _hold(env, 40)
   obs = env.observation_manager.compute()
   box = env.scene[bx.BOX]
   true_pos = mdp.object_position_b(env, bx.BOX)
