@@ -294,10 +294,39 @@ def place(args: argparse.Namespace) -> dict:
   )
   env.close()
   table_z = c["baseline"].table_top_z
+  # The plan's gate pose: the held cube's bottom 1 cm over the rim (rim = the floor's top + the wall), pads
+  # `pad_clearance` above the cube's bottom -- the grasp's TCP height raised by rim + 1 cm.
+  z_release = (
+    table_z
+    + kin.pad_offset()
+    + args.pad_clearance
+    + scene.BOX_FLOOR
+    + scene.BOX_WALL_HEIGHT
+    + 0.01
+  )
+  rng = np.random.default_rng(0)
+
+  def release_ik(xy, hand_x) -> tuple[bool, str]:
+    """A contact-free IK solution at the release pose from any seed (the path to it is not checked)."""
+    goal = np.array([xy[0], xy[1], z_release])
+    seeds = [kin.q_default] + [rng.uniform(kin.lo, kin.hi) for _ in range(160)]
+    hit = None
+    for seed in seeds:
+      sol = kin.ik(goal, hand_x, seed)
+      if sol is None:
+        continue
+      hits = kin.in_collision(sol)
+      if not hits:
+        a = np.abs(sol - offset) / scale
+        return True, f"|a| max {a.max():.2f} ({scripted.ARM_JOINTS[int(a.argmax())]})"
+      hit = hits[:2]
+    return False, "no IK" if hit is None else f"collides {hit}"
+
   rows = []
   for bxy, byaw in ((b, y) for y in (0.0, 45.0) for b in FORCED_BOXES):
     for cyaw in (0.0, 30.0, 45.0):
       carry_x = scripted.box_place_hand_x(kin, math.radians(cyaw), math.radians(byaw))
+      rel_ok, rel_note = release_ik(bxy, carry_x)
       tried, row = [], None
       for sp in PLACE_SPAWNS:
         if math.hypot(sp[0] - bxy[0], sp[1] - bxy[1]) < BOX_MIN_SEPARATION:
@@ -335,7 +364,16 @@ def place(args: argparse.Namespace) -> dict:
         break
       if row is None:
         row = {"ok": None, "fails_at": "no spawn grasps", "tried": tried}
-      rows.append({"box": [*bxy, byaw], "cube_yaw": cyaw, "bin": _bin(*bxy), **row})
+      rows.append(
+        {
+          "box": [*bxy, byaw],
+          "cube_yaw": cyaw,
+          "bin": _bin(*bxy),
+          "release_ik": rel_ok,
+          "release_note": rel_note,
+          **row,
+        }
+      )
   return {"place": rows}
 
 
@@ -411,6 +449,13 @@ def main() -> None:
           else f"FAILS at {r['fails_at']}: {r.get('error', '')[:70]}"
         )
       )
+    for r in res["place"]:
+      if not r["release_ik"]:
+        print(f"  release pose unreachable: box {r['box']} cube yaw {r['cube_yaw']}: {r['release_note']}")
+    print(
+      f"release pose (cube bottom 1 cm over the rim, aligned) reachable "
+      f"{sum(r['release_ik'] for r in res['place'])} / {len(res['place'])}"
+    )
     ok = [r for r in res["place"] if r["ok"]]
     print(
       f"place reachable {len(ok)} / {len(res['place'])}; clipped in "
