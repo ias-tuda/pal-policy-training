@@ -117,14 +117,28 @@ def clearance(args: argparse.Namespace) -> dict:
     for c in cases
   ]
   hook = _Contacts(n)
-  rows = scripted.rollout(
-    num_envs=n,
-    **_common(args),
-    spawns=spawns,
-    box_poses=boxes,
-    phases=GRASP_PHASES,
-    hook=hook,
-  )
+  # Only the grasp is run: plan the (unused) carry and place over the cube itself, so that a box
+  # pinned where the arm cannot place (x > 0.6 m, behind the torso) does not leave the arm at home --
+  # with the full plan 29-38 of 48 cases per distance failed on the carry / place (2026-10-05).
+  full = scripted.waypoints
+
+  def grasp_only(kin, cube_xy, cube_yaw, target_xy, *a, **kw):
+    kw["carry_hand_x"] = None
+    kw["place_dz"] = 0.0
+    return full(kin, cube_xy, cube_yaw, np.asarray(cube_xy), *a, **kw)
+
+  scripted.waypoints = grasp_only
+  try:
+    rows = scripted.rollout(
+      num_envs=n,
+      **_common(args),
+      spawns=spawns,
+      box_poses=boxes,
+      phases=GRASP_PHASES,
+      hook=hook,
+    )
+  finally:
+    scripted.waypoints = full
   out = []
   for r in rows:
     i = r["env"]
