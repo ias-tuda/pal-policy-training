@@ -203,6 +203,23 @@ for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRA
   fi
 done
 
+# Plan S9.1 (`pick_place/kangaroo/env_cfg.py`): BASE_OBS (goal | pose: SC-Y, the stack base's yaw on the actor and
+# the yaw grade against the base) and CONTACT (box | ccd, decision 0003: unset is box-box through mujoco_warp's
+# box_box collider; ccd gives back the GJK/EPA path every run before S9.1 trained on). Exported when set; in the
+# run name and the tags only when set.
+S91_NAME=""
+S91_TAG=""
+for _pair in BASE_OBS:base CONTACT:contact; do
+  _var=${_pair%%:*}
+  _short=${_pair##*:}
+  _val="${!_var:-}"
+  if [ -n "$_val" ]; then
+    export "${_var?}"
+    S91_NAME="${S91_NAME}_${_short}${_val}"
+    S91_TAG="${S91_TAG},\"${_short}${_val}\""
+  fi
+done
+
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -236,7 +253,7 @@ if ! uv run --extra cu128 python -c \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
     "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)}" \
-    "S11:${S11_NAME:-(none)} did not validate." >&2
+    "S11:${S11_NAME:-(none)} S9.1:${S91_NAME:-(none)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -265,6 +282,7 @@ echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_O
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
 echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}"
+echo "s9.1        base_obs ${BASE_OBS:-(default)}   contact ${CONTACT:-(default: box)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
@@ -290,5 +308,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}${S8_NAME}${S9_NAME}${S79_NAME}${S11_NAME}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$S8_TAG$S9_TAG$S79_TAG$S11_TAG$RESUME_TAG)"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}${S8_NAME}${S9_NAME}${S79_NAME}${S11_NAME}${S91_NAME}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$S8_TAG$S9_TAG$S79_TAG$S11_TAG$S91_TAG$RESUME_TAG)"
