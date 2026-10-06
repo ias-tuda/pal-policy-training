@@ -215,6 +215,22 @@ def test_the_a_latch_survives_a_5_mm_nudge_and_a_push_costs_once(monkeypatch):
   assert bool(getattr(env, ladder._A_LATCHED).all())
 
 
+def test_a_reset_clears_the_a_latch_for_bi_f(monkeypatch):
+  """BI-F (S11-BI + INIT=seq) reads the latch through its gated right target; a reset must clear it, as
+  S12-BI's does (batch 2's BI-F trained with it set from an env's first latch on)."""
+  assert "reset_ladder_state" not in _cfg(monkeypatch, "BI-J").events
+  cfg = _cfg(monkeypatch, "BI-J", num_envs=2, INIT="seq", INIT_LT="lt.pt", INIT_RST="rst.pt")
+  assert "right_target" in cfg.observations["actor"].terms
+  assert list(cfg.events)[0] == "reset_ladder_state"
+  env = _env(monkeypatch, "BI-J", cfg=cfg)
+  _place_a(env)
+  _step(env, 4)
+  assert bool(getattr(env, ladder._A_LATCHED).all())
+  with torch.inference_mode():
+    env.reset()
+  assert not bool(getattr(env, ladder._A_LATCHED).any())
+
+
 def test_the_left_ladder_freezes_at_its_hand_off(monkeypatch):
   env = _env(monkeypatch, "BI-S", num_envs=2, HANDOFF_TRAIN="none")
   _place_a(env)

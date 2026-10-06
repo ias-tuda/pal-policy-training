@@ -827,6 +827,14 @@ def make_bimanual_env_cfg(
         params={"kind": k, "gate": _gate_dict(gate), "right_gate": right_gate},
         reduce="last",
       )
+  if reward == "S12-BI" or right_target == "gated":
+    # The A latch and the ladders' freezes clear at a reset, before any start event can set them: every code
+    # whose terms read the latch (S12-BI; INIT=seq's gated right target and its KL mask). BI-F (S11-BI +
+    # INIT=seq, batch 2) trained without it: A_latched stayed set from an env's first latch on.
+    cfg.events = {
+      "reset_ladder_state": EventTermCfg(func=mdp.reset_ladder_state, mode="reset"),
+      **cfg.events,
+    }
   if (
     reward == "S12-BI"
     or start == "hold"
@@ -930,11 +938,6 @@ def _apply_ladders(cfg, left, right, left_placed: RewardTermCfg, gate: dict) -> 
     weight=HH_CLEARANCE_WEIGHT,
     params={"margin": HH_MARGIN},
   )
-  # The latches clear before any start event can set them.
-  cfg.events = {
-    "reset_ladder_state": EventTermCfg(func=mdp.reset_ladder_state, mode="reset"),
-    **cfg.events,
-  }
   for arm, levels in (("right", range(6)), ("left", range(4))):
     for k in levels:
       cfg.metrics[f"{arm}_level_{k}"] = MetricsTermCfg(
