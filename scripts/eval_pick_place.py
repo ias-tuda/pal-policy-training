@@ -295,6 +295,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     "cfg's 10 / 20 (plan S10: 100 50 is converged for cube-on-box contacts, S7-9 step 0); eval only",
   )
   p.add_argument(
+    "--stress-jaw",
+    action="store_true",
+    help="plan S7-11 stress (a): the jaw servo slower than training's -- its time constant x 2 "
+    "(0.22-0.38 s) and its speed limit x 0.5 (0.625-0.875 rad/s). Needs LAG with JS",
+  )
+  p.add_argument(
+    "--stress-lag",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="plan S7-11 stress (b): the cube tracker's lag, control steps, drawn per episode in "
+    "[LO, HI] in place of LAG's 5-8 (e.g. 8 12 = 160-240 ms). Needs LAG with FP",
+  )
+  p.add_argument(
+    "--stress-friction",
+    type=float,
+    default=None,
+    metavar="MU",
+    help="plan S7-11 stress (c): the cube-table sliding friction MU (e.g. 0.4): the table top's "
+    "and the cube's sliding friction both set to MU. MuJoCo takes the larger of two geoms' "
+    "coefficients, so the table alone would leave the cube's DR draw (0.5-1.2); the pads keep "
+    "theirs (geom priority 2)",
+  )
+  p.add_argument(
     "--trace",
     type=pathlib.Path,
     default=None,
@@ -1873,7 +1898,83 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
       else s
       for s in cfg.scene.sensors
     )
+  apply_stress(cfg, args)
   return ManagerBasedRlEnv(cfg=cfg, device=args.device)
+
+
+#: Plan S7-11 stress (a): factors on the jaw servo's time constant and speed limit.
+STRESS_JAW_TAU = 2.0
+STRESS_JAW_SPEED = 0.5
+
+
+def apply_stress(cfg, args: argparse.Namespace) -> None:
+  """Plan S7-11's stress tests (step 0 item 4), eval only, outside S7-6's ``LAG=FP+JS`` range:
+  (a) a slower jaw servo, (b) a longer cube-tracker lag, (c) a slipperier table. Each raises
+  rather than silently doing nothing on an env without the model it changes."""
+  from mjlab.envs.mdp import dr
+  from mjlab.managers.event_manager import EventTermCfg
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+  if getattr(args, "stress_jaw", False):
+    act = cfg.actions["joint_pos"]
+    if getattr(act, "servo_joints", None) is None:
+      raise SystemExit("--stress-jaw needs the jaw servo model (LAG=JS or FP+JS)")
+    tau, vel = act.servo_tau, act.servo_max_vel
+    cfg.actions["joint_pos"] = dataclasses.replace(
+      act,
+      servo_tau=(tau[0] * STRESS_JAW_TAU, tau[1] * STRESS_JAW_TAU),
+      servo_max_vel=(vel[0] * STRESS_JAW_SPEED, vel[1] * STRESS_JAW_SPEED),
+    )
+  lag = getattr(args, "stress_lag", None)
+  if lag is not None:
+    lo, hi = lag
+    actor = cfg.observations["actor"]
+    terms = {}
+    for name, term in actor.terms.items():
+      if name in ("object_pos", "object_yaw"):
+        if term.params.get("lag") is None:
+          raise SystemExit(
+            "--stress-lag needs the cube tracker (LAG=FP or FP+JS, no OCC)"
+          )
+        term = dataclasses.replace(term, params={**term.params, "lag": (lo, hi)})
+      terms[name] = term
+    actor.terms = terms
+  mu = getattr(args, "stress_friction", None)
+  if mu is not None:
+    cfg.events["stress_table_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(TABLE, geom_names=("table_top",)),
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],
+        "ranges": (mu, mu),
+      },
+    )
+    cfg.events["object_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(OBJECT, geom_names=(f"{OBJECT}_geom",)),
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],
+        "ranges": (mu, mu),
+      },
+    )
+
+
+def stress_of(args: argparse.Namespace) -> dict:
+  """The stress conditions an eval ran under, for its JSON."""
+  out: dict = {}
+  if getattr(args, "stress_jaw", False):
+    out["jaw"] = {"tau_x": STRESS_JAW_TAU, "speed_x": STRESS_JAW_SPEED}
+  if getattr(args, "stress_lag", None) is not None:
+    out["lag_steps"] = list(args.stress_lag)
+  if getattr(args, "stress_friction", None) is not None:
+    out["cube_table_friction"] = args.stress_friction
+  return out
 
 
 def load_policy(args: argparse.Namespace, env: ManagerBasedRlEnv):
@@ -2589,6 +2690,7 @@ def main() -> None:
           "num_envs": args.num_envs,
           "seed": args.seed,
           "solver_iterations": args.solver_iterations,
+          "stress": stress_of(args),
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
