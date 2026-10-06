@@ -188,7 +188,8 @@ def envs():
   """Each code at 0 and 22 mm, the same seed, the actor's noise off."""
   out = {(c, dz): _build(c, dz) for c in CODES for dz in ("0", "22")}
   yield {k: v[0] for k, v in out.items()}
-  for env, mp in out.values():
+  # Undo in reverse: each patch recorded the variables the earlier ones had set.
+  for env, mp in reversed(list(out.values())):
     env.close()
     mp.undo()
 
@@ -273,7 +274,9 @@ def test_l_t_goal_and_r_st_w_base_sit_at_t_on_the_raised_top(envs):
   env = envs[("L-T", "22")]
   goal = env.command_manager.get_term("goal_pose").command - env.scene.env_origins
   top = mdp.surface_top_z(env, TABLE_CFG)
-  assert torch.allclose(goal[:, 2] + env.scene.env_origins[:, 2], top + 0.025, atol=1e-4)
+  assert torch.allclose(
+    goal[:, 2] + env.scene.env_origins[:, 2], top + 0.025, atol=1e-4
+  )
   assert float((goal[:, 0] - T11_XY[0]).abs().max()) <= 0.01 + 1e-6
   env = envs[("R-ST-W", "22")]
   base = env.scene["base_object"].data.root_link_pos_w - env.scene.env_origins
