@@ -71,10 +71,18 @@ base through its own tracker), `HANDOFF_ROUTE` (`none` | `up-out`: the up-out-ho
 action term, for the eval to start) and `ARMS` (`left` | `both`): `both` is JOINT, one policy for
 both arms (`pick_place/bimanual.py`), with `HANDOFF_TRAIN` (`none` | `left`) and `START` (`scratch` |
 `mixed`). Unset is every run before S11.
+Plan S10.2 / S11.3 add `TABLE_DZ` (mm): the table's top face raised (or lowered) by that much from the
+baseline's height. The real robot cell's table stands about 22 mm above baseline B's 0.815 m (Siwei,
+2026-10-06, on the robot), so `TABLE_DZ=22` trains on 0.837 m. Everything else that touches the table
+reads its live surface (spawns, T's goal, the base cube at T, the rewards, the arm-table terms, DR-scene's
++/-1 cm on top), so the height is this one number; it applies to the one-arm env and to the two-arm env
+(`ARMS=both`, which `eval_chain.py` and `eval_bimanual.py` build) alike. Unset or 0 is the baseline's
+table exactly; |TABLE_DZ| above 50 mm raises.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 
@@ -157,6 +165,7 @@ HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
 ARMS_ENV_VAR = "ARMS"
 HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
+TABLE_DZ_ENV_VAR = "TABLE_DZ"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -183,6 +192,9 @@ CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
 DEFAULT_ARM_HOME = "default"
 DEFAULT_TRACKER = "B"
+#: The largest table offset `TABLE_DZ` may ask for, mm (plan S10.2): a guard against a value in metres
+#: or centimetres, not a reach limit.
+TABLE_DZ_MAX_MM = 50.0
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
@@ -322,7 +334,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     dr=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     play=play,
     action_slew_rate_scale=slew,
-    baseline=BASELINES[baseline],
+    baseline=_baseline_with_table(BASELINES[baseline]),
     tool_speed_cap=TOOL_SPEED_CAPS[tool_speed],
     effort=effort,
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
@@ -370,6 +382,7 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
   return make_bimanual_env_cfg(
     gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
     effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    baseline=_baseline_with_table(BASELINES[BIMANUAL_FIXED["BASELINE"]]),
     dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
     episode_length_s=_select_episode() or BIMANUAL_EPISODE_S,
@@ -380,6 +393,33 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
     start=_select(START_ENV_VAR, "scratch", BIMANUAL_STARTS),
     play=play,
   )
+
+
+def _select_table_dz() -> float:
+  """Plan S10.2's ``TABLE_DZ``: the table's offset from the baseline's height, in metres (the variable is
+  in mm). Unset is 0."""
+  raw = os.environ.get(TABLE_DZ_ENV_VAR)
+  if raw is None:
+    return 0.0
+  try:
+    value = float(raw)
+  except ValueError:
+    value = float("nan")
+  if not abs(value) <= TABLE_DZ_MAX_MM:  # also catches nan
+    raise ValueError(
+      f"{TABLE_DZ_ENV_VAR}={raw!r} is not a table offset in mm within +/-{TABLE_DZ_MAX_MM:g}. Set it "
+      "to e.g. 22 (the robot cell's table, plan S10.2), or unset it for the baseline's table."
+    )
+  return value / 1000.0
+
+
+def _baseline_with_table(baseline):
+  """The baseline with its table moved by ``TABLE_DZ``; the same object when the offset is 0, so an
+  unset variable resolves to the baseline's cfg exactly."""
+  dz = _select_table_dz()
+  if dz == 0.0:
+    return baseline
+  return dataclasses.replace(baseline, table_top_z=round(baseline.table_top_z + dz, 6))
 
 
 def _select_goal() -> tuple[str, BoxGoal | None]:

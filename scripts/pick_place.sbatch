@@ -203,6 +203,14 @@ for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRA
   fi
 done
 
+# Plan S10.2 / S11.3: TABLE_DZ (mm) raises the table's top face from the baseline's height (22: the robot
+# cell's table, 0.837 m on baseline B). In the run name and the tags only when set.
+if [ -n "${TABLE_DZ:-}" ]; then
+  export TABLE_DZ
+  S11_NAME="${S11_NAME}_tabledz${TABLE_DZ}"
+  S11_TAG="${S11_TAG},\"tabledz${TABLE_DZ}\""
+fi
+
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -264,7 +272,7 @@ echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
-echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}"
+echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}   table_dz ${TABLE_DZ:-(none)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
