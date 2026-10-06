@@ -70,6 +70,11 @@ computed from the box (S10's, unset) or the box's own position and yaw; a resume
 and critic for the appended yaw. `CKPT_SPAWN` names the spawn whose arm a checkpoint was trained with when it
 is not this run's (`W2` for a W2 box checkpoint on `SPAWN=WC`, whose arm 1 / arm 4 action scales differ): every
 load -- a resume's, an eval's -- then converts the actor to this env's scales (`runner.rescale_actions`).
+Plan S10.2 adds `TABLE_DZ` (mm): the table's top face raised (or lowered) by that much from the
+baseline's height. The real robot cell's table stands about 22 mm above baseline B's 0.815 m (Siwei,
+2026-10-06, on the robot), so `TABLE_DZ=22` trains on 0.837 m. Everything else that touches the table
+reads its live surface (spawns, the target, the box, the rewards, DR-scene's +/-1 cm on top), so the
+height is this one number. Unset or 0 is the baseline's table exactly; |TABLE_DZ| above 50 mm raises.
 """
 
 from __future__ import annotations
@@ -87,7 +92,11 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
 from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
-from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BOX_OBS_NAMES, BoxGoal
+from pal_mjlab.tasks.manipulation.pick_place.box import (
+  BOX_GOALS,
+  BOX_OBS_NAMES,
+  BoxGoal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
@@ -141,6 +150,7 @@ ARM_TABLE_ENV_VAR = "ARM_TABLE"
 BOX_FEET_ENV_VAR = "BOX_FEET"
 BOX_OBS_ENV_VAR = "BOX_OBS"
 CKPT_SPAWN_ENV_VAR = "CKPT_SPAWN"
+TABLE_DZ_ENV_VAR = "TABLE_DZ"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -166,6 +176,9 @@ DEFAULT_CRITIC_OBS = "base"
 CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
 DEFAULT_BOX_OBS = "goal"
+#: The largest table offset `TABLE_DZ` may ask for, mm (plan S10.2): a guard against a value in metres
+#: or centimetres, not a reach limit.
+TABLE_DZ_MAX_MM = 50.0
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -273,7 +286,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     dr=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     play=play,
     action_slew_rate_scale=slew,
-    baseline=BASELINES[baseline],
+    baseline=_baseline_with_table(BASELINES[baseline]),
     tool_speed_cap=TOOL_SPEED_CAPS[tool_speed],
     effort=effort,
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
@@ -293,6 +306,33 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     box=box,
     box_obs=_select_box_obs(),
   )
+
+
+def _select_table_dz() -> float:
+  """Plan S10.2's ``TABLE_DZ``: the table's offset from the baseline's height, in metres (the variable is
+  in mm). Unset is 0."""
+  raw = os.environ.get(TABLE_DZ_ENV_VAR)
+  if raw is None:
+    return 0.0
+  try:
+    value = float(raw)
+  except ValueError:
+    value = float("nan")
+  if not abs(value) <= TABLE_DZ_MAX_MM:  # also catches nan
+    raise ValueError(
+      f"{TABLE_DZ_ENV_VAR}={raw!r} is not a table offset in mm within +/-{TABLE_DZ_MAX_MM:g}. Set it "
+      "to e.g. 22 (the robot cell's table, plan S10.2), or unset it for the baseline's table."
+    )
+  return value / 1000.0
+
+
+def _baseline_with_table(baseline):
+  """The baseline with its table moved by ``TABLE_DZ``; the same object when the offset is 0, so an
+  unset variable resolves to the baseline's cfg exactly."""
+  dz = _select_table_dz()
+  if dz == 0.0:
+    return baseline
+  return dataclasses.replace(baseline, table_top_z=round(baseline.table_top_z + dz, 6))
 
 
 def _select_box_obs() -> str:

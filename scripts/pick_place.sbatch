@@ -203,6 +203,14 @@ if [ -n "${CKPT_SPAWN:-}" ]; then
   S79_TAG="${S79_TAG},\"ckpt${CKPT_SPAWN}\""
 fi
 
+# Plan S10.2: TABLE_DZ (mm) raises the table's top face from the baseline's height (22: the robot cell's
+# table, 0.837 m on baseline B). In the run name and the tags only when set.
+if [ -n "${TABLE_DZ:-}" ]; then
+  export TABLE_DZ
+  S79_NAME="${S79_NAME}_tabledz${TABLE_DZ}"
+  S79_TAG="${S79_TAG},\"tabledz${TABLE_DZ}\""
+fi
+
 # Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT | AH10 -- arm 1-6 against
 # the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
 # contact). Unset is every run before S7-10; in the run name and the tags only when set.
@@ -244,7 +252,7 @@ if ! uv run --extra cu128 python -c \
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
-    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} BOX_OBS=$BOX_OBS did not validate." >&2
+    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} BOX_OBS=$BOX_OBS TABLE_DZ=${TABLE_DZ:-(default)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -271,7 +279,7 @@ echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}"
-echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}"
+echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}   table_dz ${TABLE_DZ:-(none)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
