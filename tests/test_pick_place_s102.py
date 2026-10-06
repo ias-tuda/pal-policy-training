@@ -13,6 +13,7 @@ its margin).
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 import torch
@@ -93,7 +94,8 @@ def _flat(obj, prefix=""):
     for i, v in enumerate(obj):
       out.update(_flat(v, f"{prefix}[{i}]"))
   else:
-    out[prefix] = repr(obj)
+    # A closure's repr carries its address, which differs between any two builds.
+    out[prefix] = re.sub(r" at 0x[0-9a-f]+", "", repr(obj))
   return out
 
 
