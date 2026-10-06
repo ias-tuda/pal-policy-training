@@ -38,7 +38,7 @@ Plan S7-4 adds `EFFORT` (`none` | `C` | `CTP`, `pick_place_env_cfg.EFFORT_BOUNDS
 the driven arm's effort. `C` clips the arm's targets to the joint range; `CTP` adds T -- the arm's
 effort limit lowered to 0.7 x effort on the plant, mirrored as a target band in the action term
 -- and P, the effort hinge. The plant half of T is built into the robot here, from the same code.
-Plan S7-6 adds `LAG` (`none` | `FP` | `JS` | `FP+JS`, `tabletop_env_cfg.LATENCY_MODELS`): the
+Plan S7-6 adds `LAG` (`none` | `FP` | `JS` | `FP+JS`; S7-11 adds `FP+JSW`, the servo down to twice as slow; `tabletop_env_cfg.LATENCY_MODELS`): the
 real robot's latencies -- `FP` the FoundationPose cube tracker's 5-8 steps on the cube pose,
 `JS` the jaw servo's lag behind its command. Unset is `none`, every run up to S7-5.
 `TOOL_SPEED=V0.5` is S7-4's V at 0.5 m/s. The release-by-jaw (J) and the retreat (M8) are reward

@@ -205,6 +205,11 @@ VISION_TRACKER_LAG = (5, 8)  # control steps
 #: Claudius's reading, kept as is. Per env, per episode.
 JAW_SERVO_TAU = (0.11, 0.19)  # s
 JAW_SERVO_MAX_VEL = (1.25, 1.75)  # rad/s
+#: Plan S7-11's wide servo (JSW): the same model, with the slow end stretched to the eval's stress
+#: (a) -- time constant x 2, speed x 0.5 (0.22-0.38 s, 0.625-0.875 rad/s) -- under which every S7-11
+#: policy lost 12-40 points (2026-10-06): their close is timed to the servo they trained on.
+JAW_SERVO_TAU_WIDE = (0.11, 0.38)  # s
+JAW_SERVO_MAX_VEL_WIDE = (0.625, 1.75)  # rad/s
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,14 +223,28 @@ class LatencyModelCfg:
   jaw_servo: bool
   """The jaw servo model (`JAW_SERVO_TAU`, `JAW_SERVO_MAX_VEL`) between command and joint."""
 
+  servo_tau: tuple[float, float] = JAW_SERVO_TAU
+  """Per-env range of the servo's time constant, s (with ``jaw_servo``)."""
+
+  servo_max_vel: tuple[float, float] = JAW_SERVO_MAX_VEL
+  """Per-env range of the servo's speed limit, rad/s (with ``jaw_servo``)."""
+
 
 #: Latency models by name (`LAG`). ``none`` is every run up to S7-5; ``FP`` the FoundationPose
-#: tracker alone, ``JS`` the jaw servo alone, ``FP+JS`` both (plan S7-6).
+#: tracker alone, ``JS`` the jaw servo alone, ``FP+JS`` both (plan S7-6); ``FP+JSW`` both with the
+#: wide servo (plan S7-11).
 LATENCY_MODELS = {
   "none": LatencyModelCfg(tracker_lag=None, jaw_servo=False),
   "FP": LatencyModelCfg(tracker_lag=VISION_TRACKER_LAG, jaw_servo=False),
   "JS": LatencyModelCfg(tracker_lag=None, jaw_servo=True),
   "FP+JS": LatencyModelCfg(tracker_lag=VISION_TRACKER_LAG, jaw_servo=True),
+  # Plan S7-11: the jaw servo drawn down to twice as slow (`JAW_SERVO_TAU_WIDE`).
+  "FP+JSW": LatencyModelCfg(
+    tracker_lag=VISION_TRACKER_LAG,
+    jaw_servo=True,
+    servo_tau=JAW_SERVO_TAU_WIDE,
+    servo_max_vel=JAW_SERVO_MAX_VEL_WIDE,
+  ),
 }
 
 #: The actor's terms that read the tracked object, and so move onto the tracker's lag.
@@ -654,8 +673,8 @@ def make_tabletop_env_cfg(
     bounds["effort_band_joints"] = arm_regex
   if latency.jaw_servo:
     bounds["servo_joints"] = (re.escape(gripper.finger_joint),)
-    bounds["servo_tau"] = JAW_SERVO_TAU
-    bounds["servo_max_vel"] = JAW_SERVO_MAX_VEL
+    bounds["servo_tau"] = latency.servo_tau
+    bounds["servo_max_vel"] = latency.servo_max_vel
   if bounds and not rate_limit:
     raise ValueError(
       "the arm bounds and the jaw servo live in the rate-limited action term; no slew limit"

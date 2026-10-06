@@ -289,3 +289,55 @@ def test_the_gate_caps_outside_the_window_and_not_inside(monkeypatch, code, cap)
     assert (term.commanded_target[:, -1] > 0.1).all()
   finally:
     env.close()
+
+
+# -- The wide jaw servo (LAG=FP+JSW, 2026-10-06) ------------------------------------------
+
+
+def test_fp_jsw_only_widens_the_servo(monkeypatch):
+  """FP+JSW is FP+JS with the servo's slow end at stress (a)'s: nothing else in the cfg moves."""
+  from pal_mjlab.tasks.manipulation import tabletop_env_cfg as tt
+
+  base = _cfg(monkeypatch, None)
+  monkeypatch.setenv("LAG", "FP+JSW")
+  wide = kenv.kangaroo_pick_place_env_cfg()
+  assert tt.JAW_SERVO_TAU_WIDE == (0.11, 0.38)
+  assert tt.JAW_SERVO_MAX_VEL_WIDE == (0.625, 1.75)
+  # The fast end is S7-6's, the slow end twice as slow.
+  assert tt.JAW_SERVO_TAU_WIDE[0] == tt.JAW_SERVO_TAU[0]
+  assert tt.JAW_SERVO_TAU_WIDE[1] == pytest.approx(2 * tt.JAW_SERVO_TAU[1])
+  assert tt.JAW_SERVO_MAX_VEL_WIDE[0] == pytest.approx(0.5 * tt.JAW_SERVO_MAX_VEL[0])
+  assert tt.JAW_SERVO_MAX_VEL_WIDE[1] == tt.JAW_SERVO_MAX_VEL[1]
+  old, new = base.actions["joint_pos"], wide.actions["joint_pos"]
+  assert (old.servo_tau, old.servo_max_vel) == (tt.JAW_SERVO_TAU, tt.JAW_SERVO_MAX_VEL)
+  assert (new.servo_tau, new.servo_max_vel) == (
+    tt.JAW_SERVO_TAU_WIDE,
+    tt.JAW_SERVO_MAX_VEL_WIDE,
+  )
+  import dataclasses
+
+  assert (
+    dataclasses.replace(new, servo_tau=old.servo_tau, servo_max_vel=old.servo_max_vel)
+    == old
+  )
+  for field in ("observations", "commands", "events", "terminations", "rewards"):
+    assert getattr(wide, field) == getattr(base, field), field
+
+
+def test_fp_jsw_draws_slow_servos_in_an_env(monkeypatch):
+  _cfg(monkeypatch, None)  # WC-c's variables
+  monkeypatch.setenv("LAG", "FP+JSW")
+  cfg = kenv.kangaroo_pick_place_env_cfg()
+  cfg.scene.num_envs, cfg.seed = 64, 0
+  env = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
+  try:
+    env.reset()
+    term = env.action_manager.get_term("joint_pos")
+    tau, vel = term._servo_tau[:, 0], term._servo_max_vel[:, 0]
+    assert ((tau >= 0.11) & (tau <= 0.38)).all() and (
+      (vel >= 0.625) & (vel <= 1.75)
+    ).all()
+    # Not stuck at S7-6's range: a fair share of envs is slower than anything it trained.
+    assert (tau > 0.19).float().mean() > 0.4 and (vel < 1.25).float().mean() > 0.2
+  finally:
+    env.close()
