@@ -138,6 +138,8 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
+  JAW_SERVO_MAX_VEL,
+  JAW_SERVO_TAU,
   ROBOT,
   SUPPORT_SENSOR,
   TABLE,
@@ -297,8 +299,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   p.add_argument(
     "--stress-jaw",
     action="store_true",
-    help="plan S7-11 stress (a): the jaw servo slower than training's -- its time constant x 2 "
-    "(0.22-0.38 s) and its speed limit x 0.5 (0.625-0.875 rad/s). Needs LAG with JS",
+    help="plan S7-11 stress (a): the jaw servo slower than S7-6's -- its time constant x 2 "
+    "(0.22-0.38 s) and its speed limit x 0.5 (0.625-0.875 rad/s), the same absolute range for every "
+    "run (also one trained on LAG=FP+JSW). Needs LAG with JS",
   )
   p.add_argument(
     "--stress-lag",
@@ -1919,7 +1922,9 @@ def apply_stress(cfg, args: argparse.Namespace) -> None:
     act = cfg.actions["joint_pos"]
     if getattr(act, "servo_joints", None) is None:
       raise SystemExit("--stress-jaw needs the jaw servo model (LAG=JS or FP+JS)")
-    tau, vel = act.servo_tau, act.servo_max_vel
+    # From S7-6's servo (`JAW_SERVO_TAU` / `JAW_SERVO_MAX_VEL`), not the run's own: a run trained
+    # on the wide servo (``LAG=FP+JSW``) is stressed with the same absolute range as every other.
+    tau, vel = JAW_SERVO_TAU, JAW_SERVO_MAX_VEL
     cfg.actions["joint_pos"] = dataclasses.replace(
       act,
       servo_tau=(tau[0] * STRESS_JAW_TAU, tau[1] * STRESS_JAW_TAU),
