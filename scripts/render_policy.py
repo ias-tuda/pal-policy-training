@@ -318,6 +318,12 @@ def main() -> None:
   )
   if args.handoff_lift is not None and not args.handoff:
     raise ValueError("--handoff-lift needs --handoff")
+  if args.handoff_lift is not None and hasattr(
+    env.action_manager.get_term("joint_pos"), "start_handoff"
+  ):
+    raise ValueError(
+      "--handoff-lift is the IK lift; HANDOFF_ROUTE=up-out is plan S11's route -- pick one"
+    )
   lift = (
     None if args.handoff_lift is None else ev.VerticalRetreat(env, args.handoff_lift)
   )
@@ -348,7 +354,13 @@ def main() -> None:
         home_err,
       )
       actions = policy(obs)
-      if lift is not None:
+      route = env.action_manager.get_term("joint_pos")
+      up_out = args.handoff and hasattr(route, "start_handoff")
+      if up_out:
+        # Plan S11's up-out-home route (`HANDOFF_ROUTE=up-out`), as `eval_pick_place.py` runs it:
+        # the action term takes the arm over from the hand-off on; the policy's actions pass unread.
+        route.start_handoff("left", handed)
+      elif lift is not None:
         actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
       elif args.handoff:
         # Action 0 is home with the jaw open for an absolute action; for plan S7-8's delta
@@ -361,7 +373,13 @@ def main() -> None:
       status = (
         (
           "position controller: "
-          + ("home" if lift is None or bool(lift.home[0]) else "lift")
+          + (
+            "up-out-home"
+            if up_out
+            else "home"
+            if lift is None or bool(lift.home[0])
+            else "lift"
+          )
           if bool(handed[0])
           else "policy"
         )
