@@ -88,6 +88,8 @@ against the base. And `CONTACT` (`box` | `ccd`, `CONTACT_FLAGS`), the one select
 is not the old one: ``box`` sends box-box pairs to mujoco_warp's ``box_box`` collider (decision 0004,
 `tabletop_env_cfg.SIM_DISABLE_FLAGS`); ``ccd`` gives back the GJK/EPA path every run before S9.1
 trained on, to re-read those runs on their own physics.
+Plan S11.3 applies `TABLE_DZ` to the two-arm env too (`ARMS=both`, which `eval_chain.py` and `eval_bimanual.py`
+build), so a chain is read on the same table as its one-arm skills.
 """
 
 from __future__ import annotations
@@ -421,6 +423,7 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
   return make_bimanual_env_cfg(
     gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
     effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    baseline=_baseline_with_table(BASELINES[BIMANUAL_FIXED["BASELINE"]]),
     dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
     episode_length_s=_select_episode() or BIMANUAL_EPISODE_S,
