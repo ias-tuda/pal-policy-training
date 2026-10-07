@@ -271,7 +271,15 @@ def hold_rollout(args) -> dict:
   ).cpu().numpy() - np.asarray(scene.TABLE_POS[:2])
   pos = (obj.data.root_link_pos_w - origins).cpu().numpy()
   quat = obj.data.root_link_quat_w.cpu().numpy()
-  plans, errors, tcp_goal = [], [], []
+  plans, errors, tcp_goal, tcp_h_goal = [], [], [], []
+  # IK inside the action box as well as the soft limits: a target outside home +/- scale is clipped by the env.
+  box_lo = (
+    drv.offset[0, drv.arm_cols].cpu().numpy() - drv.scale[0, drv.arm_cols].cpu().numpy()
+  )
+  box_hi = (
+    drv.offset[0, drv.arm_cols].cpu().numpy() + drv.scale[0, drv.arm_cols].cpu().numpy()
+  )
+  arm.lo, arm.hi = np.maximum(arm.lo, box_lo + 0.02), np.minimum(arm.hi, box_hi - 0.02)
   for i in range(env.num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
@@ -364,9 +372,12 @@ def hold_rollout(args) -> dict:
         continue
       plan = {"above": q_up, "pregrasp": q_p, "grasp": q_g, "lift": q_l, "H": q_hh}
       tcp_goal.append(tcp)
+      tcp_h_goal.append(tcp_h)
+      err = ""
       break
     if plan is None:
       tcp_goal.append(np.full(3, np.nan))
+      tcp_h_goal.append(np.full(3, np.nan))
       q0 = arm.q_default
       plan = dict.fromkeys(("above", "pregrasp", "grasp", "lift", "H"), q0)
     plans.append(plan)
@@ -395,6 +406,7 @@ def hold_rollout(args) -> dict:
     for k in ("grasped", "lifted", "arm_table", "hand_table", "held_after")
   }
   phase = {"name": ""}
+  first = {"hand_table": [""] * n_env, "arm_table": [""] * n_env}
   pre = torch.zeros(n_env, 3, device=dev)
 
   def hook():
@@ -449,6 +461,25 @@ def hold_rollout(args) -> dict:
   phase["name"] = "hold"
   drv.hold(stack("H"), 2.0)
   pre[:] = obj.data.root_link_pos_w
+  cmd_w = env.command_manager.get_term("goal_pose").command
+  at_h = {
+    "tcp_err_at_H_mm": (
+      1e3
+      * (
+        robot_tcp(env, gripper)
+        - torch.as_tensor(np.stack(tcp_h_goal), dtype=torch.float32, device=dev)
+      ).norm(dim=-1)
+    ).tolist(),
+    "block_err_at_H_mm": (
+      1e3 * (cmd_w - obj.data.root_link_pos_w).norm(dim=-1)
+    ).tolist(),
+    "block_dz_at_H_mm": (1e3 * (obj.data.root_link_pos_w - cmd_w)[:, 2]).tolist(),
+    "tilt_at_H_deg": torch.rad2deg(mdp.axis_tilt(env, "object")).tolist(),
+    "speed_at_H": obj.data.root_link_lin_vel_w.norm(dim=-1).tolist(),
+    "elev_at_H_deg": torch.rad2deg(
+      mdp.approach_elevation(env, hp["side_cfg"])
+    ).tolist(),
+  }
   phase["name"] = "push"
   from mjlab.utils.lab_api.math import matrix_from_quat
 
@@ -495,6 +526,9 @@ def hold_rollout(args) -> dict:
         "clipped_steps": int(drv.clipped[i]),
         "resets": int(drv.resets[i]),
         "tcp_err_at_grasp_mm": 1e3 * float(tcp_err[i]),
+        "first_hand_table": first["hand_table"][i],
+        "first_arm_table": first["arm_table"][i],
+        **{k: float(v[i]) for k, v in at_h.items()},
       }
     )
     print(json.dumps(rows[-1]), flush=True)
