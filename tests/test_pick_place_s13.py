@@ -61,6 +61,31 @@ _ALL = {
 }
 
 
+def _flat(obj, prefix=""):
+  """Every leaf of a cfg as path -> repr, closures' addresses dropped (`test_pick_place_s113`)."""
+  import dataclasses
+  import re
+
+  out = {}
+  if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+    for f in dataclasses.fields(obj):
+      out.update(_flat(getattr(obj, f.name), f"{prefix}.{f.name}"))
+  elif isinstance(obj, dict):
+    for k, v in obj.items():
+      out.update(_flat(v, f"{prefix}[{k!r}]"))
+  elif isinstance(obj, (list, tuple)):
+    for i, v in enumerate(obj):
+      out.update(_flat(v, f"{prefix}[{i}]"))
+  else:
+    out[prefix] = re.sub(r" at 0x[0-9a-f]+", "", repr(obj))
+  return out
+
+
+def _diff(a, b):
+  fa, fb = _flat(a), _flat(b)
+  return {k: (fa.get(k), fb.get(k)) for k in fa.keys() | fb.keys() if fa.get(k) != fb.get(k)}
+
+
 def _cfg(monkeypatch, num_envs: int = 4, **changes):
   for var in _ALL:
     monkeypatch.delenv(var, raising=False)
@@ -89,8 +114,8 @@ def test_lh_changes_the_arm_object_spawn_goal_and_reward(monkeypatch):
   assert side != wc and set(side) == set(wc)
   assert lh.actions["joint_pos"].scale == side
   assert base.actions["joint_pos"].scale == wc
-  # The plant is untouched: same robot entity apart from the action term.
-  assert lh.scene.entities["robot"] == base.scene.entities["robot"]
+  # The plant is untouched: the same robot entity (the action term carries the scales).
+  assert _diff(lh.scene.entities["robot"], base.scene.entities["robot"]) == {}
   # The goal is H, 10 cm over the table, robot frame.
   cmd = lh.commands[COMMAND]
   assert (
@@ -215,7 +240,8 @@ def test_side_grade_is_one_for_a_level_hand_and_less_at_the_start_pose(lh_env):
 
 def test_lhp_pushes_the_top_from_4s_and_not_before(lh_env):
   env = lh_env
-  env.reset()
+  with torch.inference_mode():
+    env.reset()
   block = env.scene[OBJECT]
   bid = int(block.indexing.body_ids[0])
   seen_before, seen_after = 0.0, 0.0
