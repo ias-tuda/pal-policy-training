@@ -583,12 +583,9 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
       paths[INIT_RST_ENV_VAR],
       kl_floor=_select_kl_floor(),
     )
-  elif any(
-    os.environ.get(k) is not None
-    for k in (KL_FLOOR_ENV_VAR, HOLD_MIX_ENV_VAR, HH_TERM_ENV_VAR, RIGHT_GATE_ENV_VAR)
-  ):
+  elif os.environ.get(KL_FLOOR_ENV_VAR) is not None:
     raise ValueError(
-      "HOLD_MIX / HH_TERM / RIGHT_GATE / KL_FLOOR are plan S11.4's, on an S11.2 JOINT code (ARMS=both)"
+      f"{KL_FLOOR_ENV_VAR} is {INIT_ENV_VAR}=seq's (the KL to SEQ), with {ARMS_ENV_VAR}=both"
     )
   return cfg
 
