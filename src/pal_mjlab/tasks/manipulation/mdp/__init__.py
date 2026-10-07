@@ -58,6 +58,7 @@ from .box import (
   contact_while_held,
   object_in_box_bool,
   object_position_biased_b,
+  reset_box_in_area,
   reset_box_on_surface,
   reset_tracker_bias,
   reset_tracker_yaw_bias,
@@ -186,8 +187,9 @@ __all__ = [
   "set_box_geometry",
   "tracker_bias",
   "yaw_error_mod_90",
-  # Plan S10.1's tracked yaw (S9.1's SC-Y observes the base's with it).
+  # Plan S10.1, the box on the wide area at any yaw.
   "box_yaw_b",
+  "reset_box_in_area",
   "reset_tracker_yaw_bias",
   "tracker_yaw_bias",
   "yaw_reference_quat",

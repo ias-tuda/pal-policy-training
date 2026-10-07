@@ -84,6 +84,12 @@ reads its live surface (spawns, T's goal, the base cube at T, the rewards, the a
 +/-1 cm on top), so the height is this one number; it applies to the one-arm env and to the two-arm env
 (`ARMS=both`, which `eval_chain.py` and `eval_bimanual.py` build) alike. Unset or 0 is the baseline's
 table exactly; |TABLE_DZ| above 50 mm raises.
+Plan S10.1 puts the box on an area (`TARGET=WC` with a box `GOAL`: the box drawn from the area at any yaw,
+clear of the cube) and adds `BOX_OBS` (`goal` | `pose`, `box.BOX_OBS_NAMES`): the actor sees the goal point
+computed from the box (S10's, unset) or the box's own position and yaw; a resume widens the loaded actor
+and critic for the appended yaw. `CKPT_SPAWN` names the spawn whose arm a checkpoint was trained with when it
+is not this run's (`W2` for a W2 box checkpoint on `SPAWN=WC`, whose arm 1 / arm 4 action scales differ): every
+load -- a resume's, an eval's -- then converts the actor to this env's scales (`runner.rescale_actions`).
 """
 
 from __future__ import annotations
@@ -111,7 +117,7 @@ from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   handoff_arm,
   make_bimanual_env_cfg,
 )
-from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BoxGoal
+from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BOX_OBS_NAMES, BoxGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASE_OBS_NAMES,
   BASELINES,
@@ -175,6 +181,9 @@ START_ENV_VAR = "START"
 BASE_OBS_ENV_VAR = "BASE_OBS"
 CONTACT_ENV_VAR = "CONTACT"
 TABLE_DZ_ENV_VAR = "TABLE_DZ"
+BOX_FEET_ENV_VAR = "BOX_FEET"
+BOX_OBS_ENV_VAR = "BOX_OBS"
+CKPT_SPAWN_ENV_VAR = "CKPT_SPAWN"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -235,6 +244,7 @@ BIMANUAL_FIXED = {
   "CRITIC_OBS": "q",
   "HANDOFF_ROUTE": "up-out",
 }
+DEFAULT_BOX_OBS = "goal"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -370,6 +380,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ],
     box=box,
     base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
+    box_obs=_select_box_obs(),
   )
   _apply_contact(cfg)
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
@@ -448,13 +459,26 @@ def _baseline_with_table(baseline):
   return dataclasses.replace(baseline, table_top_z=round(baseline.table_top_z + dz, 6))
 
 
+def _select_box_obs() -> str:
+  """Plan S10.1's ``BOX_OBS``: what the actor observes of the box (`box.BOX_OBS_NAMES`)."""
+  return _select(BOX_OBS_ENV_VAR, DEFAULT_BOX_OBS, BOX_OBS_NAMES)
+
+
 def _select_goal() -> tuple[str, BoxGoal | None]:
   """`GOAL`: plan S9's goal (`GOALS`: ``table`` | ``stack``) and plan S10's box (`box.BOX_GOALS`), one
-  variable for both. A box name is the table goal plus that box."""
+  variable for both. A box name is the table goal plus that box. ``BOX_FEET=0`` builds the box with the
+  flat floor every run of `0ba3f60` trained on (to re-read those runs on their own box); unset or 1 the
+  corner feet (S10 report §8)."""
   name = _select(GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS))
+  feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
+  if feet not in ("0", "1"):
+    raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
   if name in GOALS:
     return name, None
-  return DEFAULT_GOAL, BOX_GOALS[name]
+  box = BOX_GOALS[name]
+  if box is None or feet == "1":
+    return DEFAULT_GOAL, box
+  return DEFAULT_GOAL, dataclasses.replace(box, feet=False)
 
 
 def _critic_release() -> bool:
@@ -480,8 +504,27 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
   recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
   cfg = PPO_RECIPES[recipe]("kangaroo_pick_place")
-  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9). JOINT trains from
-  # scratch (plan S11).
+  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9); plan S10.1's box pose
+  # from W2 box checkpoints without the box's yaw (actor and critic) and, from BX-RIM, without PQ.
+  # JOINT trains from scratch (plan S11).
   both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
-  cfg.widen_critic_on_resume = False if both else _critic_release()
+  box_pose = _select_box_obs() == "pose"
+  cfg.widen_critic_on_resume = False if both else (_critic_release() or box_pose)
+  cfg.widen_actor_on_resume = box_pose
+  cfg.rescale_actions_on_load = _ckpt_action_ratio()
   return cfg
+
+
+def _ckpt_action_ratio() -> dict[str, float] | None:
+  """Plan S10.1's ``CKPT_SPAWN``: joint regex -> (the checkpoint's arm's action scale / this run's), for
+  the joints whose scales differ; None when unset or the same arm."""
+  ckpt = os.environ.get(CKPT_SPAWN_ENV_VAR)
+  if ckpt is None:
+    return None
+  ckpt = _select(CKPT_SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
+  spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
+  old, new = SPAWN_ROBOTS[ckpt].action_scale, SPAWN_ROBOTS[spawn].action_scale
+  if set(old) != set(new):
+    raise ValueError(f"CKPT_SPAWN={ckpt} and SPAWN={spawn} scale different joints")
+  ratio = {k: old[k] / new[k] for k in new if old[k] != new[k]}
+  return ratio or None

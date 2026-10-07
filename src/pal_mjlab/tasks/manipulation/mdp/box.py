@@ -10,6 +10,12 @@ The actor sees the goal through the box's own tracker (`box_goal_position_tracke
 box's pose as FoundationPose reports it, lagged like the cube's, and both poses carry a tracker
 bias split into a part shared by every object in the episode (the camera) and a part of each
 object's own (`reset_tracker_bias`; plan S9/S10: 6 + 4 mm). The critic keeps the live goal.
+
+Plan S10.1 (the box on the wide area, at any yaw): `reset_box_in_area` draws the box from an area
+of the table at least a distance from the cube, at a yaw in +/- 45 deg; with ``BOX_OBS=pose`` the
+actor sees the box itself -- its tracked position (`object_position_biased_b` on the box) and its
+yaw as (cos 4 psi, sin 4 psi) (`box_yaw_b`, 4-fold symmetric like the box) -- instead of the goal
+point; and M6's yaw grade is taken against the box (`BoxGoalCommandCfg.yaw_reference`).
 """
 
 from __future__ import annotations
@@ -154,6 +160,11 @@ class BoxGoalCommandCfg(LiftingCommandCfg):
   """Thickness of the box floor, m (`scene.BOX_FLOOR`): its top is this far above the box's
   origin, the centre of its bottom face."""
 
+  yaw_reference: str | None = None
+  """Plan S10.1: the entity M6's yaw grade measures the object's yaw against (the box, which
+  stands at any yaw there), read by the release latch (`observations._release_latch`); None
+  measures it against the world's axes, as every S10 / DEP1 run did (box at 0 +/- 5 deg)."""
+
   # Placement belongs to a reset event, not to the command -- as for `SurfaceOffsetCommandCfg`.
   object_pose_range: LiftingCommandCfg.ObjectPoseRangeCfg | None = None
 
@@ -194,6 +205,65 @@ def reset_box_on_surface(
   box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
 
 
+#: Rounds of redrawing in `reset_box_in_area` before the stragglers take the area's farthest corner.
+BOX_AREA_REDRAWS = 32
+
+
+def reset_box_in_area(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  asset_cfg: SceneEntityCfg,
+  surface_cfg: SceneEntityCfg,
+  object_name: str,
+  area_x: tuple[float, float],
+  area_y: tuple[float, float],
+  yaw: float,
+  min_distance: float,
+) -> None:
+  """Plan S10.1: put the box down on the surface, its centre drawn uniformly from the area
+  (``area_x`` x ``area_y``, relative to the surface centre -- table-relative, so DR-scene's table
+  shift moves it), at least ``min_distance`` (xy, centre to centre) from the object, at a yaw drawn
+  in +/- ``yaw``, at rest.
+
+  Runs after the object's reset event and reads the object from its free joint's ``qpos`` (the
+  derived ``xpos`` is stale until the next ``forward()``, S7-8). Vectorised rejection as
+  `SurfaceOffsetCommand._draw_clear_of_object`: each round redraws only the envs still too close;
+  after `BOX_AREA_REDRAWS` rounds the stragglers take the area's corner farthest from the object,
+  which is at least ``min_distance`` away when the object was drawn where one is
+  (`events.reset_objects_on_surface`'s ``goal_area``)."""
+  n = len(env_ids)
+  device = env.device
+  box: Entity = env.scene[asset_cfg.name]
+  centre = _surface_centre_xy(env, surface_cfg)[env_ids]
+  top = surface_top_z(env, surface_cfg)[env_ids]
+  cube, _ = _free_pose(env.scene[object_name])
+  cube = cube[env_ids, :2]
+  lo = torch.tensor([area_x[0], area_y[0]], device=device)
+  hi = torch.tensor([area_x[1], area_y[1]], device=device)
+  offsets = sample_uniform(lo, hi, (n, 2), device=device)
+  for _ in range(BOX_AREA_REDRAWS):
+    too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
+    if not bool(too_close.any()):
+      break
+    redraw = sample_uniform(lo, hi, (n, 2), device=device)
+    offsets = torch.where(too_close.unsqueeze(-1), redraw, offsets)
+  too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
+  if bool(too_close.any()):
+    corners = torch.tensor(
+      [[area_x[0], area_y[0]], [area_x[0], area_y[1]], [area_x[1], area_y[0]], [area_x[1], area_y[1]]],
+      device=device,
+    )
+    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(-1)
+    offsets = torch.where(too_close.unsqueeze(-1), corners[far], offsets)
+  zeros = torch.zeros(n, device=device)
+  quat = quat_from_euler_xyz(
+    zeros, zeros, sample_uniform(-yaw, yaw, (n,), device=device)
+  )
+  pose = torch.cat([centre + offsets, top.unsqueeze(-1), quat], dim=-1)
+  box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+  box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+
 @requires_model_fields("geom_size", "geom_pos", "geom_rbound", "geom_aabb")
 def set_box_geometry(
   env: ManagerBasedRlEnv,
@@ -205,12 +275,15 @@ def set_box_geometry(
   floor: float,
   inner_range: tuple[float, float],
   height_range: tuple[float, float],
+  feet: tuple[str, ...] = (),
+  foot_inset: float = 0.0,
 ) -> None:
   """Startup event, plan S10's BX-DR: draw each world's box inner width and wall height
   (above the floor) uniformly, and rebuild the floor and the four walls (`scene.get_box_spec`'s
   layout: walls +x, -x, +y, -y, the y walls across the outer width) -- sizes, positions and the
-  bounds the broadphase reads. Wall and floor thickness stay. The mass is the DR of the box's
-  mass, a separate event."""
+  bounds the broadphase reads. Wall and floor thickness stay; ``feet`` (+x+y, +x-y, -x+y, -x-y,
+  `scene.box_foot_geom_names`) move to ``foot_inset`` inside the new outer corners. The mass is the
+  DR of the box's mass, a separate event."""
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device)
   n = len(env_ids)
@@ -235,6 +308,12 @@ def set_box_geometry(
     size[env_ids, gid, 2] = h / 2
   size[env_ids, floor_id, 0] = half_out
   size[env_ids, floor_id, 1] = half_out
+  if feet:
+    c = half_out - foot_inset
+    for name, (sx, sy) in zip(feet, ((1, 1), (1, -1), (-1, 1), (-1, -1)), strict=True):
+      gid = box.indexing.geom_ids[box.geom_names.index(name)]
+      pos[env_ids, gid, 0] = sx * c
+      pos[env_ids, gid, 1] = sy * c
   _recompute_geom_bounds(env, env_ids.to(dtype=torch.int), asset_cfg)
 
 

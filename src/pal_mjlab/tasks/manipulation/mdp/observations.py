@@ -480,9 +480,7 @@ def yaw_error_mod_90(
   return torch.abs(yaw - quarter * torch.round(yaw / quarter))
 
 
-def yaw_reference_quat(
-  env: ManagerBasedRlEnv, command_name: str
-) -> torch.Tensor | None:
+def yaw_reference_quat(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor | None:
   """The world orientation M6's yaw grade measures against: the entity the goal command names in
   its cfg's ``yaw_reference`` (plan S10.1, `box.BoxGoalCommandCfg`), or None for the world's axes. (B, 4)"""
   term = env.command_manager.get_term(command_name)
