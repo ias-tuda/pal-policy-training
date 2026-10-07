@@ -59,6 +59,11 @@ HOLD_APPROACH = (1.0, 0.0, 0.0)
 #: 40 mm, but there the palm's hull is 1.7 mm over the table (`results/S13-insert/step0/dummy_hand_40.json`) and the
 #: scripted grasp at 40 mm scraped it in 7 of 8 envs; at 48 mm it is ~10 mm clear.
 PAD_HEIGHT = 0.048
+#: How far short of the block's axis the pads close, toward the hand: at 0 the jaw's inner links (the four-bar's,
+#: next to the palm) sit 1.5 mm behind the block's back face (`results/S13-insert/step0/dummy_hand_40.json`), and the
+#: scripted grasp pushed the free block 18 mm ahead of the hand before the jaw closed (28 mm after); 10 mm leaves them
+#: ~11 mm clear and the pads still on the faces (their pads span ~+/-15 mm along the approach).
+GRASP_DEPTH = 0.010
 #: How far the pads reach past the TCP along the approach axis with the jaw open (S1.3, re-measured on
 #: the tabletop model 2026-10-07: 25.57 mm).
 PAD_OFFSET = 0.0256
@@ -190,7 +195,7 @@ def _hold_rewards(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
         "approach_b": HOLD_APPROACH,
         "pad_height": PAD_HEIGHT,
         "half_height": half,
-        "pad_offset": PAD_OFFSET,
+        "pad_offset": PAD_OFFSET + GRASP_DEPTH,
         "std": REACH_STD,
         "cone_std": REACH_CONE_STD,
         "face_cone": REACH_FACE_CONE,

@@ -320,13 +320,13 @@ def hold_rollout(args) -> dict:
     for hp, n, sign in cases:
       a = np.array([-n[0], -n[1], 0.0])
       pads = np.array([pos[i][0], pos[i][1], bottom + hp])
-      tcp = pads - pad_off * a
+      tcp = pads - (pad_off + H.GRASP_DEPTH) * a
       r = K.hand_frame(a, sign * np.array([-a[1], a[0], 0.0]))
       r_h = K.hand_frame(np.array(H.HOLD_APPROACH), sign * np.array([0.0, 1.0, 0.0]))
       h_pads = np.array(
         [H.HOLD_XY[0], H.HOLD_XY[1], float(top_env[i]) + H.HOLD_DZ + hp]
       )
-      tcp_h = h_pads - pad_off * np.array(H.HOLD_APPROACH)
+      tcp_h = h_pads - (pad_off + H.GRASP_DEPTH) * np.array(H.HOLD_APPROACH)
 
       def near(q):
         return arm.contacts(q)
@@ -339,7 +339,7 @@ def hold_rollout(args) -> dict:
         err = "grasp"
         continue
       q_p = None
-      for back, up in ((0.08, 0.02), (0.0, 0.10), (0.04, 0.06)):
+      for back, up in ((0.0, 0.10), (0.04, 0.06), (0.08, 0.02)):
         q_p = K.solve(
           arm,
           tcp - back * a + np.array([0, 0, up]),

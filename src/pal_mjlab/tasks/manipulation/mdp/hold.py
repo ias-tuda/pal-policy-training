@@ -98,7 +98,8 @@ def side_grasp_targets_w(
   direction the hand should point in, e.g. +x: the hand comes from the robot's side of the block): at a block
   yaw near 45 deg two faces do, and step 0 found only the other one reachable over part of the area. The pads go
   to the block's axis at ``pad_height`` above its bottom (``half_height`` below its centre), the TCP
-  ``pad_offset`` behind them, outside the face."""
+  ``pad_offset`` behind the axis, outside the face (L-H passes the jaw's pad reach plus how far short of the axis
+  the pads should close, `pick_place.hold.GRASP_DEPTH`)."""
   obj: Entity = env.scene[object_name]
   rot = matrix_from_quat(obj.data.root_link_quat_w)
   ax, ay, up = rot[..., :, 0], rot[..., :, 1], rot[..., :, 2]
