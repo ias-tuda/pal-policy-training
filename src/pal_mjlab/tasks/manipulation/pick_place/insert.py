@@ -68,6 +68,11 @@ BLOCK_AREA_YAW = math.pi / 4
 #: The least xy distance between the pin's and the block's centres, m (plan §12.1 *Scene*: the block's
 #: half-diagonal 4.0 + the pin's half-span 1.6 + an open hand ~4 + 2 cm; step 0 item 4 measures it).
 PIN_MIN_SEPARATION = 0.12
+#: Where neither the pin's nor the block's centre may be drawn (x lo, x hi, y lo, y hi, m, the robot frame): under the
+#: start pose's left fingers, which hang 78-90 mm over the 0.837 m table at x 0.36-0.45, y 0.09-0.16 (step 0,
+#: `results/S12-insert/step0/home_hand.py`) -- below a standing pin's 90 mm top, which they hit at the reset, and
+#: below a seated pin's, which the hand-off's return home hits -- plus the pin's 16 mm reach and 4 mm. 13 % of WC.
+HOME_HAND_KEEPOUT = (0.34, 0.47, 0.07, 0.18)
 #: The tool point's height over the pin's top at the grasp, m: the fingertips reach 44 mm below the tool point at
 #: the pin's hold angle, so 15.5 mm over the top keeps them 5 mm over the block's top when the pin is seated
 #: (step 0 item 2, `results/S12-insert/step0/geometry/seated_clearance.json`); 20 mm leaves 2.5 mm of margin.
@@ -193,8 +198,10 @@ def apply_insert_goal(
       "area_y": (y0 - table_cy, y1 - table_cy),
       "yaw": BLOCK_AREA_YAW,
       "min_distance": PIN_MIN_SEPARATION,
+      "keepout": HOME_HAND_KEEPOUT,
     },
   )
+  cfg.events["reset_objects"].params["keepout"] = HOME_HAND_KEEPOUT
   cfg.events["reset_tracker_bias"] = EventTermCfg(
     func=mdp.reset_tracker_bias,
     mode="reset",

@@ -102,6 +102,7 @@ PHASES = (
 #: place pose (the pin's bottom `INSERT_PUSH` into the table) and a short press before the jaw opens. The retreat
 #: is `CLEAR_HEIGHT` straight up (L9).
 INSERT_PHASES = (
+  ("rise", "rise", False, 40),
   ("approach", "pregrasp", False, 60),
   ("descend", "grasp", False, 40),
   ("close", "grasp", True, 30),
@@ -118,6 +119,10 @@ INSERT_PHASES = (
 )
 INSERT_PREINSERT = 0.02
 INSERT_PUSH = 0.003
+#: The insert's first move: the tool point straight up from the start pose by this much (m), the jaw turned down.
+#: The start pose's fingers hang 78-90 mm over the 0.837 m table, below a standing pin's top: the approach's
+#: joint-space sweep knocked 18 of 27 planned pins over (step 0, 2026-10-07).
+INSERT_RISE = 0.10
 #: `align` corrects an env whose pin bottom is further than this off the hole's axis (m).
 INSERT_ALIGN_TOL = 0.002
 #: Every waypoint `waypoints` plans, in order.
@@ -1044,6 +1049,17 @@ def rollout(
       # Unreachable for the planner: the arm stays home and the env is scored as it ends.
       plan_error[i] = str(e)
       plans.append({name: kin.q_default.copy() for name in WAYPOINT_NAMES})
+    if insert is not None and i not in plan_error:
+      try:
+        plans[-1]["rise"] = _solve(
+          kin,
+          "rise",
+          kin.fk(kin.q_default)[0] + np.array([0.0, 0.0, INSERT_RISE]),
+          hand_x_for(kin, yaw),
+          kin.q_default,
+        )
+      except RuntimeError as e:
+        plan_error[i] = str(e)
     # Every later use of hand_xs re-plans the place, so it is the carry's hand +x.
     hand_xs.append(hand_x_for(kin, yaw) if carry_x is None else carry_x)
     if verbose:

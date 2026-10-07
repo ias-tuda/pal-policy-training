@@ -476,3 +476,20 @@ def test_l5_the_ladder_floors_and_shaping():
   for lo, hi in zip(floors, floors[1:], strict=False):
     assert lo + ins_mdp.LADDER_SHAPE < hi
     assert (hi - lo) * ins_mdp.LADDER_SCALE >= 2 * 2.0
+
+
+def test_nothing_is_drawn_under_the_home_hand(monkeypatch):
+  """The reset keeps the pin's and the block's centres out of `insert.HOME_HAND_KEEPOUT` (robot frame), where the
+  start pose's fingers hang below a standing pin's top, wherever DR-scene puts the table; 3 resets x 64 envs."""
+  from pal_mjlab.tasks.manipulation.mdp.events import in_keepout
+
+  cfg = _cfg(monkeypatch, num_envs=64)
+  e = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
+  try:
+    for _ in range(3):
+      e.reset()
+      for name in ("object", ins.BLOCK):
+        xy = e.scene[name].data.root_link_pos_w[:, :2] - e.scene.env_origins[:, :2]
+        assert not bool(in_keepout(xy, ins.HOME_HAND_KEEPOUT).any()), name
+  finally:
+    e.close()
