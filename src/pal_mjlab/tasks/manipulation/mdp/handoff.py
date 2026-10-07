@@ -59,6 +59,16 @@ HANDOFF_TOL = 0.005
 HANDOFF_CLEAR = 0.03
 HANDOFF_CLEAR_STEPS = 5
 
+#: Plan S9.3's park poses (`HANDOFF_PARK`): where the last leg ends, as offsets (rad) on the arm's 7
+#: joints from its home. ``home`` is every run before S9.3. ``elbow`` bends arm 4 a further 0.2 rad:
+#: the TCP 11 cm higher, and >= 7.6 cm from a standing tower anywhere on WC at a table of 0.827-0.847 m,
+#: where the home pose's fingers reach 4.8 cm into one (S9.3 step 0 item 3,
+#: `results/S9.3-wide/step0/`).
+HANDOFF_PARK_POSES: dict[str, tuple[float, ...] | None] = {
+  "home": None,
+  "elbow": (0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0),
+}
+
 #: The phases, per env and arm.
 POLICY, UP, OUT, HOME = 0, 1, 2, 3
 
@@ -96,6 +106,9 @@ class HandoffArmCfg:
   """+1 when the arm's own side is +y (the left arm), -1 when it is -y (the right)."""
   trigger: HandoffTriggerCfg | None = None
   """The arm's own trigger (training); None: `start_handoff` starts it (the eval)."""
+  park: tuple[float, ...] | None = None
+  """Offsets (rad) on the 7 arm joints from home where the last leg ends (`HANDOFF_PARK_POSES`);
+  None: home."""
 
 
 class HandoffJointPositionAction(RateLimitedJointPositionAction):
@@ -124,6 +137,8 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
       missing = [j for j in (*arm.arm_joints, arm.jaw_joint) if j not in names]
       if missing:
         raise ValueError(f"hand-off arm {arm.name!r}: {missing} not in {names}")
+      if arm.park is not None and len(arm.park) != len(arm.arm_joints):
+        raise ValueError(f"hand-off arm {arm.name!r}: park has {len(arm.park)} offsets")
       idx = torch.tensor(
         [names.index(j) for j in arm.arm_joints], device=self.device, dtype=torch.long
       )
@@ -134,6 +149,9 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
           "jaw": names.index(arm.jaw_joint),
           "joints": entity.indexing.joint_ids[self._target_ids[idx]],
           "site": entity.site_names.index(arm.tcp_site),
+          "park": None
+          if arm.park is None
+          else torch.tensor(arm.park, device=self.device, dtype=torch.float),
         }
       )
     n, k = self.num_envs, len(self._arms)
@@ -277,9 +295,10 @@ class HandoffJointPositionAction(RateLimitedJointPositionAction):
         (rate / dq.abs().clamp_min(1e-9)).amin(dim=-1, keepdim=True).clamp(max=1.0)
       )
       q_route = self._last_target[:, idx] + dq * shrink
-      q_star = torch.where(
-        (phase == HOME).unsqueeze(-1), self._default_target()[:, idx], q_route
-      )
+      home_q = self._default_target()[:, idx]
+      if arm["park"] is not None:
+        home_q = home_q + arm["park"]
+      q_star = torch.where((phase == HOME).unsqueeze(-1), home_q, q_route)
       a_arm = (q_star - self._offset_of(idx)) / self._scale_of(idx)
       out[:, idx] = torch.where(active.unsqueeze(-1), a_arm, out[:, idx])
       jaw = arm["jaw"]

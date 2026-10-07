@@ -1628,6 +1628,61 @@ class OccTally:
     }
 
 
+#: Plan S9.3's ``sunk``: the red cube on the base lower than resting on it by more than this, mm.
+SUNK_MM = 3.0
+
+
+class _CubeHandContacts:
+  """Plan S9.3's return contact: whether an arm 4-7 / gripper collider of either arm touches either
+  cube, per env, from mujoco_warp's contact list (``dist`` <= 0). ``ok`` is False when the data has
+  no contact list to read."""
+
+  PATTERN = r"(arm_(left|right)_[4-7]|gripper_(left|right))_"
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    import re
+
+    m = env.sim.mj_model
+    self.ok = hasattr(env.sim, "wp_data")
+    robot = env.scene[ROBOT]
+    hand = [
+      int(g)
+      for g, name in zip(
+        robot.indexing.geom_ids.tolist(), robot.geom_names, strict=True
+      )
+      if re.match(self.PATTERN, name)
+    ]
+    cubes = [
+      int(g)
+      for name in (OBJECT, "base_object")
+      if name in env.scene.entities
+      for g in env.scene[name].indexing.geom_ids.tolist()
+    ]
+    self.hand = torch.zeros(m.ngeom, dtype=torch.bool, device=env.device)
+    self.cube = torch.zeros(m.ngeom, dtype=torch.bool, device=env.device)
+    self.hand[hand] = True
+    self.cube[cubes] = True
+    self.ok = self.ok and bool(hand) and bool(cubes)
+
+  def touching(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    import warp as wp
+
+    d = env.sim.wp_data
+    out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    n = int(wp.to_torch(d.nacon)[0])
+    if n == 0:
+      return out
+    geom = wp.to_torch(d.contact.geom)[:n].long()
+    world = wp.to_torch(d.contact.worldid)[:n].long()
+    dist = wp.to_torch(d.contact.dist)[:n]
+    a, b = geom[:, 0], geom[:, 1]
+    hit = ((self.hand[a] & self.cube[b]) | (self.hand[b] & self.cube[a])) & (
+      dist <= 0.0
+    )
+    out[world[hit]] = True
+    return out
+
+
 class StackTally:
   """Plan S9's reads on a stack goal (`GOAL=stack`), per episode.
 
@@ -1637,6 +1692,12 @@ class StackTally:
   ``OK`` and how many there were. The lock's steps (`GATE=stack`): armed (held, lifted, not OK)
   and refused (the policy asked to open while armed) -- the stall read. And the base cube's
   largest horizontal displacement from where it spawned.
+
+  Plan S9.3 adds, per episode: where the base and the red cube started (env frame, the base's yaw
+  folded to +/- 45 deg) for the read's bins; ``sunk`` -- at the end the red cube on the base (within
+  2.5 cm) but more than `SUNK_MM` lower than resting on it (decision 0004's sink); and return contact
+  -- the steps after the hand-off started on which an arm 4-7 / gripper collider of either arm
+  touches either cube.
   """
 
   NAMES = ("dxy", "height", "tilt", "yaw", "speed")
@@ -1656,15 +1717,46 @@ class StackTally:
     self.fresh = torch.ones(n, dtype=torch.bool, device=device)
     self.base0 = torch.zeros(n, 2, device=device)
     self.base_moved = zf()
+    #: Plan S9.3: base x, y, yaw and red cube x, y at the episode's start (env frame).
+    self.start = torch.zeros(n, 5, device=device)
+    self.top_dxy, self.top_dz = zf(), zf()
+    self.return_contact = zl()
+    self._contact = _CubeHandContacts(env)
     self.done: list[dict] = []
 
   @property
   def active(self) -> bool:
     return self.reference is not None
 
-  def step(self, env: ManagerBasedRlEnv, grasped: torch.Tensor) -> None:
+  def step(
+    self,
+    env: ManagerBasedRlEnv,
+    grasped: torch.Tensor,
+    handed: torch.Tensor | None = None,
+  ) -> None:
     from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
     from pal_mjlab.tasks.manipulation.mdp.stack import stack_state
+
+    origin = env.scene.env_origins[:, :2]
+    base_w = env.scene[self.reference].data.root_link_pos_w
+    cube_w = env.scene[OBJECT].data.root_link_pos_w
+    q = env.scene[self.reference].data.root_link_quat_w
+    base_yaw = torch.atan2(
+      2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+    )
+    now = torch.cat(
+      [
+        base_w[:, :2] - origin,
+        yaw_mod90(base_yaw).unsqueeze(-1),
+        cube_w[:, :2] - origin,
+      ],
+      dim=-1,
+    )
+    self.start = torch.where(self.fresh.unsqueeze(-1), now, self.start)
+    self.top_dxy = torch.norm(cube_w[:, :2] - base_w[:, :2], dim=-1)
+    self.top_dz = cube_w[:, 2] - base_w[:, 2]
+    if handed is not None and self._contact.ok:
+      self.return_contact += (handed & self._contact.touching(env)).long()
 
     lifted = getattr(env, _WAS_LIFTED, None)
     lifted = torch.zeros_like(grasped) if lifted is None else lifted
@@ -1700,6 +1792,19 @@ class StackTally:
       row["stack_lock_armed_steps"] = int(self.armed[i])
       row["stack_lock_refused_steps"] = int(self.refused[i])
       row["stack_base_moved_m"] = float(self.base_moved[i])
+      bx, by, byaw, cx, cy = self.start[i].tolist()
+      row.update(
+        stack_base_x=bx,
+        stack_base_y=by,
+        stack_base_yaw_deg=math.degrees(byaw),
+        stack_cube_x=cx,
+        stack_cube_y=cy,
+        stack_carry_cm=100 * math.hypot(bx - cx, by - cy),
+      )
+      on_top = float(self.top_dxy[i]) < 0.025
+      row["stack_end_dz_mm"] = 1e3 * float(self.top_dz[i])
+      row["stack_sunk"] = bool(on_top and 1e3 * float(self.top_dz[i]) < 50.0 - SUNK_MM)
+      row["stack_return_contact_steps"] = int(self.return_contact[i])
       self.done.append(row)
     for t in (self.prev, self.rel_ok, self.any_ok):
       t[env_ids] = False
@@ -1707,6 +1812,7 @@ class StackTally:
     self.armed[env_ids] = 0
     self.refused[env_ids] = 0
     self.base_moved[env_ids] = 0.0
+    self.return_contact[env_ids] = 0
     self.fresh[env_ids] = True
 
   def summarise(self, episodes: int) -> dict:
@@ -1734,6 +1840,12 @@ class StackTally:
       "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows)
       / n,
     }
+    out["stack_sunk"] = sum(r["stack_sunk"] for r in rows) / n
+    out["stack_return_contact"] = (
+      sum(r["stack_return_contact_steps"] > 0 for r in rows) / n
+      if self._contact.ok
+      else None
+    )
     armed = sorted(r["stack_lock_armed_steps"] for r in rows)
     if armed and armed[-1] > 0:
       out["stack_lock_armed_median_s"] = armed[len(armed) // 2] * STEP_DT_S
@@ -1803,7 +1915,8 @@ class BoxTally:
       box_e = env.scene[b.BOX]
       q = box_e.data.root_link_quat_w
       yaw = torch.atan2(
-        2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+        2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+        1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2),
       )
       now = torch.cat(
         [
@@ -2641,7 +2754,7 @@ def main() -> None:
       tally.measure(flags["grasped"], dxy, dz)
       tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
       if stack.active:
-        stack.step(env, flags["grasped"])
+        stack.step(env, flags["grasped"], retreat.handed)
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
       jaw_thr = jaw_open_for(env)
       handed = retreat.step(

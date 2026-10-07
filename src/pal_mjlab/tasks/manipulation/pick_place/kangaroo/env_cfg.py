@@ -117,7 +117,11 @@ from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   handoff_arm,
   make_bimanual_env_cfg,
 )
-from pal_mjlab.tasks.manipulation.pick_place.box import BOX_GOALS, BOX_OBS_NAMES, BoxGoal
+from pal_mjlab.tasks.manipulation.pick_place.box import (
+  BOX_GOALS,
+  BOX_OBS_NAMES,
+  BoxGoal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASE_OBS_NAMES,
   BASELINES,
@@ -175,6 +179,7 @@ ARM_TABLE_ENV_VAR = "ARM_TABLE"
 ARM_HOME_ENV_VAR = "ARM_HOME"
 TRACKER_ENV_VAR = "TRACKER"
 HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
+HANDOFF_PARK_ENV_VAR = "HANDOFF_PARK"
 ARMS_ENV_VAR = "ARMS"
 HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
@@ -383,11 +388,18 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     box_obs=_select_box_obs(),
   )
   _apply_contact(cfg)
+  park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
+    # Plan S9.3's `HANDOFF_PARK` names where it ends (home unset).
     left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
-    cfg.actions["joint_pos"] = mdp.with_handoff(
-      cfg.actions["joint_pos"], arms=(handoff_arm(left, +1.0, None),)
+    arm = dataclasses.replace(
+      handoff_arm(left, +1.0, None), park=mdp.HANDOFF_PARK_POSES[park]
+    )
+    cfg.actions["joint_pos"] = mdp.with_handoff(cfg.actions["joint_pos"], arms=(arm,))
+  elif park != "home":
+    raise ValueError(
+      "HANDOFF_PARK ends plan S11's up-out route; it needs HANDOFF_ROUTE=up-out"
     )
   return cfg
 
