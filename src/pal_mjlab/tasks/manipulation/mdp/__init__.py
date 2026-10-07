@@ -105,6 +105,14 @@ from .hold import (
   side_grasp_target_w,
   side_reach,
 )
+from .holder import (
+  chain_spec_fns,
+  held_block_moved_penalty,
+  held_block_offset,
+  held_block_weld,
+  holder_spec,
+  reset_held_block,
+)
 from .observations import (
   commanded_target_rel,
   ee_orientation_b,
@@ -177,6 +185,13 @@ from .terminations import (
 )
 
 __all__ = [
+  # Plan §13, the block held by a stand-in left hand (R-I).
+  "chain_spec_fns",
+  "held_block_moved_penalty",
+  "held_block_offset",
+  "held_block_weld",
+  "holder_spec",
+  "reset_held_block",
   # Plan §13, the side grasp and the hold of the socket block.
   "approach_elevation",
   "axis_tilt",
