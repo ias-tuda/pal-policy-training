@@ -160,7 +160,8 @@ def envs():
     env.reset()
     out[dz] = (env, mp)
   yield {k: v[0] for k, v in out.items()}
-  for env, mp in out.values():
+  # In reverse: each patch restores what it found, and the second found the first's variables set.
+  for env, mp in reversed(list(out.values())):
     env.close()
     mp.undo()
 

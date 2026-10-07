@@ -47,6 +47,18 @@ class EntityOffsetCommand(LiftingCommand):
     super().__init__(cfg, env)
     self.reference: Entity = env.scene[cfg.reference_name]
     self._offset = torch.tensor(cfg.offset, device=self.device, dtype=torch.float32)
+    #: The reference's world xy when the episode's goal was drawn (plan S11's `base_moved`). (B, 2)
+    self.reference_start_xy = torch.zeros(self.num_envs, 2, device=self.device)
+
+  def _reference_xy(self) -> torch.Tensor:
+    """The reference's world xy from its free joint's ``qpos`` -- what a reset event wrote, valid
+    before the next ``forward()``, when the derived pose is still the last episode's. (B, 2)"""
+    adr = self.reference.data.indexing.free_joint_q_adr[:2]
+    return self.reference.data.data.qpos[:, adr]
+
+  def reference_displacement(self) -> torch.Tensor:
+    """Horizontal distance the reference has moved since the goal was drawn, m. (B,)"""
+    return torch.norm(self._reference_xy() - self.reference_start_xy, dim=-1)
 
   @property
   def _stacking_height(self) -> torch.Tensor:
@@ -65,6 +77,7 @@ class EntityOffsetCommand(LiftingCommand):
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     super()._resample_command(env_ids)
     self.target_pos[env_ids] = self._goal_from_reference()[env_ids]
+    self.reference_start_xy[env_ids] = self._reference_xy()[env_ids]
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     super()._update_command(env_ids)
@@ -106,6 +119,12 @@ class SurfaceOffsetCommand(LiftingCommand):
 
   def __init__(self, cfg: SurfaceOffsetCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
+    if cfg.frame not in ("surface", "env"):
+      raise ValueError(f"unknown frame {cfg.frame!r}; have ('surface', 'env')")
+    if cfg.frame == "env" and cfg.min_object_distance > 0.0:
+      raise ValueError(
+        "min_object_distance is drawn about the surface centre; frame='env'"
+      )
     self._surface_cfg = SceneEntityCfg(cfg.surface_name)
     self._offset = torch.tensor(cfg.offset, device=self.device, dtype=torch.float32)
     self._half_range = torch.tensor(
@@ -123,7 +142,11 @@ class SurfaceOffsetCommand(LiftingCommand):
       surface_top_z,
     )
 
-    centre_xy = _surface_centre_xy(self._env, self._surface_cfg)
+    centre_xy = (
+      _surface_centre_xy(self._env, self._surface_cfg)
+      if self.cfg.frame == "surface"
+      else self._env.scene.env_origins[:, :2]
+    )
     top_z = surface_top_z(self._env, self._surface_cfg)
     half_z = object_half_height(self._env, self.cfg.entity_name)
     return torch.cat([centre_xy + self.offsets, (top_z + half_z).unsqueeze(-1)], dim=-1)
@@ -210,6 +233,11 @@ class SurfaceOffsetCommandCfg(LiftingCommandCfg):
   in. Zero, the default, draws once. Needs the cube already placed when the command resamples,
   which the reset events guarantee."""
 
+  frame: str = "surface"
+  """What ``offset`` is from: the surface geom's centre (``surface``, every task before plan S11),
+  or the env origin (``env``): plan S11's meeting point T, fixed in the robot frame while
+  DR-scene shifts the table under it. The height is the surface's either way."""
+
   # Placement belongs to a reset event, not to the command -- as for `EntityOffsetCommandCfg`.
   # Without this the inherited default is mjlab's own spawn range (x 0.30-0.35, y +/-0.10,
   # z 0.02-0.05 in the env frame), and `LiftingCommand._resample_command` re-placed the object
@@ -232,6 +260,11 @@ class EntityOffsetCommandCfg(LiftingCommandCfg):
 
   stack_on_top: bool = False
   """Replace the offset's z with the resting height of the object on the reference."""
+
+  yaw_reference: str | None = None
+  """Plan S9.1's SC-Y: the entity M6's yaw grade measures the object's yaw against (the base, which
+  stands at +/- 45 deg there), read by the release latch (`observations._release_latch`) as
+  S10.1's `BoxGoalCommandCfg.yaw_reference`; None measures it against the world's axes."""
 
   # Placement belongs to a reset event, not to the command.
   object_pose_range: LiftingCommandCfg.ObjectPoseRangeCfg | None = None

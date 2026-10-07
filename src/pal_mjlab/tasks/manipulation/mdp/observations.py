@@ -306,6 +306,39 @@ def _on_surface_bool(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
 #: Attribute on the env holding the `was_lifted` episode latch.
 _WAS_LIFTED = "_pp_was_lifted"
 
+#: The grasp sensor whose latches keep the plain attributes (`_WAS_LIFTED`, `_RELEASE`): the left
+#: gripper's (`GripperCfg.contact_sensor_name`), the one every single-arm task drives, and what the
+#: tests and `scripts/eval_pick_place.py` read. Plan S11's JOINT has a second arm with a grasp
+#: sensor -- and a cube -- of its own; its latches live under `latch_attr`'s suffixed names, so
+#: the two arms' lifts and releases are never confused.
+PRIMARY_GRASP_SENSOR = "left_pad_contact"
+#: Attribute on the env listing every latch attribute made, for the reset events.
+_LATCH_ATTRS = "_pp_latch_attrs"
+
+
+def latch_attr(base: str, grasp_sensor_name: str) -> str:
+  """The env attribute of latch ``base`` (`_WAS_LIFTED` or `_RELEASE`) for a grasp sensor: ``base``
+  itself for `PRIMARY_GRASP_SENSOR`, ``base:<sensor>`` for any other (plan S11)."""
+  if grasp_sensor_name == PRIMARY_GRASP_SENSOR:
+    return base
+  return f"{base}:{grasp_sensor_name}"
+
+
+def _remember_latch(env: ManagerBasedRlEnv, attr: str) -> None:
+  attrs = getattr(env, _LATCH_ATTRS, None)
+  if attrs is None:
+    attrs = set()
+    setattr(env, _LATCH_ATTRS, attrs)
+  attrs.add(attr)
+
+
+def latch_attrs(env: ManagerBasedRlEnv, base: str) -> list[str]:
+  """Every attribute of latch ``base`` this env has made so far, the plain one first if it is
+  there (`events.reset_was_lifted` / `reset_release_latch` clear them all)."""
+  attrs = getattr(env, _LATCH_ATTRS, set())
+  keyed = sorted(a for a in attrs if a.startswith(base + ":"))
+  return ([base] if hasattr(env, base) else []) + keyed
+
 
 def _was_lifted_bool(
   env: ManagerBasedRlEnv, grasp_sensor_name: str, support_sensor_name: str
@@ -329,10 +362,12 @@ def _was_lifted_bool(
   the goal is the same state whether it was carried or slid. The reward still separates the
   two *trajectories*, so the gradient is right; it is the value function that pays.
   """
-  latch = getattr(env, _WAS_LIFTED, None)
+  attr = latch_attr(_WAS_LIFTED, grasp_sensor_name)
+  latch = getattr(env, attr, None)
   if latch is None or latch.shape[0] != env.num_envs:
     latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    setattr(env, _WAS_LIFTED, latch)
+    setattr(env, attr, latch)
+    _remember_latch(env, attr)
   lifted = _grasped_bool(env, grasp_sensor_name) & ~_on_surface_bool(
     env, support_sensor_name
   )
@@ -497,7 +532,7 @@ def _release_latch(
   the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table. On a stack
   goal (plan S9: `EntityOffsetCommand` with ``stack_on_top``) it is the goal's own z -- the cube
   resting on the base -- and ``rel_ok`` records whether `stack.StackState.ok` held at the let-go.
-  passes the box's walls as ``surface_cfg`` (`events.surface_top_z` with named geoms), so the
+  Plan S10 passes the box's walls as ``surface_cfg`` (`events.surface_top_z` with named geoms), so the
   height is the object's bottom above the rim; every reader must pass the same surface.
 
   M7's set-down (plan S7-2): a *touchdown* is the first held-on-surface update after the held
@@ -520,7 +555,8 @@ def _release_latch(
     surface_cfg.name,
     None if surface_cfg.geom_names is None else tuple(surface_cfg.geom_names),
   )
-  latch = getattr(env, _RELEASE, None)
+  attr = latch_attr(_RELEASE, grasp_sensor_name)
+  latch = getattr(env, attr, None)
   if latch is None or latch.released.shape[0] != env.num_envs:
     no = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     zero = torch.zeros(env.num_envs, device=env.device)
@@ -551,7 +587,8 @@ def _release_latch(
       latch.pend_dwell = count.clone()
       latch.pend_tilt = zero.clone()
       latch.pend_yaw = zero.clone()
-    setattr(env, _RELEASE, latch)
+    setattr(env, attr, latch)
+    _remember_latch(env, attr)
   if latch.jaw != jaw:
     raise ValueError(
       f"the release latch was built with jaw={latch.jaw}, read with jaw={jaw}: every "

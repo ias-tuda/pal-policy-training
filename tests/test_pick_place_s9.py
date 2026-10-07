@@ -178,7 +178,8 @@ def test_rg_and_sa_need_m6_and_m1():
     rw._s52_arm(("M1", "RG", "M6"))
   with pytest.raises(ValueError, match="SA"):
     rw._s52_arm(("M3", "SA"))
-  assert rw.STACK_ONLY_ARMS == {RCTP_RG, RCTP_SA}
+  # Plan S9.1 adds SAW (SC-SAw), which reads the base too.
+  assert rw.STACK_ONLY_ARMS == {RCTP_RG, RCTP_SA, f"{RCTP}+SAW"}
   assert {RCTP_RG, RCTP_SA} <= rw.JAW_RELEASE and {RCTP_RG, RCTP_SA} <= (
     rw.NO_SUCCESS_TERMINATION
   )

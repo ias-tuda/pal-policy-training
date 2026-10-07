@@ -2501,6 +2501,12 @@ def main() -> None:
   )
   if args.handoff_lift is not None and not args.handoff:
     raise SystemExit("--handoff-lift needs --handoff")
+  if args.handoff_lift is not None and hasattr(
+    env.action_manager.get_term("joint_pos"), "start_handoff"
+  ):
+    raise SystemExit(
+      "--handoff-lift is the IK lift; HANDOFF_ROUTE=up-out is plan S11's route -- pick one"
+    )
   if args.handoff_lift is not None and isinstance(
     env.action_manager.get_term("joint_pos"), DeltaRateLimitedJointPositionAction
   ):
@@ -2592,7 +2598,12 @@ def main() -> None:
         goal,
       )
       actions = policy(obs)
-      if lift is not None:
+      route = env.action_manager.get_term("joint_pos")
+      if args.handoff and hasattr(route, "start_handoff"):
+        # Plan S11's up-out-home route (`HANDOFF_ROUTE=up-out`, `mdp.handoff`): the action term
+        # takes the arm over from this step on; the policy's actions pass through unread.
+        route.start_handoff("left", handed)
+      elif lift is not None:
         actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
       elif args.handoff:
         # The position controller: action 0 is the home pose with the jaw open, reached

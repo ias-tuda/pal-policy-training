@@ -694,6 +694,7 @@ def stack_alignment(
   grasp_sensor_name: str,
   support_sensor_name: str,
   near: float = 0.03,
+  widths: tuple[float, float, float, float | None, float] | None = None,
 ) -> torch.Tensor:
   """Plan S9's SA: how close the held cube is to the release condition ``OK``, as the product of
   one Gaussian per quantity with its bound as the width, prod_i exp(-(x_i / bound_i)^2), paid
@@ -702,17 +703,28 @@ def stack_alignment(
 
   The gradient towards ``OK`` beside the lock (ST-GA): with the lock alone the policy is paid
   nothing until it happens to satisfy all five at once and can open.
+
+  ``widths`` (dxy m, height m, tilt rad, yaw rad or None to drop it, speed m/s) replaces the
+  ``OK`` bounds as the Gaussians' widths: plan S9.1's SC-SAw (`pick_place.rewards.SAW_WIDTHS`), whose
+  let-gos sit far outside ``OK`` (S9 and DEP1 measured SA at ~0 per episode, L15).
   """
   state = stack_state(env, object_name, reference_name, command_name)
-  score = torch.exp(
-    -(
-      torch.square(state.dxy / OK_DXY)
-      + torch.square(state.height / OK_HEIGHT)
-      + torch.square(state.tilt / OK_TILT)
-      + torch.square(state.yaw / OK_YAW)
-      + torch.square(state.speed / OK_SPEED)
-    )
+  w_dxy, w_height, w_tilt, w_yaw, w_speed = widths or (
+    OK_DXY,
+    OK_HEIGHT,
+    OK_TILT,
+    OK_YAW,
+    OK_SPEED,
   )
+  exponent = (
+    torch.square(state.dxy / w_dxy)
+    + torch.square(state.height / w_height)
+    + torch.square(state.tilt / w_tilt)
+    + torch.square(state.speed / w_speed)
+  )
+  if w_yaw is not None:
+    exponent = exponent + torch.square(state.yaw / w_yaw)
+  score = torch.exp(-exponent)
   held = _grasped_bool(env, grasp_sensor_name) & _was_lifted_bool(
     env, grasp_sensor_name, support_sensor_name
   )
