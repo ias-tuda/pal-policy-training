@@ -46,6 +46,13 @@ from pal_mjlab.tasks.manipulation.pick_place.box import (
   append_critic_box_yaw,
   apply_box_goal,
 )
+from pal_mjlab.tasks.manipulation.pick_place.insert import (
+  INSERT_REWARD,
+  PIN_MIN_SEPARATION,
+  InsertGoal,
+  append_critic_insert,
+  apply_insert_goal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
@@ -53,6 +60,7 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   EPISODE_LENGTH_S,
   JAW_OPEN,
   NO_SUCCESS_TERMINATION,
+  PIN_JAW_OPEN,
   REQUIRE_LIFTED,
   STACK_ONLY_ARMS,
   YAW_GRADED_ARMS,
@@ -293,6 +301,11 @@ class ObjectShape:
   rolling_scale: tuple[float, float] | None = None
   """BALL-DR's factor on the ball's rolling friction, drawn log-uniformly per world."""
 
+  friction: tuple[float, float] | None = None
+  """`DR-object`'s range for the object's sliding friction (``abs``); None is the cube's 0.5-1.2. Plan
+  §12's pin keeps its own 0.4: its friction is the pin-block pair's (the element-wise max), which plan
+  §0.4 sized the chamfer for, and DR-object's range would make it 0.5-1.2 (IN-DR draws it, phase 2)."""
+
 
 #: BALL-DR (plan S8): the ball's diameter 5.5-6.5 cm and its rolling friction x (0.5, 2). The mass
 #: (30-100 g) and sliding friction come with `DR-object`, which every run here has.
@@ -320,6 +333,13 @@ OBJECT_SHAPES = {
     jaw_open=PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS),
     geoms=(f"{OBJECT}_geom", scene.mixed_ball_geom_name(OBJECT)),
     ball_probability=0.5,
+  ),
+  # Plan §12: the cross pin (`scene.get_pin_spec`, its origin at its centre), standing on its foot.
+  "pin": ObjectShape(
+    objects={OBJECT: scene.get_pin_cfg(name=OBJECT)},
+    jaw_open=PIN_JAW_OPEN,
+    geoms=scene.pin_geom_names(OBJECT),
+    friction=(scene.PIN_BLOCK_FRICTION, scene.PIN_BLOCK_FRICTION),
   ),
 }
 
@@ -768,6 +788,7 @@ def make_pick_place_env_cfg(
   robot_target: RobotFrameTarget | None = None,
   tracker: str = "B",
   base_obs: str = "goal",
+  insert: InsertGoal | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -821,6 +842,9 @@ def make_pick_place_env_cfg(
       before S11.
     tracker: plan S11's ``TRACKER`` (`TRACKERS`): ``B`` is every run before S11, ``split`` the
       shared + own bias with the base through its own tracker (`_apply_tracker_split`).
+    insert: plan §12's insert goal (``GOAL=insert`` | ``insert-t`` | ``insert-na`` | ``insert-lad``,
+      `insert.INSERT_GOALS`) -- push the pin (``shape`` pin) through a socket block drawn from ``target_area``
+      (`insert.apply_insert_goal`); needs RCTP, no box, no occlusion, the table goal. None is every run before §12.
     base_obs: plan S9.1's ``BASE_OBS`` (`BASE_OBS_NAMES`): ``goal`` is every run before S9.1,
       ``pose`` adds the stack base's yaw to the actor and the critic and grades the let-go's yaw
       against the base (`_apply_base_pose`). Needs ``GOAL=stack`` and ``TRACKER=split``.
@@ -851,6 +875,24 @@ def make_pick_place_env_cfg(
     raise ValueError(
       "TRACKER=split is the box's own model already, and not built for OCC"
     )
+  if insert is not None and (
+    shape is not OBJECT_SHAPES["pin"]
+    or target_area is None
+    or box is not None
+    or box_obs != "goal"
+    or occlusion is not None
+    or goal != "table"
+    or robot_target is not None
+    or tracker != "B"
+    or reward != INSERT_REWARD
+  ):
+    raise ValueError(
+      f"plan §12's insert is built for the pin (SHAPE=pin) on a target area (TARGET=WC), {INSERT_REWARD}, "
+      "no box GOAL / BOX_OBS, no OCC, no stack goal, no robot-frame target and the default TRACKER (the "
+      "block brings its own tracker split)"
+    )
+  if shape is OBJECT_SHAPES["pin"] and insert is None:
+    raise ValueError("SHAPE=pin is plan §12's pin; it needs an insert GOAL")
   if box is not None and (
     shape is not OBJECT_SHAPES["cube"] or occlusion is not None or goal != "table"
   ):
@@ -927,7 +969,12 @@ def make_pick_place_env_cfg(
     goal_area=None
     if target_area is None
     else _goal_area(
-      target_area, TARGET_MIN_SEPARATION if box is None else BOX_MIN_SEPARATION
+      target_area,
+      BOX_MIN_SEPARATION
+      if box is not None
+      else PIN_MIN_SEPARATION
+      if insert is not None
+      else TARGET_MIN_SEPARATION,
     ),
     objects={
       OBJECT: scene.get_cube_cfg(name=OBJECT),
@@ -936,6 +983,7 @@ def make_pick_place_env_cfg(
     if stack
     else shape.objects,
     object_geoms=shape.geoms,
+    object_friction=shape.friction,
   )
   if stack:
     _apply_stack_goal(cfg, baseline, robot_target)
@@ -1031,6 +1079,17 @@ def make_pick_place_env_cfg(
     area=None if target_area is None or box is None else (target_area.x, target_area.y),
     pose_obs=box_obs == "pose",
   )
+  if insert is not None:
+    # Plan §12: after every other reward edit, so that it sees RCTP's terms as built.
+    assert target_area is not None
+    apply_insert_goal(
+      cfg,
+      gripper,
+      insert,
+      (target_area.x, target_area.y),
+      baseline.table_top_z,
+      GOAL_THRESHOLD,
+    )
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)
@@ -1039,6 +1098,9 @@ def make_pick_place_env_cfg(
     append_critic_box_yaw(cfg)
   if base_obs == "pose":
     _append_critic_base_yaw(cfg)
+  if insert is not None:
+    # Plan §12: last, after PQ's inputs (`insert.append_critic_insert`).
+    append_critic_insert(cfg, insert)
 
   success_params = {
     "command_name": COMMAND,
