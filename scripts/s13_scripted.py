@@ -447,6 +447,18 @@ def hold_rollout(args) -> dict:
   drv.move(q, stack("above"))
   drv.move(stack("above"), stack("pregrasp"))
   drv.move(stack("pregrasp"), stack("grasp"))
+
+  def block_in_hand() -> torch.Tensor:
+    """The block's centre in the hand frame (x: jaw axis, y, z: approach), mm. (B, 3)"""
+    from mjlab.utils.lab_api.math import matrix_from_quat
+
+    robot = env.scene["robot"]
+    k = robot.site_names.index(gripper.tcp_site)
+    rot = matrix_from_quat(robot.data.site_quat_w[:, k])
+    d = obj.data.root_link_pos_w - robot.data.site_pos_w[:, k]
+    return 1e3 * torch.einsum("bji,bj->bi", rot, d)
+
+  rel_pre = block_in_hand()
   tcp_err = (
     robot_tcp(env, gripper)
     - torch.as_tensor(np.stack(tcp_goal), dtype=torch.float32, device=dev)
@@ -455,12 +467,14 @@ def hold_rollout(args) -> dict:
   drv.jaw[:] = 1.0
   drv.hold(stack("grasp"), JAW_CLOSE_S)
   flags["grasped"] = _grasped_bool(env, gripper.contact_sensor_name)
+  rel_grasp = block_in_hand()
   phase["name"] = "lift"
   drv.move(stack("grasp"), stack("lift"))
   drv.move(stack("lift"), stack("H"))
   phase["name"] = "hold"
   drv.hold(stack("H"), 2.0)
   pre[:] = obj.data.root_link_pos_w
+  rel_h = block_in_hand()
   cmd_w = env.command_manager.get_term("goal_pose").command
   at_h = {
     "tcp_err_at_H_mm": (
@@ -526,6 +540,9 @@ def hold_rollout(args) -> dict:
         "clipped_steps": int(drv.clipped[i]),
         "resets": int(drv.resets[i]),
         "tcp_err_at_grasp_mm": 1e3 * float(tcp_err[i]),
+        "block_in_hand_before_close_mm": rel_pre[i].round().tolist(),
+        "block_in_hand_closed_mm": rel_grasp[i].round().tolist(),
+        "block_in_hand_at_H_mm": rel_h[i].round().tolist(),
         "first_hand_table": first["hand_table"][i],
         "first_arm_table": first["arm_table"][i],
         **{k: float(v[i]) for k, v in at_h.items()},
