@@ -577,9 +577,84 @@ def hold_rollout(args) -> dict:
   return {"summary": summary, "rows": rows}
 
 
+def weld_probe(args) -> dict:
+  """R-I's held block (``S13=R-I``): for each weld ``solref`` in ``--solrefs``, the block's offset from its hold
+  after 1 s of gravity, then under ``--push-n`` straight down on its top for 1 s (peak displacement and tilt), and
+  1 s after (the arm stays home)."""
+  import pal_mjlab.tasks  # noqa: F401
+  from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.tasks.registry import load_env_cfg
+  from mjlab.utils.lab_api.math import matrix_from_quat
+  from pal_mjlab.tasks.manipulation import mdp, scene
+  from pal_mjlab.tasks.manipulation.pick_place import insert_held as IH
+
+  out = []
+  for pair in args.solrefs:
+    a, b = (float(v) for v in pair.split(","))
+    cfg = load_env_cfg(args.task, play=False)
+    cfg.scene.num_envs = args.num_envs
+    cfg.seed = args.seed
+    cfg.scene.spec_fn = mdp.chain_spec_fns(
+      None, mdp.held_block_weld(f"{IH.HOLDER}/{IH.HOLDER}", "block/block", (a, b))
+    )
+    env = ManagerBasedRlEnv(cfg=cfg, device=args.device)
+    env.reset()
+    zero = torch.zeros(env.action_space.shape, device=env.device)
+    off0 = []
+    for _ in range(50):
+      env.step(zero)
+    d0, ang0 = mdp.held_block_offset(env, IH.HOLDER, "block")
+    block = env.scene["block"]
+    peak_d = torch.zeros(env.num_envs, device=env.device)
+    peak_a = torch.zeros(env.num_envs, device=env.device)
+    for _ in range(50):
+      up = matrix_from_quat(block.data.root_link_quat_w)[..., :, 2]
+      force = torch.zeros(env.num_envs, 1, 3, device=env.device)
+      force[:, 0, 2] = -args.push_n
+      torque = torch.cross(scene.BLOCK_HEIGHT * up.unsqueeze(1), force, dim=-1)
+      block.data.write_external_wrench(force, torque, body_ids=[0])
+      env.step(zero)
+      d, ang = mdp.held_block_offset(env, IH.HOLDER, "block")
+      peak_d, peak_a = torch.maximum(peak_d, d), torch.maximum(peak_a, ang)
+    block.data.write_external_wrench(
+      torch.zeros(env.num_envs, 1, 3, device=env.device),
+      torch.zeros(env.num_envs, 1, 3, device=env.device),
+      body_ids=[0],
+    )
+    for _ in range(50):
+      env.step(zero)
+    d1, ang1 = mdp.held_block_offset(env, IH.HOLDER, "block")
+    top = mdp.surface_top_z(env, SceneEntityCfg_table())
+    hold_z = env.scene[IH.HOLDER].data.root_link_pos_w[:, 2] - top
+    row = {
+      "solref": [a, b],
+      "rest_offset_mm": 1e3 * float(d0.median()),
+      "push_peak_mm": 1e3 * float(peak_d.median()),
+      "push_peak_max_mm": 1e3 * float(peak_d.max()),
+      "push_peak_tilt_deg": math.degrees(float(peak_a.median())),
+      "after_mm": 1e3 * float(d1.median()),
+      "hold_bottom_over_table_mm": (1e3 * hold_z).round().tolist()[:4],
+      "nan": bool(torch.isnan(block.data.root_link_pos_w).any()),
+    }
+    print(json.dumps(row), flush=True)
+    out.append(row)
+    env.close()
+    del off0, ang0, ang1
+  return {"rows": out}
+
+
+def SceneEntityCfg_table():  # noqa: N802
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+  return SceneEntityCfg("table")
+
+
 def main(argv=None) -> None:
   p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-  p.add_argument("mode", choices=("hold",))
+  p.add_argument("mode", choices=("hold", "weld"))
+  p.add_argument(
+    "--solrefs", nargs="+", default=["-10000,-200", "-3000,-110", "0.02,1", "0.005,1"]
+  )
   p.add_argument("--task", default=TASK)
   p.add_argument("--num-envs", type=int, default=16)
   p.add_argument("--device", default="cuda:0")
@@ -593,7 +668,7 @@ def main(argv=None) -> None:
     "--video-close", action="store_true", help="a close side view on each env's block"
   )
   args = p.parse_args(argv)
-  out = hold_rollout(args)
+  out = hold_rollout(args) if args.mode == "hold" else weld_probe(args)
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(out, indent=1))
