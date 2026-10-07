@@ -83,7 +83,9 @@ def _flat(obj, prefix=""):
 
 def _diff(a, b):
   fa, fb = _flat(a), _flat(b)
-  return {k: (fa.get(k), fb.get(k)) for k in fa.keys() | fb.keys() if fa.get(k) != fb.get(k)}
+  return {
+    k: (fa.get(k), fb.get(k)) for k in fa.keys() | fb.keys() if fa.get(k) != fb.get(k)
+  }
 
 
 def _cfg(monkeypatch, num_envs: int = 4, **changes):
@@ -256,3 +258,113 @@ def test_lhp_pushes_the_top_from_4s_and_not_before(lh_env):
         seen_after = max(seen_after, float(f))
   assert seen_before == 0.0
   assert 0.0 < seen_after <= math.hypot(H.PUSH_DOWN_N[1], H.PUSH_SIDE_N) + 1e-4
+
+
+# -- R-I: the insertion into the held block (`pick_place/insert_held.py`) ----------------------------
+
+RI = {
+  **{k: v for k, v in BS12_LH.items()},
+  "GOAL": "insert",
+  "SHAPE": "pin",
+  "TARGET": "WC",
+  "CRITIC_OBS": "q",
+}
+
+
+def test_ri_cfg_holds_the_block_and_keeps_ins_actor(monkeypatch):
+  from pal_mjlab.tasks.manipulation.pick_place import insert_held as IH
+
+  base = _cfg(monkeypatch, **RI)
+  ri = _cfg(monkeypatch, **RI, S13="R-I")
+  assert IH.HOLDER in ri.scene.entities and IH.HOLDER not in base.scene.entities
+  assert list(ri.observations["actor"].terms) == list(base.observations["actor"].terms)
+  assert list(ri.observations["critic"].terms) == [
+    *base.observations["critic"].terms,
+    "pin_through",
+  ]
+  assert ri.rewards["release"].weight == 0.0 and ri.rewards["placed"].weight == 0.0
+  assert "retreat" not in ri.rewards and "through" in ri.rewards
+  assert ri.events["reset_block"].func is mdp.reset_held_block
+  assert (
+    "keepout" in ri.events["reset_objects"].params
+  )  # §12's HOME_HAND_KEEPOUT kept for the pin
+  wide = _cfg(monkeypatch, **RI, S13="R-I-W")
+  assert (
+    wide.events["reset_block"].params["half_xy"]
+    > ri.events["reset_block"].params["half_xy"]
+  )
+
+
+@pytest.mark.parametrize(
+  "changes", [{"GOAL": "insert-lad"}, {"GOAL": None, "SHAPE": None, "TARGET": None}]
+)
+def test_ri_refuses_anything_but_ins_insert(monkeypatch, changes):
+  with pytest.raises(ValueError):
+    _cfg(monkeypatch, **{**RI, "S13": "R-I", **changes})
+
+
+@pytest.fixture(scope="module")
+def ri_env():
+  mp = pytest.MonkeyPatch()
+  cfg = _cfg(mp, num_envs=8, **RI, S13="R-I")
+  cfg.observations["actor"].enable_corruption = False
+  cfg.seed = 5
+  env = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
+  with torch.inference_mode():
+    env.reset()
+  yield env
+  env.close()
+  mp.undo()
+
+
+def test_ri_block_hangs_at_h_and_the_pin_stands_clear(ri_env):
+  from pal_mjlab.tasks.manipulation.pick_place import insert_held as IH
+  from pal_mjlab.tasks.manipulation.pick_place.insert import HOME_HAND_KEEPOUT
+
+  env = ri_env
+  _hold(env, 50)
+  top = mdp.surface_top_z(env, SceneEntityCfg(TABLE))
+  block = env.scene["block"]
+  pos = block.data.root_link_pos_w - env.scene.env_origins
+  # H: the block's bottom 10 cm (+/- 1 cm) over the table at (0.45, 0.00) +/- 1.5 cm, sagging ~1 mm on the weld.
+  assert bool((torch.abs(pos[:, 0] - H.HOLD_XY[0]) < 0.016).all())
+  assert bool((torch.abs(pos[:, 1] - H.HOLD_XY[1]) < 0.016).all())
+  dz = pos[:, 2] + env.scene.env_origins[:, 2] - top
+  assert bool(((dz > H.HOLD_DZ - 0.013) & (dz < H.HOLD_DZ + 0.011)).all()), dz
+  d, ang = mdp.held_block_offset(env, IH.HOLDER, "block")
+  assert float(d.max()) < 0.003 and float(ang.max()) < math.radians(1.0)
+  # The pin stands on the table in its area, out of the start pose's finger keepout.
+  pin = env.scene[OBJECT].data.root_link_pos_w - env.scene.env_origins
+  assert bool((pin[:, 1] > IH.PIN_AREA_Y[0] - 0.03).all())
+  x0, x1, y0, y1 = HOME_HAND_KEEPOUT
+  inside = (pin[:, 0] > x0) & (pin[:, 0] < x1) & (pin[:, 1] > y0) & (pin[:, 1] < y1)
+  assert not bool(inside.any())
+  assert float(env.reward_manager.get_term_cfg("through").weight) == IH.THROUGH_WEIGHT
+
+
+def test_through_reads_a_pin_pushed_through_the_held_block(ri_env):
+  env = ri_env
+  geo = {
+    k: env.cfg.rewards["depth"].params[k]
+    for k in ("object_name", "block_name", "block_height", "hole_d")
+  }
+  block = env.scene["block"]
+  pin = env.scene[OBJECT]
+  with torch.inference_mode():
+    bp, bq = block.data.root_link_pos_w.clone(), block.data.root_link_quat_w.clone()
+    half = scene.PIN_LENGTH / 2
+    from mjlab.utils.lab_api.math import quat_apply
+
+    up = torch.zeros_like(bp)
+    up[:, 2] = 1.0
+    axis = quat_apply(bq, up)
+    for below, want in ((0.002, True), (-0.010, False)):
+      # The pin's bottom `below` under the block's bottom face (negative: above it), on the hole's axis.
+      centre = bp + axis * (half - below)
+      pin.write_root_link_pose_to_sim(torch.cat([centre, bq], dim=-1))
+      pin.write_root_link_velocity_to_sim(
+        torch.zeros(env.num_envs, 6, device=env.device)
+      )
+      env.sim.forward()
+      st = mdp.insert_state(env, **geo)
+      assert bool((st.through() == want).all()), (below, st.height)

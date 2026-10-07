@@ -75,11 +75,18 @@ class HoldNoise:
   solref: tuple[float, float]
   """The weld's (timeconst, dampratio) -- or (-stiffness, -damping) -- as MuJoCo reads it."""
 
+  torquescale: float
+  """The weld's angular residual's weight (`mdp.held_block_weld`)."""
+
 
 #: R-I: xy +/- 1.5 cm, z +/- 1 cm, yaw +/- 10 deg, tilt +/- 3 deg; R-I-W: xy +/- 3 cm, tilt +/- 6 deg, the weld 2x
-#: softer. The weld's stiffness: a 10 N push on the block's top moves it as far as the scripted L-H hold gave way
-#: under the same push (median ~11 mm, step 0 item 4; `HOLD_SOLREF`, measured in `tests/test_pick_place_s13.py`).
-HOLD_SOLREF = (-10000.0, -200.0)
+#: softer. The weld's stiffness from the scripted L-H hold (step 0 item 4: a 10 N push on the block's top moved it
+#: ~10-18 mm, 1-4 deg, on the G20 arm): (-500, -45) gives 11 mm under the same push and ~1 mm of sag at rest; the
+#: angular residual weighted 10x (at 1 the 100 g block's inertia let it flip over under the push, at 10 it turns
+#: 0.1 deg) -- `scripts/s13_scripted.py weld`, `results/S13-insert/scripted/weld*.json`. R-I-W: (-250, -32), 22 mm,
+#: torquescale 5.
+HOLD_SOLREF = (-500.0, -45.0)
+HOLD_TORQUESCALE = 10.0
 HOLD_CODES = {
   "R-I": HoldNoise(
     half_xy=0.015,
@@ -87,13 +94,15 @@ HOLD_CODES = {
     yaw=math.radians(10.0),
     tilt=math.radians(3.0),
     solref=HOLD_SOLREF,
+    torquescale=HOLD_TORQUESCALE,
   ),
   "R-I-W": HoldNoise(
     half_xy=0.03,
     half_z=0.01,
     yaw=math.radians(10.0),
     tilt=math.radians(6.0),
-    solref=(HOLD_SOLREF[0] / 2.0, HOLD_SOLREF[1] / math.sqrt(2.0)),
+    solref=(-250.0, -32.0),
+    torquescale=5.0,
   ),
 }
 
@@ -130,7 +139,9 @@ def apply_held_insert(
   cfg.scene.entities = {**cfg.scene.entities, HOLDER: holder_cfg()}
   cfg.scene.spec_fn = mdp.chain_spec_fns(
     cfg.scene.spec_fn,
-    mdp.held_block_weld(f"{HOLDER}/{HOLDER}", f"{BLOCK}/{BLOCK}", code.solref),
+    mdp.held_block_weld(
+      f"{HOLDER}/{HOLDER}", f"{BLOCK}/{BLOCK}", code.solref, code.torquescale
+    ),
   )
   cfg.scene.sensors = (*cfg.scene.sensors, _hh_sensor(gripper))
 
