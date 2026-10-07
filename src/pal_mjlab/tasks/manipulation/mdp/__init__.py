@@ -32,6 +32,8 @@ from .actions import (
   DeltaRateLimitedJointPositionActionCfg,
   RateLimitedJointPositionAction,
   RateLimitedJointPositionActionCfg,
+  StackGateJointPositionAction,
+  StackGateJointPositionActionCfg,
   ToolSpeedCappedJointPositionAction,
   ToolSpeedCappedJointPositionActionCfg,
 )
@@ -56,7 +58,10 @@ from .observations import (
   is_grasped,
   is_on_surface,
   object_position_b,
+  object_tilt,
   object_yaw_b,
+  release_grade,
+  release_latched,
 )
 from .occlusion import (
   CubeSensor,
@@ -68,6 +73,7 @@ from .occlusion import (
 )
 from .rewards import (
   arm_effort_hinge,
+  arm_table_clearance,
   bring_object_after_lift,
   bring_object_when_lifted,
   contact_penalty,
@@ -91,6 +97,8 @@ from .rewards import (
   released_at_goal_graded,
   retreat_height,
   set_down_placed,
+  stack_alignment,
+  table_clearance_penalty,
   time_penalty,
 )
 from .rewards import object_placed as object_placed_reward
@@ -103,6 +111,7 @@ from .shapes import (
   set_object_shape,
   shape_kind,
 )
+from .stack import StackState, fold_quarter, stack_state
 from .terminations import (
   entity_below_height,
   entity_out_of_reach,
@@ -129,10 +138,18 @@ __all__ = [
   "DeltaRateLimitedJointPositionActionCfg",
   "RateLimitedJointPositionAction",
   "RateLimitedJointPositionActionCfg",
+  "StackGateJointPositionAction",
+  "StackGateJointPositionActionCfg",
+  "StackState",
+  "fold_quarter",
+  "stack_state",
+  "stack_alignment",
   "ToolSpeedCappedJointPositionAction",
   "ToolSpeedCappedJointPositionActionCfg",
   "entity_out_of_reach",
+  "arm_table_clearance",
   "keepout_box_penalty",
+  "table_clearance_penalty",
   # mjlab manipulation terms, re-exported so a task needs one namespace.
   "bring_object_reward",
   "ee_to_object_distance",
@@ -160,7 +177,10 @@ __all__ = [
   "is_grasped",
   "is_on_surface",
   "object_position_b",
+  "object_tilt",
   "object_yaw_b",
+  "release_grade",
+  "release_latched",
   # Rewards.
   "arm_effort_hinge",
   "bring_object_after_lift",

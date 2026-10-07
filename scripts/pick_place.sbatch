@@ -144,6 +144,54 @@ if [ "$SHAPE" != "cube" ]; then
   S8_TAG=",\"shape${SHAPE}\""
 fi
 
+# Plan S9 (`pick_place/kangaroo/env_cfg.py`, `pick_place_env_cfg.GOALS` / `GATES`): GOAL is where the cube goes --
+# table (every run up to S8) | stack (on a blue base cube in B's target box) -- and GATE what may hold the jaw shut --
+# none | stack (the lock: no opening while the held cube is not aligned, low and slow over the base). In the run name
+# and the tags only when set, so every earlier run's name still reads the same.
+GOAL="${GOAL:-table}"
+GATE="${GATE:-none}"
+export GOAL GATE
+S9_NAME=""
+S9_TAG=""
+if [ "$GOAL" != "table" ]; then
+  S9_NAME="${S9_NAME}_goal${GOAL}"
+  S9_TAG="${S9_TAG},\"goal${GOAL}\""
+fi
+if [ "$GATE" != "none" ]; then
+  S9_NAME="${S9_NAME}_gate${GATE}"
+  S9_TAG="${S9_TAG},\"gate${GATE}\""
+fi
+
+# Plan S7-9 (`pick_place/kangaroo/env_cfg.py`): CRITIC_OBS is what the critic sees -- base (every run up
+# to S8) | q (also M6's latched release grade and the release latch, PQ; critic only, and a resume widens
+# the loaded critic for them). The other S7-9 codes are REWARD (+PXY, +PT) and TOOL_SPEED (PV). In the run
+# name and the tags only when set, so every earlier run's name still reads the same.
+CRITIC_OBS="${CRITIC_OBS:-base}"
+export CRITIC_OBS
+S79_NAME=""
+S79_TAG=""
+if [ "$CRITIC_OBS" != "base" ]; then
+  S79_NAME="_critic${CRITIC_OBS}"
+  S79_TAG=",\"critic${CRITIC_OBS}\""
+fi
+
+# Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT | AH10 -- arm 1-6 against
+# the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
+# contact). Unset is every run before S7-10; in the run name and the tags only when set.
+[ -n "${ARM_TABLE:-}" ] && export ARM_TABLE
+if [ -n "${ARM_TABLE:-}" ]; then
+  S78_NAME="${S78_NAME}_arm${ARM_TABLE}"
+  S78_TAG="${S78_TAG},\"arm${ARM_TABLE}\""
+fi
+
+# Plan S7-11 (`pick_place/pregrasp.py`): PREGRASP (none | watch | NP | JO | G | S | OVR -- the jaw open before
+# the grasp: a push penalty, the jaw angle priced on the approach, a cap on the jaw outside the grasp window, or
+# NP + JO + the grasp's yaw alignment). Unset is every run before S7-11; in the run name and the tags only when set.
+[ -n "${PREGRASP:-}" ] && export PREGRASP
+if [ -n "${PREGRASP:-}" ]; then
+  S78_NAME="${S78_NAME}_pre${PREGRASP}"
+  S78_TAG="${S78_TAG},\"pre${PREGRASP}\""
+fi
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -176,7 +224,7 @@ if ! uv run --extra cu128 python -c \
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
-    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE did not validate." >&2
+    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} PREGRASP=${PREGRASP:-(default)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -202,8 +250,8 @@ echo "ppo         $PPO"
 echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
-echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}"
-echo "shape       $SHAPE"
+echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}   pregrasp ${PREGRASP:-(default)}"
+echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
@@ -229,5 +277,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}${S8_NAME}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$S8_TAG$RESUME_TAG)"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}${S8_NAME}${S9_NAME}${S79_NAME}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$S8_TAG$S9_TAG$S79_TAG$RESUME_TAG)"

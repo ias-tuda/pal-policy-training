@@ -50,6 +50,26 @@ Every episode's spawn pose, table offset from its nominal pose, target, release 
 and final cube position go into the JSON (``episodes_detail``): what plan S7-2's D5
 diagnosis and the W runs' placed rate by spawn distance are read from.
 
+Plan S7-10: the arm on the table (``ArmTally``)
+--------------------------------------------------------------------------------
+Per episode, the driven arm's links 1-6 against the table: whether any presses harder than
+`ARM_CONTACT_N` (1 N), on how many steps, the peak force, which link, and in which phase (before
+the first grasp, while held, after the let-go, other). The contact reads need the arm-table
+sensor, i.e. an env built with ``ARM_TABLE`` set (``ARM_TABLE=watch`` for a policy trained without
+it); without it they are left out. The clearance read needs no sensor: each link's lowest
+collision point above the table top, the episode's minimum, and the share of episodes that come
+within 1 / 2 / 3 cm -- the margin a real arm with tracking error needs.
+
+Plan S7-11: the jaw before the grasp (``PregraspTally``)
+--------------------------------------------------------------------------------
+Per episode, from the true state (`mdp.pregrasp`): how far the cube moved horizontally from its
+spawn before the first two-pad grasp (``push_pre_grasp_cm``, the largest displacement), the jaw's
+measured angle when the cube first entered the grasp window (``jaw_at_arrival``), how often the
+commanded jaw crossed 0.25 rad upwards up to the first grasp (``close_attempts``; a first-try
+grasp is one crossing), the time of the first grasp (``t_grasp``), the hand-cube yaw at it, mod
+90 deg (``grasp_rel_yaw``), and -- under ``PREGRASP=G`` / ``OVR`` -- the steps the gate lowered the
+jaw. ``stall`` is an episode that never grasps. Read on every policy; no env change is needed.
+
 Plan S7-4: the release is the jaw opening, and the retreat (``RetreatTally``)
 --------------------------------------------------------------------------------
 Every read above keeps its old definition (a let-go = the pads losing the cube), so a number
@@ -85,6 +105,7 @@ the policy was optimised for and the only one these rates mean anything against.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import pathlib
@@ -119,6 +140,8 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
+  JAW_SERVO_MAX_VEL,
+  JAW_SERVO_TAU,
   ROBOT,
   SUPPORT_SENSOR,
   TABLE,
@@ -275,6 +298,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     metavar="H",
     help="with --handoff: the position controller first lifts the TCP straight up to H m over "
     "the cube's top (S7-5 report §8 item 1), then goes home; instead of the default return (rise, cross, come down; not with ACTION=delta)",
+  )
+  p.add_argument(
+    "--obs-noise",
+    choices=("off", "on", "on-no-object"),
+    default="off",
+    help="plan S7-9's precision split: the actor's observation noise. off (default, every eval "
+    "before it: play mode turns corruption off); on (as trained: joint and cube-tracker bias and "
+    "jitter); on-no-object (as trained but the cube's position / yaw noise off). The tracker lag "
+    "is LAG's, not this flag's",
+  )
+  p.add_argument(
+    "--stress-jaw",
+    action="store_true",
+    help="plan S7-11 stress (a): the jaw servo slower than S7-6's -- its time constant x 2 "
+    "(0.22-0.38 s) and its speed limit x 0.5 (0.625-0.875 rad/s), the same absolute range for every "
+    "run (also one trained on LAG=FP+JSW). Needs LAG with JS",
+  )
+  p.add_argument(
+    "--stress-lag",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="plan S7-11 stress (b): the cube tracker's lag, control steps, drawn per episode in "
+    "[LO, HI] in place of LAG's 5-8 (e.g. 8 12 = 160-240 ms). Needs LAG with FP",
+  )
+  p.add_argument(
+    "--stress-friction",
+    type=float,
+    default=None,
+    metavar="MU",
+    help="plan S7-11 stress (c): the cube-table sliding friction MU (e.g. 0.4): the table top's "
+    "and the cube's sliding friction both set to MU. MuJoCo takes the larger of two geoms' "
+    "coefficients, so the table alone would leave the cube's DR draw (0.5-1.2); the pads keep "
+    "theirs (geom priority 2)",
   )
   p.add_argument(
     "--trace",
@@ -858,6 +916,298 @@ class PlantTally:
     }
 
 
+#: Arm-table force above which a contact counts (N): plan S7-10's AC threshold.
+ARM_CONTACT_N = 1.0
+#: Phases an arm-table contact is filed under (plan S7-10 step 0).
+ARM_PHASES = ("before_grasp", "held", "after_let_go", "other")
+
+
+class ArmTally:
+  """Plan S7-10's reads, per episode, kept beside `Tally` and banked with it. Tensors in, like
+  `PlantTally`; `from_env` wires one to an env. ``force`` is (B, L) per link (None: no sensor),
+  ``clearance`` (B, L) per link, m (+inf: not over the table)."""
+
+  def __init__(self, num_envs: int, device: str, links: list[str]) -> None:
+    self.links = links
+    n = len(links)
+    self.contact_steps = torch.zeros(num_envs, n, dtype=torch.long, device=device)
+    self.phase_steps = torch.zeros(
+      num_envs, len(ARM_PHASES), dtype=torch.long, device=device
+    )
+    self.peak = torch.zeros(num_envs, device=device)
+    self.min_clear = torch.full((num_envs, n), float("inf"), device=device)
+    self.ever_grasped = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.has_force = False
+    self.done: list[dict] = []
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> ArmTally:
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+      ARM_TABLE_SENSOR,
+      arm_body_regex,
+    )
+
+    gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+    asset = SceneEntityCfg(ROBOT, body_names=(arm_body_regex(gripper),))
+    asset.resolve(env.scene)
+    robot = env.scene[ROBOT]
+    links = [robot.body_names[i] for i in asset.body_ids]
+    tally = cls(env.num_envs, env.device, links)
+    tally._env, tally._asset = env, asset
+    tally._sensor = None
+    try:
+      tally._sensor = env.scene[ARM_TABLE_SENSOR]
+    except KeyError:
+      pass
+    if tally._sensor is not None:
+      names = [n.split("/")[-1] for n in tally._sensor.primary_names]
+      if names != links:  # slot i must be link i for the per-link reads
+        raise RuntimeError(f"arm-table sensor primaries {names} are not {links}")
+      tally.has_force = True
+    return tally
+
+  def step_env(self, grasped: torch.Tensor, let_go: torch.Tensor) -> None:
+    """`step` from the env `from_env` was built on, at the current state."""
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.tabletop_env_cfg import TABLE
+
+    force = None
+    if self._sensor is not None:
+      hist = self._sensor.data.force_history  # (B, L, H, 3)
+      force = torch.norm(hist, dim=-1).amax(dim=-1)
+    clearance = mdp.arm_table_clearance(self._env, self._asset, SceneEntityCfg(TABLE))
+    self.step(force, clearance, grasped, let_go)
+
+  def step(
+    self,
+    force: torch.Tensor | None,
+    clearance: torch.Tensor,
+    grasped: torch.Tensor,
+    let_go: torch.Tensor,
+  ) -> None:
+    grasped, let_go = grasped.bool(), let_go.bool()
+    self.ever_grasped |= grasped
+    self.min_clear = torch.minimum(self.min_clear, clearance)
+    if force is None:
+      return
+    touch = force > ARM_CONTACT_N  # (B, L)
+    self.contact_steps += touch.long()
+    self.peak = torch.maximum(self.peak, force.amax(dim=-1))
+    any_touch = touch.any(dim=-1)
+    phase = torch.full_like(self.ever_grasped, 3, dtype=torch.long)  # other
+    phase = torch.where(grasped, torch.ones_like(phase), phase)
+    phase = torch.where(let_go & ~grasped, torch.full_like(phase, 2), phase)
+    phase = torch.where(~self.ever_grasped, torch.zeros_like(phase), phase)
+    self.phase_steps += torch.nn.functional.one_hot(
+      phase, len(ARM_PHASES)
+    ) * any_touch.unsqueeze(-1)
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      clear = self.min_clear[i].tolist()
+      row: dict = {
+        "arm_min_clearance_m": min(clear),
+        "arm_min_clearance_by_link_m": dict(zip(self.links, clear, strict=True)),
+      }
+      if self.has_force:
+        steps = self.contact_steps[i].tolist()
+        row.update(
+          {
+            "arm_table_contact": any(steps),
+            "arm_table_contact_steps": max(steps) if steps else 0,
+            "arm_table_peak_force_n": float(self.peak[i]),
+            "arm_table_contact_by_link": dict(zip(self.links, steps, strict=True)),
+            "arm_table_contact_by_phase": dict(
+              zip(ARM_PHASES, self.phase_steps[i].tolist(), strict=True)
+            ),
+          }
+        )
+      self.done.append(row)
+    self.contact_steps[env_ids] = 0
+    self.phase_steps[env_ids] = 0
+    self.peak[env_ids] = 0.0
+    self.min_clear[env_ids] = float("inf")
+    self.ever_grasped[env_ids] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    if not rows:
+      return {}
+    n = len(rows)
+    median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+    finite = [
+      r["arm_min_clearance_m"] for r in rows if math.isfinite(r["arm_min_clearance_m"])
+    ]
+    out: dict = {
+      "arm_min_clearance_median_m": median(finite),
+      "arm_min_clearance_min_m": min(finite, default=None),
+      "arm_min_clearance_median_by_link_m": {
+        link: median(
+          [
+            r["arm_min_clearance_by_link_m"][link]
+            for r in rows
+            if math.isfinite(r["arm_min_clearance_by_link_m"][link])
+          ]
+        )
+        for link in self.links
+      },
+      **{
+        f"arm_within_{cm}cm_share": sum(
+          r["arm_min_clearance_m"] < cm / 100 for r in rows
+        )
+        / n
+        for cm in (1, 2, 3)
+      },
+    }
+    if self.has_force:
+      touched = [r for r in rows if r["arm_table_contact"]]
+      out.update(
+        {
+          "arm_table_contact_share": len(touched) / n,
+          "arm_table_contact_share_by_link": {
+            link: sum(r["arm_table_contact_by_link"][link] > 0 for r in rows) / n
+            for link in self.links
+          },
+          "arm_table_contact_steps_by_phase": {
+            p: sum(r["arm_table_contact_by_phase"][p] for r in rows) for p in ARM_PHASES
+          },
+          "arm_table_peak_force_median_n": median(
+            [r["arm_table_peak_force_n"] for r in touched]
+          ),
+          "arm_table_peak_force_max_n": max(
+            (r["arm_table_peak_force_n"] for r in rows), default=None
+          ),
+          "arm_table_over_30n_share": sum(
+            r["arm_table_peak_force_n"] > 30.0 for r in rows
+          )
+          / n,
+        }
+      )
+    return out
+
+
+#: Plan S7-11: the commanded jaw angle whose upward crossing counts as one close attempt, rad.
+CLOSE_ATTEMPT_RAD = 0.25
+
+
+class PregraspTally:
+  """Plan S7-11's reads, per episode, kept beside `Tally` and banked with it. `step` reads the
+  env before the policy acts; an env at ``episode_length_buf == 0`` has just been reset and its
+  cube is where it spawned."""
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+    n, dev = env.num_envs, env.device
+    self._env = env
+    self._tcp = SceneEntityCfg(ROBOT, site_names=(TCP_SITE,))
+    self._tcp.resolve(env.scene)
+    term = env.action_manager.get_term("joint_pos")
+    names = [t.split("/")[-1] for t in term.target_names]
+    self._jaw_cmd = names.index(JAW_JOINT)
+    self._jaw_q = env.scene[ROBOT].joint_names.index(JAW_JOINT)
+    self._gate = term if hasattr(term, "capped") else None
+    zf = lambda: torch.zeros(n, device=dev)  # noqa: E731
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zl = lambda: torch.zeros(n, dtype=torch.long, device=dev)  # noqa: E731
+    self.spawn = torch.zeros(n, 2, device=dev)
+    self.cube_tcp = torch.zeros(n, 3, device=dev)
+    self.push, self.jaw_arrival, self.rel_yaw = zf(), zf(), zf()
+    self.grasped, self.arrived, self.prev_high = zb(), zb(), zb()
+    self.attempts, self.t_grasp, self.capped, self.armed = zl(), zl(), zl(), zl()
+    self.done: list[dict] = []
+
+  def step(self, grasped: torch.Tensor) -> None:
+    from pal_mjlab.tasks.manipulation.mdp import pregrasp as pg
+
+    env = self._env
+    grasped = grasped.bool()
+    pos = env.scene[OBJECT].data.root_link_pos_w
+    fresh = env.episode_length_buf == 0
+    self.spawn = torch.where(fresh.unsqueeze(-1), pos[:, :2], self.spawn)
+    before = ~self.grasped
+    d = torch.norm(pos[:, :2] - self.spawn, dim=-1)
+    self.push = torch.where(before, torch.maximum(self.push, d), self.push)
+    cmd = env.action_manager.get_term("joint_pos").commanded_target[:, self._jaw_cmd]
+    high = cmd > CLOSE_ATTEMPT_RAD
+    self.attempts += (before & high & ~self.prev_high).long()
+    self.prev_high = high
+    arrive = before & ~self.arrived & pg.in_grasp_window(env, pos, self._tcp)
+    q = env.scene[ROBOT].data.joint_pos[:, self._jaw_q]
+    self.jaw_arrival = torch.where(arrive, q, self.jaw_arrival)
+    self.arrived |= arrive
+    onset = before & grasped
+    self.t_grasp = torch.where(onset, env.episode_length_buf.long(), self.t_grasp)
+    yaw = pg.grasp_relative_yaw(env, OBJECT, self._tcp)
+    self.rel_yaw = torch.where(onset, yaw, self.rel_yaw)
+    self.cube_tcp = torch.where(
+      onset.unsqueeze(-1), pg.cube_in_tcp(env, pos, self._tcp), self.cube_tcp
+    )
+    self.grasped |= grasped
+    if self._gate is not None:
+      self.capped += self._gate.capped.long()
+      self.armed += self._gate.armed.long()
+
+  def finish(self, env_ids: torch.Tensor, step_dt: float) -> None:
+    for i in env_ids.tolist():
+      g = bool(self.grasped[i])
+      self.done.append(
+        {
+          "push_pre_grasp_cm": float(self.push[i]) * 100,
+          "jaw_at_arrival": float(self.jaw_arrival[i])
+          if bool(self.arrived[i])
+          else None,
+          "close_attempts": int(self.attempts[i]),
+          "first_try_grasp": g and int(self.attempts[i]) <= 1,
+          "t_grasp_s": int(self.t_grasp[i]) * step_dt if g else None,
+          "grasp_rel_yaw_deg": math.degrees(float(self.rel_yaw[i])) if g else None,
+          "cube_in_tcp_at_grasp_cm": (self.cube_tcp[i] * 100).tolist() if g else None,
+          "stall": not g,
+          "pregrasp_gate_capped_steps": int(self.capped[i]),
+          "pregrasp_gate_armed_steps": int(self.armed[i]),
+        }
+      )
+    for t in (self.push, self.jaw_arrival, self.rel_yaw, self.cube_tcp):
+      t[env_ids] = 0.0
+    for t in (self.grasped, self.arrived, self.prev_high):
+      t[env_ids] = False
+    for t in (self.attempts, self.t_grasp, self.capped, self.armed):
+      t[env_ids] = 0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    if not rows:
+      return {}
+    n = len(rows)
+    median = lambda xs: sorted(xs)[len(xs) // 2] if xs else None  # noqa: E731
+    got = [r for r in rows if not r["stall"]]
+    vals = lambda k, rs=rows: [r[k] for r in rs if r[k] is not None]  # noqa: E731
+    return {
+      "push_pre_grasp_median_cm": median(vals("push_pre_grasp_cm")),
+      "push_pre_grasp_over_1cm": sum(r["push_pre_grasp_cm"] > 1.0 for r in rows) / n,
+      "jaw_at_arrival_median": median(vals("jaw_at_arrival")),
+      "jaw_at_arrival_over_0p05": sum(
+        r["jaw_at_arrival"] is not None and r["jaw_at_arrival"] > 0.05 for r in rows
+      )
+      / max(len(vals("jaw_at_arrival")), 1),
+      "close_attempts_median": median(vals("close_attempts", got)),
+      "first_try_grasp": sum(r["first_try_grasp"] for r in got) / max(len(got), 1),
+      "t_grasp_median_s": median(vals("t_grasp_s")),
+      "grasp_rel_yaw_median_deg": median(vals("grasp_rel_yaw_deg")),
+      "grasp_rel_yaw_over_20deg": sum(r["grasp_rel_yaw_deg"] > 20 for r in got)
+      / max(len(got), 1),
+      "stall": sum(r["stall"] for r in rows) / n,
+      "pregrasp_gate_capped_episodes": sum(
+        r["pregrasp_gate_capped_steps"] > 0 for r in rows
+      )
+      / n,
+      "pregrasp_gate_armed_median_s": median(vals("pregrasp_gate_armed_steps"))
+      * STEP_DT_S,
+    }
+
+
 class RetreatTally:
   """Plan S7-4's reads, per episode, kept beside `Tally` and banked with it: the jaw release
   (module J), the retreat and the hand-off to the position controller. Tensors in, like
@@ -885,6 +1235,7 @@ class RetreatTally:
     self.rel_xy = torch.zeros(num_envs, 2, device=device)
     self.placed_j, self.placed_j_step = zb(), zl(-1)
     self.placed_jz, self.final_placed_jz, self.tilt_at_let_go = zb(), zb(), zf()
+    self.yaw_at_let_go = zf()
     self.clear_max = zf(float("-inf"))
     self.clear_run = zl()
     self.handed, self.hand_step, self.hand_by = zb(), zl(-1), zl()
@@ -908,6 +1259,7 @@ class RetreatTally:
     placed_jz: torch.Tensor | None = None,
     tilt: torch.Tensor | None = None,
     jaw_open_below: float | torch.Tensor = JAW_OPEN,
+    yaw: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """One step's state -> the envs the position controller drives this step. (B,)
 
@@ -924,6 +1276,8 @@ class RetreatTally:
     self.jaw_at_let_go = torch.where(let_go, jaw_q, self.jaw_at_let_go)
     if tilt is not None:
       self.tilt_at_let_go = torch.where(let_go, tilt, self.tilt_at_let_go)
+    if yaw is not None:
+      self.yaw_at_let_go = torch.where(let_go, yaw, self.yaw_at_let_go)
     self.let_go |= let_go
     # J's release: entering "jaw open and the pads off the cube" after the lift -- for a cube
     # held across an edge (the pads touch at ~0.10 rad) that is the let-go itself.
@@ -983,6 +1337,7 @@ class RetreatTally:
         "tilt_at_let_go": float(self.tilt_at_let_go[i])
         if bool(self.let_go[i])
         else None,
+        "yaw_at_let_go": float(self.yaw_at_let_go[i]) if bool(self.let_go[i]) else None,
         "placed_j": bool(self.placed_j[i]),
         "placed_and_lifted_j": bool(self.placed_j[i]) and bool(self.lifted[i]),
         "lift_clear_max": float(self.clear_max[i]) if rel else None,
@@ -1400,6 +1755,128 @@ class OccTally:
     }
 
 
+class StackTally:
+  """Plan S9's reads on a stack goal (`GOAL=stack`), per episode.
+
+  At every let-go of the pads after `was_lifted`: the five quantities of the release condition
+  (`mdp.stack`: xy offset to the goal on the base, height above it, tilt, yaw against the base,
+  speed) and whether ``OK`` held; the last let-go's are reported, plus whether any let-go was
+  ``OK`` and how many there were. The lock's steps (`GATE=stack`): armed (held, lifted, not OK)
+  and refused (the policy asked to open while armed) -- the stall read. And the base cube's
+  largest horizontal displacement from where it spawned.
+  """
+
+  NAMES = ("dxy", "height", "tilt", "yaw", "speed")
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation.mdp.stack import stack_command_reference
+
+    n, device = env.num_envs, env.device
+    self.reference = stack_command_reference(env, COMMAND)
+    zf = lambda: torch.zeros(n, device=device)  # noqa: E731
+    zl = lambda: torch.zeros(n, dtype=torch.long, device=device)  # noqa: E731
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=device)  # noqa: E731
+    self.prev = zb()
+    self.rel = {k: zf() for k in self.NAMES}
+    self.rel_ok, self.any_ok, self.n_let_go = zb(), zb(), zl()
+    self.armed, self.refused = zl(), zl()
+    self.fresh = torch.ones(n, dtype=torch.bool, device=device)
+    self.base0 = torch.zeros(n, 2, device=device)
+    self.base_moved = zf()
+    self.done: list[dict] = []
+
+  @property
+  def active(self) -> bool:
+    return self.reference is not None
+
+  def step(self, env: ManagerBasedRlEnv, grasped: torch.Tensor) -> None:
+    from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
+    from pal_mjlab.tasks.manipulation.mdp.stack import stack_state
+
+    lifted = getattr(env, _WAS_LIFTED, None)
+    lifted = torch.zeros_like(grasped) if lifted is None else lifted
+    let_go = self.prev & ~grasped & lifted
+    self.prev = grasped.clone()
+    state = stack_state(env, OBJECT, self.reference, COMMAND)
+    for k in self.NAMES:
+      self.rel[k] = torch.where(let_go, getattr(state, k), self.rel[k])
+    self.rel_ok = torch.where(let_go, state.ok, self.rel_ok)
+    self.any_ok |= let_go & state.ok
+    self.n_let_go += let_go.long()
+    term = env.action_manager.get_term("joint_pos")
+    if hasattr(term, "armed"):
+      self.armed += term.armed.long()
+      self.refused += term.locked.long()
+    base_xy = env.scene[self.reference].data.root_link_pos_w[:, :2]
+    self.base0 = torch.where(self.fresh.unsqueeze(-1), base_xy, self.base0)
+    self.fresh[:] = False
+    self.base_moved = torch.maximum(
+      self.base_moved, torch.norm(base_xy - self.base0, dim=-1)
+    )
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      seen = int(self.n_let_go[i]) > 0
+      row = {
+        f"stack_release_{k}": float(self.rel[k][i]) if seen else None
+        for k in self.NAMES
+      }
+      row["stack_release_ok"] = bool(self.rel_ok[i]) if seen else None
+      row["stack_any_ok"] = bool(self.any_ok[i])
+      row["stack_let_gos"] = int(self.n_let_go[i])
+      row["stack_lock_armed_steps"] = int(self.armed[i])
+      row["stack_lock_refused_steps"] = int(self.refused[i])
+      row["stack_base_moved_m"] = float(self.base_moved[i])
+      self.done.append(row)
+    for t in (self.prev, self.rel_ok, self.any_ok):
+      t[env_ids] = False
+    self.n_let_go[env_ids] = 0
+    self.armed[env_ids] = 0
+    self.refused[env_ids] = 0
+    self.base_moved[env_ids] = 0.0
+    self.fresh[env_ids] = True
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    released = [r for r in rows if r["stack_let_gos"] > 0]
+    out = {
+      "stack_episodes_with_let_go": len(released) / n,
+      "stack_let_go_ok": (
+        sum(r["stack_release_ok"] for r in released) / len(released)
+        if released
+        else None
+      ),
+      "stack_any_ok": sum(r["stack_any_ok"] for r in rows) / n,
+      "stack_lock_armed_median_s": None,
+      "stack_lock_refused_episodes": sum(
+        r["stack_lock_refused_steps"] > 0 for r in rows
+      )
+      / n,
+      "stack_base_moved_median_m": sorted(r["stack_base_moved_m"] for r in rows)[
+        len(rows) // 2
+      ]
+      if rows
+      else None,
+      "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows)
+      / n,
+    }
+    armed = sorted(r["stack_lock_armed_steps"] for r in rows)
+    if armed and armed[-1] > 0:
+      out["stack_lock_armed_median_s"] = armed[len(armed) // 2] * STEP_DT_S
+    for k in self.NAMES:
+      vals = sorted(r[f"stack_release_{k}"] for r in released)
+      out[f"stack_release_{k}_median"] = vals[len(vals) // 2] if vals else None
+      out[f"stack_release_{k}_p90"] = (
+        vals[min(len(vals) - 1, round(0.9 * (len(vals) - 1)))] if vals else None
+      )
+    return out
+
+
+#: The control step, s (`tabletop_env_cfg.CONTROL_DT`), for the stack tally's lock times.
+STEP_DT_S = 0.02
+
+
 def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
   """The position controller's action: home pose, jaw open. ``zero`` (B, A) for an absolute
   action, whose 0 is the default pose; for plan S7-8's ``ACTION=delta`` the action moves the
@@ -1755,19 +2232,108 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
   cfg.episode_length_s = load_env_cfg(args.task, play=False).episode_length_s
   cfg.scene.num_envs = args.num_envs
   cfg.seed = args.seed
+  noise = getattr(args, "obs_noise", "off")
+  if noise != "off":
+    # Plan S7-9's precision split: the noise the policy was trained with, back on -- with or
+    # without the cube's own (the terms keep their tracker lag either way).
+    actor = cfg.observations["actor"]
+    actor.enable_corruption = True
+    if noise == "on-no-object":
+      actor.terms = {
+        name: dataclasses.replace(term, noise=None)
+        if name in ("object_pos", "object_yaw")
+        else term
+        for name, term in actor.terms.items()
+      }
   if getattr(args, "plant", False):
     # The support sensor records contact only (`found`); the set-down read needs its force
     # too. A sensor field is read-only on the physics, and `found` -- what every other read
     # here uses -- is unchanged.
-    import dataclasses
-
     cfg.scene.sensors = tuple(
       dataclasses.replace(s, fields=(*s.fields, "force"))
       if s.name == SUPPORT_SENSOR and "force" not in s.fields
       else s
       for s in cfg.scene.sensors
     )
+  apply_stress(cfg, args)
   return ManagerBasedRlEnv(cfg=cfg, device=args.device)
+
+
+#: Plan S7-11 stress (a): factors on the jaw servo's time constant and speed limit.
+STRESS_JAW_TAU = 2.0
+STRESS_JAW_SPEED = 0.5
+
+
+def apply_stress(cfg, args: argparse.Namespace) -> None:
+  """Plan S7-11's stress tests (step 0 item 4), eval only, outside S7-6's ``LAG=FP+JS`` range:
+  (a) a slower jaw servo, (b) a longer cube-tracker lag, (c) a slipperier table. Each raises
+  rather than silently doing nothing on an env without the model it changes."""
+  from mjlab.envs.mdp import dr
+  from mjlab.managers.event_manager import EventTermCfg
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+  if getattr(args, "stress_jaw", False):
+    act = cfg.actions["joint_pos"]
+    if getattr(act, "servo_joints", None) is None:
+      raise SystemExit("--stress-jaw needs the jaw servo model (LAG=JS or FP+JS)")
+    # From S7-6's servo (`JAW_SERVO_TAU` / `JAW_SERVO_MAX_VEL`), not the run's own: a run trained
+    # on the wide servo (``LAG=FP+JSW``) is stressed with the same absolute range as every other.
+    tau, vel = JAW_SERVO_TAU, JAW_SERVO_MAX_VEL
+    cfg.actions["joint_pos"] = dataclasses.replace(
+      act,
+      servo_tau=(tau[0] * STRESS_JAW_TAU, tau[1] * STRESS_JAW_TAU),
+      servo_max_vel=(vel[0] * STRESS_JAW_SPEED, vel[1] * STRESS_JAW_SPEED),
+    )
+  lag = getattr(args, "stress_lag", None)
+  if lag is not None:
+    lo, hi = lag
+    actor = cfg.observations["actor"]
+    terms = {}
+    for name, term in actor.terms.items():
+      if name in ("object_pos", "object_yaw"):
+        if term.params.get("lag") is None:
+          raise SystemExit(
+            "--stress-lag needs the cube tracker (LAG=FP or FP+JS, no OCC)"
+          )
+        term = dataclasses.replace(term, params={**term.params, "lag": (lo, hi)})
+      terms[name] = term
+    actor.terms = terms
+  mu = getattr(args, "stress_friction", None)
+  if mu is not None:
+    cfg.events["stress_table_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(TABLE, geom_names=("table_top",)),
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],
+        "ranges": (mu, mu),
+      },
+    )
+    cfg.events["object_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(OBJECT, geom_names=(f"{OBJECT}_geom",)),
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],
+        "ranges": (mu, mu),
+      },
+    )
+
+
+def stress_of(args: argparse.Namespace) -> dict:
+  """The stress conditions an eval ran under, for its JSON."""
+  out: dict = {}
+  if getattr(args, "stress_jaw", False):
+    out["jaw"] = {"tau_x": STRESS_JAW_TAU, "speed_x": STRESS_JAW_SPEED}
+  if getattr(args, "stress_lag", None) is not None:
+    out["lag_steps"] = list(args.stress_lag)
+  if getattr(args, "stress_friction", None) is not None:
+    out["cube_table_friction"] = args.stress_friction
+  return out
 
 
 def load_policy(args: argparse.Namespace, env: ManagerBasedRlEnv):
@@ -1824,6 +2390,12 @@ def tilt(env: ManagerBasedRlEnv) -> torch.Tensor:
     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
   )
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
+
+
+def yaw_mod90(yaw: torch.Tensor) -> torch.Tensor:
+  """A cube's yaw folded to [-pi/4, pi/4) (it looks the same every 90 deg), rad: plan S7-9's yaw
+  error against a box at yaw 0 (S10's drop table). (B,)"""
+  return torch.remainder(yaw + math.pi / 4, math.pi / 2) - math.pi / 4
 
 
 def pad_height_above_object(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -2248,6 +2820,80 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
           f"max {v['max_m'] * 100:5.2f} cm  (n {v['n']})"
         )
 
+  if "stack_any_ok" in result:
+    print("\n  STACK (plan S9) ---------------------------------------------------")
+    print(
+      f"    episodes with a let-go   {result['stack_episodes_with_let_go']:6.1%}   last let-go OK "
+      f"{fmt(result['stack_let_go_ok'], '')}   any let-go OK {result['stack_any_ok']:6.1%}"
+    )
+    for k in StackTally.NAMES:
+      print(
+        f"    at the let-go {k:10s} median {fmt(result[f'stack_release_{k}_median'], '')}  "
+        f"p90 {fmt(result[f'stack_release_{k}_p90'], '')}"
+      )
+    print(
+      f"    lock refused an opening  {result['stack_lock_refused_episodes']:6.1%} of episodes; armed "
+      f"{fmt(result['stack_lock_armed_median_s'], 's')} (median)"
+    )
+    print(
+      f"    base moved               {fmt(result['stack_base_moved_median_m'], 'm')} (median); "
+      f"> 5 mm in {result['stack_base_moved_over_5mm']:6.1%}"
+    )
+  if "arm_min_clearance_median_m" in result:
+    print("\n  ARM VS TABLE, links 1-6 (plan S7-10) --------------------------------")
+    cm = lambda v: "   n/a" if v is None else f"{v * 100:6.2f} cm"  # noqa: E731
+    fmt3 = lambda v, u: "n/a" if v is None else f"{v:7.4f} {u}"  # noqa: E731
+    print(
+      f"    lowest point over table  {cm(result['arm_min_clearance_median_m'])}"
+      f"  (episode min, median; min {cm(result['arm_min_clearance_min_m'])})"
+    )
+    for link, v in result["arm_min_clearance_median_by_link_m"].items():
+      print(f"      {link:22s} {cm(v)}")
+    print(
+      "    within 1 / 2 / 3 cm      "
+      + " / ".join(f"{result[f'arm_within_{c}cm_share']:.0%}" for c in (1, 2, 3))
+    )
+    if "arm_table_contact_share" in result:
+      print(
+        f"    episodes with contact    {result['arm_table_contact_share']:.0%}"
+        f"  (> 30 N {result['arm_table_over_30n_share']:.0%}; peak median "
+        f"{fmt3(result['arm_table_peak_force_median_n'], 'N')}, max "
+        f"{fmt3(result['arm_table_peak_force_max_n'], 'N')})"
+      )
+      for link, v in result["arm_table_contact_share_by_link"].items():
+        print(f"      {link:22s} {v:.0%}")
+      print(
+        f"    contact steps by phase   {result['arm_table_contact_steps_by_phase']}"
+      )
+    else:
+      print("    contact: no arm-table sensor in this env (set ARM_TABLE=watch)")
+
+  if "push_pre_grasp_over_1cm" in result:
+    print("\n  BEFORE THE GRASP (plan S7-11) --------------------------------------")
+    f2 = lambda v, u="": "n/a" if v is None else f"{v:.3f}{u}"  # noqa: E731
+    print(
+      f"    cube pushed > 1 cm       {result['push_pre_grasp_over_1cm']:6.1%}   (median "
+      f"{f2(result['push_pre_grasp_median_cm'], ' cm')})"
+    )
+    print(
+      f"    jaw at arrival           {f2(result['jaw_at_arrival_median'], ' rad')} (median; "
+      f"> 0.05 in {result['jaw_at_arrival_over_0p05']:6.1%})"
+    )
+    print(
+      f"    first-try grasp          {result['first_try_grasp']:6.1%}   (close attempts median "
+      f"{result['close_attempts_median']}); never grasped {result['stall']:6.1%}"
+    )
+    print(
+      f"    time to grasp            {f2(result['t_grasp_median_s'], ' s')} (median); hand-cube "
+      f"yaw {f2(result['grasp_rel_yaw_median_deg'], ' deg')} (> 20 deg "
+      f"{result['grasp_rel_yaw_over_20deg']:6.1%})"
+    )
+    if result["pregrasp_gate_capped_episodes"]:
+      print(
+        f"    gate lowered the jaw     in {result['pregrasp_gate_capped_episodes']:6.1%} of "
+        f"episodes; armed {f2(result['pregrasp_gate_armed_median_s'], ' s')} (median)"
+      )
+
   if rewards:
     print("\n  PER-TERM REWARD (mean episode sum) --------------------------------")
     for name, value in sorted(rewards.items(), key=lambda kv: -abs(kv[1])):
@@ -2290,6 +2936,9 @@ def main() -> None:
     if not args.handoff or args.handoff_direct or lift is not None or delta
     else RiseReturn(env)
   )
+  stack = StackTally(env)
+  arm = ArmTally.from_env(env)
+  pre = PregraspTally(env)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
   arm_ids = [robot.joint_names.index(n) for n in robot.joint_names]
@@ -2308,6 +2957,8 @@ def main() -> None:
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
       tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
+      if stack.active:
+        stack.step(env, flags["grasped"])
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
       jaw_thr = jaw_open_for(env)
       handed = retreat.step(
@@ -2322,6 +2973,7 @@ def main() -> None:
         placed_jz=flags["placed_and_lifted_z"] & (jaw_q < jaw_thr),
         tilt=tilt(env),
         jaw_open_below=jaw_thr,
+        yaw=yaw_mod90(obj_yaw),
       )
       if plant is not None:
         plant.measure_env(
@@ -2337,6 +2989,8 @@ def main() -> None:
         dxy,
         ~handed & (env.episode_length_buf > 0),
       )
+      arm.step_env(flags["grasped"], retreat.let_go)
+      pre.step(flags["grasped"])
       sensors = getattr(env, "_pal_cube_sensors", None)
       if sensors and OBJECT in sensors:
         occ.step(
@@ -2400,8 +3054,12 @@ def main() -> None:
         jawt.finish(finished)
         if rise is not None:
           rise.finish(finished)
+        if stack.active:
+          stack.finish(finished)
         if plant is not None:
           plant.finish(finished)
+        arm.finish(finished)
+        pre.finish(finished, env.step_dt)
         for key, value in extras.get("log", {}).items():
           if key.startswith("Episode_Reward/"):
             reward_sums.setdefault(key.removeprefix("Episode_Reward/"), []).append(
@@ -2413,6 +3071,8 @@ def main() -> None:
   result.update(jawt.summarise(args.episodes))
   if occ.done:
     result.update(occ.summarise(args.episodes))
+  if stack.active:
+    result.update(stack.summarise(args.episodes))
   result["handoff"] = bool(args.handoff)
   if not args.handoff:
     result["handoff_return"] = None
@@ -2426,6 +3086,8 @@ def main() -> None:
     result.update(rise.summarise(args.episodes))
   if plant is not None:
     result.update(plant.summarise(args.episodes))
+  result.update(arm.summarise(args.episodes))
+  result.update(pre.summarise(args.episodes))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
@@ -2449,19 +3111,22 @@ def main() -> None:
           "task": args.task,
           "num_envs": args.num_envs,
           "seed": args.seed,
+          "stress": stress_of(args),
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o, **j}
-            for r, q, o, j in zip(
+            {**r, **q, **o, **j, **st, **a, **pr}
+            for r, q, o, j, st, a, pr in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
               jawt.done[: args.episodes],
+              stack.done[: args.episodes] or [{}] * args.episodes,
+              arm.done[: args.episodes],
+              pre.done[: args.episodes],
               strict=True,
             )
           ],
-
         },
         indent=2,
       )

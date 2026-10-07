@@ -42,6 +42,7 @@ from pal_mjlab.tasks.manipulation.mdp.observations import (
 )
 from pal_mjlab.tasks.manipulation.mdp.rewards import release_quality_of
 from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+from pal_mjlab.tasks.manipulation.pick_place import rewards as rw_s9
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   M1_PLACED_WEIGHT,
   M1_RELEASE_WEIGHT,
@@ -171,8 +172,14 @@ def test_m6_needs_m1_before_it():
 def test_every_arm_resets_the_release_latch(arm):
   """Registered unconditionally, as `reset_was_lifted` is: an eval or test that reads the
   latch on any arm must not be graded by the previous episode's release."""
+  # Plan S9's RG / SA read the base cube: they are built on the stack goal, which needs B's box.
+  stack = (
+    {"goal": "stack", "baseline": pp.BASELINES["B"]}
+    if arm in rw_s9.STACK_ONLY_ARMS
+    else {}
+  )
   cfg = pp.make_pick_place_env_cfg(
-    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=arm
+    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=arm, **stack
   )
   assert cfg.events["reset_release_latch"].func is mdp.reset_release_latch
   assert cfg.events["reset_release_latch"].mode == "reset"

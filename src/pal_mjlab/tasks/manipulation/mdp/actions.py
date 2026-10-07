@@ -311,6 +311,90 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
     return RateLimitedJointPositionAction(self, env)
 
 
+class StackGateJointPositionAction(RateLimitedJointPositionAction):
+  """Plan S9's lock (`GATE=stack`): the jaw may not open while the held cube is not ``OK``.
+
+  While the cube is held (both pads, the grasp sensor) after `was_lifted` and the release
+  condition (`stack.StackState.ok`: within 1 cm of the goal on the base, at most 1 cm above
+  it, tilted and turned against the base by at most 10 deg, slower than 5 cm/s) is false, the
+  jaw's commanded target cannot move towards open -- a smaller angle -- from where it was: it
+  may hold or close. Once ``OK`` holds, or the cube is not held, the jaw is free.
+
+  In the slew hook (`_shape_step`, after the slew and before plan S7-4's bounds), so the
+  policy's output and the ONNX contract are unchanged; a deployer has to apply the same lock,
+  from what the robot measures (both cubes from FoundationPose, the arm's kinematics, the jaw
+  angle in place of the contact sensor). Here it reads the true sim state.
+
+  Absolute targets only: a delta action and the tool speed cap are not built on it.
+  """
+
+  cfg: StackGateJointPositionActionCfg
+
+  def __init__(self, cfg: StackGateJointPositionActionCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg=cfg, env=env)
+    index_list, _ = resolve_matching_names(cfg.gate_joints, self._target_names)
+    if len(index_list) != 1:
+      raise ValueError(
+        f"gate_joints must match the one jaw actuator; patterns={list(cfg.gate_joints)}, "
+        f"matched {[self._target_names[i] for i in index_list]}"
+      )
+    self._gate_idx = index_list[0]
+    #: Per env, whether the lock held the jaw at the last step (it asked to open and was
+    #: refused). For the eval's stall read.
+    self.locked = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    #: Per env, whether the lock was armed (held, lifted, not OK) at the last step.
+    self.armed = torch.zeros_like(self.locked)
+
+  def lock_mask(self) -> torch.Tensor:
+    """Held after `was_lifted` and not ``OK``: the jaw may not open. (B,)"""
+    from pal_mjlab.tasks.manipulation.mdp.observations import (
+      _grasped_bool,
+      _was_lifted_bool,
+    )
+    from pal_mjlab.tasks.manipulation.mdp.stack import stack_state
+
+    cfg, env = self.cfg, self._env
+    held = _grasped_bool(env, cfg.grasp_sensor_name)
+    lifted = _was_lifted_bool(env, cfg.grasp_sensor_name, cfg.support_sensor_name)
+    ok = stack_state(env, cfg.object_name, cfg.reference_name, cfg.command_name).ok
+    return held & lifted & ~ok
+
+  def _shape_step(self, previous: torch.Tensor) -> None:
+    self.armed = self.lock_mask()
+    i = self._gate_idx
+    target = self._processed_actions
+    held_back = torch.maximum(target[:, i], previous[:, i])
+    self.locked = self.armed & (held_back > target[:, i])
+    target[:, i] = torch.where(self.armed, held_back, target[:, i])
+    self._processed_actions = target
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    super().reset(env_ids)
+    if env_ids is None:
+      env_ids = slice(None)
+    self.locked[env_ids] = False
+    self.armed[env_ids] = False
+
+
+@dataclass(kw_only=True)
+class StackGateJointPositionActionCfg(RateLimitedJointPositionActionCfg):
+  """`RateLimitedJointPositionActionCfg` plus plan S9's jaw lock (`StackGateJointPositionAction`)."""
+
+  gate_joints: tuple[str, ...]
+  """Actuator regex of the jaw, the one joint the lock holds."""
+
+  object_name: str
+  reference_name: str
+  """The base cube the goal sits on, for the yaw against it."""
+
+  command_name: str
+  grasp_sensor_name: str
+  support_sensor_name: str
+
+  def build(self, env: ManagerBasedRlEnv) -> StackGateJointPositionAction:
+    return StackGateJointPositionAction(self, env)
+
+
 class DeltaRateLimitedJointPositionAction(RateLimitedJointPositionAction):
   """Plan S7-8's DEL: the action moves the commanded target, it does not set it.
 
@@ -388,7 +472,8 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
 
   v_max is ``speed_limit``, and ``slow_speed_limit`` while the object is held and either
   within ``slow_zone`` of its resting height on the surface (lifting off, setting down) or
-  within ``slow_zone`` of the goal horizontally (arriving over it).
+  within ``slow_zone`` of the goal horizontally (arriving over it). With ``slow_near_surface``
+  off only the second (plan S7-9's PV); an infinite ``speed_limit`` is no bound outside it.
 
   Like the slew, this lives in the action term: a deployment must apply the same bound to
   reproduce what was trained. The bound uses the robot's own kinematics (anchors, axes, tool
@@ -439,9 +524,9 @@ class ToolSpeedCappedJointPositionAction(RateLimitedJointPositionAction):
     half_z = object_half_height(env, cfg.object_name)
     height = pos[:, 2] - surface_top_z(env, SceneEntityCfg(cfg.surface_name)) - half_z
     goal = env.command_manager.get_term(cfg.command_name).command
-    near = (height < cfg.slow_zone) | (
-      torch.norm((pos - goal)[:, :2], dim=-1) < cfg.slow_zone
-    )
+    near = torch.norm((pos - goal)[:, :2], dim=-1) < cfg.slow_zone
+    if cfg.slow_near_surface:
+      near = near | (height < cfg.slow_zone)
     slow = _grasped_bool(env, cfg.grasp_sensor_name) & near
     return torch.where(
       slow,
@@ -478,6 +563,9 @@ class ToolSpeedCappedJointPositionActionCfg(RateLimitedJointPositionActionCfg):
   slow_zone: float
   """Distance (m) to the object's resting height, or horizontally to the goal, inside which a
   held object gets ``slow_speed_limit``."""
+
+  slow_near_surface: bool = True
+  """Whether the resting-height half of the slow zone applies (False: near the goal only)."""
 
   control_dt: float
   """Control period, s: the bound is a speed times this."""

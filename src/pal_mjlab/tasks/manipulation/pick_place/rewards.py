@@ -29,6 +29,7 @@ Literature behind the shapes, read before they were written:
 from __future__ import annotations
 
 import dataclasses
+import math
 
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -716,6 +717,108 @@ def _eq(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
+# -- S9: RG (pay the release grade only for an OK let-go) and SA (a gradient towards OK) --------
+#
+# Plan S9 revised again (Siwei, 2026-10-01 22:04-22:20): stack, and let go only when aligned and
+# slow. The release condition OK (`mdp.stack`) is within 1 cm of the goal on the base, at most 1 cm
+# above it, tilted and turned against the base by at most 10 deg, slower than 5 cm/s. Three ways
+# of enforcing it are compared: the lock (`GATE=stack`, the action term), RG and SA.
+#
+# RG pays M6's grade on `release` and `placed` only when OK held at the let-go
+# (`release_quality(require_ok=True)`, the release latch's ``rel_ok``); any other release is graded
+# at the floor (0.25), so a sloppy let-go that still lands on the base keeps `placed` x 0.25.
+#
+# SA pays prod_i G(x_i / bound_i) over the five OK quantities while the cube is held after the lift
+# within `SA_NEAR` of the goal horizontally (`mdp.stack_alignment`): 1 per step at a perfect hold on
+# the base. Weight 1, the order of one `grasp` step, and checked by the L5 ordering test: a hold on
+# the base must still earn less per step than the placed state.
+#: The base cube's entity name (the old `stack` task's; `pick_place_env_cfg.GOAL=stack`).
+BASE_OBJECT = "base_object"
+SA_WEIGHT = 1.0
+SA_NEAR = 0.03  # m, horizontal
+
+
+def _rg(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in ("release", "placed"):
+    term = rewards.get(name)
+    assert term is not None and "floor" in term.params, (
+      "RG pays M6's grade for an OK let-go only; apply M6 first"
+    )
+    rewards[name] = RewardTermCfg(
+      func=term.func, weight=term.weight, params={**term.params, "require_ok": True}
+    )
+
+
+def _sa(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["stack_align"] = RewardTermCfg(
+    func=mdp.stack_alignment,
+    weight=SA_WEIGHT,
+    params={
+      "command_name": COMMAND,
+      "object_name": OBJECT,
+      "reference_name": BASE_OBJECT,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "support_sensor_name": SUPPORT_SENSOR,
+      "near": SA_NEAR,
+    },
+  )
+
+
+# -- S7-9: placing precision at the stack speed (PXY, PT; plan S7-9, designed 2026-10-01 13:20) --
+#
+# At the stack speeds ABS-a lets go 1.5-2.5 cm off the target, tilted 21-28 deg and at 0.07-0.19
+# m/s, and between 3 k and 5 k the release drifts out while M6's grade halves (S7-8 eval). The
+# table forgives it; a cube on a cube (S9) or in a box (S10) does not. Two reward modules, each
+# resumed from ABS-a's 3 k checkpoint against the unchanged control (P0):
+#
+# * PXY narrows the grade: M6's xy width 0.02 -> 0.01 m and M2's ``goal_near`` 0.03 -> 0.01 m.
+#   The lowering path over the target stays monotone (analytic check in
+#   `tests/test_pick_place_s79.py`), but is nearly flat between 3 and 5 cm up (+0.01).
+# * PT grades the let-go's tilt and speed as well: M6's graded part x G_10deg(tilt) x
+#   G_0.05(speed), both at the pads' let-go (`observations._release_latch`). Inside M6's
+#   ``(1 - floor)`` part, so a poor release keeps the floor (`mdp.release_quality_of`).
+#
+# Plan S7-9's other two codes are not reward modules: PQ is a critic input (`CRITIC_OBS=q`) and PV
+# a tool speed cap (`TOOL_SPEED=PV`).
+PXY_DIST_STD = 0.01  # m, M6's xy width (was M6_DIST_STD)
+PXY_NEAR_STD = 0.01  # m, M2's goal_near width (was M2_NEAR_STD)
+PT_TILT_STD = math.radians(10.0)  # rad
+PT_SPEED_STD = 0.05  # m/s, `observations.STILL_SPEED`
+
+
+def _graded_terms(rewards: dict[str, RewardTermCfg], module: str) -> list[str]:
+  names = [n for n in ("release", "placed") if n in rewards]
+  assert names and all("floor" in rewards[n].params for n in names), (
+    f"{module} changes M6's grade; apply M6 first"
+  )
+  return names
+
+
+def _pxy(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in _graded_terms(rewards, "PXY"):
+    term = rewards[name]
+    rewards[name] = RewardTermCfg(
+      func=term.func,
+      weight=term.weight,
+      params={**term.params, "dist_std": PXY_DIST_STD},
+    )
+  near = rewards.get("goal_near")
+  assert near is not None, "PXY narrows M2's goal_near; apply M2 first"
+  rewards["goal_near"] = RewardTermCfg(
+    func=near.func, weight=near.weight, params={**near.params, "std": PXY_NEAR_STD}
+  )
+
+
+def _pt(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in _graded_terms(rewards, "PT"):
+    term = rewards[name]
+    rewards[name] = RewardTermCfg(
+      func=term.func,
+      weight=term.weight,
+      params={**term.params, "tilt_std": PT_TILT_STD, "speed_std": PT_SPEED_STD},
+    )
+
+
 _MODULES = {
   "M1": _m1,
   "M2": _m2,
@@ -730,6 +833,10 @@ _MODULES = {
   "O": _o,
   "Z": _z,
   "EQ": _eq,
+  "RG": _rg,
+  "SA": _sa,
+  "PXY": _pxy,
+  "PT": _pt,
 }
 
 
@@ -755,6 +862,13 @@ def _s52_arm(modules: tuple[str, ...]):
     )
   if "EQ" in modules and "M1" not in modules:
     raise ValueError("EQ is a term beside M1's; it needs M1 in the arm")
+  if "RG" in modules and "M6" not in modules[: modules.index("RG")]:
+    raise ValueError("RG pays M6's grade for an OK let-go only; it needs M6 before it")
+  if "SA" in modules and "M1" not in modules:
+    raise ValueError("SA is a term beside M1's; it needs M1 in the arm")
+  for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",))):
+    if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
+      raise ValueError(f"{name} needs {' and '.join(needs)} before it")
 
   def build(ctx: RewardContext) -> dict[str, RewardTermCfg]:
     rewards = REWARD_VARIANTS[S52_BASE](ctx)
@@ -806,7 +920,32 @@ S8_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+EQ": ("M1", "M2", "M3", "M6", "J", "M8", "EQ"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S8_ARMS.items()})
-_MODULE_ARMS = {**S52_ARMS, **S7_ARMS, **S72_ARMS, **S74_ARMS, **S75_ARMS, **S8_ARMS}
+#: The S9 arms (plan S9 revised again, 2026-10-01 22:04-22:20): S7-4's RCTP + RG (ST-R) and RCTP + SA
+#: (ST-GA, with the lock). ST, ST-G and ST-GFT are RCTP itself on the stack goal (`GOAL`, `GATE`).
+S9_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+RG": ("M1", "M2", "M3", "M6", "J", "M8", "RG"),
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+SA": ("M1", "M2", "M3", "M6", "J", "M8", "SA"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S9_ARMS.items()})
+#: The S7-9 arms (plan S7-9): S7-4's RCTP reward + one precision module. P0 (the control) and the
+#: other two codes, PQ (`CRITIC_OBS`) and PV (`TOOL_SPEED`), run RCTP itself.
+S79_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+PXY": ("M1", "M2", "M3", "M6", "J", "M8", "PXY"),
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+PT": ("M1", "M2", "M3", "M6", "J", "M8", "PT"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S79_ARMS.items()})
+_MODULE_ARMS = {
+  **S52_ARMS,
+  **S7_ARMS,
+  **S72_ARMS,
+  **S74_ARMS,
+  **S75_ARMS,
+  **S8_ARMS,
+  **S9_ARMS,
+  **S79_ARMS,
+}
+#: Arms whose terms read the base cube (RG, SA): they need plan S9's `GOAL=stack`.
+STACK_ONLY_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m))
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)
