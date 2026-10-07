@@ -142,8 +142,12 @@ class Recorder:
         self.m.body_pos[self.table] = bpos[i, self.table]
       mujoco.mj_forward(self.m, self.d)
       cam = mujoco.MjvCamera()
-      cam.lookat[:] = (0.47, 0.10, 0.90)
-      cam.distance, cam.azimuth, cam.elevation = 0.95, 210.0, -28.0
+      if self.close:
+        cam.lookat[:] = self.lookat[i] + np.array([0.0, 0.0, 0.03])
+        cam.distance, cam.azimuth, cam.elevation = 0.32, 135.0, -12.0
+      else:
+        cam.lookat[:] = (0.47, 0.10, 0.90)
+        cam.distance, cam.azimuth, cam.elevation = 0.95, 210.0, -28.0
       self.r.update_scene(self.d, cam)
       tiles.append(self.r.render().copy())
     self.frames.append(np.concatenate(tiles, axis=1))
@@ -382,7 +386,7 @@ def hold_rollout(args) -> dict:
   drv.hooks.append(hook)
   rec = None
   if args.video is not None:
-    rec = Recorder(env, model, args.video_envs, every=2)
+    rec = Recorder(env, model, args.video_envs, every=2, close=args.video_close)
     drv.hooks.append(rec)
   stack = lambda key: np.stack([p[key] for p in plans])  # noqa: E731
   q = drv.q()
@@ -477,6 +481,9 @@ def main(argv=None) -> None:
   p.add_argument("--json", type=pathlib.Path, default=None)
   p.add_argument("--video", type=pathlib.Path, default=None)
   p.add_argument("--video-envs", type=int, nargs="+", default=[0, 1, 2, 3])
+  p.add_argument(
+    "--video-close", action="store_true", help="a close side view on each env's block"
+  )
   args = p.parse_args(argv)
   out = hold_rollout(args)
   if args.json:
