@@ -590,7 +590,9 @@ def weld_probe(args) -> dict:
 
   out = []
   for pair in args.solrefs:
-    vals = [float(v) for v in pair.split(",")]
+    vals = [
+      float(v.replace("m", "-")) for v in pair.split(",")
+    ]  # "m500" = -500 (argparse eats a leading "-")
     a, b = vals[0], vals[1]
     ts = vals[2] if len(vals) > 2 else 1.0
     cfg = load_env_cfg(args.task, play=False)
@@ -656,7 +658,7 @@ def main(argv=None) -> None:
   p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   p.add_argument("mode", choices=("hold", "weld"))
   p.add_argument(
-    "--solrefs", nargs="+", default=["-10000,-200", "-3000,-110", "0.02,1", "0.005,1"]
+    "--solrefs", nargs="+", default=["m10000,m200", "m3000,m110", "0.02,1", "0.005,1"]
   )
   p.add_argument("--task", default=TASK)
   p.add_argument("--num-envs", type=int, default=16)
