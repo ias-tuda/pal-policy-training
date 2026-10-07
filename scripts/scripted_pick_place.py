@@ -356,6 +356,7 @@ def waypoints(
   pad_clearance: float = PAD_CLEARANCE,
   carry_hand_x: np.ndarray | None = None,
   place_dz: float = 0.0,
+  clear_height: float = CLEAR_HEIGHT,
 ) -> dict[str, np.ndarray]:
   """Joint configurations for every phase, each IK seeded from the previous one so the
   sequence stays on one solution branch. Raises if any waypoint has no solution or puts
@@ -370,7 +371,7 @@ def waypoints(
   if table_z is None:
     table_z = scene.TABLE_TOP_Z
   z_grasp = table_z + kin.pad_offset() + pad_clearance
-  z_high = z_grasp + CLEAR_HEIGHT
+  z_high = z_grasp + clear_height
   hand_x = hand_x_for(kin, cube_yaw)
   carry_x = hand_x if carry_hand_x is None else carry_hand_x
   goals = {
@@ -466,6 +467,7 @@ def replan_place(
   cube_actual: np.ndarray,
   goal: np.ndarray,
   release_height: float = RELEASE_HEIGHT,
+  clear_height: float = CLEAR_HEIGHT,
 ) -> None:
   """Re-plan `place` and `retreat` from the cube's measured position in the hand.
 
@@ -484,7 +486,7 @@ def replan_place(
   plan["retreat"] = _solve(
     kin,
     "retreat",
-    want - bias + np.array([0.0, 0.0, CLEAR_HEIGHT]),
+    want - bias + np.array([0.0, 0.0, clear_height]),
     hand_x,
     plan["place"],
   )
@@ -711,6 +713,7 @@ def rollout(
   robot_target=None,
   tracker: str = "B",
   insert=None,
+  clear_height: float = CLEAR_HEIGHT,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -793,7 +796,9 @@ def rollout(
   over the pin's top), the place with the pin's bottom `INSERT_PUSH` into the table, via ``preinsert`` and the
   closed-loop ``align`` (the module's `INSERT_PHASES`). ``box_poses`` then forces the block. Rows gain ``seated``
   (`mdp.InsertState.seated`), the pin's bottom height over the block's bottom, its offset from the axis and tilt
-  at the end, the block's displacement and the steps the hand touched the block.
+  at the end, the block's displacement and the steps the hand touched the block. ``clear_height`` is how far the
+  pre-grasp, lift, carry and retreat waypoints sit over the grasp / place (`CLEAR_HEIGHT`): the pin's grasp is
+  7 cm higher than the cube's, and 10 cm over it puts the hand into the torso near the body.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -1032,6 +1037,7 @@ def rollout(
           else pad_clearance,
           carry_hand_x=carry_x,
           place_dz=place_dz if box_goal is not None else 0.0,
+          clear_height=clear_height,
         )
       )
     except RuntimeError as e:
@@ -1209,6 +1215,7 @@ def rollout(
               cube_a[i],
               goal[i] + release_off[i],
               RELEASE_HEIGHT if insert is None else -INSERT_PUSH,
+              clear_height,
             )
           except RuntimeError as e:  # keep the open-loop place; scored as it lands
             skipped_corrections.append((i, f"replan: {e}"))

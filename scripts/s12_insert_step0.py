@@ -65,6 +65,7 @@ def _common(args: argparse.Namespace) -> dict:
     insert=INSERT_GOALS[args.goal],
     arm_table=ARM_TABLE_CODES["AH10"],
     pad_clearance=_pad_clearance(args.above_top),
+    clear_height=args.clear_height,
   )
 
 
@@ -316,6 +317,13 @@ def main() -> None:
   p.add_argument("--goal", default="insert")
   p.add_argument("--random", type=int, default=0)
   p.add_argument("--above-top", type=float, default=None)
+  p.add_argument(
+    "--clear-height",
+    type=float,
+    default=0.07,
+    help="pre-grasp / lift / carry / retreat over the grasp and place (m); 7 cm: the pin's bottom 14 mm over the "
+    "block's top in the carry",
+  )
   p.add_argument("--distances", type=float, nargs="+", default=[0.08, 0.10, 0.12])
   p.add_argument("--json", type=pathlib.Path, default=None)
   args = p.parse_args()
