@@ -96,6 +96,30 @@ PHASES = (
   ("retreat", "retreat", False, 40),
   ("settle", "retreat", False, 20),
 )
+#: Plan §12's insert (`rollout(insert=...)`): the place goes through ``preinsert`` -- the pin's bottom
+#: `INSERT_PREINSERT` over the hole's entry, re-planned with the place at `lower` --, where `align` corrects the
+#: pin bottom's xy onto the hole's axis (closed loop, as `hold` does for the cube), then a slow straight push to the
+#: place pose (the pin's bottom `INSERT_PUSH` into the table) and a short press before the jaw opens. The retreat
+#: is `CLEAR_HEIGHT` straight up (L9).
+INSERT_PHASES = (
+  ("approach", "pregrasp", False, 60),
+  ("descend", "grasp", False, 40),
+  ("close", "grasp", True, 30),
+  ("lift", "lift", True, 40),
+  ("carry", "carry", True, 60),
+  ("steady", "carry", True, 15),
+  ("lower", "preinsert", True, 40),
+  ("align", "preinsert", True, 15),
+  ("insert", "place", True, 80),
+  ("press", "place", True, 20),
+  ("open", "place", False, 30),
+  ("retreat", "retreat", False, 40),
+  ("settle", "retreat", False, 20),
+)
+INSERT_PREINSERT = 0.02
+INSERT_PUSH = 0.003
+#: `align` corrects an env whose pin bottom is further than this off the hole's axis (m).
+INSERT_ALIGN_TOL = 0.002
 #: Every waypoint `waypoints` plans, in order.
 WAYPOINT_NAMES = ("pregrasp", "grasp", "lift", "carry", "place", "retreat")
 #: The place pose at the goal itself, for a cube set down at a release offset and then dragged
@@ -441,6 +465,7 @@ def replan_place(
   tcp_actual: np.ndarray,
   cube_actual: np.ndarray,
   goal: np.ndarray,
+  release_height: float = RELEASE_HEIGHT,
 ) -> None:
   """Re-plan `place` and `retreat` from the cube's measured position in the hand.
 
@@ -449,11 +474,12 @@ def replan_place(
   target. Both are measured here, with the arm holding still at the carry waypoint, and the
   place target is shifted so that the *cube* lands on the goal: the grasp point goes to
   ``goal + (tcp - cube)``, commanded as that minus the current tracking bias. The policy
-  observes the cube's pose too, so this uses nothing it does not have.
+  observes the cube's pose too, so this uses nothing it does not have. Plan §12's insert passes a negative
+  ``release_height``: the pin's centre pushed that far below its seated position (into the table).
   """
   tcp_planned, _ = kin.fk(plan["carry"])
   bias = tcp_actual - tcp_planned
-  want = goal + (tcp_actual - cube_actual) + np.array([0.0, 0.0, RELEASE_HEIGHT])
+  want = goal + (tcp_actual - cube_actual) + np.array([0.0, 0.0, release_height])
   plan["place"] = _solve(kin, "place", want - bias, hand_x, plan["carry"])
   plan["retreat"] = _solve(
     kin,
@@ -684,6 +710,7 @@ def rollout(
   box_poses: list[tuple[tuple[float, float], float]] | None = None,
   robot_target=None,
   tracker: str = "B",
+  insert=None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -760,6 +787,13 @@ def rollout(
   Plan S11: ``robot_target`` (`pick_place_env_cfg.ROBOT_TARGETS`, ``T11`` / ``T11W``) puts the goal --
   or a stack goal's base -- at the meeting point T in the robot frame, and ``tracker`` is
   `TRACKERS`'s name; the robot's right home comes with ``robot``.
+
+  Plan §12: ``insert`` (`insert.INSERT_GOALS`, with ``shape`` the pin and ``phases`` `INSERT_PHASES`) pushes the
+  pin through the socket block: the grasp at ``pad_clearance`` (the caller's: the TCP `insert.GRASP_ABOVE_TOP`
+  over the pin's top), the place with the pin's bottom `INSERT_PUSH` into the table, via ``preinsert`` and the
+  closed-loop ``align`` (the module's `INSERT_PHASES`). ``box_poses`` then forces the block. Rows gain ``seated``
+  (`mdp.InsertState.seated`), the pin's bottom height over the block's bottom, its offset from the axis and tilt
+  at the end, the block's displacement and the steps the hand touched the block.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -794,6 +828,7 @@ def rollout(
     box=box_goal,
     robot_target=robot_target,
     tracker=tracker,
+    insert=insert,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -903,10 +938,11 @@ def rollout(
   )
   if box_poses is not None:
     from pal_mjlab.tasks.manipulation.pick_place.box import BOX as _BOX
+    from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK as _BLOCK
 
-    if box_goal is None or len(box_poses) != num_envs:
-      raise ValueError("box_poses needs box_goal and one pose per env")
-    box_e = env.scene[_BOX]
+    if (box_goal is None and insert is None) or len(box_poses) != num_envs:
+      raise ValueError("box_poses needs box_goal or insert and one pose per env")
+    box_e = env.scene[_BOX if insert is None else _BLOCK]
     bpose = box_e.data.root_link_pose_w.clone()
     for i, (xy, yaw) in enumerate(box_poses):
       bpose[i, 0] = origins[i, 0] + float(xy[0]) + float(shift[i, 0])
@@ -1130,6 +1166,27 @@ def rollout(
       if user_hook is not None:
         user_hook(phase, env_)
 
+  insert_rows: dict[str, np.ndarray] = {}
+  if insert is not None:
+    from pal_mjlab.tasks.manipulation import mdp as mdp_mod
+    from pal_mjlab.tasks.manipulation import scene as scene_mod
+    from pal_mjlab.tasks.manipulation.pick_place import insert as _ins
+    from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK as _BLOCK
+
+    insert_rows["hand_block_steps"] = np.zeros(num_envs, int)
+    insert_rows["hand_block_after_open_steps"] = np.zeros(num_envs, int)
+    user_hook_i = hook
+
+    def hook(phase: str, env_) -> None:  # noqa: F811
+      hit = (
+        env_.scene[_ins.BLOCK_HAND_SENSOR].data.found.bool().any(dim=-1).cpu().numpy()
+      )
+      insert_rows["hand_block_steps"] += hit.astype(int)
+      if phase in ("open", "retreat", "settle"):
+        insert_rows["hand_block_after_open_steps"] += hit.astype(int)
+      if user_hook_i is not None:
+        user_hook_i(phase, env_)
+
   with torch.inference_mode():
     for phase, wp, closed, steps in phase_list:
       phase_now[0] = phase
@@ -1145,10 +1202,32 @@ def rollout(
           kin.move_table(shift[i])
           try:
             replan_place(
-              kin, plans[i], hand_xs[i], tcp_a[i], cube_a[i], goal[i] + release_off[i]
+              kin,
+              plans[i],
+              hand_xs[i],
+              tcp_a[i],
+              cube_a[i],
+              goal[i] + release_off[i],
+              RELEASE_HEIGHT if insert is None else -INSERT_PUSH,
             )
           except RuntimeError as e:  # keep the open-loop place; scored as it lands
             skipped_corrections.append((i, f"replan: {e}"))
+          if insert is not None:
+            # Plan §12: the pin's bottom INSERT_PREINSERT over the entry, straight above the place.
+            up = np.array(
+              [0.0, 0.0, scene_mod.BLOCK_HEIGHT + INSERT_PREINSERT + INSERT_PUSH]
+            )
+            try:
+              plans[i]["preinsert"] = _solve(
+                kin,
+                "preinsert",
+                kin.fk(plans[i]["place"])[0] + up,
+                hand_xs[i],
+                plans[i]["carry"],
+              )
+            except RuntimeError as e:
+              skipped_corrections.append((i, f"preinsert: {e}"))
+              plans[i]["preinsert"] = plans[i]["carry"]
       if wp == DRAG_WAYPOINT and DRAG_WAYPOINT not in plans[0]:
         # The (corrected) place pose, moved along the table by -release offset: the held cube
         # is dragged from where it was set down onto the goal.
@@ -1170,7 +1249,8 @@ def rollout(
         for pl in plans:
           pl[PRESS_WAYPOINT] = pl["place"].copy()
           pl[PRESS_WAYPOINT][elbow] += PRESS_ELBOW_DQ
-      nxt = np.stack([p[wp] for p in plans])
+      # An env with no plan (or ended before `lower`) has no `preinsert`: it holds its carry there.
+      nxt = np.stack([p.get(wp, p["carry"]) for p in plans])
       n = n_steps(prev, nxt, steps, closed)
       if n > steps:
         stretched[phase] = n
@@ -1185,6 +1265,43 @@ def rollout(
           step_to(nxt, closed)
           waited += 1
         settle_steps[phase] = waited
+      if phase == "align" and insert is not None:
+        # Plan §12: move the pin's bottom onto the hole's axis at the pre-insert height (closed loop; the
+        # pin may sit tilted in the hand, so its bottom, not its centre, is what has to be over the hole).
+        for _ in range(PLACE_CORRECTIONS):
+          st = mdp_mod.insert_state(env, pp.OBJECT, _BLOCK, **insert.geometry)
+          err = np.zeros((num_envs, 3))
+          err[:, :2] = (
+            (st.bottom_w - env.scene[_BLOCK].data.root_link_pos_w)[:, :2].cpu().numpy()
+          )
+          fix = [
+            i
+            for i in torch.nonzero(~ended).flatten().tolist()
+            if np.linalg.norm(err[i]) > INSERT_ALIGN_TOL and i not in plan_error
+          ]
+          if not fix:
+            break
+          shifted = nxt.copy()
+          for i in fix:
+            kin.move_table(shift[i])
+            try:
+              up_i = _solve(
+                kin, "preinsert", kin.fk(nxt[i])[0] - err[i], hand_xs[i], nxt[i]
+              )
+              down_i = _solve(
+                kin,
+                "place",
+                kin.fk(plans[i]["place"])[0] - err[i],
+                hand_xs[i],
+                plans[i]["place"],
+              )
+            except RuntimeError as e:
+              skipped_corrections.append((i, f"align: {e}"))
+              continue
+            shifted[i], plans[i]["place"] = up_i, down_i
+          move_and_settle(nxt, shifted, True)
+          nxt = shifted
+          place_corrections += 1
       if phase == "hold":
         # Corrections are made with the cube lifted clear of the table: resting on it, the
         # cube's friction holds the hand against a centimetre-scale move (measured: a
@@ -1256,6 +1373,17 @@ def rollout(
         1e3 * env.command_manager.get_term("goal_pose").box_displacement().cpu().numpy()
       )
       for key, v in box_rows.items():
+        diag[key] = v
+    if insert is not None:
+      st = mdp_mod.insert_state(env, pp.OBJECT, _BLOCK, **insert.geometry)
+      diag["seated"] = st.seated().cpu().numpy()
+      diag["pin_bottom_over_block_mm"] = 1e3 * st.height.cpu().numpy()
+      diag["pin_offset_mm"] = 1e3 * st.offset.cpu().numpy()
+      diag["pin_tilt_deg"] = np.degrees(st.tilt.cpu().numpy())
+      diag["block_displacement_mm"] = (
+        1e3 * env.command_manager.get_term("goal_pose").box_displacement().cpu().numpy()
+      )
+      for key, v in insert_rows.items():
         diag[key] = v
     goal = env.command_manager.get_term("goal_pose").command
     d = obj.data.root_link_pos_w - goal
