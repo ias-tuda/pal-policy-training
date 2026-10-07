@@ -125,7 +125,6 @@ class Reads:
 
   def start(self, ids: torch.Tensor) -> None:
     """Fresh episode in ``ids``: read the spawn, clear the reads."""
-    from pal_mjlab.tasks.manipulation.mdp.hold import object_yaw4_b  # noqa: F401
 
     env = self.env
     pos = self.obj.data.root_link_pos_w[ids] - env.scene.env_origins[ids]
