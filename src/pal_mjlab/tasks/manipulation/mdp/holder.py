@@ -20,6 +20,8 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
 
 from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+from pal_mjlab.tasks.manipulation.mdp.insert import insert_state
+from pal_mjlab.tasks.manipulation.mdp.observations import _grasped_bool
 
 
 def holder_spec(
@@ -133,3 +135,22 @@ def held_block_moved_penalty(
   1. Weight it negative. (B,)"""
   d, _ = held_block_offset(env, holder_name, block_name)
   return (d / scale).clamp(0.0, 1.0)
+
+
+def pin_through_held(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  block_name: str,
+  block_height: float,
+  hole_d: float,
+  grasp_sensor_name: str,
+) -> torch.Tensor:
+  """1 while the pin is held with its bottom at or below the block's bottom face, inside the bore (plan §13's
+  "through", `mdp.InsertState.through`). (B,)"""
+  st = insert_state(env, object_name, block_name, block_height, hole_d)
+  return (st.through() & _grasped_bool(env, grasp_sensor_name)).float()
+
+
+def pin_through_obs(env: ManagerBasedRlEnv, **params) -> torch.Tensor:
+  """`pin_through_held`, for the critic. (B, 1)"""
+  return pin_through_held(env, **params).unsqueeze(-1)

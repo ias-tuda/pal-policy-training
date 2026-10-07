@@ -127,6 +127,10 @@ from pal_mjlab.tasks.manipulation.pick_place.box import (
 )
 from pal_mjlab.tasks.manipulation.pick_place.hold import HOLD_CODES, apply_hold
 from pal_mjlab.tasks.manipulation.pick_place.insert import INSERT_GOALS, InsertGoal
+from pal_mjlab.tasks.manipulation.pick_place.insert_held import (
+  HOLD_CODES as HELD_INSERT_CODES,
+)
+from pal_mjlab.tasks.manipulation.pick_place.insert_held import apply_held_insert
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASE_OBS_NAMES,
   BASELINES,
@@ -232,8 +236,10 @@ DEFAULT_BASE_OBS = "goal"
 CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
 DEFAULT_CONTACT = "box"
 #: Plan §13.1's one-arm skills (`S13`): ``L-H`` / ``L-HP``, the left's side grasp and hold of the socket
-#: block at H (`pick_place/hold.py`, on the `SPAWN=WC` cfg with the side-grasp arm). Unset is none.
-S13_CODES = ("none", *HOLD_CODES)
+#: block at H (`pick_place/hold.py`, on the `SPAWN=WC` cfg with the side-grasp arm); ``R-I`` / ``R-I-W``, the
+#: right's insertion into the block held at H by a stand-in hand (`pick_place/insert_held.py`, on ``GOAL=insert``,
+#: trained on the left arm and run mirrored). Unset is none.
+S13_CODES = ("none", *HOLD_CODES, *HELD_INSERT_CODES)
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
@@ -372,6 +378,11 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         f"SPAWN={spawn}, TARGET={target}, GOAL={os.environ.get(GOAL_ENV_VAR)}"
       )
     arm = KANGAROO_GRIPPERS_LEFT_ARM_SIDE
+  if s13 in HELD_INSERT_CODES and (insert is None or insert.ladder):
+    raise ValueError(
+      f"{S13_ENV_VAR}={s13} is built on GOAL=insert (IN's terms; plan §13.1); got "
+      f"GOAL={os.environ.get(GOAL_ENV_VAR)}"
+    )
   for name in (HANDOFF_TRAIN_ENV_VAR, START_ENV_VAR):
     if os.environ.get(name) is not None:
       raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
@@ -415,6 +426,10 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   _apply_contact(cfg)
   if s13 in HOLD_CODES:
     apply_hold(cfg, KANGAROO_GRIPPERS_LEFT_ARM.gripper("left"), HOLD_CODES[s13])
+  if s13 in HELD_INSERT_CODES:
+    apply_held_insert(
+      cfg, KANGAROO_GRIPPERS_LEFT_ARM.gripper("left"), HELD_INSERT_CODES[s13]
+    )
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
     left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")

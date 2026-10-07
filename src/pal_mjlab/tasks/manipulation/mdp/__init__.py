@@ -111,6 +111,8 @@ from .holder import (
   held_block_offset,
   held_block_weld,
   holder_spec,
+  pin_through_held,
+  pin_through_obs,
   reset_held_block,
 )
 from .insert import (
@@ -208,6 +210,8 @@ __all__ = [
   "held_block_offset",
   "held_block_weld",
   "holder_spec",
+  "pin_through_held",
+  "pin_through_obs",
   "reset_held_block",
   # Plan §13, the side grasp and the hold of the socket block.
   "approach_elevation",
