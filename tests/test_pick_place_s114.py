@@ -215,13 +215,14 @@ def test_the_kl_falls_to_its_floor_and_never_below(monkeypatch):
 
 def _mirrored_arm_targets(env, alpha: float) -> torch.Tensor:
   """Both arms' joint positions a share ``alpha`` of the way from home towards a mirrored pose whose hands
-  overlap at the midline (the arms' capsules meet near ``alpha`` = 0.7). (B, n_joints)"""
+  overlap at the midline. On this path the arms' capsules close monotonically (13 cm at home, 0 near ``alpha``
+  = 0.45) and no arm link 4-7 comes nearer the table than at home. (B, n_joints)"""
   robot = env.scene["robot"]
   names = robot.joint_names
   left = [names.index(f"arm_left_{i}_joint") for i in range(1, 8)]
   right = [names.index(f"arm_right_{i}_joint") for i in range(1, 8)]
   q = robot.data.default_joint_pos.clone()
-  far = torch.tensor([-0.408, 2.357, 0.57, 0.902], device=env.device)
+  far = torch.tensor([-1.048, 2.329, 1.664, 1.372], device=env.device)
   ql = q[:, left].clone()
   ql[:, :4] = (1.0 - alpha) * ql[:, :4] + alpha * far
   q[:, left] = ql
@@ -242,37 +243,37 @@ def _action_for(env, q: torch.Tensor) -> torch.Tensor:
 
 
 def test_hh_term_positive_control_two_arms_driven_together(monkeypatch):
-  """Two arms driven into each other end the episode on ``arm_arm_force`` -- a termination, not a time-out --
-  and the contact the sensor saw is over the threshold. Without HH_TERM the same drive does not end it."""
+  """Two arms driven into each other (scripted: each step both are put 2 % further along a mirrored path and
+  commanded there) end the episode on ``arm_arm_force`` -- a termination, not a time-out -- once the sensor sees
+  more than 30 N. Without HH_TERM the same drive sees the force and does not end."""
   for hh_term in ("30", None):
-    cfg = _cfg(monkeypatch, num_envs=1, HH_TERM=hh_term)
+    cfg = _cfg(monkeypatch, num_envs=1, HH_TERM=hh_term, HANDOFF_TRAIN="none")
     cfg.auto_reset = False  # keep the terminal state
     assert (bi.ARM_ARM_TERM in cfg.terminations) == (hh_term is not None)
     env = _env(cfg)
     try:
       robot = env.scene["robot"]
+      term = env.action_manager.get_term("joint_pos")
+      ended_at, peak = None, 0.0
       with torch.inference_mode():
-        q = _mirrored_arm_targets(env, 0.55)
-        robot.write_joint_state_to_sim(q, torch.zeros_like(q))
-        # The slew starts from the pose written, not from home.
-        env.action_manager.get_term("joint_pos")._last_target[:] = q[:, _cols(env)]
-        env.sim.forward()
-        assert bool((mdp.arm_arm_clearance(env) > 0.03).all())
-        act = _action_for(env, _mirrored_arm_targets(env, 1.0))
-        ended_at, peak = -1, 0.0
-        for t in range(60):
-          _, _, terminated, truncated, _ = env.step(act)
+        for t in range(30):
+          q = _mirrored_arm_targets(env, 0.2 + 0.02 * t)
+          robot.write_joint_state_to_sim(q, torch.zeros_like(q))
+          term._last_target[:] = q[:, _cols(env)]
+          _, _, terminated, truncated, _ = env.step(_action_for(env, q))
           f = torch.norm(env.scene[bi.ARM_ARM_SENSOR].data.force_history, dim=-1)
           peak = max(peak, float(f.max()))
           assert not bool(truncated.any())
+          if t == 0:
+            assert peak == 0.0  # 7 cm apart at the start
           if bool(terminated.any()):
             ended_at = t
             break
       assert peak > 30.0, peak
       if hh_term is None:
-        assert ended_at < 0, ended_at
+        assert ended_at is None, ended_at
       else:
-        assert ended_at >= 0
+        assert ended_at is not None
         assert bool(env.termination_manager.get_term(bi.ARM_ARM_TERM).all())
         assert not bool(env.termination_manager.time_outs.any())
     finally:
