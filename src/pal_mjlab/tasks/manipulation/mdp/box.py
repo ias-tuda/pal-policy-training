@@ -219,6 +219,8 @@ def reset_box_in_area(
   area_y: tuple[float, float],
   yaw: float,
   min_distance: float,
+  redraws: int = BOX_AREA_REDRAWS,
+  on_half_height: bool = False,
 ) -> None:
   """Plan S10.1: put the box down on the surface, its centre drawn uniformly from the area
   (``area_x`` x ``area_y``, relative to the surface centre -- table-relative, so DR-scene's table
@@ -230,7 +232,11 @@ def reset_box_in_area(
   `SurfaceOffsetCommand._draw_clear_of_object`: each round redraws only the envs still too close;
   after `BOX_AREA_REDRAWS` rounds the stragglers take the area's corner farthest from the object,
   which is at least ``min_distance`` away when the object was drawn where one is
-  (`events.reset_objects_on_surface`'s ``goal_area``)."""
+  (`events.reset_objects_on_surface`'s ``goal_area``).
+
+  Plan S9.3 puts the stack's base cube down the same way: ``redraws`` rounds (64 there), and
+  ``on_half_height`` rests the entity on its own half-height above the top (a cube's origin is its
+  centre; the box's is its floor's underside, so the box keeps the default)."""
   n = len(env_ids)
   device = env.device
   box: Entity = env.scene[asset_cfg.name]
@@ -241,7 +247,7 @@ def reset_box_in_area(
   lo = torch.tensor([area_x[0], area_y[0]], device=device)
   hi = torch.tensor([area_x[1], area_y[1]], device=device)
   offsets = sample_uniform(lo, hi, (n, 2), device=device)
-  for _ in range(BOX_AREA_REDRAWS):
+  for _ in range(redraws):
     too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
     if not bool(too_close.any()):
       break
@@ -250,15 +256,24 @@ def reset_box_in_area(
   too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
   if bool(too_close.any()):
     corners = torch.tensor(
-      [[area_x[0], area_y[0]], [area_x[0], area_y[1]], [area_x[1], area_y[0]], [area_x[1], area_y[1]]],
+      [
+        [area_x[0], area_y[0]],
+        [area_x[0], area_y[1]],
+        [area_x[1], area_y[0]],
+        [area_x[1], area_y[1]],
+      ],
       device=device,
     )
-    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(-1)
+    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(
+      -1
+    )
     offsets = torch.where(too_close.unsqueeze(-1), corners[far], offsets)
   zeros = torch.zeros(n, device=device)
   quat = quat_from_euler_xyz(
     zeros, zeros, sample_uniform(-yaw, yaw, (n,), device=device)
   )
+  if on_half_height:
+    top = top + object_half_height(env, asset_cfg.name, env_ids)
   pose = torch.cat([centre + offsets, top.unsqueeze(-1), quat], dim=-1)
   box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
   box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
