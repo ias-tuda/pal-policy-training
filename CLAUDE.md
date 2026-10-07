@@ -55,8 +55,9 @@ task ids; avoid introducing unnecessary abstractions.
 5. Implement minimal changes.
 6. Validate.
 7. Summarize: files changed, commands executed, validation performed, remaining limitations.
-8. Update the relevant docs, the decision record if a decision was taken, and
-   `memory_oppsie_kangaroo.md`.
+8. Update the task's plan and report files (the same section in both), the experiment
+   dashboard, the decision record if a decision was taken, and `memory_oppsie_kangaroo.md`
+   (see *One plan file and one report file per task, and the experiment dashboard*).
 
 **Never immediately begin editing files.**
 
@@ -64,9 +65,9 @@ task ids; avoid introducing unnecessary abstractions.
 
 # Working agreement — plan, implement, document, report
 
-1. **A plan comes first.** Usually the user writes it (`../docs/*-plan.md`); follow that one.
-   If no plan exists for the work being asked, produce one and get it approved before
-   implementing.
+1. **A plan comes first.** Usually the user writes it, in the task's plan file (see *One plan
+   file and one report file per task*); follow that one. If no plan exists for the work being
+   asked, write one there and get it approved before implementing.
 2. **Follow the plan, and say where you deviate.** Deviations are allowed and often correct,
    but they are written down with the evidence that forced them — never applied silently.
 3. **Document the implementation as it happens**, not afterwards from memory: what changed,
@@ -80,16 +81,141 @@ task ids; avoid introducing unnecessary abstractions.
    with file/line or measurement evidence → decision → consequences → confidence and what
    would change it. Supersede old records rather than editing the history out of them.
 6. **Write a stage report at the end of each stage** — each milestone or experiment campaign —
-   in `../docs/reports/`; raw artifacts go in `../results/<STAGE>/` and videos in `../videos/<STAGE>/`
+   as the stage's section of the task's report file (see *One plan file and one report file per
+   task*); raw artifacts go in `../results/<STAGE>/` and videos in `../videos/<STAGE>/`
    (outside the repo, e.g. `../results/S7-3/`, `../videos/S7-3/`). Written for
    someone reading it cold in three months, it states: what the stage set out to do and which
    exit criteria were met, missed or dropped; the numbers and how they were measured; the
    decisions taken and where their records live; what broke; what is still open; and the
    provenance (branch, commit, task id, config, seed, host, wandb run, exact command).
 7. **Update `memory_oppsie_kangaroo.md`** whenever a milestone, decision or result lands.
+8. **Put every new experiment plan and every new result on the experiment dashboard**, in the
+   same session that writes it into the plan or report file.
 
 Never claim a step is done without saying how it was validated. If validation was not
 possible, say so explicitly and why.
+
+---
+
+# One plan file and one report file per task, and the experiment dashboard
+
+Standing instruction (Siwei, 2026-10-05): **every task keeps exactly one plan file and one
+report file, the two files carry the same list of sections, and every new experiment plan and
+every new result also goes onto the experiment dashboard.** "Task" means one row of the
+register below, which is the same unit as one tab of the dashboard.
+
+## Task register
+
+| task | dashboard tab | plan file (`../docs/`) | report file (`../docs/reports/`) |
+|---|---|---|---|
+| cube pick-and-place 方块抓放 (incl. sim2sim ⓪–②, S8 gains) | `cube` | `pick-place-v0-plan.md` §3 (S1 … S8, S7-1 … S7-11) | `pick-place-cube-report.md` *(to create)* |
+| ball 抓球 | `ball` | `pick-place-v1-objects-plan.md` §S8 | `pick-place-ball-report.md` *(to create)* |
+| stack 堆叠 | `stack` | `pick-place-v1-objects-plan.md` §S9 | `pick-place-stack-report.md` *(to create)* |
+| box 放进盒子 | `box` | `pick-place-v1-objects-plan.md` §S10, §S10.1 | `pick-place-box-report.md` *(to create)* |
+| two arms 双臂 | `bi` | `pick-place-s11-bimanual-plan.md` | `pick-place-bimanual-report.md` *(to create)* |
+| DEP1 deployable base (cross-task) | — | `pick-place-v1-objects-plan.md` §DEP1 | `pick-place-v0/dep1-deployable-report.md` |
+
+- **A new task** gets a row here and two new files, `../docs/pick-place-<task>-plan.md` and
+  `../docs/reports/pick-place-<task>-report.md`, before its first stage is written. If the task's
+  name or scope is not obvious, ask.
+- **Shared plan files** (`pick-place-v0-plan.md`, `pick-place-v1-objects-plan.md`) stay the
+  task's plan file until Siwei asks to split them. A split is a move, done the way S11 was
+  consolidated on 2026-10-05: sections move unchanged, and the old place keeps a one-line pointer.
+- **Existing per-stage reports** in `reports/pick-place-v0/` stay where they are. The task's
+  report file is created the next time that task gets a stage; its section for an older stage is
+  a short summary (status, headline numbers, conclusion) plus a link to the per-stage report,
+  never a copy of it.
+
+## How the two files line up
+
+1. **Same sections, same order, same headings.** One `## <code> — <title>` section per stage
+   (S7-11, S10.1, S11.2, …), with the heading text identical in both files. Sub-steps (step 0,
+   batch 1, read, revision) are `###` inside the stage. Appendices (literature, notation) are
+   `## Appendix …` and may exist in one file only.
+2. **A stage exists in both files from the moment it is planned.** Writing a plan section means
+   adding the report section in the same edit, as a stub: `Status: planned — no results yet; plan
+   §<code>`.
+3. **Both files open with the same index table**: `code | title | status | date | plan § | report § |
+   dashboard id`, one row per stage, followed by a short dated *Where it stands* paragraph.
+   Status uses the dashboard's words: planned 计划中 · running 在跑 · toread 跑完待读 · read 已完成 ·
+   hold 搁置. A status change is made in both indexes and on the dashboard at once.
+4. **The plan holds intent; the report holds what happened.**
+   - Plan section: the question and why; what changes against which baseline; the codes and what
+     each one isolates; step 0; the batch (codes × seeds × iterations, host); reads and exit bars
+     (达标线); order and check-ins. A change of plan is a dated `### Revision YYYY-MM-DD` with
+     the reason — never rewrite or delete the earlier version.
+   - Report section, in this order: status; what was done and every deviation from the plan with
+     the evidence that forced it; results (table, and how each number was measured); conclusion
+     (which exit bars were met, missed or dropped); decisions (link to `decisions/`); what broke;
+     open questions and the next step; provenance (branch, commit, task id, config, seeds, host,
+     job ids, wandb run, exact command, `results/<STAGE>/`, `videos/<STAGE>/`).
+   - New "as implemented / as read" records go into the report, not into the plan. The plan's
+     stage section gets one status line linking to the report section.
+5. **Check the alignment after every edit** of either file:
+   ```bash
+   cd oppsie-data/docs
+   diff <(grep -E '^## ' <plan> | grep -v '^## Appendix') \
+        <(grep -E '^## ' reports/<report> | grep -v '^## Appendix')    # expected: no output
+   ```
+   (For a shared plan file, compare only that task's stage sections.)
+
+`run_log.md` (one row per cluster job), `status_summary.md` and `memory_oppsie_kangaroo.md` are
+still updated as before; the plan/report pair does not replace them.
+
+## The experiment dashboard
+
+**Kangaroo 抓放实验看板**, `https://claude.ai/artifact/8xwXjRYWmeajnFW2Pra64C`. It is the
+one-page summary Siwei reads: one card per stage, grouped by task tab. Its content lives in the
+page's database, read and written with the `ArtifactData` tool, so a data update needs **no
+republish** of the page.
+
+| document | holds | written when |
+|---|---|---|
+| `stages/<id>` | one stage card: `task`, `code`, `title`, `brief`, `status`, `date`, `order`, `issues` (`[{q, v}]`: the questions and their verdict), `legend` (`[[code, meaning]]`), `results` (`{cols, rows, highlight, note}`), `conclusion`, `analysis`, `next`, `jobs`, `branch`, `report`, `updated` | planned, launched, read, revised |
+| `metrics/<id>` | per-run eval readings for the curves and the table: `groups[{id, label, runs[{run, code, seed, pts[{it, n, succ, …}]}]}]`, `primary`, `cols`, `codeOrder`, `bar` | every time eval files land; generated by `_claude_tmp/dashboard/extract_metrics.py` from `results/` |
+| `videos/<slot>` | a video slot: `stage`, `title`, `shows`, `priority`, `spec`, `out`; `asset` once recorded | when a stage plans or records videos (`docs/dashboard-video-list.md`) |
+| `actions/*` | to-dos: `text`, `owner` (`siwei` / `claude`), `task`, `done` | a decision is needed from Siwei, or one is closed |
+| `overview/main` | the 总览 tab: headline, per-task level and best result, path, lessons, open problems, next | a read changes a task's best result or level |
+| `meta/snapshot` | `at`, `note` | every update |
+
+What triggers what:
+
+| event | plan file | report file | dashboard |
+|---|---|---|---|
+| a stage is planned | new section + index row | stub section + index row | new `stages/<id>`, `status: planned`: `brief` = the problem to solve, questions as `issues` (`v: planned`), codes as `legend`, the batch as the `results` table with the exit bars in its `note`, `next`; video slots if any |
+| the plan is revised | `### Revision` | index date | update `legend` / `results` / `issues` / `next` |
+| jobs launched | index status | launch record and provenance | `status: running`, `jobs`, `branch`, `date` |
+| evals land / a read | index status | results, conclusion, … | `status: toread` → `read`; `brief` = the conclusion; `results`, `conclusion`, `analysis`, issue verdicts, `next`; `metrics/<id>`; `overview/main` if the task's best changed; `actions` for decisions Siwei has to take |
+
+Rules for writing to it:
+
+- **Read before writing, then `update` (merge) pinned with `if_version`**; use `batch` for more
+  than a couple of documents. Never `set` an existing stage — it wipes the fields below.
+- **Siwei's fields are never written by Claude:** `notes`, the `note` inside each issue, and video
+  uploads (`asset`). When rewriting the `issues` array, carry every `note` over unchanged. Siwei
+  can also change `status` and the issue verdicts in the page: if the stored value disagrees with
+  the report, ask instead of overwriting it.
+- **Ids:** the code in lower case without `-`, `.` or spaces (S7-11 → `s711`, S10.1 → `s101`,
+  S11.2 → `s112`), plus the object where a code is shared (S8 ball → `s8ball`, S8 gains →
+  `s8gain`). `order` sorts the cards inside a tab. `report` names the plan § and the report §
+  (the same heading in both).
+- **`brief`** is the one line shown under the stage title, even when the card is collapsed: until
+  the stage is read it states the problem the stage has to solve (labelled 要解决), once it is read
+  the conclusion (labelled 结论), with the headline number. One sentence, about 60 characters at
+  most; every stage card has one.
+- **Language:** the dashboard is in plain Chinese (说人话); the numbers are the report's numbers,
+  never re-derived or rounded differently.
+- Finish every update by setting `meta/snapshot` (`at`: local time, `note`: what changed) and
+  reading back the documents written.
+- A change to the page itself (a new tab in `TASKS`, a new metric key in `MET`) is a republish of
+  the HTML with the `Artifact` tool, built on the live version read first. Data never goes into
+  the HTML.
+- **expdb** (`../expdb/`, `docs/expdb.md`) is the local index behind the dashboard: refresh
+  `expdb/stages_seed.json` from the dashboard after a stage update, and give a new `results/`
+  folder its `FOLDER_STAGE` / `RULES` line (and bump `PARSER_VERSION`).
+- If the dashboard cannot be reached from the current session (no `ArtifactData` tool, e.g. a
+  terminal session on a cluster host), say so, and list the pending dashboard updates at the end
+  of the report section under *Dashboard: pending*, so the next session with access applies them.
 
 ---
 
@@ -258,13 +384,15 @@ quoted without its sources being read.
 
 **Whenever work is done on one of these tasks** — a run launched, finished, stopped or
 invalidated; a motion retargeted or repaired; an evaluation scored; a gate passed or failed; a
-defect found; a decision taken — update **both**:
+defect found; a decision taken — update **all three**:
 
 1. **that task's own document** (`../docs/<task-id>.md`), with the full record: branch, commit,
    config function, seed, wandb run id/path, checkpoint, launch command, and the measurement
    itself; and
 2. **the status summary** — the matrix cell, the task's section, and its "what still needs
-   doing" list when the change opens or closes a task.
+   doing" list when the change opens or closes a task; and
+3. **the task's plan and report files and the experiment dashboard** (see *One plan file and one
+   report file per task, and the experiment dashboard*).
 
 Updating one and not the other is precisely what makes the summary stale and its numbers unsafe
 to quote.
@@ -296,7 +424,9 @@ static/                     # images used by README and docs
 ../docs/                    # plans, decision records, stage reports — canonical working context, OUTSIDE the repo
   roadmap.md                # goal, phases, milestones, open questions — start here
   decisions/                # decision records NNNN-slug.md
-  reports/                  # stage reports
+  pick-place-<task>-plan.md # one plan file per task (see the task register)
+  reports/pick-place-<task>-report.md  # one report file per task, sections aligned with its plan
+  reports/pick-place-v0/    # older per-stage reports and figures
   status_summary.md         # cross-task status matrix
 ../results/<STAGE>/         # raw run artifacts per stage (S5.2, S7-3, ...), outside the repo
 ../videos/<STAGE>/          # rendered videos per stage
