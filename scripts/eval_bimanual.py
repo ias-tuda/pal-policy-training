@@ -26,6 +26,12 @@ runs with ``REWARD=S11-BI`` and ``HANDOFF_TRAIN=left`` (the actor's inputs depen
 then handed off here on the trigger its training used). With the gated right target (``INIT=seq``) the
 A latch is cleared at every reset here (`mdp.reset_ladder_state`), as S12-BI's cfg does.
 
+Plan S11.4's reads: arm-arm contact (> 1 N steps, and the peak for > 30 N) split by phase -- the left driven
+by the policy, on its up / out / home legs, and the right before / after A is placed; A within 2.5 cm of T;
+when the left's hand-off started and reached its home leg (out leg done); and how far B is held from A
+(horizontal, mean) while A is placed and B not yet, the "is the right timid" read. ``HH_TERM`` (a training
+termination) is dropped here: the eval reads the contacts, as S7-10 read AT.
+
     ARMS=both ... python scripts/eval_bimanual.py --checkpoint model_4999.pt --json out.json
 """
 
@@ -46,6 +52,8 @@ TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 MOVING = 0.05
 #: An arm is home within this of its home pose (rad, every joint), as `eval_pick_place.HOME_TOL`.
 HOME_TOL = 0.05
+#: Plan S11.4's contact phases: the left's hand-off phase (`mdp.handoff`), then before / after A is placed.
+HH_PHASES = ("left_policy", "left_up", "left_out", "left_home", "before_a", "after_a")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -102,6 +110,12 @@ def build_env(args):
       "reset_ladder_state": EventTermCfg(func=mdp.reset_ladder_state, mode="reset"),
       **cfg.events,
     }
+  from pal_mjlab.tasks.manipulation.pick_place.bimanual import ARM_ARM_TERM
+
+  if cfg.terminations.pop(ARM_ARM_TERM, None) is not None:
+    print(
+      f"eval: dropped the training termination {ARM_ARM_TERM} (HH_TERM); contacts are read"
+    )
   return ManagerBasedRlEnv(cfg=cfg, device=args.device)
 
 
@@ -187,6 +201,11 @@ class Reads:
     self.right_handed = zb()
     self.release_step, self.handoff_step = zl(), zl()
     self.handoff_by_trigger = zb()
+    # Plan S11.4: contacts by phase -- the left's phase 0-3 (policy, up, out, home) and before / after A placed.
+    self.hh_phase_steps = torch.zeros(n, 6, dtype=torch.long, device=dev)
+    self.hh_phase_peak = torch.zeros(n, 6, device=dev)
+    self.left_off_step, self.left_home_step = zl(), zl()
+    self.wait_dxy_sum, self.wait_steps = zf(), zl(0)
     self.done: list[dict] = []
 
   def _home(self, side: str) -> torch.Tensor:
@@ -241,6 +260,27 @@ class Reads:
     self.hh_steps += (peak > bi.HH_CONTACT_FORCE).long()
     self.hh_peak = torch.maximum(self.hh_peak, peak)
     self.hh_clear = torch.minimum(self.hh_clear, mdp.arm_arm_clearance(env))
+    from pal_mjlab.tasks.manipulation.mdp.handoff import HOME
+
+    left_phase = self.term.phase[:, self.term.arm_index("left")]
+    self.left_off_step = torch.where(
+      (left_phase > 0) & (self.left_off_step < 0), t, self.left_off_step
+    )
+    self.left_home_step = torch.where(
+      (left_phase == HOME) & (self.left_home_step < 0), t, self.left_home_step
+    )
+    bins = torch.stack(
+      [left_phase.clamp(0, 3), 4 + (self.a_step >= 0).long()], dim=-1
+    )  # (B, 2): a left-phase bin and an A bin
+    hit = (peak > bi.HH_CONTACT_FORCE).long().unsqueeze(-1).expand(-1, 2)
+    self.hh_phase_steps.scatter_add_(1, bins, hit)
+    cur = self.hh_phase_peak.gather(1, bins)
+    self.hh_phase_peak.scatter_(1, bins, torch.maximum(cur, peak.unsqueeze(-1)))
+    waiting = grasp_r & a_placed & (self.b_step < 0)
+    self.wait_dxy_sum += torch.where(
+      waiting, torch.norm(b.data.root_link_pos_w[:, :2] - a[:, :2], dim=-1), 0.0
+    )
+    self.wait_steps += waiting.long()
     for name, acc in (
       ("arm_table_contact", "at_left"),
       ("right_arm_table_contact", "at_right"),
@@ -325,9 +365,30 @@ class Reads:
         "t_b_released_s": sec(self.release_step[i]),
         "t_right_handoff_s": sec(self.handoff_step[i]),
         "right_handoff_by_trigger": bool(self.handoff_by_trigger[i]),
+        "t_left_handoff_s": sec(self.left_off_step[i]),
+        "t_left_home_leg_s": sec(self.left_home_step[i]),
+        "hh_steps_by_phase": dict(
+          zip(HH_PHASES, self.hh_phase_steps[i].tolist(), strict=True)
+        ),
+        "hh_peak_n_by_phase": dict(
+          zip(HH_PHASES, self.hh_phase_peak[i].tolist(), strict=True)
+        ),
+        "b_wait_dxy_to_a_mean_m": (
+          float(self.wait_dxy_sum[i]) / int(self.wait_steps[i])
+          if int(self.wait_steps[i])
+          else None
+        ),
       }
       self.done.append(row)
-    for name in ("a_step", "b_step", "home_step", "release_step", "handoff_step"):
+    for name in (
+      "a_step",
+      "b_step",
+      "home_step",
+      "release_step",
+      "handoff_step",
+      "left_off_step",
+      "left_home_step",
+    ):
       getattr(self, name)[env_ids] = -1
     for name in (
       "b_grasped",
@@ -345,8 +406,12 @@ class Reads:
       "both_moving",
       "steps",
       "clear_run",
+      "hh_phase_steps",
+      "wait_steps",
     ):
       getattr(self, name)[env_ids] = 0
+    self.hh_phase_peak[env_ids] = 0.0
+    self.wait_dxy_sum[env_ids] = 0.0
     self.a_moved[env_ids] = 0.0
     self.hh_peak[env_ids] = 0.0
     self.hh_clear[env_ids] = float("inf")
@@ -384,6 +449,9 @@ def summarise(rows: list[dict], right_timeout_s: float, split: bool = True) -> d
     "b_grasped": share("b_grasped"),
     "b_placed": share("b_placed_ever"),
     "a_within_1cm_of_t": sum(r["a_final_dxy_m"] < 0.01 for r in placed) / n,
+    "a_within_2p5cm_of_t": sum(r["a_final_dxy_m"] < 0.025 for r in placed) / n,
+    "b_placed_given_a_placed": sum(r["b_placed_ever"] for r in placed)
+    / max(len(placed), 1),
     "a_yaw_within_10deg": sum(r["a_final_yaw_deg"] < 10 for r in placed) / n,
     "a_final_dxy_median_m": med([r["a_final_dxy_m"] for r in placed]),
     "a_final_yaw_median_deg": med([r["a_final_yaw_deg"] for r in placed]),
@@ -398,6 +466,22 @@ def summarise(rows: list[dict], right_timeout_s: float, split: bool = True) -> d
     "hh_contact_episodes": sum(r["hh_contact_steps"] > 0 for r in rows) / n,
     "hh_over_30n_episodes": sum(r["hh_peak_force_n"] > 30 for r in rows) / n,
     "hh_min_clearance_median_m": med([r["hh_min_clearance_m"] for r in rows]),
+    "hh_contact_episodes_by_phase": {
+      k: sum(r["hh_steps_by_phase"][k] > 0 for r in rows) / n for k in HH_PHASES
+    },
+    "hh_over_30n_episodes_by_phase": {
+      k: sum(r["hh_peak_n_by_phase"][k] > 30 for r in rows) / n for k in HH_PHASES
+    },
+    "t_left_handoff_median_s": med([r["t_left_handoff_s"] for r in rows]),
+    "t_left_home_leg_median_s": med([r["t_left_home_leg_s"] for r in rows]),
+    "a_placed_to_left_home_leg_median_s": med(
+      [
+        r["t_left_home_leg_s"] - r["t_a_placed_s"]
+        for r in rows
+        if r["t_left_home_leg_s"] is not None and r["t_a_placed_s"] is not None
+      ]
+    ),
+    "b_wait_dxy_to_a_median_m": med([r["b_wait_dxy_to_a_mean_m"] for r in rows]),
     "arm_table_left_episodes": sum(r["arm_table_left_steps"] > 0 for r in rows) / n,
     "arm_table_right_episodes": sum(r["arm_table_right_steps"] > 0 for r in rows) / n,
     "t_a_placed_median_s": med([r["t_a_placed_s"] for r in rows]),
@@ -422,7 +506,9 @@ def summarise(rows: list[dict], right_timeout_s: float, split: bool = True) -> d
     **(
       {
         "by_start": {
-          k: summarise([r for r in rows if r["start_kind"] == k], right_timeout_s, False)
+          k: summarise(
+            [r for r in rows if r["start_kind"] == k], right_timeout_s, False
+          )
           for k in sorted({r["start_kind"] for r in rows})
         }
       }

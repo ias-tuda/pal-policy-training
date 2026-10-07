@@ -220,6 +220,20 @@ if [ -n "${TABLE_DZ:-}" ]; then
   S11_TAG="${S11_TAG},\"tabledz${TABLE_DZ}\""
 fi
 
+# Plan S11.4 (JOINT on the high table): HOLD_MIX (h/p/s percent, START=hold's shares; "/" becomes "-" in the name),
+# HH_TERM (N: arm-arm contact above it ends the episode), RIGHT_GATE (latch | clear) and KL_FLOOR (the KL to SEQ's
+# floor). In the run name and the tags only when set.
+for _pair in HOLD_MIX:mix HH_TERM:hhterm RIGHT_GATE:rgate KL_FLOOR:klfloor; do
+  _var=${_pair%%:*}
+  _short=${_pair##*:}
+  _val="${!_var:-}"
+  if [ -n "$_val" ]; then
+    export "${_var?}"
+    S11_NAME="${S11_NAME}_${_short}${_val//\//-}"
+    S11_TAG="${S11_TAG},\"${_short}${_val//\//-}\""
+  fi
+done
+
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -283,6 +297,7 @@ echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   epi
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
 echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}   table_dz ${TABLE_DZ:-(none)}"
 echo "s11.2       init ${INIT:-(default)}   hold_bank ${HOLD_BANK:-(none)}   init_lt ${INIT_LT:-(none)}   init_rst ${INIT_RST:-(none)}"
+echo "s11.4       hold_mix ${HOLD_MIX:-(default)}   hh_term ${HH_TERM:-(none)}   right_gate ${RIGHT_GATE:-(default)}   kl_floor ${KL_FLOOR:-(default)}"
 [ -n "${HOLD_BANK:-}" ] && echo "hold_bank   sha256 $(sha256sum "$HOLD_BANK" | cut -c1-16)"
 [ -n "${INIT_LT:-}" ] && echo "init_lt     sha256 $(sha256sum "$INIT_LT" | cut -c1-16)"
 [ -n "${INIT_RST:-}" ] && echo "init_rst    sha256 $(sha256sum "$INIT_RST" | cut -c1-16)"

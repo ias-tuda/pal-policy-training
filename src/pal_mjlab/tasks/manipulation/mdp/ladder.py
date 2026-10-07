@@ -417,14 +417,20 @@ def right_target_gated(
   target_command_name: str,
   gate: dict,
   asset_cfg: SceneEntityCfg = _ROBOT,
+  left_home: bool = False,
 ) -> torch.Tensor:
   """Plan S11.2's BI-F: the right's goal as the actor sees it, gated on A_latched -- the wait point (T +
   `WAIT_OFFSET`) before, A's tracked top after (R-ST's own `target_pos`, `stack_goal_position_tracked_b`),
-  base frame. Without the gate R-ST would set B down on the empty T. (B, 3)"""
+  base frame. Without the gate R-ST would set B down on the empty T. ``left_home`` (plan S11.4's
+  ``RIGHT_GATE=clear``): the wait point until A_latched and the left's hand-off on its home leg. (B, 3)"""
   from pal_mjlab.tasks.manipulation.mdp.bimanual import stack_goal_position_tracked_b
   from pal_mjlab.tasks.manipulation.mdp.observations import _to_base_frame
 
   latched, _ = update_a_latch(env, gate)
+  if left_home:
+    from pal_mjlab.tasks.manipulation.mdp.bimanual import handoff_home_bool
+
+    latched = latched & handoff_home_bool(env, "left")
   stack = stack_goal_position_tracked_b(
     env, base_name, object_name, bias_key, asset_cfg, lag
   )

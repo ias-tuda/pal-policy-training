@@ -83,6 +83,11 @@ reads its live surface (spawns, T's goal, the base cube at T, the rewards, the a
 +/-1 cm on top), so the height is this one number; it applies to the one-arm env and to the two-arm env
 (`ARMS=both`, which `eval_chain.py` and `eval_bimanual.py` build) alike. Unset or 0 is the baseline's
 table exactly; |TABLE_DZ| above 50 mm raises.
+Plan S11.4 (JOINT on the high table) adds, for `ARMS=both` only: `HOLD_MIX` (`h/p/s` in percent: the hold
+starts' shares of hold, A placed and scratch; with `START=hold`), `HH_TERM` (N: arm-arm contact above it
+ends the episode), `RIGHT_GATE` (`latch` | `clear`: with `INIT=seq`, the right's goal waits for the left's
+home leg too) and `KL_FLOOR` (with `INIT=seq`: the KL to SEQ falls to this weight, not to 0). Unset is
+S11.2's cfgs exactly.
 """
 
 from __future__ import annotations
@@ -105,6 +110,7 @@ from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
 )
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   HANDOFF_TRAINS,
+  RIGHT_GATES,
   handoff_arm,
   make_bimanual_env_cfg,
 )
@@ -179,6 +185,10 @@ INIT_ENV_VAR = "INIT"
 INIT_LT_ENV_VAR = "INIT_LT"
 INIT_RST_ENV_VAR = "INIT_RST"
 TABLE_DZ_ENV_VAR = "TABLE_DZ"
+HOLD_MIX_ENV_VAR = "HOLD_MIX"
+HH_TERM_ENV_VAR = "HH_TERM"
+RIGHT_GATE_ENV_VAR = "RIGHT_GATE"
+KL_FLOOR_ENV_VAR = "KL_FLOOR"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -339,6 +349,10 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     INIT_ENV_VAR,
     INIT_LT_ENV_VAR,
     INIT_RST_ENV_VAR,
+    HOLD_MIX_ENV_VAR,
+    HH_TERM_ENV_VAR,
+    RIGHT_GATE_ENV_VAR,
+    KL_FLOOR_ENV_VAR,
   ):
     if os.environ.get(name) is not None:
       raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
@@ -405,6 +419,14 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
   if bank is not None and not os.path.isfile(bank):
     raise ValueError(f"{HOLD_BANK_ENV_VAR}={bank!r} is not a file")
   init = _select(INIT_ENV_VAR, "scratch", INITS)
+  right_gate = _select(RIGHT_GATE_ENV_VAR, "latch", RIGHT_GATES)
+  if right_gate != "latch" and init != "seq":
+    raise ValueError(
+      f"{RIGHT_GATE_ENV_VAR}={right_gate} gates INIT=seq's right target; set {INIT_ENV_VAR}=seq"
+    )
+  hold_mix = _select_hold_mix()
+  if hold_mix is not None and start != "hold":
+    raise ValueError(f"{HOLD_MIX_ENV_VAR} is {START_ENV_VAR}=hold's")
   for name, value in BIMANUAL_FIXED.items():
     got = os.environ.get(name)
     if got is not None and got != value:
@@ -425,7 +447,42 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
     reward=reward,
     hold_bank=bank,
     right_target="gated" if init == "seq" else "plain",
+    hold_mix=hold_mix,
+    hh_term=_select_positive(HH_TERM_ENV_VAR, "an arm-arm force in N, e.g. 30"),
+    right_gate=right_gate,
   )
+
+
+def _select_hold_mix() -> tuple[float, float] | None:
+  """Plan S11.4's ``HOLD_MIX=h/p/s``: the hold starts' (hold, A placed) shares, from three whole percentages
+  summing to 100 (the rest start from scratch). Unset is None (`bimanual.HOLD_SHARE` / `PLACED_SHARE`)."""
+  raw = os.environ.get(HOLD_MIX_ENV_VAR)
+  if raw is None:
+    return None
+  try:
+    parts = [int(x) for x in raw.split("/")]
+  except ValueError:
+    parts = []
+  if len(parts) != 3 or min(parts) < 0 or sum(parts) != 100:
+    raise ValueError(
+      f"{HOLD_MIX_ENV_VAR}={raw!r} is not hold/placed/scratch in whole percent summing to 100, e.g. "
+      "10/20/70 (plan S11.4's BI-H-RS); unset it for 30/20/50"
+    )
+  return parts[0] / 100.0, parts[1] / 100.0
+
+
+def _select_positive(var: str, what: str) -> float | None:
+  """A positive number from ``var``, or None when unset."""
+  raw = os.environ.get(var)
+  if raw is None:
+    return None
+  try:
+    value = float(raw)
+  except ValueError:
+    value = float("nan")
+  if not value > 0.0 or math.isinf(value):  # also catches nan
+    raise ValueError(f"{var}={raw!r} is not {what}")
+  return value
 
 
 def _select_table_dz() -> float:
@@ -516,5 +573,38 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
       raise ValueError(
         f"{INIT_LT_ENV_VAR} / {INIT_RST_ENV_VAR} are {INIT_ENV_VAR}=seq's"
       )
-    cfg = apply_joint_rl_cfg(cfg, init, paths[INIT_LT_ENV_VAR], paths[INIT_RST_ENV_VAR])
+    kl_floor = os.environ.get(KL_FLOOR_ENV_VAR)
+    if kl_floor is not None and init != "seq":
+      raise ValueError(f"{KL_FLOOR_ENV_VAR} is {INIT_ENV_VAR}=seq's (the KL to SEQ)")
+    cfg = apply_joint_rl_cfg(
+      cfg,
+      init,
+      paths[INIT_LT_ENV_VAR],
+      paths[INIT_RST_ENV_VAR],
+      kl_floor=_select_kl_floor(),
+    )
+  elif any(
+    os.environ.get(k) is not None
+    for k in (KL_FLOOR_ENV_VAR, HOLD_MIX_ENV_VAR, HH_TERM_ENV_VAR, RIGHT_GATE_ENV_VAR)
+  ):
+    raise ValueError(
+      "HOLD_MIX / HH_TERM / RIGHT_GATE / KL_FLOOR are plan S11.4's, on an S11.2 JOINT code (ARMS=both)"
+    )
   return cfg
+
+
+def _select_kl_floor() -> float:
+  """Plan S11.4's ``KL_FLOOR``: the weight the KL to SEQ anneals to and holds, in [0, 1] (the schedule's
+  start); unset is 0 (S11.2's BI-F)."""
+  raw = os.environ.get(KL_FLOOR_ENV_VAR)
+  if raw is None:
+    return 0.0
+  try:
+    value = float(raw)
+  except ValueError:
+    value = float("nan")
+  if not 0.0 <= value <= 1.0:  # also catches nan
+    raise ValueError(
+      f"{KL_FLOOR_ENV_VAR}={raw!r} is not a KL weight in [0, 1], e.g. 0.2"
+    )
+  return value

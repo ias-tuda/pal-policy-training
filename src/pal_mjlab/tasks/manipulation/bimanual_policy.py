@@ -88,6 +88,8 @@ class JointPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   kl_hold_iterations: int = 0
   """The KL weight stays at ``kl_coef`` this many updates, then falls linearly to 0 at ``kl_anneal_iterations``."""
   kl_anneal_iterations: int = 0
+  kl_floor: float = 0.0
+  """Plan S11.4's ``KL_FLOOR``: the weight the schedule falls to at ``kl_anneal_iterations`` and keeps; 0: S11.2's."""
   critic_warmup_iterations: int = 0
   action_names: list | None = None
   """Filled by `prepare_train_cfg`: the action term's target names, for the std log."""
@@ -104,9 +106,11 @@ SEQ_KL_ANNEAL = 1000
 SEQ_CRITIC_WARMUP = 50
 
 
-def apply_joint_rl_cfg(cfg, init: str, init_lt: str | None, init_rst: str | None):
+def apply_joint_rl_cfg(
+  cfg, init: str, init_lt: str | None, init_rst: str | None, kl_floor: float = 0.0
+):
   """The PPO recipe ``cfg`` for a plan S11.2 JOINT run: `JointPPO` always (the std log); with ``init="seq"`` the
-  factored actor and BI-F's warm-up and KL schedule."""
+  factored actor and BI-F's warm-up and KL schedule, falling to ``kl_floor`` (plan S11.4) instead of 0."""
   alg = dataclasses.asdict(cfg.algorithm)
   alg.pop("class_name", None)
   cfg.algorithm = JointPpoAlgorithmCfg(**alg)
@@ -117,6 +121,7 @@ def apply_joint_rl_cfg(cfg, init: str, init_lt: str | None, init_rst: str | None
     cfg.algorithm.kl_coef = SEQ_KL_COEF
     cfg.algorithm.kl_hold_iterations = SEQ_KL_HOLD
     cfg.algorithm.kl_anneal_iterations = SEQ_KL_ANNEAL
+    cfg.algorithm.kl_floor = float(kl_floor)
     cfg.algorithm.critic_warmup_iterations = SEQ_CRITIC_WARMUP
   return cfg
 
@@ -204,6 +209,9 @@ def prepare_train_cfg(env, train_cfg: dict) -> None:
       "a_latched": critic["a_latched"],
       "left_handed_off": critic["left_handed_off"],
     }
+    if "left_home" in critic:
+      # Plan S11.4's RIGHT_GATE=clear: the right's KL waits for the left's home leg too, as its goal does.
+      alg["kl_layout"]["left_home"] = critic["left_home"]
 
 
 def mirror_quat(q: torch.Tensor) -> torch.Tensor:
@@ -434,6 +442,7 @@ class JointPPO(PPO):
     kl_coef: float = 0.0,
     kl_hold_iterations: int = 0,
     kl_anneal_iterations: int = 0,
+    kl_floor: float = 0.0,
     critic_warmup_iterations: int = 0,
     action_names: list | None = None,
     kl_layout: dict | None = None,
@@ -447,6 +456,11 @@ class JointPPO(PPO):
     self.kl_coef = float(kl_coef)
     self.kl_hold_iterations = int(kl_hold_iterations)
     self.kl_anneal_iterations = int(kl_anneal_iterations)
+    self.kl_floor = float(kl_floor)
+    if not 0.0 <= self.kl_floor <= max(self.kl_coef, 0.0) or (
+      self.kl_floor > 0.0 and self.kl_coef <= 0.0
+    ):
+      raise ValueError(f"kl_floor {kl_floor} must lie in [0, kl_coef {kl_coef}]")
     self.kl_layout = kl_layout
     self.critic_warmup_iterations = int(critic_warmup_iterations)
     self.action_names = list(action_names or [])
@@ -461,15 +475,17 @@ class JointPPO(PPO):
         p.requires_grad_(False)
 
   def kl_weight(self) -> float:
-    """``kl_coef`` until ``kl_hold_iterations`` updates, then linearly to 0 at ``kl_anneal_iterations``."""
+    """``kl_coef`` until ``kl_hold_iterations`` updates, then linearly to ``kl_floor`` (S11.2: 0; plan S11.4's
+    BI-F2: 0.2) at ``kl_anneal_iterations``, and that floor after."""
     if self.teacher is None:
       return 0.0
     u, hold, end = self.updates_done, self.kl_hold_iterations, self.kl_anneal_iterations
+    lo = getattr(self, "kl_floor", 0.0)
     if u < hold:
       return self.kl_coef
     if end <= hold:
-      return self.kl_coef if end <= 0 else 0.0
-    return self.kl_coef * max(0.0, 1.0 - (u - hold) / (end - hold))
+      return self.kl_coef if end <= 0 else lo
+    return lo + (self.kl_coef - lo) * max(0.0, 1.0 - (u - hold) / (end - hold))
 
   def kl_to_teacher(
     self, critic_obs: torch.Tensor, mu_t, std_t, mu_s, std_s
@@ -481,6 +497,9 @@ class JointPPO(PPO):
     a0, a1 = lay["a_latched"]
     h0, h1 = lay["left_handed_off"]
     mask = (critic_obs[:, a0:a1] > 0.5).all(-1) & (critic_obs[:, h0:h1] > 0.5).all(-1)
+    if "left_home" in lay:
+      c0, c1 = lay["left_home"]
+      mask &= (critic_obs[:, c0:c1] > 0.5).all(-1)
     return kl[:, lay["left_cols"]].sum(-1) + mask.float() * kl[
       :, lay["right_cols"]
     ].sum(-1)

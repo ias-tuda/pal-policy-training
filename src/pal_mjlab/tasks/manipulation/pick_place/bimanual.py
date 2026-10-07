@@ -37,6 +37,15 @@ Plan S11.2 (`pick-place-s11-bimanual-plan.md`) adds, each default-off:
 * ``right_target="gated"`` (BI-F's actor): an actor term ``right_target`` after the 73 -- the wait point
   before A_latched, A's tracked top after (`mdp.right_target_gated`) -- for the factored policy's right
   half (`tasks.manipulation.bimanual_policy`).
+
+Plan S11.4 (`pick-place-s11-bimanual-plan.md`, *S11.4*) adds, each default-off:
+
+* ``hold_mix``: the hold starts' (hold, A placed) shares in place of `HOLD_SHARE` / `PLACED_SHARE` (BI-H-RS).
+* ``hh_term``: arm-arm contact above that force (N) ends the episode -- a termination ``arm_arm_force``
+  (`illegal_contact` on HH's sensor, whose history spans the control step), not a time-out (BI-F2-T).
+* ``right_gate="clear"`` (with the gated right target only): the right's goal stays the wait point until A is
+  latched *and* the left's hand-off is on its home leg (past the out leg); its gated reward terms pay from the
+  same moment, and the critic gets ``left_home`` for the factored policy's right KL mask (BI-F2-G).
 """
 
 from __future__ import annotations
@@ -53,6 +62,7 @@ from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
 
@@ -157,6 +167,10 @@ HANDOFF_TRAINS = ("none", "left", "both")
 #: snapshot) and with A placed and B on the table; the rest start from scratch.
 HOLD_SHARE = 0.3
 PLACED_SHARE = 0.2
+#: Plan S11.4's ``RIGHT_GATE`` names: the right's goal opens at A_latched (S11.2), or once the left is also home-bound.
+RIGHT_GATES = ("latch", "clear")
+#: The termination ``hh_term`` adds.
+ARM_ARM_TERM = "arm_arm_force"
 #: `hold_start`'s per-episode label (`_pp_start_kind`), for the metrics.
 START_KINDS = {"scratch": 0, "placed": 1, "hold": 2}
 #: The terms `S12-BI` replaces by the ladders: each half's task terms (the left's, and the right's with
@@ -545,11 +559,15 @@ def make_bimanual_env_cfg(
   reward: str = "S11-BI",
   hold_bank: str | None = None,
   right_target: str = "plain",
+  hold_mix: tuple[float, float] | None = None,
+  hh_term: float | None = None,
+  right_gate: str = "latch",
 ) -> ManagerBasedRlEnvCfg:
   """Plan S11's JOINT cfg (BI-J: ``start="scratch"``, BI-JM: ``"mixed"``) and plan S11.2's codes; see the
   module docstring. ``handoff_train`` is ``HANDOFF_TRAIN``: ``left`` the left's up-out-home hand-off on its
   own trigger in training (the eval starts the right's), ``both`` the right's too, ``none`` the controller is
-  there for the eval to start. ``hold_bank`` is the snapshot file ``start="hold"`` draws from."""
+  there for the eval to start. ``hold_bank`` is the snapshot file ``start="hold"`` draws from. ``hold_mix``,
+  ``hh_term`` and ``right_gate`` are plan S11.4's (module docstring)."""
   if start not in STARTS:
     raise ValueError(f"unknown start {start!r}; have {STARTS}")
   if reward not in REWARDS:
@@ -560,6 +578,17 @@ def make_bimanual_env_cfg(
     raise ValueError(f"unknown right_target {right_target!r}; have ('plain', 'gated')")
   if (start == "hold") != (hold_bank is not None):
     raise ValueError("START=hold needs a snapshot bank (HOLD_BANK), and only it does")
+  if right_gate not in RIGHT_GATES:
+    raise ValueError(f"unknown right_gate {right_gate!r}; have {RIGHT_GATES}")
+  if right_gate == "clear" and right_target != "gated":
+    raise ValueError("right_gate='clear' gates the gated right target (INIT=seq)")
+  if hold_mix is not None:
+    if start != "hold":
+      raise ValueError("hold_mix is START=hold's")
+    if not (min(hold_mix) >= 0.0 and sum(hold_mix) <= 1.0):
+      raise ValueError(f"hold_mix {hold_mix} is not two shares summing to at most 1")
+  if hh_term is not None and not hh_term > 0.0:
+    raise ValueError(f"hh_term {hh_term!r} is not a positive force (N)")
   if not critic_release:
     raise ValueError("JOINT's critic carries both PQ pairs (BS11); CRITIC_OBS=q")
   robot = kangaroo_grippers_both_arms(gains, arm_effort_scale=effort.effort_scale)
@@ -705,6 +734,11 @@ def make_bimanual_env_cfg(
   critic_terms["left_handed_off"] = ObservationTermCfg(
     func=mdp.handoff_active, params={"arm": "left"}
   )
+  clear = right_gate == "clear"
+  if clear:
+    critic_terms["left_home"] = ObservationTermCfg(
+      func=mdp.handoff_home, params={"arm": "left"}
+    )
   if reward == "S12-BI" or right_target == "gated":
     # A_latched for the critic; with INIT=seq also the KL mask of the right half (`bimanual_policy.JointPPO`).
     critic_terms["a_latched"] = ObservationTermCfg(
@@ -721,6 +755,7 @@ def make_bimanual_env_cfg(
         "lag": a["object_pos"].params.get("lag"),
         "target_command_name": COMMAND,
         "gate": _gate_dict(gate),
+        **({"left_home": True} if clear else {}),
       },
       noise=a["object_pos"].noise,
     )
@@ -729,7 +764,12 @@ def make_bimanual_env_cfg(
       term = RewardTermCfg(
         func=mdp.when_base_placed,
         weight=term.weight,
-        params={**term.params, "inner": term.func, **gate},
+        params={
+          **term.params,
+          "inner": term.func,
+          **gate,
+          **({"gate_left_home": True} if clear else {}),
+        },
       )
     cfg.rewards[f"right_{name}"] = term
   apply_arm_table(cfg, right, arm_table, prefix="right_")
@@ -743,6 +783,11 @@ def make_bimanual_env_cfg(
     weight=HH_CONTACT_WEIGHT,
     params={"sensor_name": ARM_ARM_SENSOR, "force_threshold": HH_CONTACT_FORCE},
   )
+  if hh_term is not None:
+    cfg.terminations[ARM_ARM_TERM] = TerminationTermCfg(
+      func=mdp.illegal_contact,
+      params={"sensor_name": ARM_ARM_SENSOR, "force_threshold": float(hh_term)},
+    )
   left_placed = cfg.rewards["placed"]
   right_placed = right_rewards["placed"]
   rp = right_placed.params
@@ -799,8 +844,8 @@ def make_bimanual_env_cfg(
       mode="reset",
       params={
         "bank_path": hold_bank,
-        "hold_share": HOLD_SHARE,
-        "placed_share": PLACED_SHARE,
+        "hold_share": HOLD_SHARE if hold_mix is None else float(hold_mix[0]),
+        "placed_share": PLACED_SHARE if hold_mix is None else float(hold_mix[1]),
         "half_xy": MIXED_A_HALF_XY,
         "yaw": MIXED_A_YAW,
         "target_command_name": COMMAND,
