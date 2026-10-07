@@ -8,8 +8,8 @@ right still holds the pin). The adapter (`eval_chain.MirrorAdapter`'s maps): the
 actions x `ARM_MIRROR_SIGNS`, positions y -> -y, its TCP frame M R F M, a 4-fold yaw (cos 4 psi, sin 4 psi) ->
 (cos, -sin), the pin's tilt (x, y) -> (x, -y).
 
-Per episode: **through with the block held** -- the pin's bottom at or below the block's bottom inside the bore
-(`mdp.InsertState.through`), the right grasping the pin and the left the block -- on >= 80 % of the last second
+Per episode: **through with the block held** -- the pin's bottom at or below the block's bottom inside the bore, its
+top above the block's top (`mdp.held_through`), the right grasping the pin and the left the block -- on >= 80 % of the last second
 (headline) and the first time it holds; when the block was presented; the block's largest drift from H and tilt while
 the right works; drops (either part off its hand after the presentation, or below the table); arm-arm contact (S11's
 sensor: any, > 30 N) and arm 1-6 on the table per arm; bins by both parts' spawn positions.
@@ -197,10 +197,9 @@ class Reads:
 
     env = self.env
     tt = (env.episode_length_buf.float() - 1.0) * self.dt
-    st = mdp.insert_state(env, **self.geo)
     hl = _grasped_bool(env, self.left.contact_sensor_name)
     hr = _grasped_bool(env, self.right.contact_sensor_name)
-    through = st.through() & hl & hr
+    through = mdp.held_through(env, **self.geo) & hl & hr
     first = through & torch.isnan(self.t_through)
     self.t_through[first] = tt[first]
     end = tt >= self.episode_s - 1.0 - self.dt

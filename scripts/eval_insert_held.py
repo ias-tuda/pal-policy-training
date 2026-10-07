@@ -5,9 +5,10 @@ One episode per row (``--episode-s``, 20 s by default), the actor's tracked obse
 policy deterministic, ``S13=R-I`` / ``R-I-W`` on ``GOAL=insert`` with `BS12`'s selectors as trained (``S13=R-I`` reads
 an R-I-W policy at the nominal hold):
 
-* **through while held** -- the pin's bottom at or below the block's bottom face inside the bore
-  (`mdp.InsertState.through`) with the jaw on the pin, on >= 80 % of the last second (headline), and the first time;
-* the pin grasped / lifted, its bottom's offset from the hole's axis when it first reaches the entry, its depth at
+* **through while held** -- the pin's bottom at or below the block's bottom face inside the bore, its top above the
+  block's top face (`mdp.held_through`), with the jaw on the pin, on >= 80 % of the last second (headline), and the
+  first time;
+* the pin grasped / lifted, its bottom's offset from the hole's axis when it first crosses the entry from above, its depth at
   the end, the block's largest displacement from its hold, the arm on the stand-in hand (any / > 30 N), arm 1-6 on
   the table, the pin dropped;
 * bins by the pin's spawn x, y and yaw, and by the hold's offset from H.
@@ -84,6 +85,7 @@ class Reads:
     self.hold_off = z()
     self.end_through, self.end_steps, self.moved = z(), z(), z()
     self.t_through, self.entry_offset, self.end_depth = nan(), nan(), nan()
+    self.prev_depth = nan()
     self.grasped, self.lifted, self.hh, self.hh30, self.armt, self.dropped = (
       b(),
       b(),
@@ -110,7 +112,7 @@ class Reads:
     )
     for t in (self.end_through, self.end_steps, self.moved):
       t[ids] = 0.0
-    for t in (self.t_through, self.entry_offset, self.end_depth):
+    for t in (self.t_through, self.entry_offset, self.end_depth, self.prev_depth):
       t[ids] = float("nan")
     for t in (self.grasped, self.lifted, self.hh, self.hh30, self.armt, self.dropped):
       t[ids] = False
@@ -133,11 +135,14 @@ class Reads:
     self.lifted |= _was_lifted_bool(
       env, self.gripper.contact_sensor_name, SUPPORT_SENSOR
     )
-    through = st.through() & held
+    through = mdp.held_through(env, **self.geo) & held
     first = through & torch.isnan(self.t_through)
     self.t_through[first] = tt[first]
-    entry = (st.depth > 0.0) & torch.isnan(self.entry_offset)
+    # The entry: the pin's bottom crossing the block's top face from above (the pin starts on the table, below the
+    # face of a block held 10 cm up, so "depth > 0" alone is true from the first step).
+    entry = (self.prev_depth <= 0.0) & (st.depth > 0.0) & torch.isnan(self.entry_offset)
     self.entry_offset[entry] = st.offset[entry]
+    self.prev_depth = st.depth
     end = tt >= self.episode_s - 1.0 - self.dt
     self.end_steps += end.float()
     self.end_through += (end & through).float()

@@ -20,8 +20,9 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
 
 from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
-from pal_mjlab.tasks.manipulation.mdp.insert import insert_state
+from pal_mjlab.tasks.manipulation.mdp.insert import InsertState, insert_state
 from pal_mjlab.tasks.manipulation.mdp.observations import _grasped_bool
+from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
 
 
 def holder_spec(
@@ -144,6 +145,62 @@ def held_block_moved_penalty(
   return (d / scale).clamp(0.0, 1.0)
 
 
+def _top_over_block(st: InsertState, half: torch.Tensor) -> torch.Tensor:
+  """The pin's top end (``2 * half`` up its axis from the bottom) above the block's top face. (B,)"""
+  top = st.bottom_b[:, 2] + 2.0 * half * st.axis_b[:, 2]
+  return top >= st.block_height
+
+
+def pin_over_block(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  block_name: str,
+  block_height: float,
+  hole_d: float,
+) -> torch.Tensor:
+  """True while the pin's top end is above the held block's top face (block frame). §12's insert terms read "below the
+  hole's entry" as "in the bore, or beside a block standing on the table"; under a block held in the air it also
+  covers a pin under the block, which their offsets read as on the hole's axis. A pin whose bottom is at or below
+  the entry with its top above the top face is in the bore (the block is solid around it), so this gate leaves only
+  that. (B,)"""
+  st = insert_state(env, object_name, block_name, block_height, hole_d)
+  return _top_over_block(st, object_half_height(env, object_name))
+
+
+def held_through(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  block_name: str,
+  block_height: float,
+  hole_d: float,
+) -> torch.Tensor:
+  """Plan §13's "through" for the block in the air: `InsertState.through` (the pin's bottom at or below the block's
+  bottom face, inside the bore) with the pin's top above the block's top face (`pin_over_block`) -- without it a
+  pin held *under* the block on the hole's axis read as through (the early R-I-FT check, 2026-10-08). (B,)"""
+  st = insert_state(env, object_name, block_name, block_height, hole_d)
+  return st.through() & _top_over_block(st, object_half_height(env, object_name))
+
+
+def over_block_gated(
+  env: ManagerBasedRlEnv,
+  inner,
+  object_name: str,
+  block_name: str,
+  block_height: float,
+  hole_d: float,
+  **params,
+) -> torch.Tensor:
+  """``inner(env, ...)`` x `pin_over_block`: wraps §12's approach (goal, goal_near), align and depth terms for R-I,
+  which would otherwise pay for a pin held under the held block. (B,)"""
+  geo = {
+    "object_name": object_name,
+    "block_name": block_name,
+    "block_height": block_height,
+    "hole_d": hole_d,
+  }
+  return inner(env, **geo, **params) * pin_over_block(env, **geo).float()
+
+
 def pin_through_held(
   env: ManagerBasedRlEnv,
   object_name: str,
@@ -152,10 +209,10 @@ def pin_through_held(
   hole_d: float,
   grasp_sensor_name: str,
 ) -> torch.Tensor:
-  """1 while the pin is held with its bottom at or below the block's bottom face, inside the bore (plan §13's
-  "through", `mdp.InsertState.through`). (B,)"""
-  st = insert_state(env, object_name, block_name, block_height, hole_d)
-  return (st.through() & _grasped_bool(env, grasp_sensor_name)).float()
+  """1 while the pin is held through the block (`held_through`: its bottom at or below the block's bottom face,
+  inside the bore, its top above the block's top face). (B,)"""
+  through = held_through(env, object_name, block_name, block_height, hole_d)
+  return (through & _grasped_bool(env, grasp_sensor_name)).float()
 
 
 def pin_through_obs(env: ManagerBasedRlEnv, **params) -> torch.Tensor:

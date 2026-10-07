@@ -12,9 +12,12 @@ Against that cfg:
 * **the pin** is drawn from `PIN_AREA`, the part of `WC` at least ~10 cm from H's xy, any yaw;
 * **the reward** is IN's (RCTP + A + D + U, block moved) with the release ending removed: ``release`` / ``placed``
   stay at weight 0 (PQ's critic inputs), ``retreat`` and the pad-contact term go, and `through_held` pays per step
-  (`THROUGH_WEIGHT`, M1's placed weight) while the pin is held with its bottom at or below the block's bottom face
-  (plan §13: "flush or below while the right still holds it"); arm-holder contact costs `HH_WEIGHT` per step above
-  1 N (S11's HH);
+  (`THROUGH_WEIGHT`, M1's placed weight) while the pin is held through the block (`mdp.held_through`: its bottom at
+  or below the block's bottom face, inside the bore, its top above the block's top face; plan §13: "flush or below
+  while the right still holds it"); IN's approach (goal, goal_near), A and D pay only while the pin's top is above
+  the block's top face (`mdp.over_block_gated`): their "below the entry" was written for a block on the table and,
+  with the block in the air, paid a pin held under it (`GATED_OVER_BLOCK`); arm-holder contact costs `HH_WEIGHT` per
+  step above 1 N (S11's HH);
 * **the observations** are IN's 42-D actor and its critic, + ``pin_through`` appended to the critic.
 """
 
@@ -36,6 +39,12 @@ from pal_mjlab.tasks.manipulation.pick_place.hold import HOLD_DZ, HOLD_XY
 from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK
 from pal_mjlab.tasks.manipulation.robot_cfg import GripperCfg
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import DECIMATION, ROBOT, TABLE
+
+#: IN's terms that read "below the hole's entry" and are paid only while the pin's top is above the held block's top
+#: face (`mdp.over_block_gated`). Found by the early R-I-FT check (2026-10-08, `results/S13-insert/early/`): a pin held
+#: under the block on the hole's axis read as through, and the approach's offset, A's window and D's axis gate all read
+#: it as at the hole. U's gate (the bottom within 5 cm of the entry, in 3-D) and the faded lift need none.
+GATED_OVER_BLOCK = ("goal", "goal_near", "align", "depth")
 
 #: The holder's entity name.
 HOLDER = "holder"
@@ -178,6 +187,13 @@ def apply_held_insert(
     rw.pop(name, None)
   depth = rw["depth"].params
   pin = {k: depth[k] for k in ("object_name", "block_name", "block_height", "hole_d")}
+  for name in GATED_OVER_BLOCK:
+    term = rw[name]
+    rw[name] = dataclasses.replace(
+      term,
+      func=mdp.over_block_gated,
+      params={"inner": term.func, **term.params},
+    )
   rw["through"] = RewardTermCfg(
     func=mdp.pin_through_held,
     weight=THROUGH_WEIGHT,

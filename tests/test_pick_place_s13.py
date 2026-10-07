@@ -358,8 +358,14 @@ def test_through_reads_a_pin_pushed_through_the_held_block(ri_env):
     up = torch.zeros_like(bp)
     up[:, 2] = 1.0
     axis = quat_apply(bq, up)
-    for below, want in ((0.002, True), (-0.010, False)):
-      # The pin's bottom `below` under the block's bottom face (negative: above it), on the hole's axis.
+    # (bottom under the block's bottom face (negative: above it), through, the pin's top above the block's top):
+    # pushed through; not yet out of the bottom; and the whole pin *under* the block on the hole's axis, which
+    # `InsertState.through` alone reads as through (the early R-I-FT check, 2026-10-08) and `held_through` does not.
+    for below, want, over in (
+      (0.002, True, True),
+      (-0.010, False, True),
+      (0.095, False, False),
+    ):
       centre = bp + axis * (half - below)
       pin.write_root_link_pose_to_sim(torch.cat([centre, bq], dim=-1))
       pin.write_root_link_velocity_to_sim(
@@ -367,4 +373,21 @@ def test_through_reads_a_pin_pushed_through_the_held_block(ri_env):
       )
       env.sim.forward()
       st = mdp.insert_state(env, **geo)
-      assert bool((st.through() == want).all()), (below, st.height)
+      assert bool((st.through() == (below >= 0.0)).all()), (below, st.height)
+      assert bool((mdp.held_through(env, **geo) == want).all()), (below, st.height)
+      assert bool((mdp.pin_over_block(env, **geo) == over).all()), below
+
+
+def test_ri_pays_the_approach_terms_only_over_the_block(ri_env):
+  from pal_mjlab.tasks.manipulation.pick_place import insert_held as IH
+
+  env = ri_env
+  for name in IH.GATED_OVER_BLOCK:
+    term = env.reward_manager.get_term_cfg(name)
+    assert term.func is mdp.over_block_gated, name
+    assert term.params["inner"] in (
+      mdp.insert_approach,
+      mdp.insert_align,
+      mdp.insert_depth,
+    ), name
+  assert env.reward_manager.get_term_cfg("through").func is mdp.pin_through_held
