@@ -38,7 +38,7 @@ Plan S7-4 adds `EFFORT` (`none` | `C` | `CTP`, `pick_place_env_cfg.EFFORT_BOUNDS
 the driven arm's effort. `C` clips the arm's targets to the joint range; `CTP` adds T -- the arm's
 effort limit lowered to 0.7 x effort on the plant, mirrored as a target band in the action term
 -- and P, the effort hinge. The plant half of T is built into the robot here, from the same code.
-Plan S7-6 adds `LAG` (`none` | `FP` | `JS` | `FP+JS`, `tabletop_env_cfg.LATENCY_MODELS`): the
+Plan S7-6 adds `LAG` (`none` | `FP` | `JS` | `FP+JS`; S7-11 adds `FP+JSW`, the servo down to twice as slow; `tabletop_env_cfg.LATENCY_MODELS`): the
 real robot's latencies -- `FP` the FoundationPose cube tracker's 5-8 steps on the cube pose,
 `JS` the jaw servo's lag behind its command. Unset is `none`, every run up to S7-5.
 `TOOL_SPEED=V0.5` is S7-4's V at 0.5 m/s. The release-by-jaw (J) and the retreat (M8) are reward
@@ -51,6 +51,20 @@ drawn from one wide area -- Claudius's, or the part of it that plans -- >= 10 cm
 Plan S8 adds `SHAPE` (`cube` | `ball` | `ball-dr` | `mix`, `pick_place_env_cfg.OBJECT_SHAPES`): what is
 picked up -- the 5 cm cube of every run up to S7-8, a 6 cm ball, the ball with its size and rolling
 friction drawn, or a cube or a ball at random each episode. Unset is the cube.
+Plan S9 adds `GOAL` (`table` | `stack`, `pick_place_env_cfg.GOALS`: the cube on the table, or on top of a
+blue base cube spawned in baseline B's target box) and `GATE` (`none` | `stack`: the jaw lock that keeps
+the jaw shut while the held cube is not aligned, low and slow over the base). Unset is S8's cfg exactly.
+Plan S7-9 adds `CRITIC_OBS` (`base` | `q`: the critic also observes M6's latched grade and the release
+latch, PQ; the actor is unchanged, and a resume widens the loaded critic for the two inputs). Its other
+codes are a reward module (`REWARD=...+PXY` / `+PT`) and a tool cap (`TOOL_SPEED=PV`). Unset is `base`.
+Plan S7-10 adds `ARM_TABLE` (`none` | `watch` | `AC` | `AH` | `AT`, `arm_table.ARM_TABLE_CODES`):
+the driven arm's links 1-6 against the table -- a sensor only (`watch`, for the eval), a contact
+penalty (AC), + a clearance penalty (AH), or + a termination on a hard contact (AT). Unset is
+`none`, every run up to S7-9.
+Plan S7-11 adds `PREGRASP` (`none` | `watch` | `NP` | `JO` | `G` | `S` | `OVR`,
+`pregrasp.PREGRASP_CODES`): the jaw open before the grasp -- a push penalty (NP), the jaw angle
+priced on the approach (JO), a cap on the commanded jaw outside the grasp window (G; OVR is the
+deployer's eval-only version), or NP + JO + the grasp's yaw alignment (S). Unset is `none`.
 """
 
 from __future__ import annotations
@@ -66,15 +80,19 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 )
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASELINES,
   EFFORT_BOUNDS,
+  GATES,
+  GOALS,
   OBJECT_SHAPES,
   SPAWN_BOXES,
   TARGET_AREAS,
   TOOL_SPEED_CAPS,
   make_pick_place_env_cfg,
 )
+from pal_mjlab.tasks.manipulation.pick_place.pregrasp import PREGRASP_CODES
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
@@ -110,6 +128,11 @@ CMD_OBS_ENV_VAR = "CMD_OBS"
 TARGET_ENV_VAR = "TARGET"
 EPISODE_ENV_VAR = "EPISODE_S"
 SHAPE_ENV_VAR = "SHAPE"
+GOAL_ENV_VAR = "GOAL"
+GATE_ENV_VAR = "GATE"
+CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
+ARM_TABLE_ENV_VAR = "ARM_TABLE"
+PREGRASP_ENV_VAR = "PREGRASP"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -127,6 +150,14 @@ DEFAULT_OBJ_OBS = "live"
 DEFAULT_ACTION = "abs"
 DEFAULT_TARGET = "B"
 DEFAULT_SHAPE = "cube"
+DEFAULT_GOAL = "table"
+DEFAULT_GATE = "none"
+DEFAULT_CRITIC_OBS = "base"
+#: What `CRITIC_OBS` may be (plan S7-9): the critic as before, or with M6's grade and the release
+#: latch (PQ). Whether the critic gets the two extra inputs.
+CRITIC_OBS_NAMES = {"base": False, "q": True}
+DEFAULT_ARM_TABLE = "none"
+DEFAULT_PREGRASP = "none"
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -244,7 +275,23 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     action_mode=action,
     command_obs=_select_command_obs(action),
     shape=OBJECT_SHAPES[_select(SHAPE_ENV_VAR, DEFAULT_SHAPE, OBJECT_SHAPES)],
+    goal=_select(GOAL_ENV_VAR, DEFAULT_GOAL, GOALS),
+    gate=_select(GATE_ENV_VAR, DEFAULT_GATE, GATES),
+    critic_release=_critic_release(),
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    pregrasp=PREGRASP_CODES[
+      _select(PREGRASP_ENV_VAR, DEFAULT_PREGRASP, PREGRASP_CODES)
+    ],
   )
+
+
+def _critic_release() -> bool:
+  """Plan S7-9's ``CRITIC_OBS``: whether the critic observes M6's grade and the release latch."""
+  return CRITIC_OBS_NAMES[
+    _select(CRITIC_OBS_ENV_VAR, DEFAULT_CRITIC_OBS, CRITIC_OBS_NAMES)
+  ]
 
 
 def _select_occlusion() -> mdp.OccCfg | None:
@@ -262,4 +309,7 @@ def _select_occlusion() -> mdp.OccCfg | None:
 def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
   recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
-  return PPO_RECIPES[recipe]("kangaroo_pick_place")
+  cfg = PPO_RECIPES[recipe]("kangaroo_pick_place")
+  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9).
+  cfg.widen_critic_on_resume = _critic_release()
+  return cfg

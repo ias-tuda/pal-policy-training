@@ -29,6 +29,10 @@ from pal_mjlab.tasks.manipulation.mdp.shapes import (
   resolve,
   shape_kind,
 )
+from pal_mjlab.tasks.manipulation.mdp.stack import (
+  stack_command_reference,
+  stack_state,
+)
 
 _ROBOT = SceneEntityCfg("robot")
 
@@ -365,7 +369,8 @@ class ReleaseLatch:
   within `SET_DOWN_RADIUS` of the goal; ``dwell`` how many consecutive updates, up to the last,
   the object was held on the surface, still and within the radius, since such a touchdown.
   ``rel_on_table``, ``rel_speed`` and ``rel_dwell`` are the surface contact, the object's
-  speed and that dwell at the latest release. ``step`` is the env step of the last update.
+  speed and that dwell at the latest release, ``tilt`` its tilt then (`object_tilt`, plan S7-9).
+  ``step`` is the env step of the last update.
   """
 
   grasped: torch.Tensor
@@ -379,6 +384,8 @@ class ReleaseLatch:
   rel_speed: torch.Tensor
   rel_dwell: torch.Tensor
   step: int = -1
+  # Plan S7-9's PT: the object's tilt (`object_tilt`) at the latest release, taken with the rest.
+  tilt: torch.Tensor | None = None
   # Plan S7-4's J (``jaw`` set): a release is entering the released state -- jaw open and
   # the pads off the object -- and the where / how of it is the pads' let-go before it, held
   # here until then (``pend_*``, valid while ``pend``). ``jaw_closed`` is "not in the released
@@ -391,6 +398,27 @@ class ReleaseLatch:
   pend_on_table: torch.Tensor | None = None
   pend_speed: torch.Tensor | None = None
   pend_dwell: torch.Tensor | None = None
+  # Plan S9: on a stack goal (`EntityOffsetCommand` with ``stack_on_top``), whether the release
+  # condition `stack.StackState.ok` held at the let-go -- taken when the pads let go, like the
+  # other ``pend_*``, and committed with the release. Always False on a table goal.
+  rel_ok: torch.Tensor | None = None
+  pend_ok: torch.Tensor | None = None
+  pend_tilt: torch.Tensor | None = None
+
+
+def object_tilt(env: ManagerBasedRlEnv, object_name: str) -> torch.Tensor:
+  """The object's tilt: the angle between the vertical and its most vertical body axis, rad.
+  0 for a cube resting on a face, pi/4 on an edge. (B,)
+
+  Plan S7-9's PT grades the release by it; the same formula as `scripts/eval_pick_place.py`'s
+  ``tilt`` (S7-8's tilt-at-let-go read), so the trained quantity is the one that was measured.
+  """
+  w, x, y, z = env.scene[object_name].data.root_link_quat_w.unbind(-1)
+  # The world-z components of the body's three axes: the last row of its rotation matrix.
+  row = torch.stack(
+    [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
+  )
+  return torch.acos(row.abs().amax(-1).clamp(max=1.0))
 
 
 def _release_latch(
@@ -432,7 +460,9 @@ def _release_latch(
   after every step for the arms that have none.
 
   The resting height is the surface's top plus the object's half-height, read out of physics
-  the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table.
+  the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table. On a stack
+  goal (plan S9: `EntityOffsetCommand` with ``stack_on_top``) it is the goal's own z -- the cube
+  resting on the base -- and ``rel_ok`` records whether `stack.StackState.ok` held at the let-go.
 
   M7's set-down (plan S7-2): a *touchdown* is the first held-on-surface update after the held
   object was lifted `SET_DOWN_CLEARANCE` clear. The dwell counts only after a touchdown within
@@ -467,6 +497,9 @@ def _release_latch(
       rel_speed=zero.clone(),
       rel_dwell=count.clone(),
       jaw=jaw,
+      rel_ok=no.clone(),
+      pend_ok=no.clone(),
+      tilt=zero.clone(),
     )
     if jaw is not None:
       latch.jaw_closed = no.clone()
@@ -474,6 +507,7 @@ def _release_latch(
       latch.pend_dxy, latch.pend_height = zero.clone(), zero.clone()
       latch.pend_on_table, latch.pend_speed = no.clone(), zero.clone()
       latch.pend_dwell = count.clone()
+      latch.pend_tilt = zero.clone()
     setattr(env, _RELEASE, latch)
   if latch.jaw != jaw:
     raise ValueError(
@@ -489,15 +523,21 @@ def _release_latch(
   obj: Entity = env.scene[object_name]
   goal = env.command_manager.get_term(command_name).command
   pos = obj.data.root_link_pos_w
-  half_z = object_half_height(env, object_name)
-  rest_z = surface_top_z(env, surface_cfg) + half_z
+  reference = stack_command_reference(env, command_name)
+  if reference is None:
+    rest_z = surface_top_z(env, surface_cfg) + object_half_height(env, object_name)
+    ok = torch.zeros_like(let_go)
+  else:
+    rest_z = goal[:, 2]
+    ok = stack_state(env, object_name, reference, command_name).ok
   dxy = torch.norm((pos - goal)[:, :2], dim=-1)
   speed = torch.norm(obj.data.root_link_lin_vel_w, dim=-1)
   on_table = _on_surface_bool(env, support_sensor_name)
   height = pos[:, 2] - rest_z
+  tilt = object_tilt(env, object_name)
   if jaw is None:
     opened = let_go
-    now = (dxy, height, on_table, speed, latch.dwell)
+    now = (dxy, height, on_table, speed, latch.dwell, ok, tilt)
   else:
     assert jaw_cfg is not None and jaw_open is not None
     # The pads' let-go is held until the jaw opens; a jaw that opens with none pending (it
@@ -510,6 +550,8 @@ def _release_latch(
     latch.pend_on_table = w(on_table, latch.pend_on_table)
     latch.pend_speed = w(speed, latch.pend_speed)
     latch.pend_dwell = w(latch.dwell, latch.pend_dwell)
+    latch.pend_ok = w(ok, latch.pend_ok)
+    latch.pend_tilt = w(tilt, latch.pend_tilt)
     latch.pend = latch.pend | let_go
     released_now = _jaw_open_bool(env, jaw_cfg, jaw_open) & ~grasped
     opened = latch.jaw_closed & released_now & was_lifted
@@ -520,6 +562,8 @@ def _release_latch(
       torch.where(p, latch.pend_on_table, on_table),
       torch.where(p, latch.pend_speed, speed),
       torch.where(p, latch.pend_dwell, latch.dwell),
+      torch.where(p, latch.pend_ok, ok),
+      torch.where(p, latch.pend_tilt, tilt),
     )
     latch.pend = latch.pend & ~opened
     latch.jaw_closed = ~released_now
@@ -528,6 +572,8 @@ def _release_latch(
   latch.rel_on_table = torch.where(opened, now[2], latch.rel_on_table)
   latch.rel_speed = torch.where(opened, now[3], latch.rel_speed)
   latch.rel_dwell = torch.where(opened, now[4], latch.rel_dwell)
+  latch.rel_ok = torch.where(opened, now[5], latch.rel_ok)
+  latch.tilt = torch.where(opened, now[6], latch.tilt)
   latch.released |= opened
   latch.grasped = grasped
   # M7's dwell, after the release has been recorded with the count up to the last update.
@@ -594,3 +640,33 @@ def _placed_bool(
   if support_sensor_name is not None:
     placed &= _was_lifted_bool(env, grasp_sensor_name, support_sensor_name)
   return placed
+
+
+def release_grade(env: ManagerBasedRlEnv, **params) -> torch.Tensor:
+  """M6's grade of the latest release, as `rewards.release_quality` pays it (the floor before
+  any). (B, 1)
+
+  Plan S7-9's PQ, a critic-only input: M6 latches q at the let-go and multiplies every later
+  ``release`` / ``placed`` step by it, but the critic sees the cube where it settled, not where it
+  was let go -- two states with one observation earn x0.25 and x1.0. ``params`` are the graded
+  ``placed`` term's, so the critic sees the grade the reward actually pays.
+  """
+  from pal_mjlab.tasks.manipulation.mdp.rewards import release_quality
+
+  return release_quality(env, **params).unsqueeze(-1)
+
+
+def release_latched(env: ManagerBasedRlEnv, **params) -> torch.Tensor:
+  """1 once a release after `was_lifted` has been latched this episode, else 0 (plan S7-9's PQ,
+  critic only; ``params`` as `release_grade`). (B, 1)"""
+  latch = _release_latch(
+    env,
+    params["command_name"],
+    params["object_name"],
+    params["grasp_sensor_name"],
+    params["support_sensor_name"],
+    params["surface_cfg"],
+    params.get("jaw_cfg"),
+    params.get("jaw_open"),
+  )
+  return latch.released.float().unsqueeze(-1)

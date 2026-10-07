@@ -14,10 +14,14 @@ from conftest import get_test_device
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from pal_mjlab.tasks.manipulation import mdp
+from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   make_pick_place_env_cfg,
 )
-from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
+from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  REWARD_VARIANTS,
+  STACK_ONLY_ARMS,
+)
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 
 KEEPOUT = KANGAROO_GRIPPERS_LEFT_ARM.trunk_keepout
@@ -26,8 +30,14 @@ REACH = KANGAROO_GRIPPERS_LEFT_ARM.reach
 
 @pytest.mark.parametrize("variant", sorted(REWARD_VARIANTS))
 def test_every_reward_arm_carries_the_trunk_penalty(variant):
+  # Plan S9's RG / SA read the base cube: they are built on the stack goal, which needs B's box.
+  stack = (
+    {"goal": "stack", "baseline": pp.BASELINES["B"]}
+    if variant in STACK_ONLY_ARMS
+    else {}
+  )
   cfg = make_pick_place_env_cfg(
-    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=variant
+    KANGAROO_GRIPPERS_LEFT_ARM, gripper_name="left", reward=variant, **stack
   )
   term = cfg.rewards["trunk_clearance"]
   assert term.weight < 0

@@ -301,6 +301,16 @@ def ball_pad_clearance(offset: float | None = None) -> float:
   return scene.BALL_RADIUS + (rewards.EQ_OFFSET if offset is None else offset)
 
 
+def place_hand_x(hand_x: np.ndarray, cube_yaw: float, base_yaw: float) -> np.ndarray:
+  """Plan S9: the hand +x for the carry and the place, turned from the grasp's ``hand_x`` by the
+  base's yaw minus the cube's, folded into (-45, 45] deg, so the held cube arrives square to the
+  base (the lock's yaw bound) with the least wrist turn."""
+  quarter = math.pi / 2
+  turn = math.remainder(base_yaw - cube_yaw, quarter)
+  c, s = math.cos(turn), math.sin(turn)
+  return np.array([c * hand_x[0] - s * hand_x[1], s * hand_x[0] + c * hand_x[1], 0.0])
+
+
 def waypoints(
   kin: Kin,
   cube_xy: np.ndarray,
@@ -308,13 +318,15 @@ def waypoints(
   target_xy: np.ndarray,
   table_z: float | None = None,
   pad_clearance: float = PAD_CLEARANCE,
+  carry_hand_x: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
   """Joint configurations for every phase, each IK seeded from the previous one so the
   sequence stays on one solution branch. Raises if any waypoint has no solution or puts
   the arm in contact. ``table_z`` is the table's top face (m); `scene.TABLE_TOP_Z` if None.
   ``pad_clearance`` is the height of the pad sites above the table at the grasp pose: 1 cm for
   the 5 cm cube; for plan S8's ball, `ball_pad_clearance` (the pad centre at the ball's equator
-  plus the bench's best offset)."""
+  plus the bench's best offset). ``carry_hand_x`` (plan S9, `place_hand_x`) is the hand +x from the
+  carry on; the grasp's if None."""
   from pal_mjlab.tasks.manipulation import scene
 
   if table_z is None:
@@ -334,7 +346,12 @@ def waypoints(
   q = kin.q_default
   for name, (xy, z) in goals.items():
     goal = np.array([xy[0], xy[1], z])
-    sol = _solve(kin, name, goal, hand_x, q)
+    hx = (
+      carry_hand_x
+      if carry_hand_x is not None and name in ("carry", "place", "retreat")
+      else hand_x
+    )
+    sol = _solve(kin, name, goal, hx, q)
     # Only the free-space waypoints must be contact-free; at grasp/place the pads are
     # 1 cm off the table by construction and anything they touch is the (parked) cube.
     hits = kin.in_collision(sol)
@@ -475,6 +492,17 @@ def box_corners(box) -> list[tuple[np.ndarray, float]]:
       for yaw in (-box.yaw, box.yaw):
         out.append((np.array([x, y]), yaw))
   return out
+
+
+def base_box_corners(baseline, n: int) -> list[tuple[np.ndarray, float]]:
+  """Plan S9: ``n`` base-cube poses cycling over the baseline's target box's centre and corners
+  at -/+ the base's yaw range (`pick_place_env_cfg.STACK_BASE_YAW`)."""
+  from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+
+  (tx, ty), h = baseline.target_xy, baseline.target_half_xy
+  box = pp.SpawnBox(x=(tx - h, tx + h), y=(ty - h, ty + h), yaw=pp.STACK_BASE_YAW)
+  corners = box_corners(box)
+  return [corners[i % len(corners)] for i in range(n)]
 
 
 #: DR-scene's table shift, for the corners check: x, y +/-2 cm and z +/-1 cm
@@ -636,6 +664,10 @@ def rollout(
   action_mode: str = "abs",
   shape=None,
   ball_offset: float | None = None,
+  goal: str = "table",
+  gate: str = "none",
+  base_spawns: list[tuple[tuple[float, float], float]] | None = None,
+  pregrasp=None,
 ) -> list[dict]:
   """One scripted episode per env; returns eval_pick_place's per-episode flags.
 
@@ -693,6 +725,15 @@ def rollout(
   Plan S8: ``shape`` (`pick_place_env_cfg.OBJECT_SHAPES`; the cube if None) builds the env with a
   ball. A ball has no yaw to grasp across -- the wrist keeps its start yaw -- and is taken with the
   pad sites' midpoint ``ball_offset`` above its centre (`ball_pad_clearance`).
+
+  Plan S9: ``goal`` / ``gate`` (`pick_place_env_cfg.GOALS` / `GATES`) build the stack task and its
+  jaw lock. On a stack goal the wrist is turned for the carry and the place so the held cube
+  arrives square to the base (`place_hand_x`), and ``base_spawns`` puts env ``i``'s base cube at
+  ``base_spawns[i]`` = ((x, y), yaw) in the env frame (moved with the table, like a forced spawn).
+  Rows carry ``gate_locked_steps`` (steps the lock refused an opening) and ``gate_armed_steps``.
+
+  Plan S7-11: ``pregrasp`` (`pregrasp.PREGRASP_CODES` entry, None for none) builds the env with a
+  ``PREGRASP`` code -- G's gate must let the script's grasp through.
   """
   import pal_mjlab.tasks  # noqa: F401  # Populates the task registry.
   import torch
@@ -721,6 +762,9 @@ def rollout(
     action_mode=action_mode,
     command_obs=action_mode == "delta",
     **({} if shape is None else {"shape": shape}),
+    goal=goal,
+    gate=gate,
+    pregrasp=pregrasp,
   )
   cfg.scene.num_envs = num_envs
   cfg.seed = seed
@@ -828,16 +872,27 @@ def rollout(
     if corners_first
     else None
   )
-  if forced is not None:
-    pose = obj.data.root_link_pose_w.clone()
-    for i, (xy, yaw) in enumerate(forced):
+  if base_spawns is not None and len(base_spawns) != num_envs:
+    raise ValueError(f"{len(base_spawns)} base spawns for {num_envs} envs")
+  stack = goal == "stack"
+  base = env.scene[pp.BASE_OBJECT] if stack else None
+  for entity, poses in ((obj, forced), (base, base_spawns)):
+    if poses is None:
+      continue
+    if entity is None:
+      raise ValueError("base_spawns needs goal='stack'")
+    pose = entity.data.root_link_pose_w.clone()
+    for i, (xy, yaw) in enumerate(poses):
       pose[i, 0] = origins[i, 0] + float(xy[0]) + float(shift[i, 0])
       pose[i, 1] = origins[i, 1] + float(xy[1]) + float(shift[i, 1])
       pose[i, 3:7] = torch.tensor(
         [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
       )
-    obj.write_root_link_pose_to_sim(pose)
-    obj.write_root_link_velocity_to_sim(torch.zeros_like(obj.data.root_link_vel_w))
+    entity.write_root_link_pose_to_sim(pose)
+    entity.write_root_link_velocity_to_sim(
+      torch.zeros_like(entity.data.root_link_vel_w)
+    )
+  if forced is not None or base_spawns is not None:
     # A teleport is not visible to the entity's data views until the sim has stepped; one
     # idle step (action 0 = hold the start pose) also lets the cube settle on the table.
     with torch.inference_mode():
@@ -858,12 +913,18 @@ def rollout(
   from pal_mjlab.tasks.manipulation.mdp import ball_mask
 
   is_ball = ball_mask(env).cpu().numpy()
+  base_quat = base.data.root_link_quat_w.cpu().numpy() if stack else None
   hand_yaw0 = math.atan2(kin.fk(kin.q_default)[1][1, 0], kin.fk(kin.q_default)[1][0, 0])
   for i in range(num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
     if is_ball[i]:
       yaw = hand_yaw0  # a sphere is grasped across any pair of points: no wrist turn
+    carry_x = None
+    if stack:
+      bw, bx, by, bz = base_quat[i]
+      base_yaw = math.atan2(2 * (bw * bz + bx * by), 1 - 2 * (by * by + bz * bz))
+      carry_x = place_hand_x(hand_x_for(kin, yaw), yaw, base_yaw)
     kin.move_table(shift[i])
     try:
       plans.append(
@@ -876,13 +937,15 @@ def rollout(
           pad_clearance=ball_pad_clearance(ball_offset)
           if is_ball[i]
           else PAD_CLEARANCE,
+          carry_hand_x=carry_x,
         )
       )
     except RuntimeError as e:
       # Unreachable for the planner: the arm stays home and the env is scored as it ends.
       plan_error[i] = str(e)
       plans.append({name: kin.q_default.copy() for name in WAYPOINT_NAMES})
-    hand_xs.append(hand_x_for(kin, yaw))
+    # Every later use of hand_xs re-plans the place, so it is the carry's hand +x.
+    hand_xs.append(hand_x_for(kin, yaw) if carry_x is None else carry_x)
     if verbose:
       print(
         f"env {i}: cube at ({pos[i, 0]:.3f}, {pos[i, 1]:.3f}), yaw {math.degrees(yaw):+.1f} deg"
@@ -913,6 +976,7 @@ def rollout(
   )
   stretched: dict[str, int] = {}
   bound_hits: dict[str, dict[str, np.ndarray]] = {"band": {}, "range": {}}
+  gate_counts = {"locked": np.zeros(num_envs, int), "armed": np.zeros(num_envs, int)}
 
   def move_and_settle(a: np.ndarray, b: np.ndarray, closed: bool) -> None:
     """Interpolate the arm from pose ``a`` to ``b``, then hold ``b`` until it settles."""
@@ -948,6 +1012,10 @@ def rollout(
     tally.observe(**flags)
     tally.measure_speed(flags["grasped"], *ev.positions(env), env.step_dt, goal_w)
     _, _, terminated, truncated, _ = env.step(raw.clamp(-1.0, 1.0))
+    for key in ("locked", "armed"):
+      flag = getattr(term, key, None)
+      if flag is not None:
+        gate_counts[key] += (flag & ~ended).cpu().numpy().astype(int)
     for key, attr in (("band", "band_hit"), ("range", "range_hit")):
       hits = getattr(term, attr, None)
       if hits is not None:
@@ -1140,6 +1208,8 @@ def rollout(
     r["ended_by"] = why[i]
     r["clipped_steps"] = int(clipped_env[i])
     r["plan_error"] = plan_error.get(r["env"])
+    r["gate_locked_steps"] = int(gate_counts["locked"][r["env"]])
+    r["gate_armed_steps"] = int(gate_counts["armed"][r["env"]])
     for key in ("band", "range"):
       r[f"{key}_hit_steps"] = {
         ph: int(v[r["env"]]) for ph, v in bound_hits[key].items() if v[r["env"]]
@@ -1265,6 +1335,24 @@ def parse_args() -> argparse.Namespace:
   r.add_argument(
     "--episode-s", type=float, default=None, help="episode length; the script is slow"
   )
+  r.add_argument("--goal", default="table", help="GOALS name (plan S9: table | stack)")
+  r.add_argument("--gate", default="none", help="GATES name (plan S9: none | stack)")
+  r.add_argument(
+    "--base-corners",
+    action="store_true",
+    help="plan S9: put the base cube at the target box's centre and corners (env i at "
+    "box_corners[i mod 9]) instead of the reset's random draw",
+  )
+  r.add_argument(
+    "--arm-clearance",
+    action="store_true",
+    help="plan S7-10: arm 1-6's lowest point over the table, per phase and link",
+  )
+  r.add_argument(
+    "--pregrasp",
+    default="none",
+    help="PREGRASP_CODES name (plan S7-11: none | watch | NP | JO | G | S | OVR)",
+  )
   r.add_argument("--json", type=pathlib.Path, default=None)
   m = sub.add_parser(
     "map", help="action-space reach map over a spawn grid (plan S7 P2)"
@@ -1288,6 +1376,57 @@ def parse_args() -> argparse.Namespace:
   return p.parse_args()
 
 
+class ArmClearanceHook:
+  """Plan S7-10 step 0, item 4: how close a *legal* pick-and-place brings arm 1-6 to the table.
+
+  A `rollout` hook: per phase, per env and per link, the lowest collision point over the
+  table's footprint (`mdp.arm_table_clearance`, AH's own measure). AH's margin must stay below
+  the scripted motion's minimum, or the term fires on a correct pick. No sensor is needed."""
+
+  def __init__(self) -> None:
+    self.asset = None
+    self.links: list[str] = []
+    self.by_phase: dict = {}  # phase -> (B, L) tensor, m
+
+  def __call__(self, phase: str, env) -> None:
+    import torch
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.pick_place.arm_table import arm_body_regex
+    from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
+
+    if self.asset is None:
+      gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+      self.asset = SceneEntityCfg("robot", body_names=(arm_body_regex(gripper),))
+      self.asset.resolve(env.scene)
+      robot = env.scene["robot"]
+      self.links = [robot.body_names[i] for i in self.asset.body_ids]
+    c = mdp.arm_table_clearance(env, self.asset, SceneEntityCfg("table"))
+    prev = self.by_phase.get(phase)
+    self.by_phase[phase] = c if prev is None else torch.minimum(prev, c)
+
+  def report(self, rows: list[dict]) -> None:
+    """Print the table and add each env's per-link minimum (m) to its row."""
+    import torch
+
+    if not self.by_phase:
+      return
+    every = torch.stack(list(self.by_phase.values())).amin(dim=0)  # (B, L)
+    cm = lambda v: "      -" if not math.isfinite(v) else f"{v * 100:7.1f}"  # noqa: E731
+    print(
+      "\nARM 1-6 OVER THE TABLE (plan S7-10 step 0 item 4), lowest point, cm, min over envs"
+    )
+    print(f"{'phase':10s}" + "".join(f"{n.split('_')[2]:>7s}" for n in self.links))
+    for phase, c in self.by_phase.items():
+      print(f"{phase:10s}" + "".join(cm(float(v)) for v in c.amin(dim=0)))
+    print(f"{'all':10s}" + "".join(cm(float(v)) for v in every.amin(dim=0)))
+    for i, row in enumerate(rows):
+      if i < every.shape[0]:
+        row["arm_min_clearance_by_link_m"] = dict(
+          zip(self.links, every[i].tolist(), strict=True)
+        )
+
+
 def main() -> None:
   args = parse_args()
   if args.cmd == "derive":
@@ -1299,8 +1438,10 @@ def main() -> None:
   from pal_mjlab.tasks.manipulation import tabletop_env_cfg as tt
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
   from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+  from pal_mjlab.tasks.manipulation.pick_place.pregrasp import PREGRASP_CODES
   from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_left_arm
 
+  arm_hook = ArmClearanceHook() if args.arm_clearance else None
   robot = SPAWN_ROBOTS[args.spawn]
   if args.gains is not None:
     effort = pp.EFFORT_BOUNDS[args.effort]
@@ -1327,7 +1468,16 @@ def main() -> None:
     episode_length_s=args.episode_s,
     shape=pp.OBJECT_SHAPES[args.shape],
     ball_offset=args.ball_offset,
+    goal=args.goal,
+    gate=args.gate,
+    base_spawns=base_box_corners(pp.BASELINES[args.baseline], args.num_envs)
+    if args.base_corners
+    else None,
+    hook=arm_hook,
+    pregrasp=PREGRASP_CODES[args.pregrasp],
   )
+  if arm_hook is not None:
+    arm_hook.report(rows)
   if args.json:
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(rows, indent=2))
