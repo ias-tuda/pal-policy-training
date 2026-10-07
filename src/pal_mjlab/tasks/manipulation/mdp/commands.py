@@ -149,7 +149,8 @@ class SurfaceOffsetCommand(LiftingCommand):
     )
     top_z = surface_top_z(self._env, self._surface_cfg)
     half_z = object_half_height(self._env, self.cfg.entity_name)
-    return torch.cat([centre_xy + self.offsets, (top_z + half_z).unsqueeze(-1)], dim=-1)
+    z = top_z + half_z + self.cfg.height
+    return torch.cat([centre_xy + self.offsets, z.unsqueeze(-1)], dim=-1)
 
   def set_offsets(self, env_ids: torch.Tensor, offsets: torch.Tensor) -> None:
     """Put the goal of ``env_ids`` at ``offsets`` (N, 2) from the surface centre, for the rest
@@ -237,6 +238,10 @@ class SurfaceOffsetCommandCfg(LiftingCommandCfg):
   """What ``offset`` is from: the surface geom's centre (``surface``, every task before plan S11),
   or the env origin (``env``): plan S11's meeting point T, fixed in the robot frame while
   DR-scene shifts the table under it. The height is the surface's either way."""
+
+  height: float = 0.0
+  """How far above "resting on the surface" the goal is, m: 0 for every placing task; plan §13's H
+  holds the socket block 10 cm over the table (`pick_place.hold`)."""
 
   # Placement belongs to a reset event, not to the command -- as for `EntityOffsetCommandCfg`.
   # Without this the inherited default is mjlab's own spawn range (x 0.30-0.35, y +/-0.10,

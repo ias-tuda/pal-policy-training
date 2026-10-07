@@ -87,6 +87,24 @@ from .handoff import (
   HandoffTriggerCfg,
   with_handoff,
 )
+from .hold import (
+  approach_elevation,
+  axis_tilt,
+  hand_axes_w,
+  held_at_goal,
+  held_at_goal_obs,
+  level_near_goal,
+  object_up_b,
+  object_up_w,
+  push_active,
+  push_object_top,
+  push_state,
+  side_grade,
+  side_grade_obs,
+  side_graded,
+  side_grasp_target_w,
+  side_reach,
+)
 from .observations import (
   commanded_target_rel,
   ee_orientation_b,
@@ -159,6 +177,23 @@ from .terminations import (
 )
 
 __all__ = [
+  # Plan §13, the side grasp and the hold of the socket block.
+  "approach_elevation",
+  "axis_tilt",
+  "hand_axes_w",
+  "held_at_goal",
+  "held_at_goal_obs",
+  "level_near_goal",
+  "object_up_b",
+  "object_up_w",
+  "push_active",
+  "push_object_top",
+  "push_state",
+  "side_grade",
+  "side_grade_obs",
+  "side_graded",
+  "side_grasp_target_w",
+  "side_reach",
   "HandoffArmCfg",
   "HandoffJointPositionAction",
   "HandoffJointPositionActionCfg",

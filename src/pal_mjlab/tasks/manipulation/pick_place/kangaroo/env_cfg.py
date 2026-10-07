@@ -122,6 +122,7 @@ from pal_mjlab.tasks.manipulation.pick_place.box import (
   BOX_OBS_NAMES,
   BoxGoal,
 )
+from pal_mjlab.tasks.manipulation.pick_place.hold import HOLD_CODES, apply_hold
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASE_OBS_NAMES,
   BASELINES,
@@ -141,6 +142,7 @@ from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
   ARM_HOMES,
   KANGAROO_GRIPPERS_LEFT_ARM,
+  KANGAROO_GRIPPERS_LEFT_ARM_SIDE,
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
   KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
@@ -188,6 +190,7 @@ HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
 BASE_OBS_ENV_VAR = "BASE_OBS"
 CONTACT_ENV_VAR = "CONTACT"
+S13_ENV_VAR = "S13"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -224,6 +227,9 @@ DEFAULT_BASE_OBS = "goal"
 #: plan S9.1.
 CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
 DEFAULT_CONTACT = "box"
+#: Plan §13.1's one-arm skills (`S13`): ``L-H`` / ``L-HP``, the left's side grasp and hold of the socket
+#: block at H (`pick_place/hold.py`, on the `SPAWN=WC` cfg with the side-grasp arm). Unset is none.
+S13_CODES = ("none", *HOLD_CODES)
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
@@ -347,13 +353,27 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
   goal, box = _select_goal()
   target = _select(TARGET_ENV_VAR, DEFAULT_TARGET, (*TARGET_AREAS, *ROBOT_TARGETS))
+  s13 = _select(S13_ENV_VAR, "none", S13_CODES)
+  arm = SPAWN_ROBOTS[spawn]
+  if s13 in HOLD_CODES:
+    if (
+      spawn != "WC"
+      or target != DEFAULT_TARGET
+      or goal != DEFAULT_GOAL
+      or box is not None
+    ):
+      raise ValueError(
+        f"{S13_ENV_VAR}={s13} is built on SPAWN=WC with TARGET and GOAL unset (H is its goal); got "
+        f"SPAWN={spawn}, TARGET={target}, GOAL={os.environ.get(GOAL_ENV_VAR)}"
+      )
+    arm = KANGAROO_GRIPPERS_LEFT_ARM_SIDE
   for name in (HANDOFF_TRAIN_ENV_VAR, START_ENV_VAR):
     if os.environ.get(name) is not None:
       raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
   cfg = make_pick_place_env_cfg(
     kangaroo_grippers_left_arm(
       _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
-      SPAWN_ROBOTS[spawn],
+      arm,
       arm_effort_scale=effort.effort_scale,
       right_home=_select(ARM_HOME_ENV_VAR, DEFAULT_ARM_HOME, ARM_HOMES),
     ),
@@ -387,6 +407,8 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
   )
   _apply_contact(cfg)
+  if s13 in HOLD_CODES:
+    apply_hold(cfg, KANGAROO_GRIPPERS_LEFT_ARM.gripper("left"), HOLD_CODES[s13])
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
     left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")

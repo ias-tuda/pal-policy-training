@@ -218,6 +218,26 @@ KANGAROO_GRIPPERS_LEFT_ARM_WCK = dataclasses.replace(
 )
 
 
+# Plan §13's L-H (`pick-place-insert-plan.md` §13.1, step 0 item 1, 2026-10-07): the side grasp of the 56 mm socket
+# block -- the hand horizontal, pointing forward (+/- 60 deg), the pads 40-50 mm over the 0.837 m table -- and its hold at
+# H (0.45, 0.00, table + 0.10). The S5.0 rule (1.5 x the largest excursion from home over the contact-free plans of the
+# block on x 0.40-0.55, y 0.08-0.26 at yaw 0/15/30/45 deg -- pregrasp, grasp, lift, H -- rounded up to 0.05 rad, never
+# below WC's, capped at half the joint's range): arm 2, 3, 5 and 7 widen (the horizontal hand turns the upper arm out and
+# the forearm over), arm 3 / 5 / 6 hit the cap (`results/S13-insert/step0/reach_x3.json`).
+KANGAROO_GRIPPERS_LEFT_ARM_SIDE = dataclasses.replace(
+  KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  action_scale={
+    r"arm_left_1_joint": 2.35,
+    r"arm_left_2_joint": 1.25,
+    r"arm_left_3_joint": 2.60,
+    r"arm_left_4_joint": 1.79,
+    r"arm_left_5_joint": 2.60,
+    r"arm_left_6_joint": 2.40,
+    r"arm_left_7_joint": 2.50,
+    r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
+  },
+)
+
 # -- Plan S11: two arms -----------------------------------------------------------------------
 #
 # The right arm is the left arm's mirror image through the robot's sagittal plane (y -> -y): with
