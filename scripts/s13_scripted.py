@@ -166,22 +166,32 @@ def hold_rollout(args) -> dict:
   rng = np.random.default_rng(args.seed)
 
   top_env = surface_top_z(env, SceneEntityCfg("table")).cpu().numpy()
+  from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy
+
+  txy = (
+    _surface_centre_xy(env, SceneEntityCfg("table")) - origins[:, :2]
+  ).cpu().numpy() - np.asarray(scene.TABLE_POS[:2])
   pos = (obj.data.root_link_pos_w - origins).cpu().numpy()
   quat = obj.data.root_link_quat_w.cpu().numpy()
   plans, errors = [], []
   for i in range(env.num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-    # The CPU model's table at this env's height (xy shifts of DR-scene matter only for the collision check).
     mujoco.mj_resetData(model, data)
     data.qpos[:] = nominal_data(model).qpos
+    model.body_pos[table_bid] = table0
     model_top = None
-    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table/table_geom")
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table/table_top")
     mujoco.mj_forward(model, data)
     if gid >= 0:
       model_top = float(data.geom_xpos[gid][2] + model.geom_size[gid][2])
-    dz = 0.0 if model_top is None else float(top_env[i]) - model_top
-    model.body_pos[table_bid] = table0 + np.array([0.0, 0.0, dz])
+    if model_top is None:
+      raise RuntimeError("no table/table_top geom in the CPU model")
+    # DR-scene moves each env's table +/- 2 cm in xy and +/- 1 cm in z: the CPU model's table follows this env's.
+    shift = np.array(
+      [float(txy[i, 0]), float(txy[i, 1]), float(top_env[i]) - model_top]
+    )
+    model.body_pos[table_bid] = table0 + shift
     data.qpos[qfree : qfree + 3] = pos[i]
     data.qpos[qfree + 3 : qfree + 7] = quat[i]
     mujoco.mj_forward(model, data)
@@ -254,7 +264,7 @@ def hold_rollout(args) -> dict:
     )
 
   gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
-  hp = H.held_params(gripper)
+  hp = env.reward_manager.get_term_cfg("held").params  # resolved by the manager
   n_env = env.num_envs
   reads = {
     k: torch.zeros(n_env, device=dev)

@@ -96,12 +96,13 @@ class Reads:
   """Per-env running reads of the current episode, closed into a row when it ends."""
 
   def __init__(self, env, args) -> None:
-    from pal_mjlab.tasks.manipulation.pick_place.hold import held_params
     from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 
     self.env, self.args = env, args
     self.gripper = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
-    self.held_params = held_params(self.gripper)
+    self.held_params = env.reward_manager.get_term_cfg(
+      "held"
+    ).params  # resolved by the manager
     n, dev = env.num_envs, env.device
     self.dt = env.step_dt
     self.rows: list[dict] = []
