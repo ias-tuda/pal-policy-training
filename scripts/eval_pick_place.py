@@ -186,7 +186,13 @@ JAW_OPEN_BY_SHAPE = PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS)
 
 def jaw_open_for(env: ManagerBasedRlEnv) -> float | torch.Tensor:
   """J's threshold for ``env``'s object: `JAW_OPEN` for a cube (a float, as every run before S8),
-  `BALL_JAW_OPEN` for a ball, per env for plan S8's MIX."""
+  `BALL_JAW_OPEN` for a ball, per env for plan S8's MIX; plan §12's pin (two boxes, a "cube" to
+  `shapes.shape_kind`) its own `rewards.PIN_JAW_OPEN`, whenever the scene has the socket block."""
+  from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK
+  from pal_mjlab.tasks.manipulation.pick_place.rewards import PIN_JAW_OPEN
+
+  if BLOCK in env.scene.entities:
+    return PIN_JAW_OPEN
   return resolve(env, JAW_OPEN_BY_SHAPE)
 
 
@@ -1775,7 +1781,8 @@ class BoxTally:
       box_e = env.scene[b.BOX]
       q = box_e.data.root_link_quat_w
       yaw = torch.atan2(
-        2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+        2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+        1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2),
       )
       now = torch.cat(
         [
@@ -1882,6 +1889,222 @@ class BoxTally:
       {
         f"{lo}-{hi}cm": [r for r in rows if lo <= r["box_carry_cm"] < hi]
         for lo, hi in BOX_CARRY_BINS_CM
+      }
+    )
+    return out
+
+
+#: Plan §12.1's insert bins (*Reads*): the block's position (near the torso x < 0.45, far x > 0.55, across the
+#: centre line y < 0, the rest), its yaw folded to +/- 45 deg, the pin's yaw likewise, and the carry, pin spawn to
+#: block centre (>= `insert.PIN_MIN_SEPARATION`), cm.
+INSERT_POSITION_BINS = {
+  "near_torso": lambda x, y: x < 0.45,
+  "far": lambda x, y: x > 0.55,
+  "across_centre": lambda x, y: y < 0.0,
+  "middle": lambda x, y: 0.45 <= x <= 0.55 and y >= 0.0,
+}
+INSERT_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+INSERT_CARRY_BINS_CM = ((0, 20), (20, 30), (30, 99))
+#: A jam (plan §12 *Reward*, read only): held, the pin on the block, not seated and slower than `JAM_SPEED`
+#: (m/s) for `JAM_S` seconds in a row.
+JAM_SPEED = 0.01
+JAM_S = 1.0
+
+
+class InsertTally:
+  """Plan §12's reads, per episode, beside `Tally` (plan §12 *Reads and bars*): ``seated`` at the end -- after the
+  hand-off's return with ``--handoff`` (the headline) -- and §12's success (J-released after the lift, handed off,
+  seated at the end); seated at the J-release; the pin bottom's offset from the hole's axis at its first contact
+  with the block while held (the chamfer's catch), and its depth and tilt at the J-release; jams; the peak
+  pin-block contact force while held; the block's displacement; the time to the first seated step; and §12.1's bins.
+  ``None`` from `from_env` when the scene has no socket block."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> InsertTally | None:
+    from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK
+
+    if BLOCK not in env.scene.entities:
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation.pick_place import insert
+
+    self.ins = insert
+    ins_cfg = env.cfg.rewards.get("ladder") or env.cfg.rewards["depth"]
+    self.geo = {
+      "block_height": ins_cfg.params["block_height"],
+      "hole_d": ins_cfg.params["hole_d"],
+    }
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda v=0.0: torch.full((n,), v, device=dev)  # noqa: E731
+    self.seated, self.seated_at_release, self.rel_seen = zb(), zb(), zb()
+    self.rel_depth, self.rel_tilt = zf(float("nan")), zf(float("nan"))
+    self.touched, self.touch_offset = zb(), zf(float("nan"))
+    self.jam_run, self.jammed = zf(), zb()
+    self.peak_force = zf()
+    self.first_seated = zf(-1.0)
+    self.displacement = zf()
+    self.hand_block = zb()
+    #: Each episode's block (x, y, env frame; |yaw| folded, rad), pin spawn (x, y) and |pin yaw| folded.
+    self.start = torch.zeros(n, 6, device=dev)
+    self.step_dt = env.step_dt
+    self.done: list[dict] = []
+
+  def step(
+    self, env: ManagerBasedRlEnv, grasped: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` is
+    `RetreatTally.released` (the jaw opened after the lift)."""
+    from pal_mjlab.tasks.manipulation import mdp
+
+    b = self.ins
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      origin = env.scene.env_origins[:, :2]
+      blk, pin = env.scene[b.BLOCK], env.scene[OBJECT]
+
+      def yaw_of(q):
+        return torch.atan2(
+          2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+          1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2),
+        )
+
+      now = torch.cat(
+        [
+          blk.data.root_link_pos_w[:, :2] - origin,
+          yaw_mod90(yaw_of(blk.data.root_link_quat_w)).unsqueeze(-1),
+          pin.data.root_link_pos_w[:, :2] - origin,
+          yaw_mod90(yaw_of(pin.data.root_link_quat_w)).unsqueeze(-1),
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
+    st = mdp.insert_state(env, OBJECT, b.BLOCK, **self.geo)
+    self.seated = st.seated()
+    age = env.episode_length_buf.float() * self.step_dt
+    self.first_seated = torch.where(
+      self.seated & (self.first_seated < 0), age, self.first_seated
+    )
+    rel_now = j_released & ~self.rel_seen
+    self.seated_at_release |= rel_now & self.seated
+    self.rel_depth = torch.where(rel_now, st.depth, self.rel_depth)
+    self.rel_tilt = torch.where(rel_now, st.tilt, self.rel_tilt)
+    self.rel_seen |= j_released
+    sensor = env.scene[b.BLOCK_PIN_SENSOR].data
+    touch = sensor.found.bool().any(dim=-1)
+    first = touch & grasped & ~self.touched
+    self.touch_offset = torch.where(first, st.offset, self.touch_offset)
+    self.touched |= touch & grasped
+    if sensor.force is not None:
+      f = torch.norm(sensor.force.reshape(env.num_envs, -1, 3), dim=-1).amax(-1)
+      self.peak_force = torch.maximum(self.peak_force, f * grasped.float())
+    slow = torch.norm(env.scene[OBJECT].data.root_link_lin_vel_w, dim=-1) < JAM_SPEED
+    stuck = grasped & touch & ~self.seated & slow
+    self.jam_run = torch.where(
+      stuck, self.jam_run + self.step_dt, torch.zeros_like(self.jam_run)
+    )
+    self.jammed |= self.jam_run >= JAM_S
+    self.hand_block |= env.scene[b.BLOCK_HAND_SENSOR].data.found.bool().any(dim=-1)
+    self.displacement = env.command_manager.get_term(COMMAND).box_displacement()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      bx_, by_, byaw, px_, py_, pyaw = self.start[i].tolist()
+      self.done.append(
+        {
+          "seated_end": bool(self.seated[i]),
+          "insert_success": bool(self.seated[i] & handed[i] & j_released[i]),
+          "seated_at_release": bool(self.seated_at_release[i]),
+          "j_released": bool(j_released[i]),
+          "release_depth_mm": 1e3 * float(self.rel_depth[i]),
+          "release_tilt_deg": math.degrees(float(self.rel_tilt[i])),
+          "touched_block_held": bool(self.touched[i]),
+          "first_touch_offset_mm": 1e3 * float(self.touch_offset[i]),
+          "jammed": bool(self.jammed[i]),
+          "peak_pin_block_force_N": float(self.peak_force[i]),
+          "time_to_seat_s": float(self.first_seated[i]),
+          "hand_on_block": bool(self.hand_block[i]),
+          "block_moved_mm": 1e3 * float(self.displacement[i]),
+          "block_x": bx_,
+          "block_y": by_,
+          "block_yaw_deg": math.degrees(byaw),
+          "pin_yaw_deg": math.degrees(pyaw),
+          "carry_cm": 100 * math.hypot(bx_ - px_, by_ - py_),
+        }
+      )
+      self.seated_at_release[i] = False
+      self.rel_seen[i] = False
+      self.rel_depth[i] = float("nan")
+      self.rel_tilt[i] = float("nan")
+      self.touched[i] = False
+      self.touch_offset[i] = float("nan")
+      self.jam_run[i] = 0.0
+      self.jammed[i] = False
+      self.peak_force[i] = 0.0
+      self.first_seated[i] = -1.0
+      self.hand_block[i] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k: sum(bool(r[k]) for r in rows) / n  # noqa: E731
+
+    def med(k, sel=None):
+      v = [r[k] for r in rows if (sel is None or sel(r)) and not math.isnan(r[k])]
+      return float(np.median(v)) if v else float("nan")
+
+    out = {
+      "insert_success": share("insert_success"),
+      "insert_seated_end": share("seated_end"),
+      "insert_seated_at_release": share("seated_at_release"),
+      "insert_j_released": share("j_released"),
+      "insert_jammed": share("jammed"),
+      "insert_hand_on_block": share("hand_on_block"),
+      "insert_block_moved_mm_median": med("block_moved_mm"),
+      "insert_first_touch_offset_mm_median": med("first_touch_offset_mm"),
+      "insert_release_depth_mm_median": med("release_depth_mm"),
+      "insert_release_tilt_deg_median": med("release_tilt_deg"),
+      "insert_peak_force_N_median": med(
+        "peak_pin_block_force_N", lambda r: r["touched_block_held"]
+      ),
+      "insert_time_to_seat_s_median": med(
+        "time_to_seat_s", lambda r: r["time_to_seat_s"] >= 0
+      ),
+    }
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {
+          "n": len(g),
+          "insert_success": sum(r["insert_success"] for r in g) / len(g) if g else None,
+        }
+        for name, g in groups.items()
+      }
+
+    out["insert_by_position"] = bins(
+      {
+        name: [r for r in rows if test(r["block_x"], r["block_y"])]
+        for name, test in INSERT_POSITION_BINS.items()
+      }
+    )
+    for key, field in (
+      ("insert_by_block_yaw", "block_yaw_deg"),
+      ("insert_by_pin_yaw", "pin_yaw_deg"),
+    ):
+      out[key] = bins(
+        {
+          f"{lo}-{hi}deg": [r for r in rows if lo <= abs(r[field]) < hi]
+          for lo, hi in INSERT_YAW_BINS_DEG
+        }
+      )
+    out["insert_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["carry_cm"] < hi]
+        for lo, hi in INSERT_CARRY_BINS_CM
       }
     )
     return out
@@ -2515,6 +2738,7 @@ def main() -> None:
   occ = OccTally(args.num_envs, args.device)
   stack = StackTally(env)
   box = BoxTally.from_env(env)
+  insert = InsertTally.from_env(env)
   arm = ArmTally.from_env(env)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
@@ -2554,6 +2778,8 @@ def main() -> None:
       )
       if box is not None:
         box.step(env, flags["grasped"], retreat.released)
+      if insert is not None:
+        insert.step(env, flags["grasped"], retreat.released)
       if plant is not None:
         plant.measure_env(
           carrying=flags["lifted"],
@@ -2618,6 +2844,8 @@ def main() -> None:
         n_before = len(tally.done)
         if box is not None:  # before `retreat.finish` clears its per-episode state
           box.finish(finished, retreat.handed, retreat.released)
+        if insert is not None:
+          insert.finish(finished, retreat.handed, retreat.released)
         tally.finish(finished)
         retreat.finish(
           finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
@@ -2650,6 +2878,9 @@ def main() -> None:
   if box is not None:
     result.update(box.summarise(args.episodes))
     print("\nplan S10 (box): " + json.dumps(box.summarise(args.episodes)))
+  if insert is not None:
+    result.update(insert.summarise(args.episodes))
+    print("\nplan §12 (insert): " + json.dumps(insert.summarise(args.episodes)))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
@@ -2677,14 +2908,16 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o, **st, **a, **b}
-            for r, q, o, st, a, b in zip(
+            {**r, **q, **o, **st, **a, **b, **ins}
+            for r, q, o, st, a, b, ins in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
               stack.done[: args.episodes] or [{}] * args.episodes,
               arm.done[: args.episodes],
               (box.done[: args.episodes] if box is not None else None)
+              or [{}] * args.episodes,
+              (insert.done[: args.episodes] if insert is not None else None)
               or [{}] * args.episodes,
               strict=True,
             )

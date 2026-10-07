@@ -103,6 +103,7 @@ def reset_objects_on_surface(
   max_attempts: int = 10,
   goal_area: dict | None = None,
   frame: str = "surface",
+  keepout: tuple[float, float, float, float] | None = None,
 ) -> None:
   """Place free objects upright on a surface, clear of one another.
 
@@ -127,6 +128,11 @@ def reset_objects_on_surface(
   about the env origin -- the robot frame, ``base_link`` at the origin -- instead of the surface's
   centre: the object lands at the same place relative to the robot wherever DR-scene has put the
   table. Its height is still the surface's top.
+
+  ``keepout`` (plan §12) is a box (x lo, x hi, y lo, y hi) about the env origin -- the robot frame -- the
+  objects' centres must stay out of, whatever DR-scene's table shift: under the start pose's fingers, which
+  hang below a standing pin's top. Redrawn by the same rejection (with the goal area's test, if any); a
+  straggler after 64 rounds stays where it is.
   """
   if not asset_cfgs:
     return
@@ -179,6 +185,18 @@ def reset_objects_on_surface(
       xy = _clear_of_goal_area(
         xy, centre_xy, goal_area, lower, upper, n, device, max_attempts
       )
+    if keepout is not None:
+      origin = env.scene.env_origins[env_ids, :2]
+      for _ in range(64):
+        bad = in_keepout(xy - origin, keepout)
+        if goal_area is not None:
+          bad |= _goal_area_reach(xy, centre_xy, goal_area, device) < float(
+            goal_area["distance"]
+          )
+        if not bool(bad.any()):
+          break
+        redraw = sample_uniform(lower, upper, (n, 2), device=device) + centre_xy
+        xy = torch.where(bad.unsqueeze(-1), redraw, xy)
     placed.append(xy)
 
     half_z = object_half_height(env, asset_cfg.name, env_ids)
@@ -192,6 +210,23 @@ def reset_objects_on_surface(
     asset.write_root_link_velocity_to_sim(
       torch.zeros(n, 6, device=device), env_ids=env_ids
     )
+
+
+def in_keepout(
+  xy: torch.Tensor, keepout: tuple[float, float, float, float]
+) -> torch.Tensor:
+  """Whether each point (n, 2) is inside the box (x lo, x hi, y lo, y hi), same frame. (n,)"""
+  x0, x1, y0, y1 = keepout
+  return (xy[:, 0] > x0) & (xy[:, 0] < x1) & (xy[:, 1] > y0) & (xy[:, 1] < y1)
+
+
+def _goal_area_reach(
+  xy: torch.Tensor, centre_xy: torch.Tensor, goal_area: dict, device
+) -> torch.Tensor:
+  """Distance from each point (n, 2, world) to the goal area's farthest corner. (n,)"""
+  (x0, x1), (y0, y1) = goal_area["x"], goal_area["y"]
+  corners = torch.tensor([[x0, y0], [x0, y1], [x1, y0], [x1, y1]], device=device)
+  return torch.norm((xy - centre_xy).unsqueeze(1) - corners, dim=-1).amax(dim=-1)
 
 
 def _clear_of_goal_area(

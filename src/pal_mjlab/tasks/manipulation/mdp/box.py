@@ -38,7 +38,11 @@ from mjlab.utils.lab_api.math import (
   sample_uniform,
 )
 
-from pal_mjlab.tasks.manipulation.mdp.events import _surface_centre_xy, surface_top_z
+from pal_mjlab.tasks.manipulation.mdp.events import (
+  _surface_centre_xy,
+  in_keepout,
+  surface_top_z,
+)
 from pal_mjlab.tasks.manipulation.mdp.observations import (
   _base_pose,
   _grasped_bool,
@@ -219,6 +223,7 @@ def reset_box_in_area(
   area_y: tuple[float, float],
   yaw: float,
   min_distance: float,
+  keepout: tuple[float, float, float, float] | None = None,
 ) -> None:
   """Plan S10.1: put the box down on the surface, its centre drawn uniformly from the area
   (``area_x`` x ``area_y``, relative to the surface centre -- table-relative, so DR-scene's table
@@ -230,7 +235,9 @@ def reset_box_in_area(
   `SurfaceOffsetCommand._draw_clear_of_object`: each round redraws only the envs still too close;
   after `BOX_AREA_REDRAWS` rounds the stragglers take the area's corner farthest from the object,
   which is at least ``min_distance`` away when the object was drawn where one is
-  (`events.reset_objects_on_surface`'s ``goal_area``)."""
+  (`events.reset_objects_on_surface`'s ``goal_area``). Plan §12's ``keepout`` (x lo, x hi, y lo, y hi about the env
+  origin, `events.reset_objects_on_surface`'s) is redrawn the same way; a corner straggler is not checked
+  against it."""
   n = len(env_ids)
   device = env.device
   box: Entity = env.scene[asset_cfg.name]
@@ -241,8 +248,16 @@ def reset_box_in_area(
   lo = torch.tensor([area_x[0], area_y[0]], device=device)
   hi = torch.tensor([area_x[1], area_y[1]], device=device)
   offsets = sample_uniform(lo, hi, (n, 2), device=device)
+  origin = env.scene.env_origins[env_ids, :2]
+
+  def rejected(off: torch.Tensor) -> torch.Tensor:
+    bad = torch.norm(centre + off - cube, dim=-1) < min_distance
+    if keepout is not None:
+      bad |= in_keepout(centre + off - origin, keepout)
+    return bad
+
   for _ in range(BOX_AREA_REDRAWS):
-    too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
+    too_close = rejected(offsets)
     if not bool(too_close.any()):
       break
     redraw = sample_uniform(lo, hi, (n, 2), device=device)
@@ -250,10 +265,17 @@ def reset_box_in_area(
   too_close = torch.norm(centre + offsets - cube, dim=-1) < min_distance
   if bool(too_close.any()):
     corners = torch.tensor(
-      [[area_x[0], area_y[0]], [area_x[0], area_y[1]], [area_x[1], area_y[0]], [area_x[1], area_y[1]]],
+      [
+        [area_x[0], area_y[0]],
+        [area_x[0], area_y[1]],
+        [area_x[1], area_y[0]],
+        [area_x[1], area_y[1]],
+      ],
       device=device,
     )
-    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(-1)
+    far = torch.norm(centre.unsqueeze(1) + corners - cube.unsqueeze(1), dim=-1).argmax(
+      -1
+    )
     offsets = torch.where(too_close.unsqueeze(-1), corners[far], offsets)
   zeros = torch.zeros(n, device=device)
   quat = quat_from_euler_xyz(
