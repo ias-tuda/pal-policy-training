@@ -48,9 +48,16 @@ def holder_spec(
   return spec
 
 
-def held_block_weld(holder_body: str, block_body: str, solref: tuple[float, float]):
+def held_block_weld(
+  holder_body: str,
+  block_body: str,
+  solref: tuple[float, float],
+  torquescale: float = 1.0,
+):
   """A scene ``spec_fn``: weld ``block_body`` to ``holder_body`` at the identity relative pose with ``solref`` (the
-  hold's softness), and exclude their contacts (the holder's fingers sit on the block's faces)."""
+  hold's softness) and ``torquescale`` (MuJoCo's weight of the weld's angular residual against its linear one: the
+  block's tiny rotational inertia otherwise makes a weld soft enough to give a few mm turn it tens of degrees), and
+  exclude their contacts (the holder's fingers sit on the block's faces)."""
 
   def edit(spec: mujoco.MjSpec) -> None:
     spec.add_equality(
