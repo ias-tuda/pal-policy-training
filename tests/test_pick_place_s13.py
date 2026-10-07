@@ -48,7 +48,17 @@ BS12_LH = {
   "ARM_TABLE": "AH10",
   "TABLE_DZ": "22",
 }
-_ALL = {*BS12_LH, "S13", "GOAL", "TARGET", "CRITIC_OBS", "BOX_OBS", "SHAPE", "TRACKER", "ARMS"}
+_ALL = {
+  *BS12_LH,
+  "S13",
+  "GOAL",
+  "TARGET",
+  "CRITIC_OBS",
+  "BOX_OBS",
+  "SHAPE",
+  "TRACKER",
+  "ARMS",
+}
 
 
 def _cfg(monkeypatch, num_envs: int = 4, **changes):
@@ -66,9 +76,7 @@ def _cfg(monkeypatch, num_envs: int = 4, **changes):
 def test_unset_is_the_wc_cfg(monkeypatch):
   cfg = _cfg(monkeypatch)
   assert "held" not in cfg.rewards and "placed" in cfg.rewards
-  assert cfg.actions["joint_pos"].scale == pytest.approx(
-    cfg.actions["joint_pos"].scale
-  )
+  assert cfg.actions["joint_pos"].scale == pytest.approx(cfg.actions["joint_pos"].scale)
   assert "push_block" not in cfg.events
 
 
@@ -85,9 +93,13 @@ def test_lh_changes_the_arm_object_spawn_goal_and_reward(monkeypatch):
   assert lh.scene.entities["robot"] == base.scene.entities["robot"]
   # The goal is H, 10 cm over the table, robot frame.
   cmd = lh.commands[COMMAND]
-  assert cmd.frame == "env" and tuple(cmd.offset) == H.HOLD_XY and cmd.height == H.HOLD_DZ
+  assert (
+    cmd.frame == "env" and tuple(cmd.offset) == H.HOLD_XY and cmd.height == H.HOLD_DZ
+  )
   # The reward: the hold's terms, no release.
-  assert {"reach", "grasp", "lift", "goal", "goal_near", "level", "held"} <= set(lh.rewards)
+  assert {"reach", "grasp", "lift", "goal", "goal_near", "level", "held"} <= set(
+    lh.rewards
+  )
   assert not {"release", "placed", "retreat", "pad_contact"} & set(lh.rewards)
   for name in ("action_rate_l2", "joint_pos_limits", "table_contact", "arm_effort"):
     assert lh.rewards[name] == base.rewards[name], name
@@ -98,7 +110,13 @@ def test_lh_changes_the_arm_object_spawn_goal_and_reward(monkeypatch):
 
 @pytest.mark.parametrize(
   "changes",
-  [{"SPAWN": "W2"}, {"TARGET": "WC"}, {"GOAL": "stack"}, {"CRITIC_OBS": "q"}, {"S13": "nope"}],
+  [
+    {"SPAWN": "W2"},
+    {"TARGET": "WC"},
+    {"GOAL": "stack"},
+    {"CRITIC_OBS": "q"},
+    {"S13": "nope"},
+  ],
 )
 def test_lh_refuses_selectors_it_is_not_built_for(monkeypatch, changes):
   with pytest.raises(ValueError):
@@ -134,16 +152,32 @@ def test_block_rests_on_the_table_in_the_cut_area_and_h_is_over_it(lh_env):
   block = env.scene[OBJECT]
   pos = block.data.root_link_pos_w - env.scene.env_origins
   # The centre-origin block: its centre half its height over the table, upright.
-  assert torch.allclose(pos[:, 2] + env.scene.env_origins[:, 2], top + scene.BLOCK_HEIGHT / 2, atol=2e-3)
+  assert torch.allclose(
+    pos[:, 2] + env.scene.env_origins[:, 2], top + scene.BLOCK_HEIGHT / 2, atol=2e-3
+  )
   assert float(mdp.axis_tilt(env, OBJECT).max()) < math.radians(1.0)
   # The spawn cut (table-relative; DR-scene shifts the table +/- 2 cm).
-  assert bool(((pos[:, 0] > H.HOLD_SPAWN_X[0] - 0.03) & (pos[:, 0] < H.HOLD_SPAWN_X[1] + 0.03)).all())
-  assert bool(((pos[:, 1] > H.HOLD_SPAWN_Y[0] - 0.03) & (pos[:, 1] < H.HOLD_SPAWN_Y[1] + 0.03)).all())
+  assert bool(
+    (
+      (pos[:, 0] > H.HOLD_SPAWN_X[0] - 0.03) & (pos[:, 0] < H.HOLD_SPAWN_X[1] + 0.03)
+    ).all()
+  )
+  assert bool(
+    (
+      (pos[:, 1] > H.HOLD_SPAWN_Y[0] - 0.03) & (pos[:, 1] < H.HOLD_SPAWN_Y[1] + 0.03)
+    ).all()
+  )
   # H: (0.45, 0.00) in the robot frame, the block's centre 10 cm + half its height over the table.
   goal = env.command_manager.get_term(COMMAND).command - env.scene.env_origins
-  assert torch.allclose(goal[:, :2], torch.tensor(H.HOLD_XY, device=env.device).expand(env.num_envs, 2), atol=1e-6)
   assert torch.allclose(
-    goal[:, 2] + env.scene.env_origins[:, 2], top + H.HOLD_DZ + scene.BLOCK_HEIGHT / 2, atol=1e-5
+    goal[:, :2],
+    torch.tensor(H.HOLD_XY, device=env.device).expand(env.num_envs, 2),
+    atol=1e-6,
+  )
+  assert torch.allclose(
+    goal[:, 2] + env.scene.env_origins[:, 2],
+    top + H.HOLD_DZ + scene.BLOCK_HEIGHT / 2,
+    atol=1e-5,
   )
 
 
@@ -157,14 +191,18 @@ def test_actor_is_40d_with_the_blocks_yaw4_and_up_axis(lh_env):
   dims = dict(zip(names, (d[0] for d in mgr.group_obs_term_dim["actor"]), strict=True))
   i = sum(dims[n] for n in names[: names.index("object_yaw")])
   yaw4 = obs[:, i : i + 2]
-  assert torch.allclose(yaw4.norm(dim=-1), torch.ones(env.num_envs, device=env.device), atol=1e-4)
+  assert torch.allclose(
+    yaw4.norm(dim=-1), torch.ones(env.num_envs, device=env.device), atol=1e-4
+  )
   up = obs[:, -2:]
   assert float(up.abs().max()) < 0.02  # standing level
 
 
 def test_side_grade_is_one_for_a_level_hand_and_less_at_the_start_pose(lh_env):
   env = lh_env
-  side = SceneEntityCfg("robot", site_names=(KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site,))
+  side = SceneEntityCfg(
+    "robot", site_names=(KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site,)
+  )
   side.resolve(env.scene)
   elev = mdp.approach_elevation(env, side)
   # The start pose points the hand forward and ~20 deg down (step 0, `results/S13-insert/step0/`).

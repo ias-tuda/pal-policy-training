@@ -533,6 +533,12 @@ BALL_JAW_OPEN_BY_RADIUS = BySize(
 )
 #: ... and at the nominal radius (BALL, BALL-EQ, the eval's prints and tests).
 BALL_JAW_OPEN = 0.225
+#: J's threshold for plan §12's cross pin, rad: its touch angle minus 0.05 (the cube's and the ball's rule). The
+#: gripper bench (`scripts/gripper_bench.py --stimulus touch --shape pin --pose topdown`, G20, plan §12 step 0 item 2,
+#: `../results/S12-insert/step0/bench/`) first touches the pin at 0.546-0.563 rad with its plate ends to the pads
+#: (32 mm, pad midpoint 0-35 mm over its centre; held at 0.554-0.572, ~31 N per pad) and at 0.587 turned 45 deg
+#: (28.3 mm across the sharp sim plates; held at 0.601). 0.50 is below every touch.
+PIN_JAW_OPEN = 0.50
 M8_CLEAR_HEIGHT = 0.05  # m (plan S7-4 revision 2: was 8 cm)
 M8_RETREAT_WEIGHT = 2.0
 M8_CONTACT_WEIGHT = -1.0

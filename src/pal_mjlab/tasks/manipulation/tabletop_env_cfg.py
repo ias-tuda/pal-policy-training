@@ -470,6 +470,7 @@ def make_tabletop_env_cfg(
   command_obs: bool = False,
   goal_area: dict | None = None,
   object_geoms: tuple[str, ...] | None = None,
+  object_friction: tuple[float, float] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -530,6 +531,9 @@ def make_tabletop_env_cfg(
       raw last action. Still 8-D.
     object_geoms: the manipulated object's geom names, for the DR of its friction (`DR-object`);
       None is the one geom ``{OBJECT}_geom`` a cube and a ball have. Plan S8's MIX has two.
+    object_friction: `DR-object`'s range for the object's sliding friction (abs, uniform); None is
+      `_DR_OBJECT_FRICTION`, every object before plan §12. The pin's sets its pair with the socket
+      block (the element-wise max, L10), so it keeps its own value (`pick_place_env_cfg`'s ``pin``).
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
@@ -949,6 +953,7 @@ def make_tabletop_env_cfg(
       action_joints,
       spawn_widening=dr_spawn_widening,
       object_geoms=object_geoms,
+      object_friction=object_friction,
     )
   if latency.tracker_lag is not None:
     _apply_tracker_lag(cfg, latency.tracker_lag)
@@ -1146,6 +1151,7 @@ def apply_dr_level(
   object_name: str = OBJECT,
   spawn_widening: bool = True,
   object_geoms: tuple[str, ...] | None = None,
+  object_friction: tuple[float, float] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Set the environment's domain randomisation to a named rung, in place.
 
@@ -1173,7 +1179,7 @@ def apply_dr_level(
         "operation": "abs",
         "distribution": "uniform",
         "axes": [0],  # sliding only; torsional friction is the pads' business.
-        "ranges": _DR_OBJECT_FRICTION,
+        "ranges": _DR_OBJECT_FRICTION if object_friction is None else object_friction,
       },
     )
     cfg.events["object_mass"] = EventTermCfg(

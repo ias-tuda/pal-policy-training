@@ -276,7 +276,15 @@ def apply_hold(
     raise ValueError("L-H is built on RCTP (R-C-strict+M1+M2+M3+...)")
   if "release_grade" in cfg.observations["critic"].terms:
     raise ValueError("L-H has no release: CRITIC_OBS=q (PQ) does not apply; unset it")
-  cfg.scene.entities = {**cfg.scene.entities, OBJECT: held_block_cfg(OBJECT)}
+  # The insert tasks' table (decision of plan §12, `scene.INSERT_TABLE_CONTYPE`): only the block's outer ring
+  # stands on it, its inner boxes do not touch it.
+  table = cfg.scene.entities[TABLE]
+  top_z = table.init_state.pos[2] + scene.TABLE_THICKNESS / 2
+  cfg.scene.entities = {
+    **cfg.scene.entities,
+    TABLE: scene.get_table_cfg(top_z, contype=scene.INSERT_TABLE_CONTYPE),
+    OBJECT: held_block_cfg(OBJECT),
+  }
   cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
   reset = cfg.events["reset_objects"]
   reset.params["pose_range"] = {

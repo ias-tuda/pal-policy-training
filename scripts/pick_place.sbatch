@@ -328,6 +328,25 @@ if grep -qE '^[[:space:]]+warp_util[.]check_toolkit_driver[(][)]' \
 else
   echo "patch       mujoco_warp_io.patch applied, or upstream moved -- check"
 fi
+# Decision 0005 (plan §12): mujoco_warp 3.11's box_box takes an edge-edge axis for a box resting on a box by
+# float32 rounding and returns a contact up to 0.5 m deep (it popped 2 of 8 pins at the first reset). Every insert
+# GOAL refuses to train without mujoco_warp_boxbox.patch (scripts/apply_mujoco_warp_boxbox_patch.sh .venv).
+if grep -q BOX_BOX_EDGE_TOL .venv/lib/python*/site-packages/mujoco_warp/_src/collision_primitive_core.py 2>/dev/null; then
+  echo "patch       mujoco_warp_boxbox.patch applied (decision 0005)"
+else
+  echo "patch       mujoco_warp_boxbox.patch NOT applied"
+  case "$GOAL" in
+    insert*)
+      echo "Refusing to run: GOAL=$GOAL needs mujoco_warp_boxbox.patch (decision 0005)." >&2
+      exit 1
+      ;;
+  esac
+  # Plan §13.1's codes carry the socket block (on the table, in the hand, welded at H) and the pin.
+  if [ -n "${S13:-}" ]; then
+    echo "Refusing to run: S13=$S13 needs mujoco_warp_boxbox.patch (decision 0005)." >&2
+    exit 1
+  fi
+fi
 echo "=================="
 
 # shellcheck disable=SC2086  # EXTRA_ARGS is meant to word-split.

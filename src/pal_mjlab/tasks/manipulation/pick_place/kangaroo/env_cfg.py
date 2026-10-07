@@ -75,6 +75,9 @@ baseline's height. The real robot cell's table stands about 22 mm above baseline
 2026-10-06, on the robot), so `TABLE_DZ=22` trains on 0.837 m. Everything else that touches the table
 reads its live surface (spawns, the target, the box, the rewards, DR-scene's +/-1 cm on top), so the
 height is this one number. Unset or 0 is the baseline's table exactly; |TABLE_DZ| above 50 mm raises.
+Plan §12 (`pick-place-insert-plan.md`) adds the insert codes to `GOAL` (`insert` | `insert-t` | `insert-na` |
+`insert-lad`, `insert.INSERT_GOALS`) and the pin to `SHAPE` (`pin`): push the cross pin through a socket block
+drawn from `TARGET=WC`, on RCTP; the two only go together.
 Plan S11 (two arms) adds `ARM_HOME` (`default` | `mirror`: the right arm's home, Claudius's or the
 left home's mirror image), `TARGET=T11` | `T11W` (the meeting point T in the robot frame: L-T's goal,
 or R-ST's / R-ST-W's base with `GOAL=stack`), `TRACKER` (`B` | `split`: the 6 + 4 mm bias split, the
@@ -123,6 +126,7 @@ from pal_mjlab.tasks.manipulation.pick_place.box import (
   BoxGoal,
 )
 from pal_mjlab.tasks.manipulation.pick_place.hold import HOLD_CODES, apply_hold
+from pal_mjlab.tasks.manipulation.pick_place.insert import INSERT_GOALS, InsertGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASE_OBS_NAMES,
   BASELINES,
@@ -351,7 +355,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   effort = EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)]
   slew, stack_speed = _select_slew()
   action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
-  goal, box = _select_goal()
+  goal, box, insert = _select_goal()
   target = _select(TARGET_ENV_VAR, DEFAULT_TARGET, (*TARGET_AREAS, *ROBOT_TARGETS))
   s13 = _select(S13_ENV_VAR, "none", S13_CODES)
   arm = SPAWN_ROBOTS[spawn]
@@ -361,6 +365,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       or target != DEFAULT_TARGET
       or goal != DEFAULT_GOAL
       or box is not None
+      or insert is not None
     ):
       raise ValueError(
         f"{S13_ENV_VAR}={s13} is built on SPAWN=WC with TARGET and GOAL unset (H is its goal); got "
@@ -405,6 +410,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     box=box,
     box_obs=_select_box_obs(),
     base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
+    insert=insert,
   )
   _apply_contact(cfg)
   if s13 in HOLD_CODES:
@@ -490,21 +496,23 @@ def _select_box_obs() -> str:
   return _select(BOX_OBS_ENV_VAR, DEFAULT_BOX_OBS, BOX_OBS_NAMES)
 
 
-def _select_goal() -> tuple[str, BoxGoal | None]:
-  """`GOAL`: plan S9's goal (`GOALS`: ``table`` | ``stack``) and plan S10's box (`box.BOX_GOALS`), one
-  variable for both. A box name is the table goal plus that box. ``BOX_FEET=0`` builds the box with the
-  flat floor every run of `0ba3f60` trained on (to re-read those runs on their own box); unset or 1 the
-  corner feet (S10 report §8)."""
-  name = _select(GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS))
+def _select_goal() -> tuple[str, BoxGoal | None, InsertGoal | None]:
+  """`GOAL`: plan S9's goal (`GOALS`: ``table`` | ``stack``), plan S10's box (`box.BOX_GOALS`) and plan §12's
+  insert (`insert.INSERT_GOALS`), one variable for all. A box or insert name is the table goal plus that box /
+  block. ``BOX_FEET=0`` builds the box with the flat floor every run of `0ba3f60` trained on (to re-read those
+  runs on their own box); unset or 1 the corner feet (S10 report §8)."""
+  name = _select(GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS, *INSERT_GOALS))
   feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
   if feet not in ("0", "1"):
     raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
   if name in GOALS:
-    return name, None
+    return name, None, None
+  if name in INSERT_GOALS:
+    return DEFAULT_GOAL, None, INSERT_GOALS[name]
   box = BOX_GOALS[name]
   if box is None or feet == "1":
-    return DEFAULT_GOAL, box
-  return DEFAULT_GOAL, dataclasses.replace(box, feet=False)
+    return DEFAULT_GOAL, box, None
+  return DEFAULT_GOAL, dataclasses.replace(box, feet=False), None
 
 
 def _critic_release() -> bool:
@@ -533,8 +541,11 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9); plan S10.1's box pose
   # from W2 box checkpoints without the box's yaw (actor and critic) and, from BX-RIM, without PQ.
   # JOINT trains from scratch (plan S11).
+  # Plan §12's insert from a box checkpoint (IN-FT): the actor +2 (the pin's tilt), the critic +3 (and the
+  # box's yaw, from a checkpoint without it).
   both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
-  box_pose = not both and _select_box_obs() == "pose"
+  insert = not both and _select_goal()[2] is not None
+  box_pose = not both and (_select_box_obs() == "pose" or insert)
   cfg.widen_critic_on_resume = False if both else (_critic_release() or box_pose)
   cfg.widen_actor_on_resume = box_pose
   cfg.rescale_actions_on_load = _ckpt_action_ratio()
