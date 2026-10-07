@@ -590,12 +590,14 @@ def weld_probe(args) -> dict:
 
   out = []
   for pair in args.solrefs:
-    a, b = (float(v) for v in pair.split(","))
+    vals = [float(v) for v in pair.split(",")]
+    a, b = vals[0], vals[1]
+    ts = vals[2] if len(vals) > 2 else 1.0
     cfg = load_env_cfg(args.task, play=False)
     cfg.scene.num_envs = args.num_envs
     cfg.seed = args.seed
     cfg.scene.spec_fn = mdp.chain_spec_fns(
-      None, mdp.held_block_weld(f"{IH.HOLDER}/{IH.HOLDER}", "block/block", (a, b))
+      None, mdp.held_block_weld(f"{IH.HOLDER}/{IH.HOLDER}", "block/block", (a, b), ts)
     )
     env = ManagerBasedRlEnv(cfg=cfg, device=args.device)
     env.reset()
@@ -628,6 +630,7 @@ def weld_probe(args) -> dict:
     hold_z = env.scene[IH.HOLDER].data.root_link_pos_w[:, 2] - top
     row = {
       "solref": [a, b],
+      "torquescale": ts,
       "rest_offset_mm": 1e3 * float(d0.median()),
       "push_peak_mm": 1e3 * float(peak_d.median()),
       "push_peak_max_mm": 1e3 * float(peak_d.max()),

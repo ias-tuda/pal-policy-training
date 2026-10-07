@@ -58,7 +58,7 @@ def held_block_weld(holder_body: str, block_body: str, solref: tuple[float, floa
       objtype=mujoco.mjtObj.mjOBJ_BODY,
       name1=holder_body,
       name2=block_body,
-      data=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+      data=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, float(torquescale)],
       solref=list(solref),
       name=f"{block_body.split('/')[0]}_hold",
     )
