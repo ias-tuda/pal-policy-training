@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import sys
 
 import pytest
@@ -86,6 +87,11 @@ def _cfg(monkeypatch, num_envs: int = 2, **changes):
   return cfg
 
 
+def _r(cfg) -> str:
+  """A cfg's repr without object addresses (each build makes new spec lambdas)."""
+  return re.sub(r" at 0x[0-9a-f]+", "", repr(cfg))
+
+
 def _env(cfg) -> ManagerBasedRlEnv:
   env = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
   env.reset()
@@ -120,7 +126,7 @@ def test_unset_s114_selectors_leave_the_s112_cfgs(monkeypatch, bank):
   # BI-H: the hold mix spelled as today's default is the same cfg as no HOLD_MIX at all.
   plain = _cfg(monkeypatch, START="hold", HOLD_BANK=bank)
   same = _cfg(monkeypatch, START="hold", HOLD_BANK=bank, HOLD_MIX="30/20/50")
-  assert repr(plain) == repr(same)
+  assert _r(plain) == _r(same)
   p = plain.events["start_hold"].params
   assert (p["hold_share"], p["placed_share"]) == (bi.HOLD_SHARE, bi.PLACED_SHARE)
   assert bi.ARM_ARM_TERM not in plain.terminations
@@ -129,7 +135,7 @@ def test_unset_s114_selectors_leave_the_s112_cfgs(monkeypatch, bank):
   assert "left_home" not in cfg.observations["critic"].terms
   assert "left_home" not in cfg.observations["actor"].terms["right_target"].params
   assert "gate_left_home" not in cfg.rewards["right_goal"].params
-  assert repr(cfg) == repr(_cfg(monkeypatch, RIGHT_GATE="latch", **SEQ))
+  assert _r(cfg) == _r(_cfg(monkeypatch, RIGHT_GATE="latch", **SEQ))
   rl = kangaroo_pick_place_rl_cfg()
   assert rl.algorithm.kl_floor == 0.0 and rl.algorithm.kl_coef == bp.SEQ_KL_COEF
 
@@ -196,7 +202,9 @@ def test_the_kl_falls_to_its_floor_and_never_below(monkeypatch):
   for u in range(0, 5000, 7):
     ppo.updates_done = u
     ws.append(ppo.kl_weight())
-  assert min(ws) == pytest.approx(0.2) and all(a >= b for a, b in zip(ws, ws[1:]))
+  assert min(ws) == pytest.approx(0.2) and all(
+    a >= b for a, b in zip(ws, ws[1:], strict=False)
+  )
   _setenv(monkeypatch, KL_FLOOR="0.2", **SEQ)
   rl = kangaroo_pick_place_rl_cfg()
   assert rl.algorithm.kl_floor == 0.2 and rl.algorithm.class_name == bp.PPO_CLASS
