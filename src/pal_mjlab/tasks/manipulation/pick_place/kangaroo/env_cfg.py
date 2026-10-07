@@ -240,6 +240,9 @@ DEFAULT_CONTACT = "box"
 #: right's insertion into the block held at H by a stand-in hand (`pick_place/insert_held.py`, on ``GOAL=insert``,
 #: trained on the left arm and run mirrored). Unset is none.
 S13_CODES = ("none", *HOLD_CODES, *HELD_INSERT_CODES)
+#: ``ARMS=both S13=CHAIN``: plan §13.1's chain eval env, L-H on the left and R-I mirrored on the right
+#: (`pick_place/insert_chain.py`); its plant from `GAINS`, `EFFORT`, `DR`, `LAG`, `ARM_TABLE`, `TABLE_DZ`, `EPISODE_S`.
+S13_CHAIN = "CHAIN"
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
@@ -354,6 +357,8 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   bound is exactly the spawn box's arm.
   """
   if _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both":
+    if os.environ.get(S13_ENV_VAR) == S13_CHAIN:
+      return _apply_contact(_insert_chain_env_cfg(play))
     return _apply_contact(_bimanual_env_cfg(play))
   spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
@@ -446,6 +451,30 @@ def _apply_contact(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     f for f in cfg.sim.mujoco.disableflags if f not in keep_on
   )
   return cfg
+
+
+def _insert_chain_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
+  """Plan §13.1's chain env (`pick_place/insert_chain.py`), BS12's plant (the baseline B table raised by
+  `TABLE_DZ`)."""
+  from pal_mjlab.tasks.manipulation.pick_place.insert_chain import (
+    EPISODE_S as CHAIN_EPISODE_S,
+  )
+  from pal_mjlab.tasks.manipulation.pick_place.insert_chain import (
+    make_insert_chain_env_cfg,
+  )
+
+  return make_insert_chain_env_cfg(
+    gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
+    effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
+    latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
+    baseline=_baseline_with_table(BASELINES["B"]),
+    episode_length_s=_select_episode() or CHAIN_EPISODE_S,
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    play=play,
+  )
 
 
 def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:

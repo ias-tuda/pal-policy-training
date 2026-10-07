@@ -313,15 +313,16 @@ def kangaroo_grippers_both_arms(
   gains: str = DEFAULT_TABLETOP_GAINS,
   arm_effort_scale: float | None = None,
   right_home: str = "mirror",
+  base: ManipulationRobotCfg = KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
 ) -> ManipulationRobotCfg:
-  """`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE` on gain code ``gains``, with plan S7-4's T on both arms
-  (``arm_effort_scale``) and the right arm's home ``right_home`` (plan S11: ``mirror``)."""
+  """``base`` (`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE`, or plan §13's `both_arms_scales`) on gain code ``gains``, with
+  plan S7-4's T on both arms (``arm_effort_scale``) and the right arm's home ``right_home`` (plan S11: ``mirror``)."""
   if gains not in TABLETOP_GAINS:
     raise ValueError(
       f"unknown tabletop gain code {gains!r}; have {tuple(TABLETOP_GAINS)}"
     )
   return dataclasses.replace(
-    KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
+    base,
     entity_cfg_fn=_with_right_home(
       functools.partial(
         get_kangaroo_grippers_tabletop_robot_cfg,
@@ -331,6 +332,21 @@ def kangaroo_grippers_both_arms(
       ),
       right_home,
     ),
+  )
+
+
+def both_arms_scales(
+  left: ManipulationRobotCfg, right: ManipulationRobotCfg
+) -> ManipulationRobotCfg:
+  """`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE` with the left arm at ``left``'s action scales and the right at ``right``'s (both
+  one-arm cfgs of the left arm; the right's scales are the left's, a scale being a half-width about the mirrored home).
+  Plan §13's chain: the left runs L-H (`KANGAROO_GRIPPERS_LEFT_ARM_SIDE`), the right R-I mirrored (`..._WC`)."""
+  return dataclasses.replace(
+    KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
+    action_scale={
+      **left.action_scale,
+      **{k.replace("left", "right"): v for k, v in right.action_scale.items()},
+    },
   )
 
 

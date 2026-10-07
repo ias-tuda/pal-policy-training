@@ -214,6 +214,31 @@ def object_up_b(
   return up_b[:, :2]
 
 
+def object_point_biased_b(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  local: tuple[float, float, float],
+  bias_key: str,
+  asset_cfg: SceneEntityCfg = _ROBOT,
+  lag: tuple[int, int] | None = None,
+) -> torch.Tensor:
+  """`box.object_position_biased_b` of a point fixed in the object (``local``, its body frame) instead of its origin:
+  plan §13's chain shows the left the socket block's centre (L-H's object, trained with the origin there) while the
+  block's origin is its bottom face's (R-I's). (B, 3)"""
+  from pal_mjlab.tasks.manipulation.mdp.box import _corrupted, tracker_bias
+  from pal_mjlab.tasks.manipulation.mdp.observations import _to_base_frame
+
+  robot: Entity = env.scene[asset_cfg.name]
+  pos_w, quat_w = _object_pose_w(env, object_name, lag)
+  off = torch.tensor(local, device=env.device, dtype=torch.float32).expand(
+    pos_w.shape[0], 3
+  )
+  pos_b = _to_base_frame(robot, pos_w + quat_apply(quat_w, off))
+  if _corrupted(env):
+    pos_b = pos_b + tracker_bias(env, bias_key)
+  return pos_b
+
+
 def side_grade_obs(
   env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, std: float
 ) -> torch.Tensor:
