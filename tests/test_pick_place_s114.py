@@ -241,7 +241,7 @@ def test_hh_term_positive_control_two_arms_driven_together(monkeypatch):
   """Two arms driven into each other end the episode on ``arm_arm_force`` -- a termination, not a time-out --
   and the contact the sensor saw is over the threshold. Without HH_TERM the same drive does not end it."""
   for hh_term in ("30", None):
-    cfg = _cfg(monkeypatch, HH_TERM=hh_term)
+    cfg = _cfg(monkeypatch, num_envs=1, HH_TERM=hh_term)
     cfg.auto_reset = False  # keep the terminal state
     assert (bi.ARM_ARM_TERM in cfg.terminations) == (hh_term is not None)
     env = _env(cfg)
@@ -253,22 +253,20 @@ def test_hh_term_positive_control_two_arms_driven_together(monkeypatch):
         env.sim.forward()
         assert bool((mdp.arm_arm_clearance(env) > 0.03).all())
         act = _action_for(env, _mirrored_arm_targets(env, 1.0))
-        ended_at = torch.full((env.num_envs,), -1)
-        peak = torch.zeros(env.num_envs, device=env.device)
+        ended_at, peak = -1, 0.0
         for t in range(60):
           _, _, terminated, truncated, _ = env.step(act)
           f = torch.norm(env.scene[bi.ARM_ARM_SENSOR].data.force_history, dim=-1)
-          peak = torch.maximum(peak, f.flatten(1).amax(-1))
+          peak = max(peak, float(f.max()))
           assert not bool(truncated.any())
-          fresh = terminated.cpu() & (ended_at < 0)
-          ended_at[fresh] = t
-          if bool((ended_at >= 0).all()):
+          if bool(terminated.any()):
+            ended_at = t
             break
-      assert bool((peak > 30.0).all()), peak
+      assert peak > 30.0, peak
       if hh_term is None:
-        assert bool((ended_at < 0).all()), ended_at
+        assert ended_at < 0, ended_at
       else:
-        assert bool((ended_at >= 0).all()), ended_at
+        assert ended_at >= 0
         assert bool(env.termination_manager.get_term(bi.ARM_ARM_TERM).all())
         assert not bool(env.termination_manager.time_outs.any())
     finally:
@@ -276,9 +274,12 @@ def test_hh_term_positive_control_two_arms_driven_together(monkeypatch):
 
 
 def test_the_eval_drops_hh_term(monkeypatch):
-  from eval_bimanual import build_env
+  import eval_bimanual
+  from mjlab.tasks import registry
 
-  _setenv(monkeypatch, HH_TERM="30")
+  cfg = _cfg(monkeypatch, HH_TERM="30")
+  assert bi.ARM_ARM_TERM in cfg.terminations
+  monkeypatch.setattr(registry, "load_env_cfg", lambda task, play: cfg)
   args = argparse.Namespace(
     task="Mjlab-PickPlace-Pal-Kangaroo-Grippers",
     episode_s=25.0,
@@ -287,9 +288,10 @@ def test_the_eval_drops_hh_term(monkeypatch):
     obs_noise="on",
     device=get_test_device(),
   )
-  env = build_env(args)
+  env = eval_bimanual.build_env(args)
   try:
     assert bi.ARM_ARM_TERM not in env.cfg.terminations
+    assert bi.ARM_ARM_TERM not in env.termination_manager.active_terms
   finally:
     env.close()
 
