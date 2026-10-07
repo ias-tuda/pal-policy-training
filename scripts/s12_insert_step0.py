@@ -84,14 +84,34 @@ PAD_OFFSET = 0.0256
 
 
 class _ArmTable:
-  """A rollout hook: per env, the steps AH10's contact term fires (arm 1-6 on the table)."""
+  """A rollout hook: per env, the steps AH10's contact term fires (arm 1-6 on the table); the phase in which the
+  pin first tilts past 10 deg; the TCP's xy offset from the pin's axis at the top of its last ``close`` step."""
 
   def __init__(self, n: int):
     self.arm = np.zeros(n, int)
+    self.tipped = [""] * n
+    self.close_offset = np.full(n, np.nan)
+    self.close_dz = np.full(n, np.nan)
 
   def __call__(self, phase: str, env) -> None:
+    from pal_mjlab.tasks.manipulation import mdp
+
     term = env.reward_manager.get_term_cfg("arm_table_contact")
     self.arm += term.func(env, **term.params).bool().cpu().numpy().astype(int)
+    tilt = mdp.observations.object_tilt(env, "object").cpu().numpy()
+    for i in np.nonzero(tilt > np.radians(10.0))[0]:
+      if not self.tipped[i]:
+        self.tipped[i] = phase
+    if phase == "close":
+      robot, pin = env.scene["robot"], env.scene["object"]
+      tcp = robot.data.site_pos_w[:, robot.site_names.index("tcp_left")]
+      top = pin.data.root_link_pos_w[:, 2] + mdp.object_half_height(env, "object")
+      self.close_offset = 1e3 * torch_norm_xy(tcp - pin.data.root_link_pos_w)
+      self.close_dz = 1e3 * (tcp[:, 2] - top).cpu().numpy()
+
+
+def torch_norm_xy(v):
+  return v[:, :2].norm(dim=-1).cpu().numpy()
 
 
 def _forced_cases() -> list[
@@ -124,6 +144,9 @@ def scripted_run(args: argparse.Namespace) -> dict:
   rows = _rollout_with(args, forced, n, hook, scripted.INSERT_PHASES)
   for r in rows:
     r["arm_table_steps"] = int(hook.arm[r["env"]])
+    r["tipped_in"] = hook.tipped[r["env"]]
+    r["close_tcp_offset_mm"] = float(hook.close_offset[r["env"]])
+    r["close_tcp_over_top_mm"] = float(hook.close_dz[r["env"]])
   gate = [r for r in rows if r["env"] < len(forced)]
   out = {
     "forced_cases": [
@@ -156,7 +179,9 @@ def scripted_run(args: argparse.Namespace) -> dict:
       f"env {r['env']:3d} seated {bool(r.get('seated'))!s:5s} bottom {r.get('pin_bottom_over_block_mm', float('nan')):6.1f} mm "
       f"offset {r.get('pin_offset_mm', float('nan')):5.1f} mm tilt {r.get('pin_tilt_deg', float('nan')):5.1f} deg "
       f"block moved {r.get('block_displacement_mm', float('nan')):5.1f} mm hand-block {int(r.get('hand_block_steps', 0)):4d} "
-      f"grasped {r['grasped']!s:5s} ended {r['ended_by'] or '-'} {('ERR ' + r['plan_error'][:60]) if r['plan_error'] else ''}"
+      f"grasped {r['grasped']!s:5s} tipped {r['tipped_in'] or '-':8s} close tcp off {r['close_tcp_offset_mm']:5.1f} "
+      f"over top {r['close_tcp_over_top_mm']:5.1f} mm ended {r['ended_by'] or '-'} "
+      f"{('ERR ' + r['plan_error'][:50]) if r['plan_error'] else ''}"
     )
   return out
 
