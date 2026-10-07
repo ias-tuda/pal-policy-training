@@ -68,6 +68,7 @@ class Driver:
     self.arm_q = [robot.joint_names.index(f"arm_{side}_{i}_joint") for i in range(1, 8)]
     self.robot = robot
     self.clipped = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self.resets = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     self.hooks: list = []
     self.jaw = torch.zeros(env.num_envs, device=env.device)
 
@@ -82,7 +83,9 @@ class Driver:
     target[:, self.jaw_col] = self.jaw * 0.78
     raw = (target - self.offset) / self.scale
     self.clipped += (raw.abs() > 1.0 + 1e-6).any(dim=-1).long()
+    before = self.env.episode_length_buf.clone()
     self.env.step(raw.clamp(-1.0, 1.0))
+    self.resets += (self.env.episode_length_buf <= before).long()
     for h in self.hooks:
       h()
 
@@ -99,6 +102,58 @@ class Driver:
   def hold(self, q: np.ndarray, seconds: float) -> None:
     for _ in range(round(seconds / self.env.step_dt)):
       self.step(q)
+
+
+class Recorder:
+  """Every ``every`` control steps, the listed envs' states copied into a CPU copy of the scene and rendered
+  (front-left view on the work area), tiled side by side; written as an MP4."""
+
+  def __init__(
+    self, env, model, envs: list[int], every: int = 2, size=(360, 480)
+  ) -> None:
+    self.env, self.m, self.envs, self.every = env, model, envs, every
+    self.d = mujoco.MjData(model)
+    self.r = mujoco.Renderer(model, size[0], size[1])
+    self.frames: list[np.ndarray] = []
+    self.k = 0
+    self.table = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table/table")
+
+  def __call__(self) -> None:
+    self.k += 1
+    if self.k % self.every:
+      return
+    sim = self.env.sim
+    qpos = sim.data.qpos.cpu().numpy()
+    mpos = sim.data.mocap_pos.cpu().numpy()
+    mquat = sim.data.mocap_quat.cpu().numpy()
+    bpos = sim.model.body_pos
+    bpos = bpos.cpu().numpy() if bpos.ndim == 3 else None
+    origins = self.env.scene.env_origins.cpu().numpy()
+    tiles = []
+    for i in self.envs:
+      self.d.qpos[:] = qpos[i]
+      self.d.mocap_pos[:] = mpos[i] - origins[i]
+      self.d.mocap_quat[:] = mquat[i]
+      for j in range(self.m.njnt):
+        if self.m.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
+          a = self.m.jnt_qposadr[j]
+          self.d.qpos[a : a + 3] -= origins[i]
+      if bpos is not None:
+        self.m.body_pos[self.table] = bpos[i, self.table]
+      mujoco.mj_forward(self.m, self.d)
+      cam = mujoco.MjvCamera()
+      cam.lookat[:] = (0.47, 0.10, 0.90)
+      cam.distance, cam.azimuth, cam.elevation = 0.95, 210.0, -28.0
+      self.r.update_scene(self.d, cam)
+      tiles.append(self.r.render().copy())
+    self.frames.append(np.concatenate(tiles, axis=1))
+
+  def write(self, path: pathlib.Path, fps: float) -> None:
+    import imageio
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimwrite(str(path), self.frames, fps=fps, codec="libx264", quality=7)
+    print(f"wrote {path} ({len(self.frames)} frames)")
 
 
 def _forced_poses(n: int) -> list[tuple[float, float, float]]:
@@ -325,6 +380,10 @@ def hold_rollout(args) -> dict:
       )
 
   drv.hooks.append(hook)
+  rec = None
+  if args.video is not None:
+    rec = Recorder(env, model, args.video_envs, every=2)
+    drv.hooks.append(rec)
   stack = lambda key: np.stack([p[key] for p in plans])  # noqa: E731
   q = drv.q()
   phase["name"] = "approach"
@@ -363,6 +422,8 @@ def hold_rollout(args) -> dict:
   reads["after_tilt"] = mdp.axis_tilt(env, "object")
   flags["held_after"] = mdp.held_at_goal(env, **hp).bool()
 
+  if rec is not None:
+    rec.write(args.video, fps=1.0 / (2 * env.step_dt))
   rows = []
   for i in range(n_env):
     rows.append(
@@ -383,6 +444,7 @@ def hold_rollout(args) -> dict:
         "arm_table": bool(flags["arm_table"][i]),
         "hand_table": bool(flags["hand_table"][i]),
         "clipped_steps": int(drv.clipped[i]),
+        "resets": int(drv.resets[i]),
       }
     )
     print(json.dumps(rows[-1]), flush=True)
@@ -413,6 +475,8 @@ def main(argv=None) -> None:
   p.add_argument("--forced", action="store_true")
   p.add_argument("--push-n", type=float, default=10.0)
   p.add_argument("--json", type=pathlib.Path, default=None)
+  p.add_argument("--video", type=pathlib.Path, default=None)
+  p.add_argument("--video-envs", type=int, nargs="+", default=[0, 1, 2, 3])
   args = p.parse_args(argv)
   out = hold_rollout(args)
   if args.json:

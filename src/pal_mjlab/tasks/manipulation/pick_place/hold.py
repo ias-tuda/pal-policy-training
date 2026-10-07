@@ -55,9 +55,10 @@ HOLD_XY = (0.45, 0.00)
 HOLD_DZ = 0.10
 #: The direction the hand points in at a side grasp and at H, robot frame: forward (step 0 item 1).
 HOLD_APPROACH = (1.0, 0.0, 0.0)
-#: The pads' height above the block's bottom at the grasp: the lowest the palm clears the 0.837 m table
-#: with (step 0 item 1: 40 mm on 79 of 95 feasible cells; 45/50 on the rest).
-PAD_HEIGHT = 0.040
+#: The pads' height above the block's bottom at the grasp, 8 mm under its top. Step 0 item 1 planned most cells at
+#: 40 mm, but there the palm's hull is 1.7 mm over the table (`results/S13-insert/step0/dummy_hand_40.json`) and the
+#: scripted grasp at 40 mm scraped it in 7 of 8 envs; at 48 mm it is ~10 mm clear.
+PAD_HEIGHT = 0.048
 #: How far the pads reach past the TCP along the approach axis with the jaw open (S1.3, re-measured on
 #: the tabletop model 2026-10-07: 25.57 mm).
 PAD_OFFSET = 0.0256
