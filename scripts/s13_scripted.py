@@ -109,9 +109,18 @@ class Recorder:
   (front-left view on the work area), tiled side by side; written as an MP4."""
 
   def __init__(
-    self, env, model, envs: list[int], every: int = 2, size=(360, 480)
+    self,
+    env,
+    model,
+    envs: list[int],
+    every: int = 2,
+    size=(360, 480),
+    close: bool = False,
   ) -> None:
-    self.env, self.m, self.envs, self.every = env, model, envs, every
+    self.env, self.m, self.envs, self.every, self.close = env, model, envs, every, close
+    self.lookat = (
+      (env.scene["object"].data.root_link_pos_w - env.scene.env_origins).cpu().numpy()
+    )
     self.d = mujoco.MjData(model)
     self.r = mujoco.Renderer(model, size[0], size[1])
     self.frames: list[np.ndarray] = []
