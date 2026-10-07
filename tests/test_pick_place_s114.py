@@ -229,12 +229,16 @@ def _mirrored_arm_targets(env, alpha: float) -> torch.Tensor:
   return q
 
 
-def _action_for(env, q: torch.Tensor) -> torch.Tensor:
-  """The absolute action whose targets are ``q``'s arm joints (`ACTION=abs`: target = offset + scale x a)."""
+def _cols(env) -> list[int]:
   term = env.action_manager.get_term("joint_pos")
   names = env.scene["robot"].joint_names
-  cols = [names.index(n.split("/")[-1]) for n in term.target_names]
-  return (q[:, cols] - term._offset) / term._scale
+  return [names.index(n.split("/")[-1]) for n in term.target_names]
+
+
+def _action_for(env, q: torch.Tensor) -> torch.Tensor:
+  """The absolute action whose targets are ``q``'s (`ACTION=abs`: target = offset + scale x a, then slewed)."""
+  term = env.action_manager.get_term("joint_pos")
+  return (q[:, _cols(env)] - term._offset) / term._scale
 
 
 def test_hh_term_positive_control_two_arms_driven_together(monkeypatch):
@@ -250,6 +254,8 @@ def test_hh_term_positive_control_two_arms_driven_together(monkeypatch):
       with torch.inference_mode():
         q = _mirrored_arm_targets(env, 0.55)
         robot.write_joint_state_to_sim(q, torch.zeros_like(q))
+        # The slew starts from the pose written, not from home.
+        env.action_manager.get_term("joint_pos")._last_target[:] = q[:, _cols(env)]
         env.sim.forward()
         assert bool((mdp.arm_arm_clearance(env) > 0.03).all())
         act = _action_for(env, _mirrored_arm_targets(env, 1.0))
