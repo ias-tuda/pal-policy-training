@@ -17,6 +17,14 @@ Per episode (plan S11 *Reads*):
 * contacts: HH -- the arm-arm sensor over 1 N (steps, peak force) and the least capsule clearance;
   arm 1-6 on the table per arm (steps);
 * time: to A placed, to B placed, to both home; the share of steps both arms move (overlap).
+* plan S11.2's release read: when the right's jaw released B (J), and whether its hand-off came on its own
+  trigger or at ``--right-timeout``; the start kind (``START=hold``: scratch / placed / hold), with the
+  summary split by it.
+
+S11.2's ``REWARD=S12-BI`` removes the ``placed`` terms this read takes its predicates from: evaluate its
+runs with ``REWARD=S11-BI`` and ``HANDOFF_TRAIN=left`` (the actor's inputs depend on neither; the right is
+then handed off here on the trigger its training used). With the gated right target (``INIT=seq``) the
+A latch is cleared at every reset here (`mdp.reset_ladder_state`), as S12-BI's cfg does.
 
     ARMS=both ... python scripts/eval_bimanual.py --checkpoint model_4999.pt --json out.json
 """
@@ -80,6 +88,20 @@ def build_env(args):
     raise SystemExit(
       "eval_bimanual reads plan S11's JOINT env: set ARMS=both and its selectors"
     )
+  if "placed" not in cfg.rewards:
+    raise SystemExit(
+      "REWARD=S12-BI has no `placed` terms to read from: evaluate with REWARD=S11-BI HANDOFF_TRAIN=left"
+    )
+  if "right_target" in cfg.observations["actor"].terms and (
+    "reset_ladder_state" not in cfg.events
+  ):
+    from mjlab.managers.event_manager import EventTermCfg
+    from pal_mjlab.tasks.manipulation import mdp
+
+    cfg.events = {
+      "reset_ladder_state": EventTermCfg(func=mdp.reset_ladder_state, mode="reset"),
+      **cfg.events,
+    }
   return ManagerBasedRlEnv(cfg=cfg, device=args.device)
 
 
@@ -163,6 +185,8 @@ class Reads:
     self.prev_right_grasp = zb()
     self.clear_run = zl(0)
     self.right_handed = zb()
+    self.release_step, self.handoff_step = zl(), zl()
+    self.handoff_by_trigger = zb()
     self.done: list[dict] = []
 
   def _home(self, side: str) -> torch.Tensor:
@@ -209,6 +233,9 @@ class Reads:
       self.rel[k] = torch.where(let_go, getattr(st, k), self.rel[k])
     self.rel_ok = torch.where(let_go, st.ok, self.rel_ok)
     self.b_released |= latch.released
+    self.release_step = torch.where(
+      latch.released & (self.release_step < 0), t, self.release_step
+    )
     # HH and arm-table, over the whole control step (the sensors' force history).
     peak = _peak_force(env, bi.ARM_ARM_SENSOR)
     self.hh_steps += (peak > bi.HH_CONTACT_FORCE).long()
@@ -239,9 +266,11 @@ class Reads:
     self.clear_run = torch.where(
       clear, self.clear_run + 1, torch.zeros_like(self.clear_run)
     )
-    start = (self.clear_run >= HANDOFF_CLEAR_STEPS) | (t >= right_timeout_steps)
-    start &= ~self.right_handed
+    triggered = self.clear_run >= HANDOFF_CLEAR_STEPS
+    start = (triggered | (t >= right_timeout_steps)) & ~self.right_handed
     self.right_handed |= start
+    self.handoff_step = torch.where(start, t, self.handoff_step)
+    self.handoff_by_trigger |= start & triggered
     # The state this step began in: an env that ends on this step is reset inside it, so its
     # episode is scored on these.
     origins = env.scene.env_origins
@@ -254,6 +283,7 @@ class Reads:
         :, :2
       ].clone(),
       "a_yaw": yaw_error_mod_90(env.scene["object"].data.root_link_quat_w),
+      "start_kind": getattr(env, "_pp_start_kind", torch.zeros_like(t)).clone(),
     }
     return start
 
@@ -263,6 +293,7 @@ class Reads:
     last = self._last
     a_placed, b_placed, home = last["a_placed"], last["b_placed"], last["home"]
     a, goal, yaw = last["a_xy"], last["goal_xy"], last["a_yaw"]
+    kinds = {v: k for k, v in self.bi.START_KINDS.items()}
     sec = lambda s: None if int(s) < 0 else int(s) * dt  # noqa: E731
     for i in env_ids.tolist():
       row = {
@@ -290,9 +321,13 @@ class Reads:
         "arm_table_left_steps": int(self.at_left[i]),
         "arm_table_right_steps": int(self.at_right[i]),
         "overlap_share": float(self.both_moving[i]) / max(int(self.steps[i]), 1),
+        "start_kind": kinds.get(int(last["start_kind"][i]), "scratch"),
+        "t_b_released_s": sec(self.release_step[i]),
+        "t_right_handoff_s": sec(self.handoff_step[i]),
+        "right_handoff_by_trigger": bool(self.handoff_by_trigger[i]),
       }
       self.done.append(row)
-    for name in ("a_step", "b_step", "home_step"):
+    for name in ("a_step", "b_step", "home_step", "release_step", "handoff_step"):
       getattr(self, name)[env_ids] = -1
     for name in (
       "b_grasped",
@@ -300,6 +335,7 @@ class Reads:
       "rel_ok",
       "prev_right_grasp",
       "right_handed",
+      "handoff_by_trigger",
     ):
       getattr(self, name)[env_ids] = False
     for name in (
@@ -325,7 +361,7 @@ def _peak_force(env, name: str) -> torch.Tensor:
   return torch.norm(force.reshape(env.num_envs, -1, 3), dim=-1).amax(-1)
 
 
-def summarise(rows: list[dict]) -> dict:
+def summarise(rows: list[dict], right_timeout_s: float, split: bool = True) -> dict:
   n = max(len(rows), 1)
 
   def share(k):
@@ -368,6 +404,31 @@ def summarise(rows: list[dict]) -> dict:
     "t_b_placed_median_s": med([r["t_b_placed_s"] for r in rows]),
     "t_both_home_median_s": med([r["t_both_home_s"] for r in rows]),
     "overlap_share_median": med([r["overlap_share"] for r in rows]),
+    # Plan S11.2's release bar: of the episodes where B is placed, the share whose right jaw released B
+    # (J) before the right's time-out -- the policy let go, not the hand-off.
+    "b_placed_released_by_policy": sum(
+      r["t_b_released_s"] is not None and r["t_b_released_s"] < right_timeout_s
+      for r in rows
+      if r["b_placed_ever"]
+    )
+    / max(sum(r["b_placed_ever"] for r in rows), 1),
+    "b_placed_before_timeout": sum(
+      r["t_b_placed_s"] is not None and r["t_b_placed_s"] < right_timeout_s
+      for r in rows
+    )
+    / n,
+    "right_handoff_by_trigger": share("right_handoff_by_trigger"),
+    "t_b_released_median_s": med([r["t_b_released_s"] for r in rows]),
+    **(
+      {
+        "by_start": {
+          k: summarise([r for r in rows if r["start_kind"] == k], right_timeout_s, False)
+          for k in sorted({r["start_kind"] for r in rows})
+        }
+      }
+      if split and len({r["start_kind"] for r in rows}) > 1
+      else {}
+    ),
   }
 
 
@@ -389,7 +450,11 @@ def main(argv=None) -> None:
       if finished.numel():
         reads.finish(finished, env.step_dt)
   rows = reads.done[: args.episodes]
-  result = {"checkpoint": str(args.checkpoint), "seed": args.seed, **summarise(rows)}
+  result = {
+    "checkpoint": str(args.checkpoint),
+    "seed": args.seed,
+    **summarise(rows, args.right_timeout),
+  }
   for k, v in result.items():
     print(f"{k:36s} {v}")
   if args.json:
