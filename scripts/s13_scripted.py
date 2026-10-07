@@ -88,7 +88,7 @@ class Driver:
     raw = (target - self.offset) / self.scale
     self.clipped += (raw.abs() > 1.0 + 1e-6).any(dim=-1).long()
     before = self.env.episode_length_buf.clone()
-    self.env.step(raw.clamp(-1.0, 1.0))
+    _, self.reward, _, _, _ = self.env.step(raw.clamp(-1.0, 1.0))
     self.resets += (self.env.episode_length_buf <= before).long()
     for h in self.hooks:
       h()
@@ -406,6 +406,8 @@ def hold_rollout(args) -> dict:
     for k in ("grasped", "lifted", "arm_table", "hand_table", "held_after")
   }
   phase = {"name": ""}
+  rsum: dict[str, torch.Tensor] = {}
+  rcnt: dict[str, int] = {}
   first = {"hand_table": [""] * n_env, "arm_table": [""] * n_env}
   pre = torch.zeros(n_env, 3, device=dev)
 
@@ -426,6 +428,12 @@ def hold_rollout(args) -> dict:
     flags["lifted"] |= _was_lifted_bool(
       env, gripper.contact_sensor_name, SUPPORT_SENSOR
     )
+    name = phase["name"]
+    if name:
+      rsum.setdefault(name, torch.zeros(n_env, device=dev))
+      rcnt.setdefault(name, 0)
+      rsum[name] += drv.reward
+      rcnt[name] += 1
     if phase["name"] == "hold":
       reads["hold_steps"] += 1
       reads["held_steps"] += mdp.held_at_goal(env, **hp)
@@ -540,6 +548,9 @@ def hold_rollout(args) -> dict:
         "clipped_steps": int(drv.clipped[i]),
         "resets": int(drv.resets[i]),
         "tcp_err_at_grasp_mm": 1e3 * float(tcp_err[i]),
+        "reward_per_step_by_phase": {
+          k: float(v[i]) / max(rcnt[k], 1) for k, v in rsum.items()
+        },
         "block_in_hand_before_close_mm": rel_pre[i].round().tolist(),
         "block_in_hand_closed_mm": rel_grasp[i].round().tolist(),
         "block_in_hand_at_H_mm": rel_h[i].round().tolist(),
