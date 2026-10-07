@@ -218,7 +218,7 @@ class Reads:
     )
     after = (t >= a.push_at + a.push_s + 1.0) & torch.isnan(self.after_dist)
     if after.any():
-      cmd = env.command_manager.get_term("goal").command
+      cmd = env.command_manager.get_term("goal_pose").command
       self.after_dist[after] = torch.norm(cmd - pos, dim=-1)[after]
       self.after_tilt[after] = tilt[after]
     if self.table_sensor is not None:

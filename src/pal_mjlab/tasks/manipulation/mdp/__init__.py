@@ -102,7 +102,7 @@ from .hold import (
   side_grade,
   side_grade_obs,
   side_graded,
-  side_grasp_target_w,
+  side_grasp_targets_w,
   side_reach,
 )
 from .holder import (
@@ -224,7 +224,7 @@ __all__ = [
   "side_grade",
   "side_grade_obs",
   "side_graded",
-  "side_grasp_target_w",
+  "side_grasp_targets_w",
   "side_reach",
   "HandoffArmCfg",
   "HandoffJointPositionAction",

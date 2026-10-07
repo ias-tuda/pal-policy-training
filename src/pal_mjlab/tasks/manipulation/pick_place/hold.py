@@ -11,8 +11,8 @@ side grasp and holds it level and still at H; L-HP does the same against pushes 
 * **the goal** is H (`HOLD_XY`, `HOLD_DZ`): the block's bottom 10 cm over the table at (0.45, 0.00) in the
   robot frame, its centre ``HOLD_DZ + half`` over the table (`mdp.SurfaceOffsetCommandCfg.height`);
 * **the reward** is RCTP's reach / grasp / faded lift / M2 goal with every one of them paid only for a
-  side grasp (`mdp.side_graded`, G(approach elevation, `SIDE_STD`)), the reach on the side-grasp point
-  (`mdp.side_reach`), M2's narrow term at 1 cm, a level grade near H and the per-step `held` (×8: within
+  side grasp (`mdp.side_graded`, G(approach elevation, `SIDE_STD`)), the reach on the side-grasp point of
+  whichever face within 61 deg of facing the robot is nearer (`mdp.side_reach`), M2's narrow term at 1 cm, a level grade near H and the per-step `held` (×8: within
   1 cm of H, tilt < 3 deg, slower than 2 cm/s, hand horizontal and pointing forward). No release terms:
   the left never lets go in this task;
 * **the actor** sees the block's yaw as (cos 4 psi, sin 4 psi) through its tracker with S10.1's yaw bias and
@@ -68,6 +68,9 @@ SIDE_STD = math.radians(15.0)
 #: hand's angle to the face (half the reach is paid for pointing at it).
 REACH_STD = 0.2
 REACH_CONE_STD = 0.5
+#: Which faces the reach may take: those whose outward normal is within this of the robot's direction (-x). Step 0
+#: item 1 grasped at approaches up to 60 deg off +x (block yaw 30-45 deg on the far / left part of the area).
+REACH_FACE_CONE = math.radians(61.0)
 #: M2's narrow goal term at H: 1 cm (the plan's `goal_near` at 1 cm; placing tasks use 3 cm).
 NEAR_STD = 0.01
 #: The level grade near H: G(tilt, 3 deg) while held within 5 cm of H, weight 2.
@@ -189,6 +192,7 @@ def _hold_rewards(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
         "pad_offset": PAD_OFFSET,
         "std": REACH_STD,
         "cone_std": REACH_CONE_STD,
+        "face_cone": REACH_FACE_CONE,
       },
     ),
     "grasp": graded(r["grasp"]),

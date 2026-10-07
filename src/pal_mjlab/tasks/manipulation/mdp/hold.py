@@ -82,31 +82,35 @@ def _base_dir_w(
   return quat_apply(base_quat, d)
 
 
-def side_grasp_target_w(
+def side_grasp_targets_w(
   env: ManagerBasedRlEnv,
   object_name: str,
   approach_b: tuple[float, float, float],
   pad_height: float,
   half_height: float,
   pad_offset: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Where the TCP goes for a side grasp, and the approach direction it should have there. (B, 3) each.
+  face_cone: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """The side-grasp TCP target and approach direction for each of the block's four side faces, and which faces
+  count. (B, 4, 3), (B, 4, 3), (B, 4)
 
-  The face taken is the one whose outward normal points most against ``approach_b`` (the base-frame
-  direction the hand should point in, e.g. +x: the hand comes from the robot's side of the block). The
-  pads go to the block's axis at ``pad_height`` above its bottom (``half_height`` below its centre), and
-  the TCP ``pad_offset`` behind them, outside that face."""
+  A face counts when its outward normal is within ``face_cone`` (rad) of -``approach_b`` (the base-frame
+  direction the hand should point in, e.g. +x: the hand comes from the robot's side of the block): at a block
+  yaw near 45 deg two faces do, and step 0 found only the other one reachable over part of the area. The pads go
+  to the block's axis at ``pad_height`` above its bottom (``half_height`` below its centre), the TCP
+  ``pad_offset`` behind them, outside the face."""
   obj: Entity = env.scene[object_name]
   rot = matrix_from_quat(obj.data.root_link_quat_w)
   ax, ay, up = rot[..., :, 0], rot[..., :, 1], rot[..., :, 2]
   want = -_base_dir_w(env, approach_b)  # the outward normal we want
   normals = torch.stack([ax, -ax, ay, -ay], dim=1)  # (B, 4, 3)
-  pick = torch.einsum("bkd,bd->bk", normals, want).argmax(dim=1)
-  n = normals[torch.arange(env.num_envs, device=env.device), pick]
-  n = n - (n * up).sum(-1, keepdim=True) * up
-  n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+  normals = normals - (normals * up.unsqueeze(1)).sum(-1, keepdim=True) * up.unsqueeze(
+    1
+  )
+  normals = normals / normals.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+  ok = torch.einsum("bkd,bd->bk", normals, want) >= math.cos(face_cone)
   pads = obj.data.root_link_pos_w + (pad_height - half_height) * up
-  return pads + pad_offset * n, -n
+  return pads.unsqueeze(1) + pad_offset * normals, -normals, ok
 
 
 def side_reach(
@@ -119,18 +123,21 @@ def side_reach(
   pad_offset: float,
   std: float,
   cone_std: float,
+  face_cone: float,
 ) -> torch.Tensor:
-  """RCTP's reach on the side-grasp point instead of the object's centre, half of it paid for pointing
-  the hand at the face: G(|TCP - target|, std) x (0.5 + 0.5 G(angle(approach, wanted), cone_std)). (B,)"""
+  """RCTP's reach on a side-grasp point instead of the object's centre, half of it paid for pointing the hand at
+  the face: max over the faces that count (`side_grasp_targets_w`) of
+  G(|TCP - target|, std) x (0.5 + 0.5 G(angle(approach, wanted), cone_std)). (B,)"""
   robot: Entity = env.scene[asset_cfg.name]
   tcp = robot.data.site_pos_w[:, asset_cfg.site_ids].squeeze(1)
-  target, want = side_grasp_target_w(
-    env, object_name, approach_b, pad_height, half_height, pad_offset
+  target, want, ok = side_grasp_targets_w(
+    env, object_name, approach_b, pad_height, half_height, pad_offset, face_cone
   )
   approach, _ = hand_axes_w(env, asset_cfg)
-  angle = torch.acos((approach * want).sum(-1).clamp(-1.0, 1.0))
-  near = torch.exp(-torch.sum(torch.square(tcp - target), dim=-1) / std**2)
-  return near * (0.5 + 0.5 * torch.exp(-torch.square(angle / cone_std)))
+  angle = torch.acos(torch.einsum("bkd,bd->bk", want, approach).clamp(-1.0, 1.0))
+  near = torch.exp(-torch.sum(torch.square(tcp.unsqueeze(1) - target), dim=-1) / std**2)
+  value = near * (0.5 + 0.5 * torch.exp(-torch.square(angle / cone_std)))
+  return torch.where(ok, value, torch.zeros_like(value)).amax(dim=1)
 
 
 def side_graded(

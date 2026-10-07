@@ -195,17 +195,30 @@ def hold_rollout(args) -> dict:
     data.qpos[qfree : qfree + 3] = pos[i]
     data.qpos[qfree + 3 : qfree + 7] = quat[i]
     mujoco.mj_forward(model, data)
-    n = K.face_normal_against(yaw, (1.0, 0.0))
-    a = np.array([-n[0], -n[1], 0.0])
     bottom = pos[i][2] - half
-    pads = np.array([pos[i][0], pos[i][1], bottom + H.PAD_HEIGHT])
-    tcp = pads - pad_off * a
+    # Every face whose outward normal is within L-H's reach cone of the robot's direction, best aligned first.
+    normals = [
+      np.array([math.cos(yaw + k * math.pi / 2), math.sin(yaw + k * math.pi / 2)])
+      for k in range(4)
+    ]
+    faces = sorted(
+      (n for n in normals if -n[0] >= math.cos(H.REACH_FACE_CONE)), key=lambda n: n[0]
+    )
     plan, err = None, ""
-    for sign in (1.0, -1.0):
+    cases = (
+      (hp, n, sg)
+      for hp in (H.PAD_HEIGHT, 0.045, 0.050)
+      for n in faces
+      for sg in (1.0, -1.0)
+    )
+    for hp, n, sign in cases:
+      a = np.array([-n[0], -n[1], 0.0])
+      pads = np.array([pos[i][0], pos[i][1], bottom + hp])
+      tcp = pads - pad_off * a
       r = K.hand_frame(a, sign * np.array([-a[1], a[0], 0.0]))
       r_h = K.hand_frame(np.array(H.HOLD_APPROACH), sign * np.array([0.0, 1.0, 0.0]))
       h_pads = np.array(
-        [H.HOLD_XY[0], H.HOLD_XY[1], float(top_env[i]) + H.HOLD_DZ + H.PAD_HEIGHT]
+        [H.HOLD_XY[0], H.HOLD_XY[1], float(top_env[i]) + H.HOLD_DZ + hp]
       )
       tcp_h = h_pads - pad_off * np.array(H.HOLD_APPROACH)
 
@@ -345,7 +358,7 @@ def hold_rollout(args) -> dict:
   )
   phase["name"] = "after"
   drv.hold(stack("H"), 1.0)
-  cmd = env.command_manager.get_term("goal").command
+  cmd = env.command_manager.get_term("goal_pose").command
   reads["after_dist"] = torch.norm(cmd - obj.data.root_link_pos_w, dim=-1)
   reads["after_tilt"] = mdp.axis_tilt(env, "object")
   flags["held_after"] = mdp.held_at_goal(env, **hp).bool()
