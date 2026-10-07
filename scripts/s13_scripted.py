@@ -36,6 +36,9 @@ TASK = "Mjlab-PickPlace-Pal-Kangaroo-Grippers"
 STEP_RAD = 0.03
 SETTLE_SPEED = 0.05
 SETTLE_MAX_S = 1.5
+#: Closed-loop correction of the steady-state joint error at each waypoint: rounds, and the error that ends them.
+CORRECT_ROUNDS = 4
+CORRECT_TOL = 0.004
 JAW_CLOSE_S = 0.8
 
 
@@ -71,6 +74,7 @@ class Driver:
     self.resets = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     self.hooks: list = []
     self.jaw = torch.zeros(env.num_envs, device=env.device)
+    self.cmd: np.ndarray | None = None
 
   def q(self) -> np.ndarray:
     return self.robot.data.joint_pos[:, self.arm_q].cpu().numpy()
@@ -90,18 +94,37 @@ class Driver:
       h()
 
   def move(self, a: np.ndarray, b: np.ndarray) -> None:
+    """Interpolate the command from ``a`` to ``b`` (<= `STEP_RAD` a step), settle, then correct the steady-state
+    error (G20 has no gravity compensation, so a reaching arm sags off its target): the command is moved by the
+    remaining joint error until it is below `CORRECT_TOL` or `CORRECT_ROUNDS` rounds pass. ``self.cmd`` keeps the
+    corrected command, the start of the next move."""
     n = max(1, int(math.ceil(float(np.abs(b - a).max()) / STEP_RAD)))
+    offset = self.cmd - a if self.cmd is not None else np.zeros_like(a)
     for s in range(1, n + 1):
-      self.step(a + (b - a) * (s / n))
+      self.step(a + (b - a) * (s / n) + offset)
+    cmd = b + offset
+    self._settle(cmd)
+    for _ in range(CORRECT_ROUNDS):
+      err = b - self.q()
+      if float(np.abs(err).max()) < CORRECT_TOL:
+        break
+      cmd = cmd + err
+      self._settle(cmd)
+    self.cmd = cmd
+
+  def _settle(self, cmd: np.ndarray) -> None:
+    self.step(cmd)
     for _ in range(round(SETTLE_MAX_S / self.env.step_dt)):
       speed = self.robot.data.joint_vel[:, self.arm_q].abs().amax(dim=-1)
       if bool((speed < SETTLE_SPEED).all()):
         return
-      self.step(b)
+      self.step(cmd)
 
   def hold(self, q: np.ndarray, seconds: float) -> None:
+    """Hold the last corrected command (``q`` if there is none) for ``seconds``."""
+    cmd = self.cmd if self.cmd is not None else q
     for _ in range(round(seconds / self.env.step_dt)):
-      self.step(q)
+      self.step(cmd)
 
 
 class Recorder:
@@ -167,6 +190,13 @@ class Recorder:
     path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimwrite(str(path), self.frames, fps=fps, codec="libx264", quality=7)
     print(f"wrote {path} ({len(self.frames)} frames)")
+
+
+def robot_tcp(env, gripper) -> torch.Tensor:
+  """The gripper's TCP in each env's frame. (B, 3)"""
+  robot = env.scene["robot"]
+  i = robot.site_names.index(gripper.tcp_site)
+  return robot.data.site_pos_w[:, i] - env.scene.env_origins
 
 
 def _forced_poses(n: int) -> list[tuple[float, float, float]]:
@@ -241,7 +271,7 @@ def hold_rollout(args) -> dict:
   ).cpu().numpy() - np.asarray(scene.TABLE_POS[:2])
   pos = (obj.data.root_link_pos_w - origins).cpu().numpy()
   quat = obj.data.root_link_quat_w.cpu().numpy()
-  plans, errors = [], []
+  plans, errors, tcp_goal = [], [], []
   for i in range(env.num_envs):
     w, x, y, z = quat[i]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
@@ -333,8 +363,10 @@ def hold_rollout(args) -> dict:
         err = "up" if q_up is None else ("lift" if q_l is None else "hold_H")
         continue
       plan = {"above": q_up, "pregrasp": q_p, "grasp": q_g, "lift": q_l, "H": q_hh}
+      tcp_goal.append(tcp)
       break
     if plan is None:
+      tcp_goal.append(np.full(3, np.nan))
       q0 = arm.q_default
       plan = dict.fromkeys(("above", "pregrasp", "grasp", "lift", "H"), q0)
     plans.append(plan)
@@ -403,6 +435,10 @@ def hold_rollout(args) -> dict:
   drv.move(q, stack("above"))
   drv.move(stack("above"), stack("pregrasp"))
   drv.move(stack("pregrasp"), stack("grasp"))
+  tcp_err = (
+    robot_tcp(env, gripper)
+    - torch.as_tensor(np.stack(tcp_goal), dtype=torch.float32, device=dev)
+  ).norm(dim=-1)
   phase["name"] = "close"
   drv.jaw[:] = 1.0
   drv.hold(stack("grasp"), JAW_CLOSE_S)
@@ -422,7 +458,7 @@ def hold_rollout(args) -> dict:
     force[:, 0, 2] = -args.push_n
     torque = torch.cross(half * up.unsqueeze(1), force, dim=-1)
     obj.data.write_external_wrench(force, torque, body_ids=[0])
-    drv.step(stack("H"))
+    drv.step(drv.cmd)
   obj.data.write_external_wrench(
     torch.zeros(n_env, 1, 3, device=dev),
     torch.zeros(n_env, 1, 3, device=dev),
@@ -458,6 +494,7 @@ def hold_rollout(args) -> dict:
         "hand_table": bool(flags["hand_table"][i]),
         "clipped_steps": int(drv.clipped[i]),
         "resets": int(drv.resets[i]),
+        "tcp_err_at_grasp_mm": 1e3 * float(tcp_err[i]),
       }
     )
     print(json.dumps(rows[-1]), flush=True)
