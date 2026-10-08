@@ -190,6 +190,8 @@ HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
 BASE_OBS_ENV_VAR = "BASE_OBS"
 CONTACT_ENV_VAR = "CONTACT"
+INSERT_HOLE_D_ENV_VAR = "INSERT_HOLE_D"
+INSERT_FRICTION_ENV_VAR = "INSERT_FRICTION"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -482,11 +484,32 @@ def _select_goal() -> tuple[str, BoxGoal | None, InsertGoal | None]:
   if name in GOALS:
     return name, None, None
   if name in INSERT_GOALS:
-    return DEFAULT_GOAL, None, INSERT_GOALS[name]
+    return DEFAULT_GOAL, None, _insert_overrides(INSERT_GOALS[name])
   box = BOX_GOALS[name]
   if box is None or feet == "1":
     return DEFAULT_GOAL, box, None
   return DEFAULT_GOAL, dataclasses.replace(box, feet=False), None
+
+
+def _insert_overrides(code: InsertGoal) -> InsertGoal:
+  """Plan §12.1's finalist re-reads (eval only): ``INSERT_HOLE_D`` the hole's diameter in mm (37.5 / 38.5; the
+  chamfer kept) and ``INSERT_FRICTION`` the pin's and the block's sliding friction (0.3 / 0.6). Unset, the code
+  as trained."""
+  hole = os.environ.get(INSERT_HOLE_D_ENV_VAR)
+  friction = os.environ.get(INSERT_FRICTION_ENV_VAR)
+  if hole is not None:
+    if not 30.0 <= float(hole) <= 45.0:
+      raise ValueError(
+        f"{INSERT_HOLE_D_ENV_VAR}={hole!r} is not a hole diameter in mm (30-45)"
+      )
+    code = dataclasses.replace(code, hole_d=round(float(hole) * 1e-3, 6))
+  if friction is not None:
+    if not 0.05 <= float(friction) <= 2.0:
+      raise ValueError(
+        f"{INSERT_FRICTION_ENV_VAR}={friction!r} is not a sliding friction (0.05-2)"
+      )
+    code = dataclasses.replace(code, friction=float(friction))
+  return code
 
 
 def _critic_release() -> bool:

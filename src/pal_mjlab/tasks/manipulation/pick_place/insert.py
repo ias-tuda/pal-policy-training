@@ -131,6 +131,9 @@ class InsertGoal:
   """A's weight; 0 drops it (IN-NA)."""
   ladder: bool = False
   """IN-LAD: the task terms are the stage ladder `mdp.insert_ladder`."""
+  friction: float = scene.PIN_BLOCK_FRICTION
+  """The pin's and the block's sliding friction (their pair's, the element-wise max); plan §12.1's finalist
+  re-reads at 0.3 / 0.6 (`INSERT_FRICTION`, eval only)."""
 
   @property
   def geometry(self) -> dict:
@@ -183,9 +186,12 @@ def apply_insert_goal(
     **scene_cfg.entities,
     TABLE: scene.get_table_cfg(table_top_z, contype=scene.INSERT_TABLE_CONTYPE),
     BLOCK: scene.get_socket_block_cfg(
-      name=BLOCK, hole_d=code.hole_d, chamfer=code.chamfer
+      name=BLOCK, hole_d=code.hole_d, chamfer=code.chamfer, friction=code.friction
     ),
   }
+  # DR-object sets the pin's sliding friction at startup (`OBJECT_SHAPES["pin"]`'s fixed range): the same value.
+  if "object_friction" in cfg.events:
+    cfg.events["object_friction"].params["ranges"] = (code.friction, code.friction)
   table_cx, table_cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
   (x0, x1), (y0, y1) = area
   # After `reset_objects` (the dict keeps insertion order): it reads where the pin now is.

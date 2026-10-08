@@ -256,6 +256,35 @@ def test_the_pin_keeps_its_friction_and_dr_object_its_mass(monkeypatch):
   assert "object_mass" in cfg.events
 
 
+def _block_geoms(cfg) -> dict[str, tuple]:
+  model = cfg.scene.entities[ins.BLOCK].spec_fn().compile()
+  out = {}
+  for i in range(model.ngeom):
+    g = model.geom(i)
+    out[g.name] = (tuple(round(float(v), 6) for v in g.pos), float(g.friction[0]))
+  return out
+
+
+def test_the_finalist_re_read_overrides_hole_and_friction_and_nothing_else(monkeypatch):
+  """Plan §12.1's finalist re-reads: ``INSERT_HOLE_D`` (mm) / ``INSERT_FRICTION``; unset, the cfg as trained."""
+  base = _cfg(monkeypatch, INSERT_HOLE_D=None, INSERT_FRICTION=None)
+  wide = _cfg(monkeypatch, INSERT_HOLE_D="38.5", INSERT_FRICTION="0.6")
+  assert base.rewards["depth"].params["hole_d"] == scene.BLOCK_HOLE_D
+  assert wide.rewards["depth"].params["hole_d"] == pytest.approx(0.0385)
+  assert wide.events["object_friction"].params["ranges"] == (0.6, 0.6)
+  g0, g1 = _block_geoms(base), _block_geoms(wide)
+  assert g0.keys() == g1.keys()
+  assert {f for _, f in g0.values()} == {scene.PIN_BLOCK_FRICTION}
+  assert {f for _, f in g1.values()} == {0.6}
+  assert any(g0[k][0] != g1[k][0] for k in g0)  # the ring's boxes moved out
+  for name in ("observations", "rewards", "terminations"):
+    t0, t1 = getattr(base, name), getattr(wide, name)
+    assert t0.keys() == t1.keys()
+  monkeypatch.setenv("INSERT_HOLE_D", "0.038")
+  with pytest.raises(ValueError, match="INSERT_HOLE_D"):
+    kangaroo_pick_place_env_cfg()
+
+
 # -- The env ------------------------------------------------------------------------------------------
 
 
