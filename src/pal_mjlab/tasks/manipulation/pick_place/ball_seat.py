@@ -70,12 +70,17 @@ BALL_SEAT_REWARD = INSERT_REWARD
 #: The ball (D15-1 open: the plan assumes Ø 50 mm, 50 g); PB-DR's radius range (Ø 48-52 mm).
 BALL_SEAT_RADIUS = 0.025
 BALL_SEAT_RADIUS_RANGE = (0.024, 0.026)
-#: The seated centre's height over the block's bottom face by the ball's radius, m (`mdp.seat_centre_z`). Plan §15.0's
-#: CPU seat table (MuJoCo 3.15, §12's 60 boxes; `results/S15-ball-seat/preview/ball_cup_r*.json`'s ``rest_z``):
-#: 60.67 / 62.58 / 64.38 mm at r 24 / 25 / 26 mm -- 1.3 mm under the analytic cone's (the 16-gon sits lower). Step 0
-#: item 1 re-measures it on mujoco_warp (`tests/test_pick_place_s15.py`).
-SEAT = BySize(radii=(0.024, 0.025, 0.026), values=(0.06067, 0.06258, 0.06438))
-#: The drop point's height over the seated centre, m (plan §15.2's ``h_drop``; step 0 item 4 sets it).
+#: The seated centre's height over the block's bottom face by the ball's radius, m (`mdp.seat_centre_z`). Plan §15 step 0
+#: item 5's seat table on mujoco_warp (devbox RTX 4080, the task's env, DR-scene, the block at any yaw; `results/
+#: S15-ball-seat/step0/seat_table_warp_*.json`, the median over the seated drops): 61.45 / 63.61 / 65.75 mm at r 24 / 25 /
+#: 26 mm (n 451 / 893 / 448; r 25's 5-95 % 62.4-63.9). CPU MuJoCo's preview (plan §15.0) put r 25 at 62.58, the analytic
+#: cone at 63.9.
+SEAT = BySize(radii=(0.024, 0.025, 0.026), values=(0.06145, 0.06361, 0.06575))
+#: The drop point's height over the seated centre, m (plan §15.2's ``h_drop``). Step 0 item 4 (`results/S15-ball-seat/step0/
+#: finger_clearance.py`, CPU MuJoCo, the bench's G20 top-down grasp held): the closed hand reaches 13.8 / 18.8 / 23.7 mm
+#: under the ball's centre with the pads settled 11 / 16 / 21 mm under it; the seated centre is 7.6 mm over the block's
+#: top, so 5 mm of clearance for the lowest of those grasps needs the centre 21 mm over the seat. 25 mm leaves 4 mm more;
+#: the ball's bottom is then 5.6 mm over the block's top, inside the seat table's safe height.
 DROP_HEIGHT = 0.025
 #: The least xy distance between the ball's and the block's centres, m (§12.1's pin: 14 cm; step 0 item 6).
 BALL_MIN_SEPARATION = 0.14

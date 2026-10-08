@@ -344,7 +344,7 @@ if grep -q BOX_BOX_EDGE_TOL .venv/lib/python*/site-packages/mujoco_warp/_src/col
 else
   echo "patch       mujoco_warp_boxbox.patch NOT applied"
   case "$GOAL" in
-    insert*|place*)
+    insert*|place*|ball-seat*)
       echo "Refusing to run: GOAL=$GOAL needs mujoco_warp_boxbox.patch (decision 0005)." >&2
       exit 1
       ;;
