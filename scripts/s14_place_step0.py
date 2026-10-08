@@ -142,6 +142,15 @@ def reach(args: argparse.Namespace) -> dict:
 
   model = compile_scene(scripted.TASK)
   kin = scripted.Kin.from_model(model)
+  if args.box:
+    # Item 3: the IK held inside the named arm's action box -- the start pose +/- its action scale --, so a cell
+    # reached here is reached through that arm's actions.
+    from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+
+    sc = SPAWN_ROBOTS[args.box].action_scale
+    half = np.array([sc[f"arm_left_{j}_joint"] for j in range(1, 8)])
+    kin.lo = np.maximum(kin.lo, kin.q_default - half)
+    kin.hi = np.minimum(kin.hi, kin.q_default + half)
   table = model.geom("table/table_top").id
   d = mujoco.MjData(model)
   mujoco.mj_forward(model, d)
@@ -150,7 +159,12 @@ def reach(args: argparse.Namespace) -> dict:
   xs = np.round(np.arange(args.x[0], args.x[1] + 1e-9, args.step), 3)
   ys = np.round(np.arange(args.y[0], args.y[1] + 1e-9, args.step), 3)
   cells = [(float(x), float(y)) for x in xs for y in ys][args.shard :: args.shards]
-  out = {"table_top": top, "above_lying": args.above_lying, "cells": []}
+  out = {
+    "table_top": top,
+    "above_lying": args.above_lying,
+    "box": args.box,
+    "cells": [],
+  }
   if args.json.exists():
     out = json.loads(args.json.read_text())
   done = {(c["x"], c["y"]) for c in out["cells"]}
@@ -274,6 +288,11 @@ def main() -> None:
   r.add_argument("--shard", type=int, default=0)
   r.add_argument("--shards", type=int, default=1)
   r.add_argument("--seed", type=int, default=0)
+  r.add_argument(
+    "--box",
+    default=None,
+    help="hold the IK inside this SPAWN's arm's action box (item 3)",
+  )
   s = sub.add_parser("summarize")
   s.add_argument("files", nargs="+")
   args = p.parse_args()
