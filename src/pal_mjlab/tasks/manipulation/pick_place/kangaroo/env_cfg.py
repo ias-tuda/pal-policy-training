@@ -235,7 +235,7 @@ DEFAULT_BASE_OBS = "goal"
 #: plan S9.1.
 CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
 DEFAULT_CONTACT = "box"
-#: Plan §13.1's one-arm skills (`S13`): ``L-H`` / ``L-HP``, the left's side grasp and hold of the socket
+#: Plan §13.1's one-arm skills (`S13`): ``L-H`` / ``L-HP`` / ``L-H2``, the left's side grasp and hold of the socket
 #: block at H (`pick_place/hold.py`, on the `SPAWN=WC` cfg with the side-grasp arm); ``R-I`` / ``R-I-W``, the
 #: right's insertion into the block held at H by a stand-in hand (`pick_place/insert_held.py`, on ``GOAL=insert``,
 #: trained on the left arm and run mirrored). Unset is none.

@@ -109,15 +109,33 @@ PUSH_DURATION_S = (0.5, 1.5)
 PUSH_GAP_S = (1.0, 3.0)
 
 
+#: L-H2 (plan §13.1 phase 1.1; Siwei 2026-10-08 "Fix + resume"): what L-H's reward missed. Its policies carried the
+#: block to ~5 cm off H (+y 3-5 cm) tilted 21-47 deg and swinging, the hand rolled 9-43 deg (`results/S13-insert/read/`),
+#: and held at H on 0 / 64 at every checkpoint: the side grade looked at the approach axis alone, the level grade counted
+#: only within 5 cm of H and M2's narrow term was at 1 cm, so nothing paid between "near" (the 15 cm goal term, ~0.9 at
+#: 5 cm) and H. L-H2 grades the hand's roll as well (G(roll, `ROLL_STD`) in the side grade), pays a wide level grade
+#: whenever the block is grasped and off the table (`LEVEL_LIFTED_*`), and keeps M2's own 3 cm term as ``goal_mid``.
+ROLL_STD = math.radians(15.0)
+LEVEL_LIFTED_STD = math.radians(20.0)
+LEVEL_LIFTED_CLEAR = 0.02
+LEVEL_LIFTED_WEIGHT = 2.0
+
+
 @dataclasses.dataclass(frozen=True)
 class HoldTask:
   """An ``S13`` code's left skill."""
 
   push: bool = False
   """L-HP: pushes on the block's top (`mdp.push_object_top`)."""
+  shaped: bool = False
+  """L-H2: the roll in the side grade, the level grade while lifted, M2's 3 cm goal term (`ROLL_STD` ...)."""
 
 
-HOLD_CODES = {"L-H": HoldTask(), "L-HP": HoldTask(push=True)}
+HOLD_CODES = {
+  "L-H": HoldTask(),
+  "L-HP": HoldTask(push=True),
+  "L-H2": HoldTask(shaped=True),
+}
 
 
 def held_block_spec(name: str = OBJECT) -> mujoco.MjSpec:
@@ -146,9 +164,11 @@ def _side_cfg(gripper: GripperCfg) -> SceneEntityCfg:
   return SceneEntityCfg(ROBOT, site_names=(gripper.tcp_site,))
 
 
-def _hold_rewards(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
-  """RCTP's dict turned into L-H's (see the module docstring). Every term not named here is dropped
-  except the shared penalties (regularisers, table contact, effort hinge, trunk, arm-table)."""
+def _hold_rewards(
+  cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg, task: HoldTask
+) -> None:
+  """RCTP's dict turned into L-H's (see the module docstring), L-H2's with ``task.shaped``. Every term not named
+  here is dropped except the shared penalties (regularisers, table contact, effort hinge, trunk, arm-table)."""
   r = cfg.rewards
   side = _side_cfg(gripper)
   half = scene.BLOCK_HEIGHT / 2
@@ -172,13 +192,15 @@ def _hold_rewards(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
     )
 
   def graded(term: RewardTermCfg, **over) -> RewardTermCfg:
+    roll = {"roll_std": ROLL_STD} if task.shaped else {}
     return RewardTermCfg(
-      func=mdp.side_graded,
+      func=mdp.side_roll_graded if task.shaped else mdp.side_graded,
       weight=term.weight,
       params={
         "inner": term.func,
         "side_cfg": side,
         "side_std": SIDE_STD,
+        **roll,
         **term.params,
         **over,
       },
@@ -221,6 +243,20 @@ def _hold_rewards(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
     ),
     **keep,
   }
+  if task.shaped:
+    cfg.rewards["goal_mid"] = graded(r["goal_near"])
+    cfg.rewards["level_lifted"] = RewardTermCfg(
+      func=mdp.level_lifted,
+      weight=LEVEL_LIFTED_WEIGHT,
+      params={
+        "object_name": OBJECT,
+        "grasp_sensor_name": goal_params["grasp_sensor_name"],
+        "surface_cfg": SceneEntityCfg(TABLE),
+        "half_height": half,
+        "clear": LEVEL_LIFTED_CLEAR,
+        "std": LEVEL_LIFTED_STD,
+      },
+    )
 
 
 def held_params(gripper: GripperCfg) -> dict:
@@ -239,7 +275,9 @@ def held_params(gripper: GripperCfg) -> dict:
   }
 
 
-def _hold_observations(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
+def _hold_observations(
+  cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg, task: HoldTask
+) -> None:
   """The actor's block yaw as (cos 4 psi, sin 4 psi) and its up axis appended (40-D); the critic the same,
   live, plus the side grade and `held`."""
   actor = cfg.observations["actor"].terms
@@ -264,6 +302,11 @@ def _hold_observations(cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg) -> None:
       func=mdp.object_up_b, params={"object_name": OBJECT}
     ),
     "side_grade": ObservationTermCfg(
+      func=mdp.side_roll_grade_obs,
+      params={"asset_cfg": _side_cfg(gripper), "std": SIDE_STD, "roll_std": ROLL_STD},
+    )
+    if task.shaped
+    else ObservationTermCfg(
       func=mdp.side_grade_obs, params={"asset_cfg": _side_cfg(gripper), "std": SIDE_STD}
     ),
     "held": ObservationTermCfg(func=mdp.held_at_goal_obs, params=held_params(gripper)),
@@ -319,8 +362,8 @@ def apply_hold(
     success_threshold=HELD_DISTANCE,
     debug_vis=True,
   )
-  _hold_rewards(cfg, gripper)
-  _hold_observations(cfg, gripper)
+  _hold_rewards(cfg, gripper, task)
+  _hold_observations(cfg, gripper, task)
   cfg.events["reset_tracker_yaw_bias"] = EventTermCfg(
     func=mdp.reset_tracker_yaw_bias,
     mode="reset",

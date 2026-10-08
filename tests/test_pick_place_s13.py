@@ -135,6 +135,30 @@ def test_lh_changes_the_arm_object_spawn_goal_and_reward(monkeypatch):
   assert "push_block" in _cfg(monkeypatch, S13="L-HP").events
 
 
+def test_lh2_adds_roll_level_and_mid_goal_and_changes_nothing_else(monkeypatch):
+  lh = _cfg(monkeypatch, S13="L-H")
+  lh2 = _cfg(monkeypatch, S13="L-H2")
+  # L-H is as trained (side_graded, no new terms); L-H2 adds goal_mid and level_lifted.
+  assert lh.rewards["grasp"].func is mdp.side_graded
+  assert not {"goal_mid", "level_lifted"} & set(lh.rewards)
+  assert set(lh2.rewards) - set(lh.rewards) == {"goal_mid", "level_lifted"}
+  for name in ("grasp", "lift", "goal", "goal_near", "goal_mid"):
+    term = lh2.rewards[name]
+    assert term.func is mdp.side_roll_graded, name
+    assert term.params["roll_std"] == H.ROLL_STD, name
+  # goal_mid is M2's own 3 cm term; goal_near stays at 1 cm.
+  assert lh2.rewards["goal_mid"].params["std"] == pytest.approx(0.03)
+  assert lh2.rewards["goal_near"].params["std"] == H.NEAR_STD
+  lv = lh2.rewards["level_lifted"]
+  assert lv.weight == H.LEVEL_LIFTED_WEIGHT and lv.params["std"] == H.LEVEL_LIFTED_STD
+  # held (the eval's bar), the observations' widths, the scene and the events are L-H's.
+  assert _diff(lh2.rewards["held"], lh.rewards["held"]) == {}
+  assert list(lh2.observations["actor"].terms) == list(lh.observations["actor"].terms)
+  assert list(lh2.observations["critic"].terms) == list(lh.observations["critic"].terms)
+  assert lh2.observations["critic"].terms["side_grade"].func is mdp.side_roll_grade_obs
+  assert _diff(lh2.scene, lh.scene) == {} and _diff(lh2.events, lh.events) == {}
+
+
 @pytest.mark.parametrize(
   "changes",
   [
@@ -238,6 +262,36 @@ def test_side_grade_is_one_for_a_level_hand_and_less_at_the_start_pose(lh_env):
   assert float(grade.max()) < 0.4
   # A level hand: the same function on a rotated frame reads 1 (the grade is exp(-(elev/std)^2)).
   assert math.exp(-((0.0 / H.SIDE_STD) ** 2)) == 1.0
+
+
+def test_roll_grade_and_level_lifted_on_the_env(lh_env):
+  env = lh_env
+  side = SceneEntityCfg(
+    "robot", site_names=(KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site,)
+  )
+  side.resolve(env.scene)
+  roll = mdp.hand_roll(env, side)
+  assert bool(((roll >= 0.0) & (roll <= math.pi / 2)).all())
+  # The roll grade only ever lowers the side grade.
+  g = mdp.side_grade(env, side, H.SIDE_STD)
+  gr = mdp.side_roll_grade(env, side, H.SIDE_STD, H.ROLL_STD)
+  assert bool((gr <= g + 1e-6).all())
+  want = g * torch.exp(-torch.square(roll / H.ROLL_STD))
+  assert torch.allclose(gr, want, atol=1e-6)
+  # The block on the table, not grasped: level_lifted pays nothing.
+  sensor = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").contact_sensor_name
+  table = SceneEntityCfg(TABLE)
+  table.resolve(env.scene)
+  lv = mdp.level_lifted(
+    env,
+    OBJECT,
+    sensor,
+    table,
+    scene.BLOCK_HEIGHT / 2,
+    H.LEVEL_LIFTED_CLEAR,
+    H.LEVEL_LIFTED_STD,
+  )
+  assert float(lv.abs().max()) == 0.0
 
 
 def test_lhp_pushes_the_top_from_4s_and_not_before(lh_env):

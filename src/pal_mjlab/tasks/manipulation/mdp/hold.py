@@ -24,6 +24,7 @@ from mjlab.utils.lab_api.math import (
   quat_inv,
 )
 
+from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
 from pal_mjlab.tasks.manipulation.mdp.observations import (
   _ROBOT,
   _base_pose,
@@ -151,6 +152,60 @@ def side_graded(
   """``inner(env, **params)`` x `side_grade`: a term that pays only as much as the grasp is a side one.
   Wraps RCTP's grasp, faded lift and M2's goal terms so a top-down grasp earns none of them."""
   return inner(env, **params) * side_grade(env, side_cfg, side_std)
+
+
+def hand_roll(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+  """|Angle of the jaw axis above or below the horizontal|, rad: 0 when the jaw closes horizontally, as at L-H's
+  grasp on the block's side faces. (B,)"""
+  _, jaw = hand_axes_w(env, asset_cfg)
+  return torch.asin(jaw[:, 2].clamp(-1.0, 1.0)).abs()
+
+
+def side_roll_grade(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, std: float, roll_std: float
+) -> torch.Tensor:
+  """`side_grade` x G(`hand_roll`, ``roll_std``): a side grasp with the jaw horizontal. L-H's grade looked at the
+  approach axis alone, and L-H s2 held the block with the hand rolled ~43 deg (`results/S13-insert/read/`). (B,)"""
+  roll = torch.exp(-torch.square(hand_roll(env, asset_cfg) / roll_std))
+  return side_grade(env, asset_cfg, std) * roll
+
+
+def side_roll_graded(
+  env: ManagerBasedRlEnv,
+  inner,
+  side_cfg: SceneEntityCfg,
+  side_std: float,
+  roll_std: float,
+  **params,
+) -> torch.Tensor:
+  """``inner(env, **params)`` x `side_roll_grade` (L-H2's `side_graded`). (B,)"""
+  return inner(env, **params) * side_roll_grade(env, side_cfg, side_std, roll_std)
+
+
+def side_roll_grade_obs(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, std: float, roll_std: float
+) -> torch.Tensor:
+  """`side_roll_grade`, for the critic. (B, 1)"""
+  return side_roll_grade(env, asset_cfg, std, roll_std).unsqueeze(-1)
+
+
+def level_lifted(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  grasp_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  half_height: float,
+  clear: float,
+  std: float,
+) -> torch.Tensor:
+  """G(block tilt, ``std``) while it is grasped with its bottom at least ``clear`` over the table, anywhere (L-H2):
+  L-H's level grade counted only within 5 cm of H, and its policies carried the block to ~5 cm off H tilted 21-47
+  deg, where nothing paid for levelling it. (B,)"""
+  obj: Entity = env.scene[object_name]
+  bottom = obj.data.root_link_pos_w[:, 2] - half_height
+  up = bottom > surface_top_z(env, surface_cfg) + clear
+  gate = (_grasped_bool(env, grasp_sensor_name) & up).float()
+  return torch.exp(-torch.square(axis_tilt(env, object_name) / std)) * gate
 
 
 def held_at_goal(
