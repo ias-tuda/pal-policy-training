@@ -280,6 +280,7 @@ SPAWN_ROBOTS = {
   "WCK": KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   # Plan §14: WC's arm with the wrist roll widened (step 0 item 3).
   "WP": KANGAROO_GRIPPERS_LEFT_ARM_WP,
+  "WCP": KANGAROO_GRIPPERS_LEFT_ARM_WP,
 }
 
 

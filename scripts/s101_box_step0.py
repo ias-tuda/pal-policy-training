@@ -172,13 +172,22 @@ def clearance(args: argparse.Namespace) -> dict:
       "plan_errors": sum(r["plan_error"] is not None for r in g),
       "lifted": sum(r["lifted"] for r in g),
       "touch_cases": [
-        (r["direction_deg"], r["box_yaw_deg"], r["cube_yaw_deg"], r["hand_wall_by_phase"])
+        (
+          r["direction_deg"],
+          r["box_yaw_deg"],
+          r["cube_yaw_deg"],
+          r["hand_wall_by_phase"],
+        )
         for r in g
         if r["touch"]
       ][:16],
     }
   clear = [d for d in args.distances if summary[f"{d:.2f}"]["touch"] == 0]
-  return {"summary": summary, "least_clear_distance": min(clear) if clear else None, "rows": out}
+  return {
+    "summary": summary,
+    "least_clear_distance": min(clear) if clear else None,
+    "rows": out,
+  }
 
 
 #: The 12 forced box centres, env frame (WC: x 0.40-0.60, y -0.04-0.26).
@@ -217,7 +226,10 @@ def reach(args: argparse.Namespace) -> dict:
   for k, (bxy, yaw) in enumerate((b, y) for y in (0.0, 45.0) for b in FORCED_BOXES):
     far = max(corners, key=lambda c: math.hypot(c[0] - bxy[0], c[1] - bxy[1]))
     # Pulled 2 cm into the area so the cube is not on its very edge; yaw 0 / 30 / 45 in turn.
-    cube = (far[0] + (0.02 if far[0] < 0.5 else -0.02), far[1] + (0.02 if far[1] < 0.1 else -0.02))
+    cube = (
+      far[0] + (0.02 if far[0] < 0.5 else -0.02),
+      far[1] + (0.02 if far[1] < 0.1 else -0.02),
+    )
     forced.append((bxy, yaw, cube, (0.0, 30.0, 45.0)[k % 3]))
   results = {}
   hook = _Contacts(len(forced))
@@ -249,7 +261,14 @@ def reach(args: argparse.Namespace) -> dict:
 
 #: Spawns the place check plans from: inside the part of WC the script grasps from (W2-like, S7-8 step 0),
 #: tried in order until one is >= `box.BOX_MIN_SEPARATION` from the box and its grasp plans.
-PLACE_SPAWNS = ((0.44, 0.22), (0.40, 0.26), (0.52, 0.24), (0.46, 0.14), (0.42, 0.16), (0.56, 0.18))
+PLACE_SPAWNS = (
+  (0.44, 0.22),
+  (0.40, 0.26),
+  (0.52, 0.24),
+  (0.46, 0.14),
+  (0.42, 0.16),
+  (0.56, 0.18),
+)
 GRASP_WAYPOINTS = ("pregrasp", "grasp", "lift")
 
 
@@ -260,7 +279,6 @@ def place(args: argparse.Namespace) -> dict:
   the WC arm (> 1 is clipped)."""
   import torch
   from mjlab.envs import ManagerBasedRlEnv
-
   from pal_mjlab.tasks.manipulation import scene
   from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
   from pal_mjlab.tasks.manipulation.pick_place.box import BOX_MIN_SEPARATION
@@ -344,7 +362,9 @@ def place(args: argparse.Namespace) -> dict:
           )
         except RuntimeError as e:
           msg = str(e)
-          wp = next((w for w in scripted.WAYPOINT_NAMES if f" {w} at" in f" {msg}"), "?")
+          wp = next(
+            (w for w in scripted.WAYPOINT_NAMES if f" {w} at" in f" {msg}"), "?"
+          )
           tried.append((sp, wp, msg[:90]))
           if wp in GRASP_WAYPOINTS:
             continue  # this spawn's grasp; try the next spawn
@@ -359,7 +379,9 @@ def place(args: argparse.Namespace) -> dict:
           "ok": True,
           "spawn": sp,
           "max_abs_action_per_joint": worst.round(3).tolist(),
-          "clipped_joints": [scripted.ARM_JOINTS[j] for j in np.nonzero(worst > 1.0)[0]],
+          "clipped_joints": [
+            scripted.ARM_JOINTS[j] for j in np.nonzero(worst > 1.0)[0]
+          ],
         }
         break
       if row is None:
@@ -451,7 +473,9 @@ def main() -> None:
       )
     for r in res["place"]:
       if not r["release_ik"]:
-        print(f"  release pose unreachable: box {r['box']} cube yaw {r['cube_yaw']}: {r['release_note']}")
+        print(
+          f"  release pose unreachable: box {r['box']} cube yaw {r['cube_yaw']}: {r['release_note']}"
+        )
     print(
       f"release pose (cube bottom 1 cm over the rim, aligned) reachable "
       f"{sum(r['release_ik'] for r in res['place'])} / {len(res['place'])}"
@@ -464,7 +488,9 @@ def main() -> None:
     )
   args.json.parent.mkdir(parents=True, exist_ok=True)
   args.json.write_text(
-    json.dumps({"args": vars(args) | {"json": str(args.json)}, **res}, indent=1, default=str)
+    json.dumps(
+      {"args": vars(args) | {"json": str(args.json)}, **res}, indent=1, default=str
+    )
   )
 
 

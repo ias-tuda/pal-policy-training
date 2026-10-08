@@ -168,6 +168,11 @@ SPAWN_BOXES = {
   "WP": SpawnBox(
     x=(0.36, 0.64), y=(-0.10, 0.32), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
+  # ... and plan §14's area control PS-INC: WC's area with WP's arm (the lying pin's wrist roll), so that the code
+  # differs from PS-IN by the area alone (`TARGET=WC`).
+  "WCP": SpawnBox(
+    x=(0.40, 0.60), y=(-0.04, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
+  ),
 }
 
 #: Where the target is drawn from, by name (`TARGET`, plan S7-8). ``B``: baseline B's small box.

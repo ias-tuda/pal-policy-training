@@ -243,6 +243,9 @@ def test_wp_trains_the_wp_arm_and_a_wc_checkpoint_is_rescaled(monkeypatch):
   )
   assert {k for k in wp if wp[k] != wc[k]} == {r"arm_left_7_joint"}
   assert wp[r"arm_left_7_joint"] == 2.35
+  from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import SPAWN_ROBOTS
+
+  assert SPAWN_ROBOTS["WP"] is SPAWN_ROBOTS["WCP"] is KANGAROO_GRIPPERS_LEFT_ARM_WP
   _set_env(monkeypatch, CKPT_SPAWN="WC")
   rl = kangaroo_pick_place_rl_cfg()
   assert rl.rescale_actions_on_load == {r"arm_left_7_joint": pytest.approx(1.20 / 2.35)}
