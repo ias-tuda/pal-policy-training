@@ -82,6 +82,8 @@ Plan §14 adds `GOAL=place` (`place_pin.PLACE_GOALS`) and the wide pin area `WP`
 pin up standing or lying and put it down at a goal point, in any pose. `PIN_START` (`mix` | `stand` | `lie`,
 `place_pin.PIN_STARTS`) names the start poses, `PIN_LIE_P` the lying share for `mix` (0.5 unset); both need
 `GOAL=place`. PS-SG's grasp closure is the reward module GC (`REWARD=...+GC`).
+Plan §15 adds `GOAL=ball-seat` (`ball_seat.BALL_SEAT_GOALS`) and the Ø 50 mm ball to `SHAPE` (`ball50` | `ball50-dr`, Ø 48-52
+mm): pick the ball on `WC` and drop it into the chamfer of §12's block drawn on `WC` at any yaw; §12's 42 / 46 layout.
 Plan S11 (two arms) adds `ARM_HOME` (`default` | `mirror`: the right arm's home, Claudius's or the
 left home's mirror image), `TARGET=T11` | `T11W` (the meeting point T in the robot frame: L-T's goal,
 or R-ST's / R-ST-W's base with `GOAL=stack`), `TRACKER` (`B` | `split`: the 6 + 4 mm bias split, the
