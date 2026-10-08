@@ -216,6 +216,19 @@ KANGAROO_GRIPPERS_LEFT_ARM_WCK = dataclasses.replace(
     r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
   },
 )
+# Plan §14's `WP` (x 0.36-0.64, y -0.10-0.32, the pin standing or lying): WC's scales with the wrist roll (arm 7)
+# widened to its half-range cap. A lying pin is gripped only with the jaw across its axis, so the wrist has to
+# follow the axis's yaw; inside WC's box (arm 7 +/-1.20 rad) the lying grasp, lift and retreat reach 167 of WP's 330
+# cells at an axis of 45 deg (292 unconstrained), and every other joint's solutions stay inside WC's box (step 0
+# items 2-3, `results/S14-pin-place/step0/reach_box_summary.txt`). A WC checkpoint resumes through decision 0003's
+# exact rescale (`CKPT_SPAWN=WC`).
+KANGAROO_GRIPPERS_LEFT_ARM_WP = dataclasses.replace(
+  KANGAROO_GRIPPERS_LEFT_ARM_WC,
+  action_scale={
+    **KANGAROO_GRIPPERS_LEFT_ARM_WC.action_scale,
+    r"arm_left_7_joint": 2.35,
+  },
+)
 
 
 # -- Plan S11: two arms -----------------------------------------------------------------------

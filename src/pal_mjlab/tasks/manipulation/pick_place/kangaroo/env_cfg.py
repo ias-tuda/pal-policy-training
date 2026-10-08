@@ -155,6 +155,7 @@ from pal_mjlab.tasks.manipulation.robots import (
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
   KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  KANGAROO_GRIPPERS_LEFT_ARM_WP,
   kangaroo_grippers_left_arm,
 )
 from pal_mjlab.tasks.manipulation.runner import ManipulationRunnerCfg
@@ -277,8 +278,8 @@ SPAWN_ROBOTS = {
   "W2": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   "WC": KANGAROO_GRIPPERS_LEFT_ARM_WC,
   "WCK": KANGAROO_GRIPPERS_LEFT_ARM_WCK,
-  # Plan §14: WC's arm (step 0 item 3).
-  "WP": KANGAROO_GRIPPERS_LEFT_ARM_WC,
+  # Plan §14: WC's arm with the wrist roll widened (step 0 item 3).
+  "WP": KANGAROO_GRIPPERS_LEFT_ARM_WP,
 }
 
 

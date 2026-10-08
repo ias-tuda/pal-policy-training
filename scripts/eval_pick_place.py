@@ -189,11 +189,15 @@ JAW_OPEN_BY_SHAPE = PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS)
 def jaw_open_for(env: ManagerBasedRlEnv) -> float | torch.Tensor:
   """J's threshold for ``env``'s object: `JAW_OPEN` for a cube (a float, as every run before S8),
   `BALL_JAW_OPEN` for a ball, per env for plan S8's MIX; plan §12's pin (two boxes, a "cube" to
-  `shapes.shape_kind`) its own `rewards.PIN_JAW_OPEN`, whenever the scene has the socket block."""
+  `shapes.shape_kind`) its own `rewards.PIN_JAW_OPEN`, whenever the scene has the socket block or plan §14's
+  place goal."""
+  from pal_mjlab.tasks.manipulation import mdp
   from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK
   from pal_mjlab.tasks.manipulation.pick_place.rewards import PIN_JAW_OPEN
 
-  if BLOCK in env.scene.entities:
+  if BLOCK in env.scene.entities or isinstance(
+    env.command_manager.get_term(COMMAND), mdp.PinPlaceCommand
+  ):
     return PIN_JAW_OPEN
   return resolve(env, JAW_OPEN_BY_SHAPE)
 
@@ -2250,6 +2254,318 @@ class InsertTally:
     return out
 
 
+#: Plan §14's bins (build item 6): where the pin starts and the goal is (the robot frame): WC's part, and the ring
+#: `WP` adds around it; x in 3 cm steps; the carry; its direction; a standing pin's yaw and a lying pin's axis.
+PLACE_POSITION_BINS = {
+  "wc": lambda x, y: 0.40 <= x <= 0.60 and -0.04 <= y <= 0.26,
+  "far_x>0.60": lambda x, y: x > 0.60,
+  "near_x<0.40": lambda x, y: x < 0.40,
+  "right_y<-0.04": lambda x, y: y < -0.04,
+  "left_y>0.26": lambda x, y: y > 0.26,
+}
+PLACE_X_BINS = tuple(
+  (round(0.36 + 0.03 * k, 2), round(0.39 + 0.03 * k, 2)) for k in range(10)
+)
+PLACE_CARRY_BINS_CM = ((10, 20), (20, 30), (30, 40), (40, 99))
+PLACE_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+PLACE_AXIS_BINS_DEG = ((0, 30), (30, 60), (60, 91))
+#: A pin pushed this far (m) before the first grasp counts as pushed (`PregraspTally`'s 1 cm).
+PREGRASP_PUSH = 0.01
+
+
+class PlaceTally:
+  """Plan §14's reads, per episode, beside `Tally` (plan §14.7 *Reported*, build item 6): SUCC -- the pin rests on
+  the table (`place_pin.PinRestState.rested`: not held, its lowest point within 3 mm of the table, still) with its
+  centre within 2 cm of the goal after the hand-off's return, the policy having let go by itself (J-released) --, by
+  start pose; the end pose; topples (standing -> lying not in the hand) by phase; the centre's final error; the
+  let-go's speed and lowest-point height; regrasps; time to place; held at the hand-off; never grasped; and the
+  pre-grasp reads (pin pushed > 1 cm or knocked over before the first grasp, the jaw at arrival, a first-try grasp).
+  ``None`` from `from_env` when the goal is not ``GOAL=place``."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> PlaceTally | None:
+    from pal_mjlab.tasks.manipulation import mdp
+
+    if not isinstance(env.command_manager.get_term(COMMAND), mdp.PinPlaceCommand):
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.pick_place import place_pin
+
+    self.mdp, self.pp = mdp, place_pin
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda v=0.0: torch.full((n,), v, device=dev)  # noqa: E731
+    self.rested, self.standing, self.prev_standing = zb(), zb(), zb()
+    self.dxy = zf()
+    self.ever_grasped, self.prev_grasped, self.lifted_once = zb(), zb(), zb()
+    self.grasps = torch.zeros(n, dtype=torch.long, device=dev)
+    self.topple = {k: zb() for k in ("pregrasp", "carry", "letgo", "return")}
+    self.pushed, self.knocked = zb(), zb()
+    self.arrive_q = zf(float("nan"))
+    self.rel_seen = zb()
+    self.rel_speed, self.rel_zmin = zf(float("nan")), zf(float("nan"))
+    self.letgo_seen = zb()
+    self.first_rested = zf(-1.0)
+    self.held_at_handoff, self.handed_prev = zb(), zb()
+    #: Each episode's start: pin (x, y, env frame), standing, |yaw| folded (standing) or axis from x (lying), goal (x, y).
+    self.start = torch.zeros(n, 6, device=dev)
+    self.step_dt = env.step_dt
+    self.done: list[dict] = []
+
+  def step(
+    self,
+    env: ManagerBasedRlEnv,
+    grasped: torch.Tensor,
+    j_released: torch.Tensor,
+    handed: torch.Tensor,
+    jaw_q: torch.Tensor,
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` / ``handed`` are
+    `RetreatTally`'s."""
+    mdp = self.mdp
+    pin = env.scene[OBJECT]
+    q = pin.data.root_link_quat_w
+    origin = env.scene.env_origins[:, :2]
+    st = mdp.pin_rest_state(env, OBJECT, COMMAND)
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      axis = mdp.pin_axis_canonical_w(env, q)
+      yaw = yaw_mod90(mdp.yaw_relative_to_base(env, q)).abs()
+      axis_deg = torch.atan2(axis[:, 1], axis[:, 0]).abs()
+      axis_deg = torch.minimum(axis_deg, math.pi - axis_deg)
+      goal = env.command_manager.get_term(COMMAND).goal_surface[:, :2] - origin
+      now = torch.cat(
+        [
+          pin.data.root_link_pos_w[:, :2] - origin,
+          st.standing.float().unsqueeze(-1),
+          torch.where(st.standing, yaw, axis_deg).unsqueeze(-1),
+          goal,
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
+      self.prev_standing = torch.where(fresh, st.standing, self.prev_standing)
+    rested = st.rested(
+      grasped,
+      self.pp.PLACE_RADIUS,
+      self.pp.PLACED_TOL[1],
+      self.pp.REST_SPEED,
+      self.pp.REST_ANGULAR_SPEED,
+    )
+    self.rested, self.standing, self.dxy = rested, st.standing, st.goal_dxy
+    onset = grasped & ~self.prev_grasped
+    self.grasps += onset.long()
+    lifted_now = grasped & (st.z_min > 0.01)
+    self.lifted_once |= lifted_now
+    # Topples: standing -> lying with the pin not in the hand, by phase.
+    toppled = self.prev_standing & ~st.standing & ~grasped
+    phase_pre = ~self.ever_grasped
+    phase_ret = handed
+    phase_let = j_released & ~handed
+    phase_carry = self.ever_grasped & ~j_released & ~handed
+    for key, ph in (
+      ("pregrasp", phase_pre),
+      ("carry", phase_carry),
+      ("letgo", phase_let),
+      ("return", phase_ret),
+    ):
+      self.topple[key] |= toppled & ph
+    # Pre-grasp: pushed / knocked before the first grasp; the jaw when the tool point first reaches the grasp point.
+    moved = torch.norm(
+      pin.data.root_link_pos_w[:, :2] - origin - self.start[:, :2], dim=-1
+    )
+    self.pushed |= phase_pre & (moved > PREGRASP_PUSH)
+    self.knocked |= phase_pre & toppled
+    gp = mdp.pin_grasp_point_w(env, OBJECT, 0.020, self.pp.GRASP_ABOVE_TOP_LYING)
+    robot = env.scene[ROBOT]
+    tcp = robot.data.site_pos_w[:, robot.site_names.index(TCP_SITE)]
+    arrive = (torch.norm(tcp - gp, dim=-1) < 0.02) & torch.isnan(self.arrive_q)
+    self.arrive_q = torch.where(arrive, jaw_q, self.arrive_q)
+    # The let-go: the pads' last contact after the lift, its speed and lowest point.
+    letgo = self.prev_grasped & ~grasped & self.lifted_once & ~self.letgo_seen
+    self.rel_speed = torch.where(letgo, st.speed, self.rel_speed)
+    self.rel_zmin = torch.where(letgo, st.z_min, self.rel_zmin)
+    self.letgo_seen |= letgo
+    # A later regrasp re-arms the let-go.
+    self.letgo_seen &= ~(onset & self.lifted_once)
+    age = env.episode_length_buf.float() * self.step_dt
+    self.first_rested = torch.where(
+      rested & self.lifted_once & (self.first_rested < 0), age, self.first_rested
+    )
+    self.held_at_handoff |= handed & ~self.handed_prev & grasped
+    self.handed_prev = handed.clone()
+    self.ever_grasped |= grasped
+    self.prev_grasped = grasped.clone()
+    self.prev_standing = st.standing.clone()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      px, py, stand, ang, gx, gy = self.start[i].tolist()
+      self.done.append(
+        {
+          "place_success": bool(self.rested[i] & handed[i] & j_released[i]),
+          "rested_end": bool(self.rested[i]),
+          "start_pose": "standing" if stand > 0.5 else "lying",
+          "end_pose": "standing" if bool(self.standing[i]) else "lying",
+          "centre_error_cm": 100 * float(self.dxy[i]),
+          "j_released": bool(j_released[i]),
+          "never_grasped": not bool(self.ever_grasped[i]),
+          "grasps": int(self.grasps[i]),
+          "first_try_grasp": bool(self.ever_grasped[i])
+          and int(self.grasps[i]) == 1
+          and bool(self.lifted_once[i]),
+          "held_at_handoff": bool(self.held_at_handoff[i]),
+          "topple_pregrasp": bool(self.topple["pregrasp"][i]),
+          "topple_carry": bool(self.topple["carry"][i]),
+          "topple_letgo": bool(self.topple["letgo"][i]),
+          "topple_return": bool(self.topple["return"][i]),
+          "pushed_pregrasp": bool(self.pushed[i]),
+          "knocked_pregrasp": bool(self.knocked[i]),
+          "jaw_at_arrival": float(self.arrive_q[i]),
+          "letgo_speed_cm_s": 100 * float(self.rel_speed[i]),
+          "letgo_zmin_mm": 1e3 * float(self.rel_zmin[i]),
+          "time_to_place_s": float(self.first_rested[i]),
+          "pin_x": px,
+          "pin_y": py,
+          "goal_x": gx,
+          "goal_y": gy,
+          "start_angle_deg": math.degrees(ang),
+          "carry_cm": 100 * math.hypot(gx - px, gy - py),
+        }
+      )
+      for t in self.topple.values():
+        t[i] = False
+      for t in (
+        self.ever_grasped,
+        self.prev_grasped,
+        self.lifted_once,
+        self.pushed,
+        self.knocked,
+        self.letgo_seen,
+        self.held_at_handoff,
+        self.handed_prev,
+      ):
+        t[i] = False
+      self.grasps[i] = 0
+      self.arrive_q[i] = float("nan")
+      self.rel_speed[i] = float("nan")
+      self.rel_zmin[i] = float("nan")
+      self.first_rested[i] = -1.0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k, g=rows: sum(bool(r[k]) for r in g) / max(len(g), 1)  # noqa: E731
+
+    def med(k, sel=None):
+      v = [r[k] for r in rows if (sel is None or sel(r)) and not math.isnan(r[k])]
+      return float(np.median(v)) if v else float("nan")
+
+    def ok(r):
+      return r["place_success"]
+
+    out = {
+      "place_success": share("place_success"),
+      "place_rested_end": share("rested_end"),
+      "place_j_released": share("j_released"),
+      "place_never_grasped": share("never_grasped"),
+      "place_first_try_grasp": share("first_try_grasp"),
+      "place_held_at_handoff": share("held_at_handoff"),
+      "place_regrasp": sum(r["grasps"] > 1 for r in rows) / n,
+      "place_pushed_pregrasp": share("pushed_pregrasp"),
+      "place_knocked_pregrasp": share("knocked_pregrasp"),
+      "place_jaw_at_arrival_median": med("jaw_at_arrival"),
+      "place_centre_error_cm_median": med("centre_error_cm"),
+      "place_within_1cm": sum(
+        r["centre_error_cm"] < 1 and r["rested_end"] for r in rows
+      )
+      / n,
+      "place_within_2cm": sum(
+        r["centre_error_cm"] < 2 and r["rested_end"] for r in rows
+      )
+      / n,
+      "place_within_5cm": sum(
+        r["centre_error_cm"] < 5 and r["rested_end"] for r in rows
+      )
+      / n,
+      "place_letgo_speed_cm_s_median": med("letgo_speed_cm_s"),
+      "place_letgo_zmin_mm_median": med("letgo_zmin_mm"),
+      "place_time_to_place_s_median": med(
+        "time_to_place_s", lambda r: r["time_to_place_s"] >= 0
+      ),
+      "place_end_standing": sum(r["end_pose"] == "standing" for r in rows if ok(r))
+      / max(sum(ok(r) for r in rows), 1),
+    }
+    for key in ("topple_pregrasp", "topple_carry", "topple_letgo", "topple_return"):
+      out[f"place_{key}"] = share(key)
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {"n": len(g), "place_success": share("place_success", g) if g else None}
+        for name, g in groups.items()
+      }
+
+    out["place_by_start_pose"] = bins(
+      {p: [r for r in rows if r["start_pose"] == p] for p in ("standing", "lying")}
+    )
+    for key, (xk, yk) in (("pin", ("pin_x", "pin_y")), ("goal", ("goal_x", "goal_y"))):
+      out[f"place_by_{key}_position"] = bins(
+        {
+          name: [r for r in rows if t(r[xk], r[yk])]
+          for name, t in PLACE_POSITION_BINS.items()
+        }
+      )
+      out[f"place_by_{key}_x"] = bins(
+        {
+          f"{lo:.2f}-{hi:.2f}": [r for r in rows if lo <= r[xk] < hi]
+          for lo, hi in PLACE_X_BINS
+        }
+      )
+    out["place_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["carry_cm"] < hi]
+        for lo, hi in PLACE_CARRY_BINS_CM
+      }
+    )
+
+    def direction(r):
+      dx, dy = r["goal_x"] - r["pin_x"], r["goal_y"] - r["pin_y"]
+      return "forward-back" if abs(dx) > abs(dy) else ("left" if dy > 0 else "right")
+
+    out["place_by_direction"] = bins(
+      {
+        d: [r for r in rows if direction(r) == d]
+        for d in ("right", "left", "forward-back")
+      }
+    )
+    out["place_by_standing_yaw"] = bins(
+      {
+        f"{lo}-{hi}deg": [
+          r
+          for r in rows
+          if r["start_pose"] == "standing" and lo <= r["start_angle_deg"] < hi
+        ]
+        for lo, hi in PLACE_YAW_BINS_DEG
+      }
+    )
+    out["place_by_lying_axis"] = bins(
+      {
+        f"{lo}-{hi}deg": [
+          r
+          for r in rows
+          if r["start_pose"] == "lying" and lo <= r["start_angle_deg"] < hi
+        ]
+        for lo, hi in PLACE_AXIS_BINS_DEG
+      }
+    )
+    return out
+
+
 def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
   """The position controller's action: home pose, jaw open. ``zero`` (B, A) for an absolute
   action, whose 0 is the default pose; for plan S7-8's ``ACTION=delta`` the action moves the
@@ -2957,6 +3273,7 @@ def main() -> None:
   stack = StackTally(env)
   box = BoxTally.from_env(env)
   insert = InsertTally.from_env(env)
+  place = PlaceTally.from_env(env)
   arm = ArmTally.from_env(env)
   trace: list[dict[str, torch.Tensor]] = []
   robot = env.scene[ROBOT]
@@ -2998,6 +3315,8 @@ def main() -> None:
         box.step(env, flags["grasped"], retreat.released)
       if insert is not None:
         insert.step(env, flags["grasped"], retreat.released)
+      if place is not None:
+        place.step(env, flags["grasped"], retreat.released, retreat.handed, jaw_q)
       if plant is not None:
         plant.measure_env(
           carrying=flags["lifted"],
@@ -3064,6 +3383,8 @@ def main() -> None:
           box.finish(finished, retreat.handed, retreat.released)
         if insert is not None:
           insert.finish(finished, retreat.handed, retreat.released)
+        if place is not None:
+          place.finish(finished, retreat.handed, retreat.released)
         tally.finish(finished)
         retreat.finish(
           finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
@@ -3099,6 +3420,9 @@ def main() -> None:
   if insert is not None:
     result.update(insert.summarise(args.episodes))
     print("\nplan §12 (insert): " + json.dumps(insert.summarise(args.episodes)))
+  if place is not None:
+    result.update(place.summarise(args.episodes))
+    print("\nplan §14 (place): " + json.dumps(place.summarise(args.episodes)))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
@@ -3127,8 +3451,8 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o, **st, **a, **b, **ins}
-            for r, q, o, st, a, b, ins in zip(
+            {**r, **q, **o, **st, **a, **b, **ins, **pl}
+            for r, q, o, st, a, b, ins, pl in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
@@ -3137,6 +3461,8 @@ def main() -> None:
               (box.done[: args.episodes] if box is not None else None)
               or [{}] * args.episodes,
               (insert.done[: args.episodes] if insert is not None else None)
+              or [{}] * args.episodes,
+              (place.done[: args.episodes] if place is not None else None)
               or [{}] * args.episodes,
               strict=True,
             )
