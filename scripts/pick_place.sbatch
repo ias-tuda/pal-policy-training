@@ -320,6 +320,12 @@ if grep -qE '^[[:space:]]+warp_util[.]check_toolkit_driver[(][)]' \
 else
   echo "patch       mujoco_warp_io.patch applied, or upstream moved -- check"
 fi
+# Decision 0005: mujoco_warp_box_box_depth.patch (box_box's bogus deep contacts dropped).
+if grep -q "Local patch (oppsie, 2026-10-08)" .venv/lib/python*/site-packages/mujoco_warp/_src/collision_primitive.py 2>/dev/null; then
+  echo "patch       mujoco_warp_box_box_depth.patch applied"
+else
+  echo "patch       mujoco_warp_box_box_depth.patch NOT applied (decision 0005: scripts/apply_mujoco_warp_patches.sh)"
+fi
 echo "=================="
 
 # shellcheck disable=SC2086  # EXTRA_ARGS is meant to word-split.

@@ -394,7 +394,9 @@ def test_the_reward_rises_strictly_along_a_stack_across_wc(wide_stack_episode):
 
 
 def test_the_park_pose_ends_the_route_with_the_elbow_bent(monkeypatch):
-  cfg = _cfg(monkeypatch, "WST-R", num_envs=2, HANDOFF_ROUTE="up-out", HANDOFF_PARK="elbow")
+  cfg = _cfg(
+    monkeypatch, "WST-R", num_envs=2, HANDOFF_ROUTE="up-out", HANDOFF_PARK="elbow"
+  )
   assert cfg.actions["joint_pos"].arms[0].park == mdp.HANDOFF_PARK_POSES["elbow"]
   env = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
   try:
@@ -409,7 +411,9 @@ def test_the_park_pose_ends_the_route_with_the_elbow_bent(monkeypatch):
     for i in range(1, 8):
       j = names.index(f"arm_left_{i}_joint")
       want = 0.2 if i == 4 else 0.0
-      assert torch.allclose(q[:, j] - home[:, j], torch.full_like(q[:, j], want), atol=0.03), i
+      assert torch.allclose(
+        q[:, j] - home[:, j], torch.full_like(q[:, j], want), atol=0.03
+      ), i
   finally:
     env.close()
   with pytest.raises(ValueError, match="HANDOFF_PARK"):
@@ -442,3 +446,57 @@ def test_the_return_contact_sees_a_cube_in_the_hand(wide_env):
   env.sim.forward()
   hit = contacts.touching(env)
   assert hit[half].float().mean() > 0.9 and not bool(hit[~half].any()), hit
+
+
+# -- Decision 0005: mujoco_warp box_box's bogus deep contacts --------------------------------------
+
+
+def _box_box_patched() -> bool:
+  import mujoco_warp._src.collision_primitive as cp
+
+  return "Local patch (oppsie, 2026-10-08)" in pathlib.Path(cp.__file__).read_text()
+
+
+@pytest.mark.parametrize("yaw_deg", [39.1, 39.9, 30.0])
+def test_box_box_gives_no_contact_deeper_than_the_boxes(yaw_deg):
+  """A 5 cm cube resting flat 0.1 mm into a table box: mujoco_warp 3.11's box_box adds contacts 45-615 mm deep at
+  39.1 / 39.9 deg (CPU MuJoCo gives the 4 at 0.1 mm). With `mujoco_warp_box_box_depth.patch` (decision 0005) none
+  is deeper than the two boxes' smallest half-sizes together; without it the test is an expected failure."""
+  import mujoco
+  import mujoco_warp as mjw
+  import numpy as np
+  import warp as wp
+
+  xml = """<mujoco><option><flag nativeccd="disable"/></option><worldbody>
+    <body name="table" pos="0 0 0" mocap="true"><geom name="top" type="box" size="0.05 0.05 0.01"/></body>
+    <body name="cube" pos="0 0 1"><freejoint/><geom type="box" size="0.025 0.025 0.025" mass="0.05"/></body>
+    </worldbody></mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  d = mujoco.MjData(m)
+  a = math.radians(yaw_deg)
+  d.qpos[:7] = (
+    0.0,
+    0.0,
+    0.01 + 0.025 - 1e-4,
+    math.cos(a / 2),
+    0.0,
+    0.0,
+    math.sin(a / 2),
+  )
+  with wp.ScopedDevice(get_test_device()):
+    mw = mjw.put_model(m)
+    dw = mjw.put_data(m, d, nconmax=64, njmax=256)
+    mjw.forward(mw, dw)
+    n = int(dw.nacon.numpy()[0])
+    dist = dw.contact.dist.numpy()[:n]
+  mujoco.mj_forward(m, d)
+  cpu = np.array([d.contact.dist[j] for j in range(d.ncon)])
+  if not _box_box_patched() and dist.min() < -0.035:
+    pytest.xfail(
+      "mujoco_warp_box_box_depth.patch not applied (decision 0005); bogus contact %.3f m"
+      % dist.min()
+    )
+  assert dist.min() >= -0.035, dist
+  assert len(cpu) == 4 and np.allclose(
+    np.sort(dist[dist < 0.0]), np.sort(cpu), atol=1e-5
+  ), (dist, cpu)
