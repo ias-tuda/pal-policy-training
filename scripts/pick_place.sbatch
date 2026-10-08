@@ -245,13 +245,20 @@ for _pair in BASE_OBS:base CONTACT:contact; do
     S91_TAG="${S91_TAG},\"${_short}${_val}\""
   fi
 done
-# Plan S10.2 / S11.3: TABLE_DZ (mm) raises the table's top face from the baseline's height (22: the robot
-# cell's table, 0.837 m on baseline B). In the run name and the tags only when set.
-if [ -n "${TABLE_DZ:-}" ]; then
-  export TABLE_DZ
-  S11_NAME="${S11_NAME}_tabledz${TABLE_DZ}"
-  S11_TAG="${S11_TAG},\"tabledz${TABLE_DZ}\""
-fi
+# (S9.3's copy of the TABLE_DZ block sat here; the merge into siwei-s14-pin-place keeps §12's, above, so a run name
+# carries `_tabledz22` once, as §12's and S10.2's do.)
+# Plan §14 (`pick_place/place_pin.py`): PIN_START (mix | stand | lie, the pin's start poses) and PIN_LIE_P (the lying
+# share of mix). Exported when set; in the run name and the tags only when set.
+for _pair in PIN_START:pin PIN_LIE_P:liep; do
+  _var=${_pair%%:*}
+  _short=${_pair##*:}
+  _val="${!_var:-}"
+  if [ -n "$_val" ]; then
+    export "${_var?}"
+    S91_NAME="${S91_NAME}_${_short}${_val}"
+    S91_TAG="${S91_TAG},\"${_short}${_val}\""
+  fi
+done
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -286,7 +293,7 @@ if ! uv run --extra cu128 python -c \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
     "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} BOX_OBS=$BOX_OBS TABLE_DZ=${TABLE_DZ:-(default)}" \
-    "S11:${S11_NAME:-(none)} S9.1:${S91_NAME:-(none)} did not validate." >&2
+    "S11:${S11_NAME:-(none)} S9.1/§14:${S91_NAME:-(none)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -316,6 +323,7 @@ echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   epi
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}   table_dz ${TABLE_DZ:-(none)}"
 echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}"
 echo "s9.1        base_obs ${BASE_OBS:-(default)}   contact ${CONTACT:-(default: box)}"
+echo "s14         pin_start ${PIN_START:-(default)}   pin_lie_p ${PIN_LIE_P:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
