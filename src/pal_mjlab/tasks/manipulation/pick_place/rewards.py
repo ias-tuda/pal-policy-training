@@ -533,6 +533,12 @@ BALL_JAW_OPEN_BY_RADIUS = BySize(
 )
 #: ... and at the nominal radius (BALL, BALL-EQ, the eval's prints and tests).
 BALL_JAW_OPEN = 0.225
+#: J's threshold for plan §15's Ø 48-52 mm ball (``SHAPE=ball50`` / ``ball50-dr``), its touch angle minus 0.05 by the same
+#: rule, per radius. Provisional -- S8's kinematics extrapolated (0.012 rad per mm of diameter from 0.275 at 60 mm: touch
+#: 0.419 / 0.395 / 0.371 at 48 / 50 / 52 mm) -- until plan §15 step 0 item 3's bench replaces it.
+BALL50_JAW_OPEN_BY_RADIUS = BySize(
+  radii=(0.024, 0.025, 0.026), values=(0.369, 0.345, 0.321)
+)
 #: J's threshold for plan §12's cross pin, rad: its touch angle minus 0.05 (the cube's and the ball's rule). The
 #: gripper bench (`scripts/gripper_bench.py --stimulus touch --shape pin --pose topdown`, G20, plan §12 step 0 item 2,
 #: `../results/S12-insert/step0/bench/`) first touches the pin at 0.546-0.563 rad with its plate ends to the pads

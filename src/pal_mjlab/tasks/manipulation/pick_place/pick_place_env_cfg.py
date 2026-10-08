@@ -39,6 +39,15 @@ from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
   ArmTableCfg,
   apply_arm_table,
 )
+from pal_mjlab.tasks.manipulation.pick_place.ball_seat import (
+  BALL_MIN_SEPARATION,
+  BALL_SEAT_RADIUS,
+  BALL_SEAT_RADIUS_RANGE,
+  BALL_SEAT_REWARD,
+  BallSeatGoal,
+  append_critic_ball_seat,
+  apply_ball_seat_goal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.box import (
   BOX_MIN_SEPARATION,
   BOX_OBS_NAMES,
@@ -60,6 +69,7 @@ from pal_mjlab.tasks.manipulation.pick_place.place_pin import (
   apply_place_goal,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  BALL50_JAW_OPEN_BY_RADIUS,
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
   DEFAULT_EPISODE_LENGTH_S,
@@ -351,6 +361,19 @@ OBJECT_SHAPES = {
     jaw_open=PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS),
     geoms=(f"{OBJECT}_geom", scene.mixed_ball_geom_name(OBJECT)),
     ball_probability=0.5,
+  ),
+  # Plan §15: the Ø 50 mm ball (D15-1 open), and PB-DR's Ø 48-52 mm with its rolling friction drawn as BALL-DR's. The
+  # mass and the sliding friction are DR-object's, as for every ball.
+  "ball50": ObjectShape(
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT, radius=BALL_SEAT_RADIUS)},
+    jaw_open=BALL50_JAW_OPEN_BY_RADIUS,
+  ),
+  "ball50-dr": ObjectShape(
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT, radius=BALL_SEAT_RADIUS)},
+    jaw_open=BALL50_JAW_OPEN_BY_RADIUS,
+    ball_probability=1.0,
+    ball_radius=BALL_SEAT_RADIUS_RANGE,
+    rolling_scale=BALL_DR_ROLLING_SCALE,
   ),
   # Plan §12: the cross pin (`scene.get_pin_spec`, its origin at its centre), standing on its foot.
   "pin": ObjectShape(
@@ -831,6 +854,7 @@ def make_pick_place_env_cfg(
   base_obs: str = "goal",
   insert: InsertGoal | None = None,
   place: PlaceGoal | None = None,
+  ball_seat: BallSeatGoal | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -888,6 +912,9 @@ def make_pick_place_env_cfg(
       ``target_area`` standing or lying and put it down at a goal point drawn from it, in any pose
       (`place_pin.apply_place_goal`); needs RCTP (or RCTP + GC), no box, no occlusion, the table goal. None is every
       run before §14.
+    ball_seat: plan §15's ball seat (``GOAL=ball-seat``, `ball_seat.BALL_SEAT_GOALS`) -- drop the Ø 50 mm ball
+      (``shape`` ball50 / ball50-dr) into the chamfer of §12's block drawn from ``target_area``
+      (`ball_seat.apply_ball_seat_goal`); needs RCTP, no box, no occlusion, the table goal. None is every run before §15.
     base_obs: plan S9.1's ``BASE_OBS`` (`BASE_OBS_NAMES`): ``goal`` is every run before S9.1,
       ``pose`` adds the stack base's yaw to the actor and the critic and grades the let-go's yaw
       against the base (`_apply_base_pose`). Needs ``GOAL=stack`` and ``TRACKER=split``.
@@ -953,6 +980,28 @@ def make_pick_place_env_cfg(
       f"plan §14's place is built for the pin (SHAPE=pin) on a target area (TARGET=WP), {PLACE_REWARDS}, no "
       "insert / box GOAL, no BOX_OBS, no OCC, no stack goal, no robot-frame target and the default TRACKER"
     )
+  if ball_seat is not None and (
+    insert is not None
+    or place is not None
+    or shape not in (OBJECT_SHAPES["ball50"], OBJECT_SHAPES["ball50-dr"])
+    or target_area is None
+    or box is not None
+    or box_obs != "goal"
+    or occlusion is not None
+    or goal != "table"
+    or robot_target is not None
+    or tracker != "B"
+    or reward != BALL_SEAT_REWARD
+  ):
+    raise ValueError(
+      f"plan §15's ball seat is built for the Ø 50 mm ball (SHAPE=ball50 | ball50-dr) on a target area (TARGET=WC), "
+      f"{BALL_SEAT_REWARD}, no insert / place / box GOAL, no BOX_OBS, no OCC, no stack goal, no robot-frame target and "
+      "the default TRACKER (the block brings its own tracker split)"
+    )
+  if (
+    shape in (OBJECT_SHAPES["ball50"], OBJECT_SHAPES["ball50-dr"]) and ball_seat is None
+  ):
+    raise ValueError("SHAPE=ball50 is plan §15's ball; it needs GOAL=ball-seat")
   if reward in GC_ARMS and place is None:
     raise ValueError(
       f"{reward}'s GC reads the pin's grasp point; it needs GOAL=place (plan §14)"
@@ -1053,6 +1102,8 @@ def make_pick_place_env_cfg(
       if box is not None
       else PIN_MIN_SEPARATION
       if insert is not None
+      else BALL_MIN_SEPARATION
+      if ball_seat is not None
       else TARGET_MIN_SEPARATION,
     ),
     objects={
@@ -1181,6 +1232,17 @@ def make_pick_place_env_cfg(
       GOAL_THRESHOLD,
       SceneEntityCfg(ROBOT, site_names=gripper.pad_sites),
     )
+  if ball_seat is not None:
+    # Plan §15: as §12's, after every other reward edit.
+    assert target_area is not None
+    apply_ball_seat_goal(
+      cfg,
+      gripper,
+      ball_seat,
+      (target_area.x, target_area.y),
+      baseline.table_top_z,
+      GOAL_THRESHOLD,
+    )
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)
@@ -1195,6 +1257,9 @@ def make_pick_place_env_cfg(
   if place is not None:
     # Plan §14: §12's three slots, last (`place_pin.append_critic_place`).
     append_critic_place(cfg, grasp_sensor)
+  if ball_seat is not None:
+    # Plan §15: §12's three slots, last (`ball_seat.append_critic_ball_seat`).
+    append_critic_ball_seat(cfg, ball_seat, grasp_sensor)
 
   success_params = {
     "command_name": COMMAND,

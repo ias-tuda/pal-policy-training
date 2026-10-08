@@ -112,6 +112,10 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
 from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
+from pal_mjlab.tasks.manipulation.pick_place.ball_seat import (
+  BALL_SEAT_GOALS,
+  BallSeatGoal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
   EPISODE_S as BIMANUAL_EPISODE_S,
 )
@@ -407,6 +411,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
     insert=insert,
     place=_select_place(),
+    ball_seat=_select_ball_seat(),
   )
   _apply_contact(cfg)
   park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
@@ -503,14 +508,16 @@ def _select_goal() -> tuple[str, BoxGoal | None, InsertGoal | None]:
   block. ``BOX_FEET=0`` builds the box with the flat floor every run of `0ba3f60` trained on (to re-read those
   runs on their own box); unset or 1 the corner feet (S10 report §8)."""
   name = _select(
-    GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS, *INSERT_GOALS, *PLACE_GOALS)
+    GOAL_ENV_VAR,
+    DEFAULT_GOAL,
+    (*GOALS, *BOX_GOALS, *INSERT_GOALS, *PLACE_GOALS, *BALL_SEAT_GOALS),
   )
   feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
   if feet not in ("0", "1"):
     raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
   if name in GOALS:
     return name, None, None
-  if name in PLACE_GOALS:
+  if name in PLACE_GOALS or name in BALL_SEAT_GOALS:
     return DEFAULT_GOAL, None, None
   if name in INSERT_GOALS:
     return DEFAULT_GOAL, None, _insert_overrides(INSERT_GOALS[name])
@@ -518,6 +525,11 @@ def _select_goal() -> tuple[str, BoxGoal | None, InsertGoal | None]:
   if box is None or feet == "1":
     return DEFAULT_GOAL, box, None
   return DEFAULT_GOAL, dataclasses.replace(box, feet=False), None
+
+
+def _select_ball_seat() -> BallSeatGoal | None:
+  """Plan §15's ``GOAL=ball-seat`` (`ball_seat.BALL_SEAT_GOALS`); None for any other goal."""
+  return BALL_SEAT_GOALS.get(os.environ.get(GOAL_ENV_VAR, DEFAULT_GOAL))
 
 
 def _select_place() -> PlaceGoal | None:
@@ -596,7 +608,12 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   # box's yaw, from a checkpoint without it).
   both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
   # Plan §14's place from an insert checkpoint: the same widths (no change); from a box checkpoint as IN-FT.
-  insert = not both and (_select_goal()[2] is not None or _select_place() is not None)
+  # Plan §15's ball seat: §12's layout, so from an insert checkpoint no change, from a box one as IN-FT.
+  insert = not both and (
+    _select_goal()[2] is not None
+    or _select_place() is not None
+    or _select_ball_seat() is not None
+  )
   box_pose = not both and (_select_box_obs() == "pose" or insert)
   cfg.widen_critic_on_resume = False if both else (_critic_release() or box_pose)
   cfg.widen_actor_on_resume = box_pose
