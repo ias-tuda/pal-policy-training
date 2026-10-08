@@ -1,15 +1,16 @@
 --- a/mujoco_warp/_src/collision_primitive.py
 +++ b/mujoco_warp/_src/collision_primitive.py
-@@ -1244,11 +1244,21 @@
+@@ -1244,11 +1244,22 @@
      margin,
    )
  
 +  # Local patch (oppsie, 2026-10-08): box_box returns, at some relative yaws (e.g. a flat 5 cm cube on a table
 +  # box at 39.1 deg), extra contacts tens to hundreds of mm deep next to the correct ones; CPU MuJoCo returns
-+  # only the correct ones. No real box-box contact is deeper than the smaller box's smallest half-size.
-+  deepest = -wp.min(
-+    wp.min(wp.min(box1.size[0], box1.size[1]), box1.size[2]),
-+    wp.min(wp.min(box2.size[0], box2.size[1]), box2.size[2]),
++  # only the correct ones. No real box-box contact is deeper than the two boxes' smallest half-sizes together
++  # (the boxes would pass through each other); thin boxes (5 mm walls) keep their real contacts.
++  deepest = -(
++    wp.min(wp.min(box1.size[0], box1.size[1]), box1.size[2])
++    + wp.min(wp.min(box2.size[0], box2.size[1]), box2.size[2])
 +  )
    for i in range(8):
 +    d_i = dist[i]
