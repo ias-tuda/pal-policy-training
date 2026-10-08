@@ -1,4 +1,4 @@
-"""Plan §13.1's right skill (`pick-place-insert-plan.md`): R-I / R-I-W -- push the cross pin through the socket block
+"""Plan §13.1's right skill (`pick-place-insert-plan.md`): R-I / R-I-W / R-I2 -- push the cross pin through the socket block
 held at H by a stand-in for the left hand; trained on the left arm, run on the right through the mirror map.
 
 ``S13=R-I`` / ``R-I-W`` on top of plan §12's ``GOAL=insert`` cfg (`pick_place/insert.py`, ``SHAPE=pin``, ``TARGET=WC``).
@@ -32,7 +32,9 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.tasks.manipulation.mdp import illegal_contact
 
 from pal_mjlab.tasks.manipulation import mdp, scene
 from pal_mjlab.tasks.manipulation.pick_place.hold import HOLD_DZ, HOLD_XY
@@ -71,6 +73,16 @@ THROUGH_WEIGHT = 8.0
 HH_WEIGHT = -10.0
 HH_FORCE = 1.0
 HH_SENSOR = "arm_holder_contact"
+#: R-I2 (plan §13.1 phase 1.1; Siwei 2026-10-08 "Both"): R-I s2 knocked the stand-in hand > 30 N in ~40-50 % of
+#: episodes, its fingertips coming down onto the left fingers as it pushed the pin home holding it low (a median
+#: 5.5 mm over the pin's top at the knock, 9 mm over all grasped steps; `results/S13-insert/read/diag_holder.py`), and
+#: -10 per step did not outweigh the insert income. R-I2 pays through and D only for a grasp high on the pin
+#: (`mdp.grasp_high_grade`: 0 at `GRASP_HIGH_LOW`, 1 from `GRASP_HIGH_FULL`, §12's 15.5 mm finger clearance) and ends
+#: the episode on stand-in-hand contact above `HH_TERMINATE_N` (the chain's "never > 30 N").
+GRASP_HIGH_LOW = 0.003
+GRASP_HIGH_FULL = 0.015
+GRASP_HIGH_GATED = ("through", "depth")
+HH_TERMINATE_N = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,6 +98,8 @@ class HoldNoise:
 
   torquescale: float
   """The weld's angular residual's weight (`mdp.held_block_weld`)."""
+  careful: bool = False
+  """R-I2: through and D graded by the grasp's height on the pin, the episode ended on > 30 N on the stand-in hand."""
 
 
 #: R-I: xy +/- 1.5 cm, z +/- 1 cm, yaw +/- 10 deg, tilt +/- 3 deg; R-I-W: xy +/- 3 cm, tilt +/- 6 deg, the weld 2x
@@ -114,6 +128,7 @@ HOLD_CODES = {
     torquescale=5.0,
   ),
 }
+HOLD_CODES["R-I2"] = dataclasses.replace(HOLD_CODES["R-I"], careful=True)
 
 
 def holder_cfg() -> EntityCfg:
@@ -204,6 +219,20 @@ def apply_held_insert(
     weight=HH_WEIGHT,
     params={"sensor_name": HH_SENSOR, "force_threshold": HH_FORCE},
   )
+  if code.careful:
+    tcp = rw["reach"].params["asset_cfg"]
+    high = {"tcp_cfg": tcp, "high_low": GRASP_HIGH_LOW, "high_full": GRASP_HIGH_FULL}
+    for name in GRASP_HIGH_GATED:
+      term = rw[name]
+      rw[name] = dataclasses.replace(
+        term,
+        func=mdp.grasp_high_gated,
+        params={"high_inner": term.func, **high, **term.params},
+      )
+    cfg.terminations["arm_holder_force"] = TerminationTermCfg(
+      func=illegal_contact,
+      params={"sensor_name": HH_SENSOR, "force_threshold": HH_TERMINATE_N},
+    )
   # The block cannot leave the hold (and must not end the episode for it).
   cfg.terminations.pop("block_dropped", None)
 

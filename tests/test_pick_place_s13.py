@@ -349,6 +349,44 @@ def test_ri_cfg_holds_the_block_and_keeps_ins_actor(monkeypatch):
   )
 
 
+def test_ri2_grades_through_and_depth_by_grasp_height_and_ends_on_hard_contact(
+  monkeypatch,
+):
+  from pal_mjlab.tasks.manipulation.pick_place import insert_held as IH
+
+  ri = _cfg(monkeypatch, **RI, S13="R-I")
+  ri2 = _cfg(monkeypatch, **RI, S13="R-I2")
+  # R-I is as trained: no grasp-height gate, no hard-contact termination.
+  assert ri.rewards["through"].func is mdp.pin_through_held
+  assert ri.rewards["depth"].func is mdp.over_block_gated
+  assert "arm_holder_force" not in ri.terminations
+  # R-I2: through and D wrapped (D keeps its over-block gate inside), the episode ends above 30 N.
+  t = ri2.rewards["through"]
+  assert (
+    t.func is mdp.grasp_high_gated and t.params["high_inner"] is mdp.pin_through_held
+  )
+  d = ri2.rewards["depth"]
+  assert (
+    d.func is mdp.grasp_high_gated and d.params["high_inner"] is mdp.over_block_gated
+  )
+  assert d.params["inner"] is mdp.insert_depth
+  for term in (t, d):
+    assert term.params["high_low"] == IH.GRASP_HIGH_LOW
+    assert term.params["high_full"] == IH.GRASP_HIGH_FULL
+  term = ri2.terminations["arm_holder_force"]
+  assert term.params == {
+    "sensor_name": IH.HH_SENSOR,
+    "force_threshold": IH.HH_TERMINATE_N,
+  }
+  assert not term.time_out
+  # Nothing else moves: the other rewards, the observations, the scene and the events are R-I's.
+  for name in set(ri.rewards) - set(IH.GRASP_HIGH_GATED):
+    assert _diff(ri2.rewards[name], ri.rewards[name]) == {}, name
+  assert list(ri2.observations["actor"].terms) == list(ri.observations["actor"].terms)
+  assert list(ri2.observations["critic"].terms) == list(ri.observations["critic"].terms)
+  assert _diff(ri2.events, ri.events) == {}
+
+
 @pytest.mark.parametrize(
   "changes", [{"GOAL": "insert-lad"}, {"GOAL": None, "SHAPE": None, "TARGET": None}]
 )
@@ -430,6 +468,40 @@ def test_through_reads_a_pin_pushed_through_the_held_block(ri_env):
       assert bool((st.through() == (below >= 0.0)).all()), (below, st.height)
       assert bool((mdp.held_through(env, **geo) == want).all()), (below, st.height)
       assert bool((mdp.pin_over_block(env, **geo) == over).all()), below
+
+
+def test_grasp_height_and_its_grade_on_the_env(ri_env):
+  from pal_mjlab.tasks.manipulation.pick_place import insert_held as IH
+
+  env = ri_env
+  geo = {
+    k: env.cfg.rewards["depth"].params[k]
+    for k in ("object_name", "block_name", "block_height", "hole_d")
+  }
+  tcp = env.reward_manager.get_term_cfg("reach").params["asset_cfg"]
+  with torch.inference_mode():
+    h = mdp.pin_grasp_height(env, **geo, tcp_cfg=tcp)
+    g = mdp.grasp_high_grade(
+      env, **geo, tcp_cfg=tcp, low=IH.GRASP_HIGH_LOW, full=IH.GRASP_HIGH_FULL
+    )
+    # By hand, from the pin's own pose (an earlier test may have left it tilted in the block): its axis turned up,
+    # its top half a length along it, the tool point projected on it.
+    from mjlab.utils.lab_api.math import quat_apply
+
+    pin = env.scene[OBJECT]
+    tool = env.scene["robot"].data.site_pos_w[:, tcp.site_ids].squeeze(1)
+    ez = torch.zeros_like(tool)
+    ez[:, 2] = 1.0
+    axis = quat_apply(pin.data.root_link_quat_w, ez)
+    axis = torch.where(axis[:, 2:3] < 0.0, -axis, axis)
+    top = pin.data.root_link_pos_w + axis * scene.PIN_LENGTH / 2
+    by_hand = ((tool - top) * axis).sum(-1)
+  assert torch.allclose(h, by_hand, atol=1e-4), (h, by_hand)
+  want = ((h - IH.GRASP_HIGH_LOW) / (IH.GRASP_HIGH_FULL - IH.GRASP_HIGH_LOW)).clamp(
+    0, 1
+  )
+  assert torch.allclose(g, want)
+  assert bool(((g >= 0.0) & (g <= 1.0)).all())
 
 
 def test_ri_pays_the_approach_terms_only_over_the_block(ri_env):

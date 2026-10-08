@@ -113,12 +113,15 @@ from .hold import (
 )
 from .holder import (
   chain_spec_fns,
+  grasp_high_gated,
+  grasp_high_grade,
   held_block_moved_penalty,
   held_block_offset,
   held_block_weld,
   held_through,
   holder_spec,
   over_block_gated,
+  pin_grasp_height,
   pin_over_block,
   pin_through_held,
   pin_through_obs,
@@ -215,12 +218,15 @@ from .terminations import (
 __all__ = [
   # Plan §13, the block held by a stand-in left hand (R-I).
   "chain_spec_fns",
+  "grasp_high_gated",
+  "grasp_high_grade",
   "held_block_moved_penalty",
   "held_block_offset",
   "held_block_weld",
   "held_through",
   "holder_spec",
   "over_block_gated",
+  "pin_grasp_height",
   "pin_over_block",
   "pin_through_held",
   "pin_through_obs",

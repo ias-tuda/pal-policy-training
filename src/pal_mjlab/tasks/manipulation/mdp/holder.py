@@ -201,6 +201,57 @@ def over_block_gated(
   return inner(env, **geo, **params) * pin_over_block(env, **geo).float()
 
 
+def pin_grasp_height(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  block_name: str,
+  block_height: float,
+  hole_d: float,
+  tcp_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """The tool point's height over the pin's top end, along the pin's up-pointing axis (`InsertState.axis_w`), m.
+  §12 step 0: with the pin seated the right's fingers clear the block's top by >= 5 mm only above ~15.5 mm. (B,)"""
+  st = insert_state(env, object_name, block_name, block_height, hole_d)
+  pin: Entity = env.scene[object_name]
+  half = object_half_height(env, object_name).unsqueeze(-1)
+  robot: Entity = env.scene[tcp_cfg.name]
+  tcp = robot.data.site_pos_w[:, tcp_cfg.site_ids].squeeze(1)
+  top = pin.data.root_link_pos_w + st.axis_w * half
+  return ((tcp - top) * st.axis_w).sum(-1)
+
+
+def grasp_high_grade(
+  env: ManagerBasedRlEnv,
+  object_name: str,
+  block_name: str,
+  block_height: float,
+  hole_d: float,
+  tcp_cfg: SceneEntityCfg,
+  low: float,
+  full: float,
+) -> torch.Tensor:
+  """clip((`pin_grasp_height` - ``low``) / (``full`` - ``low``), 0, 1): 0 for a grasp at or below ``low`` over the
+  pin's top, 1 from ``full`` up. (B,)"""
+  h = pin_grasp_height(env, object_name, block_name, block_height, hole_d, tcp_cfg)
+  return ((h - low) / (full - low)).clamp(0.0, 1.0)
+
+
+def grasp_high_gated(
+  env: ManagerBasedRlEnv,
+  high_inner,
+  tcp_cfg: SceneEntityCfg,
+  high_low: float,
+  high_full: float,
+  **params,
+) -> torch.Tensor:
+  """``high_inner(env, **params)`` x `grasp_high_grade` (R-I2's through and D): R-I s2 pushed the pin home holding
+  it a median 5.5 mm over its top in the episodes where its fingertips knocked the stand-in hand (> 30 N in 28 /
+  64 at 4 k, `results/S13-insert/read/`). Named ``high_*`` so it can wrap a term that is itself a wrapper (``inner``). (B,)"""
+  geo = {k: params[k] for k in ("object_name", "block_name", "block_height", "hole_d")}
+  grade = grasp_high_grade(env, **geo, tcp_cfg=tcp_cfg, low=high_low, full=high_full)
+  return high_inner(env, **params) * grade
+
+
 def pin_through_held(
   env: ManagerBasedRlEnv,
   object_name: str,
