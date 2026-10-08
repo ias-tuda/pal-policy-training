@@ -144,7 +144,9 @@ def test_the_box_is_the_cad():
   mujoco.mj_forward(m, d)
   half = m.geom_size.copy()
   sphere = m.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE
-  half[sphere] = m.geom_size[sphere, :1]  # a sphere's extent is its radius on every axis
+  half[sphere] = m.geom_size[
+    sphere, :1
+  ]  # a sphere's extent is its radius on every axis
   lo = (d.geom_xpos - half).min(axis=0)
   hi = (d.geom_xpos + half).max(axis=0)
   assert hi[:2] == pytest.approx((0.045, 0.045), abs=1e-9)

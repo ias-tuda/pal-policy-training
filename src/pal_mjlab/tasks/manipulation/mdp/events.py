@@ -103,7 +103,7 @@ def reset_objects_on_surface(
   max_attempts: int = 10,
   goal_area: dict | None = None,
   frame: str = "surface",
-  keepout: tuple[float, float, float, float] | None = None,
+  keepout: Keepout | None = None,
 ) -> None:
   """Place free objects upright on a surface, clear of one another.
 
@@ -212,10 +212,20 @@ def reset_objects_on_surface(
     )
 
 
-def in_keepout(
-  xy: torch.Tensor, keepout: tuple[float, float, float, float]
-) -> torch.Tensor:
-  """Whether each point (n, 2) is inside the box (x lo, x hi, y lo, y hi), same frame. (n,)"""
+#: A keepout: one box (x lo, x hi, y lo, y hi), or several (plan §14: the start pose's left and right hands).
+Keepout = (
+  tuple[float, float, float, float] | tuple[tuple[float, float, float, float], ...]
+)
+
+
+def in_keepout(xy: torch.Tensor, keepout: Keepout) -> torch.Tensor:
+  """Whether each point (n, 2) is inside the box (x lo, x hi, y lo, y hi) -- or any of several such boxes --, same
+  frame. (n,)"""
+  if isinstance(keepout[0], (tuple, list)):
+    out = torch.zeros(xy.shape[0], dtype=torch.bool, device=xy.device)
+    for box in keepout:
+      out |= in_keepout(xy, box)
+    return out
   x0, x1, y0, y1 = keepout
   return (xy[:, 0] > x0) & (xy[:, 0] < x1) & (xy[:, 1] > y0) & (xy[:, 1] < y1)
 

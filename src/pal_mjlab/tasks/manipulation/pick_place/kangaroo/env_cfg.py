@@ -78,6 +78,10 @@ height is this one number. Unset or 0 is the baseline's table exactly; |TABLE_DZ
 Plan §12 (`pick-place-insert-plan.md`) adds the insert codes to `GOAL` (`insert` | `insert-t` | `insert-na` |
 `insert-lad`, `insert.INSERT_GOALS`) and the pin to `SHAPE` (`pin`): push the cross pin through a socket block
 drawn from `TARGET=WC`, on RCTP; the two only go together.
+Plan §14 adds `GOAL=place` (`place_pin.PLACE_GOALS`) and the wide pin area `WP` (`SPAWN=WP TARGET=WP`): pick the
+pin up standing or lying and put it down at a goal point, in any pose. `PIN_START` (`mix` | `stand` | `lie`,
+`place_pin.PIN_STARTS`) names the start poses, `PIN_LIE_P` the lying share for `mix` (0.5 unset); both need
+`GOAL=place`. PS-SG's grasp closure is the reward module GC (`REWARD=...+GC`).
 Plan S11 (two arms) adds `ARM_HOME` (`default` | `mirror`: the right arm's home, Claudius's or the
 left home's mirror image), `TARGET=T11` | `T11W` (the meeting point T in the robot frame: L-T's goal,
 or R-ST's / R-ST-W's base with `GOAL=stack`), `TRACKER` (`B` | `split`: the 6 + 4 mm bias split, the
@@ -138,6 +142,11 @@ from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   TRACKERS,
   make_pick_place_env_cfg,
 )
+from pal_mjlab.tasks.manipulation.pick_place.place_pin import (
+  PIN_STARTS,
+  PLACE_GOALS,
+  PlaceGoal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
@@ -193,6 +202,8 @@ BASE_OBS_ENV_VAR = "BASE_OBS"
 CONTACT_ENV_VAR = "CONTACT"
 INSERT_HOLE_D_ENV_VAR = "INSERT_HOLE_D"
 INSERT_FRICTION_ENV_VAR = "INSERT_FRICTION"
+PIN_START_ENV_VAR = "PIN_START"
+PIN_LIE_P_ENV_VAR = "PIN_LIE_P"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -266,6 +277,8 @@ SPAWN_ROBOTS = {
   "W2": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   "WC": KANGAROO_GRIPPERS_LEFT_ARM_WC,
   "WCK": KANGAROO_GRIPPERS_LEFT_ARM_WCK,
+  # Plan §14: WC's arm (step 0 item 3).
+  "WP": KANGAROO_GRIPPERS_LEFT_ARM_WC,
 }
 
 
@@ -391,6 +404,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     box_obs=_select_box_obs(),
     base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
     insert=insert,
+    place=_select_place(),
   )
   _apply_contact(cfg)
   park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
@@ -486,18 +500,47 @@ def _select_goal() -> tuple[str, BoxGoal | None, InsertGoal | None]:
   insert (`insert.INSERT_GOALS`), one variable for all. A box or insert name is the table goal plus that box /
   block. ``BOX_FEET=0`` builds the box with the flat floor every run of `0ba3f60` trained on (to re-read those
   runs on their own box); unset or 1 the corner feet (S10 report §8)."""
-  name = _select(GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS, *INSERT_GOALS))
+  name = _select(
+    GOAL_ENV_VAR, DEFAULT_GOAL, (*GOALS, *BOX_GOALS, *INSERT_GOALS, *PLACE_GOALS)
+  )
   feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
   if feet not in ("0", "1"):
     raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
   if name in GOALS:
     return name, None, None
+  if name in PLACE_GOALS:
+    return DEFAULT_GOAL, None, None
   if name in INSERT_GOALS:
     return DEFAULT_GOAL, None, _insert_overrides(INSERT_GOALS[name])
   box = BOX_GOALS[name]
   if box is None or feet == "1":
     return DEFAULT_GOAL, box, None
   return DEFAULT_GOAL, dataclasses.replace(box, feet=False), None
+
+
+def _select_place() -> PlaceGoal | None:
+  """Plan §14's ``GOAL=place`` (`place_pin.PLACE_GOALS`), with ``PIN_START`` (`place_pin.PIN_STARTS`) and, for
+  ``mix``, ``PIN_LIE_P`` (the lying share, 0-1) applied; None for any other goal, where both must be unset."""
+  name = os.environ.get(GOAL_ENV_VAR, DEFAULT_GOAL)
+  start = os.environ.get(PIN_START_ENV_VAR)
+  share = os.environ.get(PIN_LIE_P_ENV_VAR)
+  if name not in PLACE_GOALS:
+    for var, value in ((PIN_START_ENV_VAR, start), (PIN_LIE_P_ENV_VAR, share)):
+      if value is not None:
+        raise ValueError(f"{var} is plan §14's pin start; it needs GOAL=place")
+    return None
+  code = PLACE_GOALS[name]
+  start = _select(PIN_START_ENV_VAR, "mix", PIN_STARTS)
+  p = PIN_STARTS[start]
+  if share is not None:
+    if start != "mix":
+      raise ValueError(
+        f"{PIN_LIE_P_ENV_VAR} sets the lying share of PIN_START=mix, not {start}"
+      )
+    p = float(share)
+    if not 0.0 <= p <= 1.0:
+      raise ValueError(f"{PIN_LIE_P_ENV_VAR}={share!r} is not a share in [0, 1]")
+  return dataclasses.replace(code, lie_probability=p)
 
 
 def _insert_overrides(code: InsertGoal) -> InsertGoal:
@@ -550,7 +593,8 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   # Plan §12's insert from a box checkpoint (IN-FT): the actor +2 (the pin's tilt), the critic +3 (and the
   # box's yaw, from a checkpoint without it).
   both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
-  insert = not both and _select_goal()[2] is not None
+  # Plan §14's place from an insert checkpoint: the same widths (no change); from a box checkpoint as IN-FT.
+  insert = not both and (_select_goal()[2] is not None or _select_place() is not None)
   box_pose = not both and (_select_box_obs() == "pose" or insert)
   cfg.widen_critic_on_resume = False if both else (_critic_release() or box_pose)
   cfg.widen_actor_on_resume = box_pose

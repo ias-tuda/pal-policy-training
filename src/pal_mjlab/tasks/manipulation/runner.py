@@ -79,9 +79,7 @@ class ManipulationRunnerCfg(RslRlOnPolicyRunnerCfg):
   differ (plan S10.1's ``CKPT_SPAWN``, `rescale_actions`); None loads the actor as saved."""
 
 
-def widen_input(
-  loaded: dict, key: str, model: torch.nn.Module, params: list
-) -> int:
+def widen_input(loaded: dict, key: str, model: torch.nn.Module, params: list) -> int:
   """Widen ``loaded[key]`` (``"critic_state_dict"`` or ``"actor_state_dict"``), in place, to
   ``model``'s input width; returns the inputs added.
 

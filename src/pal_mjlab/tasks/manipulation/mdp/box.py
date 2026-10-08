@@ -39,6 +39,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from pal_mjlab.tasks.manipulation.mdp.events import (
+  Keepout,
   _surface_centre_xy,
   in_keepout,
   surface_top_z,
@@ -223,7 +224,7 @@ def reset_box_in_area(
   area_y: tuple[float, float],
   yaw: float,
   min_distance: float,
-  keepout: tuple[float, float, float, float] | None = None,
+  keepout: Keepout | None = None,
   redraws: int = BOX_AREA_REDRAWS,
   on_half_height: bool = False,
 ) -> None:

@@ -480,7 +480,9 @@ def yaw_error_mod_90(
   return torch.abs(yaw - quarter * torch.round(yaw / quarter))
 
 
-def yaw_reference_quat(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor | None:
+def yaw_reference_quat(
+  env: ManagerBasedRlEnv, command_name: str
+) -> torch.Tensor | None:
   """The world orientation M6's yaw grade measures against: the entity the goal command names in
   its cfg's ``yaw_reference`` (plan S10.1, `box.BoxGoalCommandCfg`), or None for the world's axes. (B, 4)"""
   term = env.command_manager.get_term(command_name)
@@ -533,7 +535,9 @@ def _release_latch(
   goal (plan S9: `EntityOffsetCommand` with ``stack_on_top``) it is the goal's own z -- the cube
   resting on the base -- and ``rel_ok`` records whether `stack.StackState.ok` held at the let-go.
   Plan S10 passes the box's walls as ``surface_cfg`` (`events.surface_top_z` with named geoms), so the
-  height is the object's bottom above the rim; every reader must pass the same surface.
+  height is the object's bottom above the rim; every reader must pass the same surface. A goal command
+  with a ``rest_centre_z()`` (plan §14's `place_pin.PinPlaceCommand`) gives the resting height itself: the pin's
+  centre over its lowest point in its current pose, standing or lying.
 
   M7's set-down (plan S7-2): a *touchdown* is the first held-on-surface update after the held
   object was lifted `SET_DOWN_CLEARANCE` clear. The dwell counts only after a touchdown within
@@ -610,7 +614,13 @@ def _release_latch(
   goal = env.command_manager.get_term(command_name).command
   pos = obj.data.root_link_pos_w
   reference = stack_command_reference(env, command_name)
-  if reference is None:
+  rest = getattr(env.command_manager.get_term(command_name), "rest_centre_z", None)
+  if reference is None and rest is not None:
+    # Plan §14's pin (`place_pin.PinPlaceCommand`): its centre's resting height in its current pose, so the
+    # height is the lowest point's over the table, standing or lying.
+    rest_z = rest()
+    ok = torch.zeros_like(let_go)
+  elif reference is None:
     rest_z = surface_top_z(env, surface_cfg) + object_half_height(env, object_name)
     ok = torch.zeros_like(let_go)
   else:

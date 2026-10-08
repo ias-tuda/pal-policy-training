@@ -53,11 +53,18 @@ from pal_mjlab.tasks.manipulation.pick_place.insert import (
   append_critic_insert,
   apply_insert_goal,
 )
+from pal_mjlab.tasks.manipulation.pick_place.place_pin import (
+  PLACE_REWARDS,
+  PlaceGoal,
+  append_critic_place,
+  apply_place_goal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
+  GC_ARMS,
   JAW_OPEN,
   NO_SUCCESS_TERMINATION,
   PIN_JAW_OPEN,
@@ -156,6 +163,11 @@ SPAWN_BOXES = {
   "WCK": SpawnBox(
     x=(0.40, 0.52), y=(0.16, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
+  # Plan §14's wide pin area (D14-1, Siwei 2026-10-08 13:47: "区域按草案的二倍"): WC grown 4 cm forward and back,
+  # 6 cm left and right -- 28 x 42 cm, 2.0 x WC -- for the pin's start and its goal (`GOAL=place`).
+  "WP": SpawnBox(
+    x=(0.36, 0.64), y=(-0.10, 0.32), yaw=math.pi / 4, widen_at_dr_scene=False
+  ),
 }
 
 #: Where the target is drawn from, by name (`TARGET`, plan S7-8). ``B``: baseline B's small box.
@@ -167,6 +179,7 @@ TARGET_AREAS: dict[str, SpawnBox | None] = {
   "B": None,
   "WC": SPAWN_BOXES["WC"],
   "WCK": SPAWN_BOXES["WCK"],
+  "WP": SPAWN_BOXES["WP"],
 }
 TARGET_MIN_SEPARATION = 0.10
 
@@ -812,6 +825,7 @@ def make_pick_place_env_cfg(
   tracker: str = "B",
   base_obs: str = "goal",
   insert: InsertGoal | None = None,
+  place: PlaceGoal | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -865,6 +879,10 @@ def make_pick_place_env_cfg(
     insert: plan §12's insert goal (``GOAL=insert`` | ``insert-t`` | ``insert-na`` | ``insert-lad``,
       `insert.INSERT_GOALS`) -- push the pin (``shape`` pin) through a socket block drawn from ``target_area``
       (`insert.apply_insert_goal`); needs RCTP, no box, no occlusion, the table goal. None is every run before §12.
+    place: plan §14's place goal (``GOAL=place``, `place_pin.PLACE_GOALS`) -- pick the pin (``shape`` pin) up from
+      ``target_area`` standing or lying and put it down at a goal point drawn from it, in any pose
+      (`place_pin.apply_place_goal`); needs RCTP (or RCTP + GC), no box, no occlusion, the table goal. None is every
+      run before §14.
     base_obs: plan S9.1's ``BASE_OBS`` (`BASE_OBS_NAMES`): ``goal`` is every run before S9.1,
       ``pose`` adds the stack base's yaw to the actor and the critic and grades the let-go's yaw
       against the base (`_apply_base_pose`). Needs ``GOAL=stack`` and ``TRACKER=split``.
@@ -914,8 +932,28 @@ def make_pick_place_env_cfg(
       "no box GOAL / BOX_OBS, no OCC, no stack goal, no robot-frame target and the default TRACKER (the "
       "block brings its own tracker split)"
     )
-  if shape is OBJECT_SHAPES["pin"] and insert is None:
-    raise ValueError("SHAPE=pin is plan §12's pin; it needs an insert GOAL")
+  if place is not None and (
+    insert is not None
+    or shape is not OBJECT_SHAPES["pin"]
+    or target_area is None
+    or box is not None
+    or box_obs != "goal"
+    or occlusion is not None
+    or goal != "table"
+    or robot_target is not None
+    or tracker != "B"
+    or reward not in PLACE_REWARDS
+  ):
+    raise ValueError(
+      f"plan §14's place is built for the pin (SHAPE=pin) on a target area (TARGET=WP), {PLACE_REWARDS}, no "
+      "insert / box GOAL, no BOX_OBS, no OCC, no stack goal, no robot-frame target and the default TRACKER"
+    )
+  if reward in GC_ARMS and place is None:
+    raise ValueError(
+      f"{reward}'s GC reads the pin's grasp point; it needs GOAL=place (plan §14)"
+    )
+  if shape is OBJECT_SHAPES["pin"] and insert is None and place is None:
+    raise ValueError("SHAPE=pin is plan §12's pin; it needs an insert or place GOAL")
   if box is not None and (
     shape is not OBJECT_SHAPES["cube"] or occlusion is not None or goal != "table"
   ):
@@ -1125,6 +1163,17 @@ def make_pick_place_env_cfg(
       baseline.table_top_z,
       GOAL_THRESHOLD,
     )
+  if place is not None:
+    # Plan §14: as §12's, after every other reward edit.
+    assert target_area is not None
+    apply_place_goal(
+      cfg,
+      gripper,
+      place,
+      (target_area.x, target_area.y),
+      GOAL_THRESHOLD,
+      SceneEntityCfg(ROBOT, site_names=gripper.pad_sites),
+    )
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)
@@ -1136,6 +1185,9 @@ def make_pick_place_env_cfg(
   if insert is not None:
     # Plan §12: last, after PQ's inputs (`insert.append_critic_insert`).
     append_critic_insert(cfg, insert)
+  if place is not None:
+    # Plan §14: §12's three slots, last (`place_pin.append_critic_place`).
+    append_critic_place(cfg, grasp_sensor)
 
   success_params = {
     "command_name": COMMAND,

@@ -870,7 +870,30 @@ def _saw(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
+# -- Plan §14: GC, the jaw's closure at the grasp point (code PS-SG) --------------------------------
+#
+# §12.1's scratch runs found the 32 mm pin's grasp late or never: the jaw closed to 0.24 of the 0.55 rad the pin
+# needs (R-I, §13.1). GC pays clip(q_jaw / q_touch, 0, 1) while the tool point is at the pin's grasp point and the
+# pin is not yet grasped or lifted (`mdp.grasp_closure`). The term is built here with the jaw and the sensors; the
+# pin's grasp point and touch angles come from ``GOAL=place`` (`place_pin.apply_place_goal`), which it needs.
+GC_WEIGHT = 1.0
+
+
+def _gc(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["grasp_closure"] = RewardTermCfg(
+    func=mdp.grasp_closure,
+    weight=GC_WEIGHT,
+    params={
+      "jaw_cfg": ctx.jaw,
+      "asset_cfg": ctx.tcp,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "support_sensor_name": SUPPORT_SENSOR,
+    },
+  )
+
+
 _MODULES = {
+  "GC": _gc,
   "M1": _m1,
   "M2": _m2,
   "M3": _m3,
@@ -1002,7 +1025,15 @@ S91_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+SAW": ("M1", "M2", "M3", "M6", "J", "M8", "SAW"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S91_ARMS.items()})
+#: The §14 arm (plan §14's PS-SG): S7-4's RCTP + GC. Every other §14 code runs RCTP itself on ``GOAL=place``.
+S14_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+GC": ("M1", "M2", "M3", "M6", "J", "M8", "GC"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S14_ARMS.items()})
+#: Arms with GC: they need plan §14's ``GOAL=place``.
+GC_ARMS = frozenset(S14_ARMS)
 _MODULE_ARMS = {
+  **S14_ARMS,
   **S52_ARMS,
   **S7_ARMS,
   **S72_ARMS,

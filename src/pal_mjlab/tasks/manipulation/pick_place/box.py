@@ -165,11 +165,15 @@ def _wall_sensor(name: str, secondary: ContactMatch) -> ContactSensorCfg:
   )
 
 
-def area_holds_the_box(area_x: tuple[float, float], area_y: tuple[float, float]) -> bool:
+def area_holds_the_box(
+  area_x: tuple[float, float], area_y: tuple[float, float]
+) -> bool:
   """Whether every point of the area has a point of it at least `BOX_MIN_SEPARATION` away -- the
   centre's farthest corner, at the half-diagonal, is the worst case. Plan S10.1: WC (20 x 30 cm,
   18.0 cm) does; WCK (12 x 10 cm, 7.8 cm) does not."""
-  return 0.5 * math.hypot(area_x[1] - area_x[0], area_y[1] - area_y[0]) >= BOX_MIN_SEPARATION
+  return (
+    0.5 * math.hypot(area_x[1] - area_x[0], area_y[1] - area_y[0]) >= BOX_MIN_SEPARATION
+  )
 
 
 def apply_box_goal(

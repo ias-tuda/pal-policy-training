@@ -197,7 +197,9 @@ def test_the_wide_area_table_task_is_unchanged(monkeypatch):
   cfg = _cfg(monkeypatch, GOAL=None, BOX_OBS=None)
   assert "box" not in cfg.scene.entities
   assert cfg.commands["goal_pose"].min_object_distance == pytest.approx(0.10)
-  assert cfg.events["reset_objects"].params["goal_area"]["distance"] == pytest.approx(0.10)
+  assert cfg.events["reset_objects"].params["goal_area"]["distance"] == pytest.approx(
+    0.10
+  )
   assert list(cfg.observations["actor"].terms)[-1] == "target_pos"
 
 
@@ -298,9 +300,9 @@ def test_the_box_yaw_is_the_same_every_90_deg(monkeypatch):
   # Continuous across +/- 45 deg: -44 deg and +44 deg are 2 deg apart, 8 deg on the 4-fold circle.
   assert torch.allclose(
     got[2],
-    torch.tensor([math.cos(math.radians(-176)), math.sin(math.radians(-176))]).expand_as(
-      got[2]
-    ),
+    torch.tensor(
+      [math.cos(math.radians(-176)), math.sin(math.radians(-176))]
+    ).expand_as(got[2]),
     atol=1e-3,
   )
   env.close()
@@ -344,7 +346,9 @@ def test_the_yaw_grade_is_taken_against_the_box(monkeypatch):
   monkeypatch.setattr(
     obs_mod,
     "_grasped_bool",
-    lambda e, s: torch.full((e.num_envs,), held["v"], dtype=torch.bool, device=e.device),
+    lambda e, s: torch.full(
+      (e.num_envs,), held["v"], dtype=torch.bool, device=e.device
+    ),
   )
   monkeypatch.setattr(
     obs_mod,
@@ -356,7 +360,15 @@ def test_the_yaw_grade_is_taken_against_the_box(monkeypatch):
   jaw.resolve(env.scene)
   rim = bx.rim_surface()
   rim.resolve(env.scene)
-  args = ("goal_pose", "object", "left_pad_contact", "object_table_contact", rim, jaw, 0.15)
+  args = (
+    "goal_pose",
+    "object",
+    "left_pad_contact",
+    "object_table_contact",
+    rim,
+    jaw,
+    0.15,
+  )
   env.common_step_counter += 1
   _release_latch(env, *args)
   held["v"] = False
@@ -367,7 +379,14 @@ def test_the_yaw_grade_is_taken_against_the_box(monkeypatch):
   assert math.degrees(float(latch.yaw[1])) == pytest.approx(30.0, abs=0.5)
   # M6 x G(yaw, 10 deg): 1 for the aligned let-go.
   q = mdp.rewards.release_quality_of(
-    torch.zeros(2), torch.zeros(2), 0.02, 0.01, 0.01, 0.25, latch.yaw.cpu(), math.radians(10)
+    torch.zeros(2),
+    torch.zeros(2),
+    0.02,
+    0.01,
+    0.01,
+    0.25,
+    latch.yaw.cpu(),
+    math.radians(10),
   )
   assert q[0] == pytest.approx(1.0, abs=1e-3)
   assert q[1] < 0.3
@@ -382,7 +401,9 @@ def test_a_cube_in_a_box_at_45_deg_is_in_it_and_placed(monkeypatch):
   _cube_in_box(env, 0.0, scene.BOX_WALL_HEIGHT + 0.01)
   _hold(env, 60)
   assert mdp.object_in_box_bool(env, "object", bx.BOX, bx.BOX_WALLS).all()
-  setattr(env, _WAS_LIFTED, torch.ones(env.num_envs, dtype=torch.bool, device=env.device))
+  setattr(
+    env, _WAS_LIFTED, torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+  )
   jaw = SceneEntityCfg("robot", joint_names=("gripper_left_finger_joint",))
   jaw.resolve(env.scene)
   placed = _placed_bool(
@@ -485,7 +506,9 @@ def test_a_w2_actor_rescaled_to_the_wc_arm_commands_the_same_targets():
   old_scale = torch.tensor([0.90, 0.85, 0.65, 0.80, 1.55, 2.40, 1.20, 0.5])
   new_scale = torch.tensor([2.35, 0.85, 0.65, 1.79, 1.55, 2.40, 1.20, 0.5])
   ratio = old_scale / new_scale
-  cols = list(range(15, 23))  # the actor's `actions` term (after joint_pos 8, joint_vel 7)
+  cols = list(
+    range(15, 23)
+  )  # the actor's `actions` term (after joint_pos 8, joint_vel 7)
   old_a, new_a, old_c = _model(38, "policy"), _model(38, "policy"), _model(39, "critic")
   # An 8-action actor: `_model` makes 3 outputs, so rebuild the last layer.
   from rsl_rl.models import MLPModel
@@ -518,9 +541,13 @@ def test_a_w2_actor_rescaled_to_the_wc_arm_commands_the_same_targets():
     a_old = old_a(TensorDict({"policy": x}, batch_size=[32]))
     a_new = new_a(TensorDict({"policy": x_new}, batch_size=[32]))
   assert torch.allclose(a_new * new_scale, a_old * old_scale, atol=1e-5)
-  assert torch.allclose(torch.exp(log_std) * new_scale, torch.exp(torch.full((8,), -1.5)) * old_scale)
+  assert torch.allclose(
+    torch.exp(log_std) * new_scale, torch.exp(torch.full((8,), -1.5)) * old_scale
+  )
   crit = loaded["critic_state_dict"]["obs_normalizer._mean"]
-  assert torch.allclose(crit[:, cols], old_c.state_dict()["obs_normalizer._mean"][:, cols] * ratio)
+  assert torch.allclose(
+    crit[:, cols], old_c.state_dict()["obs_normalizer._mean"][:, cols] * ratio
+  )
   # The critic computes the same value on the new-unit inputs.
   new_c = _model(39, "critic")
   new_c.load_state_dict(loaded["critic_state_dict"])
