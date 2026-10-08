@@ -2672,8 +2672,9 @@ SEAT_CARRY_BINS_CM = ((14, 20), (20, 30), (30, 99))
 SEAT_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
 #: A ball whose centre is below the block's top face is off the block; one over it within this of the axis is on it.
 SEAT_ON_BLOCK = 0.045
-#: A let-go this far (m, xy from the axis) from the block is a drop in the carry.
+#: A let-go this far (m, xy from the axis) from the block, out of the hand for this many steps, is a drop in the carry.
 SEAT_CARRY_DROP = 0.05
+SEAT_DROP_STEPS = 10
 
 
 class SeatTally:
@@ -2707,12 +2708,11 @@ class SeatTally:
     self.offset, self.dz = zf(), zf()
     self.ever_grasped, self.prev_grasped, self.lifted_once = zb(), zb(), zb()
     self.grasps_after_letgo = torch.zeros(n, dtype=torch.long, device=dev)
-    self.letgo_seen, self.first_letgo = zb(), zb()
-    self.rel_offset, self.rel_bottom, self.rel_speed = (
-      zf(float("nan")),
-      zf(float("nan")),
-      zf(float("nan")),
-    )
+    self.first_letgo, self.rel_committed = zb(), zb()
+    nan = float("nan")
+    self.rel_offset, self.rel_bottom, self.rel_speed = zf(nan), zf(nan), zf(nan)
+    self.pend_offset, self.pend_bottom, self.pend_speed = zf(nan), zf(nan), zf(nan)
+    self.out_run = torch.zeros(n, dtype=torch.long, device=dev)
     self.carry_drop = zb()
     self.held_at_handoff, self.handed_prev = zb(), zb()
     self.hand_block = zb()
@@ -2760,15 +2760,28 @@ class SeatTally:
     onset = grasped & ~self.prev_grasped
     self.lifted_once |= grasped & (st.centre_b[:, 2] > st.radius + 0.01)
     self.grasps_after_letgo += (onset & self.first_letgo).long()
-    letgo = self.prev_grasped & ~grasped & self.lifted_once & ~self.letgo_seen
-    first = letgo & ~self.first_letgo
-    self.rel_offset = torch.where(first, st.offset, self.rel_offset)
-    self.rel_bottom = torch.where(first, st.bottom_over_top, self.rel_bottom)
-    self.rel_speed = torch.where(first, speed, self.rel_speed)
-    self.carry_drop |= first & (st.offset > SEAT_CARRY_DROP)
+    # The let-go as training's release latch takes it (`observations._release_latch` with J): the pads' last let-go
+    # before the jaw opened, committed when `RetreatTally` first sees the J-release.
+    letgo = self.prev_grasped & ~grasped & self.lifted_once
+    self.pend_offset = torch.where(letgo, st.offset, self.pend_offset)
+    self.pend_bottom = torch.where(letgo, st.bottom_over_top, self.pend_bottom)
+    self.pend_speed = torch.where(letgo, speed, self.pend_speed)
+    commit = j_released & ~self.rel_committed
+    self.rel_offset = torch.where(commit, self.pend_offset, self.rel_offset)
+    self.rel_bottom = torch.where(commit, self.pend_bottom, self.rel_bottom)
+    self.rel_speed = torch.where(commit, self.pend_speed, self.rel_speed)
+    self.rel_committed |= j_released
+    # A drop in the carry: out of the hand for `SEAT_DROP_STEPS` after the lift, before the J-release, having left the
+    # hand more than `SEAT_CARRY_DROP` from the axis (a grasp flag flickering for a step mid-carry is not one).
+    self.out_run = torch.where(
+      ~grasped & self.lifted_once & ~j_released,
+      self.out_run + 1,
+      torch.zeros_like(self.out_run),
+    )
+    self.carry_drop |= (self.out_run >= SEAT_DROP_STEPS) & (
+      self.pend_offset > SEAT_CARRY_DROP
+    )
     self.first_letgo |= letgo
-    self.letgo_seen |= letgo
-    self.letgo_seen &= ~onset
     self.ever_seated |= self.seated & j_released
     age = env.episode_length_buf.float() * self.step_dt
     self.first_seated = torch.where(
@@ -2833,7 +2846,7 @@ class SeatTally:
         self.ever_grasped,
         self.prev_grasped,
         self.lifted_once,
-        self.letgo_seen,
+        self.rel_committed,
         self.first_letgo,
         self.carry_drop,
         self.held_at_handoff,
@@ -2842,6 +2855,10 @@ class SeatTally:
       ):
         t[i] = False
       self.grasps_after_letgo[i] = 0
+      self.out_run[i] = 0
+      self.pend_offset[i] = float("nan")
+      self.pend_bottom[i] = float("nan")
+      self.pend_speed[i] = float("nan")
       self.rel_offset[i] = float("nan")
       self.rel_bottom[i] = float("nan")
       self.rel_speed[i] = float("nan")
