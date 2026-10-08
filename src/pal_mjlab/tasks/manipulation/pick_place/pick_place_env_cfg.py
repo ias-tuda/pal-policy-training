@@ -953,7 +953,7 @@ def make_pick_place_env_cfg(
       f"{reward}'s GC reads the pin's grasp point; it needs GOAL=place (plan §14)"
     )
   if shape is OBJECT_SHAPES["pin"] and insert is None and place is None:
-    raise ValueError("SHAPE=pin is plan §12's pin; it needs an insert or place GOAL")
+    raise ValueError("SHAPE=pin is plan §12's pin; it needs an insert GOAL (or plan §14's GOAL=place)")
   if box is not None and (
     shape is not OBJECT_SHAPES["cube"] or occlusion is not None or goal != "table"
   ):
