@@ -1,9 +1,12 @@
 """Plan §13.1's chain (`pick-place-insert-plan.md` §13 *Structure*, SEQ-H): L-H on the left arm, R-I on the right arm
 through the mirror map, in the two-arm env ``ARMS=both S13=CHAIN`` (`pick_place/insert_chain.py`).
 
-The left runs L-H from the start. The right holds its home until the block is **presented** -- its tracked centre
-within `PRESENT_DIST` of H and its tracked speed under `PRESENT_SPEED` for `PRESENT_S` (what FoundationPose gives on the
-robot) -- then runs R-I to the end of the episode; both keep their grasps (plan D6 (a): success is counted while the
+The left runs L-H from the start. The right holds its home until the block is **presented** -- over the last `PRESENT_S`
+its tracked centre (what FoundationPose gives on the robot) averages within `PRESENT_DIST` of H and moves slower than
+`PRESENT_SPEED` (the mean of the window's second half against its first's). The window, not a step-to-step difference:
+the tracked centre carries the actor's per-step noise (+/- 5 mm), which a one-step difference reads as ~17 cm/s, so the
+first version of this rule never fired (`results/S13-insert/read/README.md`, 2026-10-08). Then the right runs R-I to the
+end of the episode; both keep their grasps (plan D6 (a): success is counted while the
 right still holds the pin). The adapter (`eval_chain.MirrorAdapter`'s maps): the right's joints, velocities and last
 actions x `ARM_MIRROR_SIGNS`, positions y -> -y, its TCP frame M R F M, a 4-fold yaw (cos 4 psi, sin 4 psi) ->
 (cos, -sin), the pin's tilt (x, y) -> (x, -y).
@@ -134,13 +137,17 @@ class Reads:
     self.rows: list[dict] = []
     self.block = env.scene["block"]
     self.pin = env.scene["object"]
-    self.prev_centre = torch.zeros(n, 3, device=dev)
+    self.win = max(2, round(PRESENT_S / self.dt))
+    self.buf = torch.zeros(n, self.win, 3, device=dev)
+    self.count = torch.zeros(n, dtype=torch.long, device=dev)
     z = lambda: torch.zeros(n, device=dev)  # noqa: E731
     b = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
     nan = lambda: torch.full((n,), float("nan"), device=dev)  # noqa: E731
     self.still = z()
     self.started = b()
     self.t_present, self.t_through = nan(), nan()
+    # The true block at the presentation (a check on the tracked rule): distance from H, speed, tilt.
+    self.present_dist, self.present_speed, self.present_tilt = nan(), nan(), nan()
     self.end_through, self.end_steps = z(), z()
     self.drift, self.tilt = z(), z()
     self.block_drop, self.pin_drop, self.lifted_block = b(), b(), b()
@@ -160,8 +167,15 @@ class Reads:
     self.spawn[ids, 2:] = (self.pin.data.root_link_pos_w[ids] - o)[:, :2]
     for t in (self.still, self.end_through, self.end_steps, self.drift, self.tilt):
       t[ids] = 0.0
-    for t in (self.t_present, self.t_through):
+    for t in (
+      self.t_present,
+      self.t_through,
+      self.present_dist,
+      self.present_speed,
+      self.present_tilt,
+    ):
       t[ids] = float("nan")
+    self.count[ids] = 0
     for t in (
       self.started,
       self.block_drop,
@@ -177,15 +191,30 @@ class Reads:
 
   def present(self, t: dict) -> torch.Tensor:
     """Advance the presentation rule on the tracked block; returns the envs whose right starts now."""
+    from pal_mjlab.tasks.manipulation import mdp
+
     centre = t["block_centre"]
-    near = torch.norm(centre - t["hold_goal"], dim=-1) < PRESENT_DIST
-    speed = torch.norm(centre - self.prev_centre, dim=-1) / self.dt
-    self.prev_centre = centre.clone()
-    calm = near & (speed < PRESENT_SPEED)
-    self.still = torch.where(calm, self.still + self.dt, torch.zeros_like(self.still))
-    go = ~self.started & (self.still >= PRESENT_S)
-    tt = self.env.episode_length_buf.float() * self.dt
-    self.t_present[go] = tt[go]
+    self.buf = torch.cat([self.buf[:, 1:], centre.unsqueeze(1)], dim=1)
+    self.count += 1
+    full = self.count >= self.win
+    mean = self.buf.mean(dim=1)
+    near = torch.norm(mean - t["hold_goal"], dim=-1) < PRESENT_DIST
+    h = self.win // 2
+    first, second = self.buf[:, :h].mean(dim=1), self.buf[:, -h:].mean(dim=1)
+    speed = torch.norm(second - first, dim=-1) / ((self.win - h) * self.dt)
+    go = ~self.started & full & near & (speed < PRESENT_SPEED)
+    if go.any():
+      tt = self.env.episode_length_buf.float() * self.dt
+      self.t_present[go] = tt[go]
+      cmd = self.env.command_manager.get_term("goal_pose").command
+      true_centre = self.block.data.root_link_pos_w + (
+        self.scene.BLOCK_HEIGHT / 2
+      ) * mdp.object_up_w(self.env, "block")
+      self.present_dist[go] = torch.norm(true_centre - cmd, dim=-1)[go]
+      self.present_speed[go] = torch.norm(self.block.data.root_link_lin_vel_w, dim=-1)[
+        go
+      ]
+      self.present_tilt[go] = torch.rad2deg(mdp.axis_tilt(self.env, "block"))[go]
     self.started |= go
     return self.started
 
@@ -244,6 +273,9 @@ class Reads:
           "pin_xy": [round(float(v), 4) for v in self.spawn[i, 2:]],
           "through_held": steps > 0 and float(self.end_through[i]) >= 0.8 * steps,
           "t_presented": float(self.t_present[i]),
+          "present_true_dist_mm": 1e3 * float(self.present_dist[i]),
+          "present_true_speed_mm_s": 1e3 * float(self.present_speed[i]),
+          "present_true_tilt_deg": float(self.present_tilt[i]),
           "presented": bool(self.started[i]),
           "t_first_through": float(self.t_through[i]),
           "block_drift_mm": 1e3 * float(self.drift[i]),
@@ -275,6 +307,9 @@ def summarise(rows: list[dict]) -> dict:
     "presented": share("presented"),
     "through_given_presented": share("through_held", pres),
     "t_presented_median_s": med([r["t_presented"] for r in pres]),
+    "present_true_dist_median_mm": med([r["present_true_dist_mm"] for r in pres]),
+    "present_true_speed_median_mm_s": med([r["present_true_speed_mm_s"] for r in pres]),
+    "present_true_tilt_median_deg": med([r["present_true_tilt_deg"] for r in pres]),
     "t_first_through_median_s": med(
       [
         r["t_first_through"]
