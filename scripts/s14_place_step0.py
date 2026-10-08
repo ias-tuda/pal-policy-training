@@ -323,6 +323,11 @@ class Driver:
       term._rate[0, self.arm].cpu().numpy() if hasattr(term, "_rate") else None
     )
     self.kin = scripted.Kin.from_model(env.sim.mj_model)
+    # The IK inside the action box (the start pose +/- the arm's scales), so that no planned target is clipped.
+    lo = (self.offset[0, self.arm] - self.scale[0, self.arm]).cpu().numpy()
+    hi = (self.offset[0, self.arm] + self.scale[0, self.arm]).cpu().numpy()
+    self.kin.lo = np.maximum(self.kin.lo, lo + 1e-3)
+    self.kin.hi = np.minimum(self.kin.hi, hi - 1e-3)
     self.clipped = 0
     self.hook = None
 
