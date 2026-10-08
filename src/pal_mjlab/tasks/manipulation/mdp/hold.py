@@ -182,6 +182,27 @@ def side_roll_graded(
   return inner(env, **params) * side_roll_grade(env, side_cfg, side_std, roll_std)
 
 
+def level_block_graded(
+  env: ManagerBasedRlEnv,
+  inner,
+  level_object: str,
+  side_cfg: SceneEntityCfg,
+  tilt_std: float,
+  roll_std: float,
+  elevation_std: float,
+  **params,
+) -> torch.Tensor:
+  """``inner(env, **params)`` x G(block tilt, ``tilt_std``) x G(hand roll, ``roll_std``) x G(approach elevation,
+  ``elevation_std``) (L-H3's goal terms): the block level, not the hand. L-H2 grasped the block on the table with the
+  hand pitched ~21 deg down and then levelled the hand -- which `side_roll_grade` paid for on the goal terms -- leaving
+  the clamped block tilted ~18 deg at H (`results/S13-insert/read/diag_hold.py`, L-H2 @ 6500); `held` itself allows the
+  hand 25 deg off the horizontal. ``level_object`` names the block (``object_name`` is ``inner``'s). (B,)"""
+  tilt = torch.exp(-torch.square(axis_tilt(env, level_object) / tilt_std))
+  roll = torch.exp(-torch.square(hand_roll(env, side_cfg) / roll_std))
+  elev = torch.exp(-torch.square(approach_elevation(env, side_cfg) / elevation_std))
+  return inner(env, **params) * tilt * roll * elev
+
+
 def side_roll_grade_obs(
   env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, std: float, roll_std: float
 ) -> torch.Tensor:

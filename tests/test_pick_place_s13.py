@@ -159,6 +159,26 @@ def test_lh2_adds_roll_level_and_mid_goal_and_changes_nothing_else(monkeypatch):
   assert _diff(lh2.scene, lh.scene) == {} and _diff(lh2.events, lh.events) == {}
 
 
+def test_lh3_grades_the_goal_terms_by_the_block_not_the_hand(monkeypatch):
+  lh2 = _cfg(monkeypatch, S13="L-H2")
+  lh3 = _cfg(monkeypatch, S13="L-H3")
+  assert set(lh3.rewards) == set(lh2.rewards)
+  for name in H.LEVEL_GOAL_TERMS:
+    t2, t3 = lh2.rewards[name], lh3.rewards[name]
+    assert t3.func is mdp.level_block_graded, name
+    assert t3.params["inner"] is t2.params["inner"], name
+    assert t3.weight == t2.weight, name
+    assert t3.params["tilt_std"] == H.LEVEL_GOAL_TILT_STD
+    assert t3.params["elevation_std"] == H.LEVEL_GOAL_ELEVATION_STD
+    # inner's own parameters (std, sensor, command ...) pass through unchanged.
+    for k, v in t2.params.items():
+      if k not in ("inner", "side_cfg", "side_std", "roll_std"):
+        assert t3.params[k] == v, (name, k)
+  for name in set(lh2.rewards) - set(H.LEVEL_GOAL_TERMS):
+    assert _diff(lh3.rewards[name], lh2.rewards[name]) == {}, name
+  assert _diff(lh3.observations, lh2.observations) == {}
+
+
 @pytest.mark.parametrize(
   "changes",
   [
@@ -292,6 +312,37 @@ def test_roll_grade_and_level_lifted_on_the_env(lh_env):
     H.LEVEL_LIFTED_STD,
   )
   assert float(lv.abs().max()) == 0.0
+
+
+def test_level_block_grade_on_the_env(lh_env):
+  env = lh_env
+  side = SceneEntityCfg(
+    "robot", site_names=(KANGAROO_GRIPPERS_LEFT_ARM.gripper("left").tcp_site,)
+  )
+  side.resolve(env.scene)
+  ones = lambda env, **_: torch.ones(env.num_envs, device=env.device)  # noqa: E731
+  g = mdp.level_block_graded(
+    env,
+    ones,
+    OBJECT,
+    side,
+    H.LEVEL_GOAL_TILT_STD,
+    H.ROLL_STD,
+    H.LEVEL_GOAL_ELEVATION_STD,
+  )
+  want = (
+    torch.exp(-torch.square(mdp.axis_tilt(env, OBJECT) / H.LEVEL_GOAL_TILT_STD))
+    * torch.exp(-torch.square(mdp.hand_roll(env, side) / H.ROLL_STD))
+    * torch.exp(
+      -torch.square(mdp.approach_elevation(env, side) / H.LEVEL_GOAL_ELEVATION_STD)
+    )
+  )
+  assert torch.allclose(g, want)
+  # The start pose's hand points ~20 deg down: the loose elevation grade still pays most of it.
+  elev = mdp.approach_elevation(env, side)
+  assert float(
+    torch.exp(-torch.square(elev / H.LEVEL_GOAL_ELEVATION_STD)).mean()
+  ) > float(torch.exp(-torch.square(elev / H.SIDE_STD)).mean())
 
 
 def test_lhp_pushes_the_top_from_4s_and_not_before(lh_env):

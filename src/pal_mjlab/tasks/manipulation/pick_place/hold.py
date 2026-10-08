@@ -119,6 +119,14 @@ ROLL_STD = math.radians(15.0)
 LEVEL_LIFTED_STD = math.radians(20.0)
 LEVEL_LIFTED_CLEAR = 0.02
 LEVEL_LIFTED_WEIGHT = 2.0
+#: L-H3 (phase 1.1): L-H2 put the block within 1 cm of H on 96-97 % of the last 2 s with the hand level (roll 0.3 deg,
+#: pitch -0.9 deg), but it grasps the block on the table with the hand pitched ~21 deg down and the pads clamp it, so
+#: levelling the hand tilts the block ~18 deg (`results/S13-insert/read/diag_hold.py`, L-H2 @ 6500). L-H3 grades the
+#: goal terms by the block's tilt (`LEVEL_GOAL_TILT_STD`) and the hand's roll, and only loosely by its elevation
+#: (`LEVEL_GOAL_ELEVATION_STD`; `held` allows 25 deg): a pitched hand holding a level block earns them.
+LEVEL_GOAL_TILT_STD = math.radians(10.0)
+LEVEL_GOAL_ELEVATION_STD = math.radians(30.0)
+LEVEL_GOAL_TERMS = ("goal", "goal_mid", "goal_near")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,12 +137,15 @@ class HoldTask:
   """L-HP: pushes on the block's top (`mdp.push_object_top`)."""
   shaped: bool = False
   """L-H2: the roll in the side grade, the level grade while lifted, M2's 3 cm goal term (`ROLL_STD` ...)."""
+  level_goal: bool = False
+  """L-H3 (with ``shaped``): the goal terms graded by the block's tilt instead of the hand's elevation."""
 
 
 HOLD_CODES = {
   "L-H": HoldTask(),
   "L-HP": HoldTask(push=True),
   "L-H2": HoldTask(shaped=True),
+  "L-H3": HoldTask(shaped=True, level_goal=True),
 }
 
 
@@ -257,6 +268,27 @@ def _hold_rewards(
         "std": LEVEL_LIFTED_STD,
       },
     )
+  if task.level_goal:
+    for name in LEVEL_GOAL_TERMS:
+      term = cfg.rewards[name]
+      inner = {
+        k: v
+        for k, v in term.params.items()
+        if k not in ("inner", "side_cfg", "side_std", "roll_std")
+      }
+      cfg.rewards[name] = RewardTermCfg(
+        func=mdp.level_block_graded,
+        weight=term.weight,
+        params={
+          "inner": term.params["inner"],
+          "level_object": OBJECT,
+          "side_cfg": side,
+          "tilt_std": LEVEL_GOAL_TILT_STD,
+          "roll_std": ROLL_STD,
+          "elevation_std": LEVEL_GOAL_ELEVATION_STD,
+          **inner,
+        },
+      )
 
 
 def held_params(gripper: GripperCfg) -> dict:
