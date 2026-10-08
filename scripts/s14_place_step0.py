@@ -833,10 +833,19 @@ def scripted(args: argparse.Namespace) -> dict:
   hold = lambda: np.where(ok[:, None], 0, 0)  # noqa: E731
   del hold
   drv.move(np.where(ok[:, None], q_pre, kin.q_default), jaw=0.0, steps=100)
+  drv.hold(25, jaw=0.0)
+  # The arm's sag (~2 cm at G20), measured at the pre-grasp: the grasp re-planned for it.
+  bias = _tcp_env(env) - np.array([kin.fk(q)[0] for q in q_pre])
+  for i in range(n):
+    if ok[i]:
+      r = _best(kin, tcp_g[i] - bias[i], jaw_axes[i], [q_grasp[i]])
+      if r is not None:
+        q_grasp[i] = r[0]
   drv.move(np.where(ok[:, None], q_grasp, q_pre), jaw=0.0, steps=50)
   drv.hold(10, jaw=0.0)
   for k in range(1, 51):
     drv.step(None, jaw=np.where(ok, drv.jaw_closed * k / 50, 0.0))
+  st_close = _pin_state(env)
   drv.hold(15, jaw=np.where(ok, drv.jaw_closed, 0.0))
   grasped, _ = _grasp_flags(env)
   drv.move(
@@ -866,7 +875,7 @@ def scripted(args: argparse.Namespace) -> dict:
   drv.hold(25, jaw=jaw_c)
   # Set down, closed loop on the pin's measured pose: its lowest point to 2 mm, its centre over the goal.
   q_place = drv.q_arm().copy()
-  for _ in range(2):
+  for _ in range(3):
     st_c, tcp = _pin_state(env), _tcp_env(env)
     for i in range(n):
       if not ok[i]:
@@ -878,7 +887,9 @@ def scripted(args: argparse.Namespace) -> dict:
           0.002 - st_c["z_min"][i],
         ]
       )
-      r = _best(kin, tgt, jaw_axes[i], seeds_from(q_place[i]))
+      # Planned where the arm, sagging as it does now, puts the tool point at ``tgt``.
+      sag = tcp[i] - kin.fk(q_place[i])[0]
+      r = _best(kin, tgt - sag, jaw_axes[i], seeds_from(q_place[i]))
       if r is None:
         plan_err[i] = plan_err[i] or "place"
         continue
@@ -928,6 +939,9 @@ def scripted(args: argparse.Namespace) -> dict:
         "grasped": bool(grasped[i]),
         "lifted": bool(lifted[i]),
         "zmin_before_open_mm": round(1e3 * float(st_p["z_min"][i]), 1),
+        "pushed_at_close_mm": round(
+          1e3 * float(np.linalg.norm(st_close["pos"][i, :2] - st["pos"][i, :2])), 1
+        ),
         "end": "standing" if st_e["standing"][i] else "lying",
         "toppled": bool(standing0[i] and not st_e["standing"][i]),
         "centre_error_cm": round(100 * float(dxy[i]), 2),
