@@ -531,6 +531,21 @@ def bench(args: argparse.Namespace) -> dict:
     plans.append((pre[0], g[0], up[0]))
   pre, grasp, up = (np.array([p[k] for p in plans]) for k in range(3))
   drv.move(pre, jaw=0.0, steps=100)
+  drv.hold(25, jaw=0.0)
+  # The arm sags under its load at G20 (~2 cm): re-plan the grasp and the lift for the tool point's measured offset
+  # from its planned place at the pre-grasp, as `scripted_pick_place.replan_place` does.
+  bias = _tcp_env(env) - np.array([kin.fk(q)[0] for q in pre])
+  for i, c in enumerate(cases):
+    jaw_axis = (
+      None
+      if c["pose"] == "standing"
+      else np.array([math.cos(axis_yaw), math.sin(axis_yaw), 0.0])
+    )
+    goal = kin.fk(grasp[i])[0] - bias[i]
+    g = _best(kin, goal, jaw_axis, [grasp[i]])
+    u = _best(kin, goal + np.array([0, 0, 0.05]), jaw_axis, [up[i]])
+    if g is not None and u is not None:
+      grasp[i], up[i] = g[0], u[0]
   drv.move(grasp, jaw=0.0, steps=50)
   drv.hold(25, jaw=0.0)
   tcp0 = _tcp_env(env)
@@ -717,6 +732,232 @@ def rest(args: argparse.Namespace) -> dict:
   return out
 
 
+def scripted(args: argparse.Namespace) -> dict:
+  """Item 7 (L1, recorded, not gated): the scripted pick-and-place at the stack speed, ``LAG=JS``, DR-scene, 0.837 m,
+  the WP arm, both start poses. Worlds 0-15: the pin at WP's four corners and four edge midpoints, standing then
+  lying (axis 0 / 45 / 90 / 135 deg in turn), the goal the reset's; the rest the reset's own draws. Per world, IK
+  inside the action box (`Driver`): over the pin's grasp point (a standing pin 20 mm over its top, any wrist yaw; a
+  lying pin ``--above-lying`` over its top, the jaw across its axis), down, the jaw closed over 1 s, up 10 cm, over the
+  goal, down until the pin's lowest point is 2 mm over the table with its centre over the goal (closed loop on the
+  pin's measured pose), the jaw opened, up 10 cm, home; then 1.5 s. Read: plan errors, grasped, lifted, rested
+  within 2 cm of the goal at the end (SUCC without the hand-off), the end pose, topples, clipped steps, the time."""
+  import torch
+  from pal_mjlab.tasks.manipulation import mdp
+  from pal_mjlab.tasks.manipulation.pick_place import place_pin as pp
+
+  n = args.num_envs
+  env = _make_env(n, args.device, seed=args.seed, LAG="JS")
+  with torch.inference_mode():
+    env.reset()
+  drv = Driver(env)
+  kin = drv.kin
+  origins = env.scene.env_origins.cpu().numpy()
+  table = env.scene["table"]
+  tb = table.indexing.body_ids[table.body_names.index("table")]
+  from pal_mjlab.tasks.manipulation import scene
+
+  with torch.inference_mode():
+    shift = (env.sim.data.xpos[:, tb, :2] - env.scene.env_origins[:, :2]).cpu().numpy()
+  shift = shift - np.asarray(scene.table_pos(0.837)[:2])
+  tops = _table_tops(env)
+  forced = []
+  for x, y in (
+    (0.36, -0.10),
+    (0.36, 0.32),
+    (0.64, -0.10),
+    (0.64, 0.32),
+    (0.36, 0.11),
+    (0.64, 0.11),
+    (0.50, -0.10),
+    (0.50, 0.32),
+  ):
+    forced.append((x, y))
+  st0 = _pin_state(env)
+  pos = st0["pos"].copy()
+  quats = env.scene["object"].data.root_link_quat_w.cpu().numpy().copy()
+  kinds = ["reset"] * n
+  for k in range(min(16, n)):
+    x, y = forced[k % 8]
+    x, y = x + shift[k, 0], y + shift[k, 1]
+    if k < 8:
+      quats[k] = _yaw_q(np.array([0.3]))[0]
+      pos[k] = [x, y, tops[k] - origins[k, 2] + 0.045]
+      kinds[k] = "corner_standing"
+    else:
+      quats[k] = _lying_q(
+        np.array([math.radians(45.0 * (k % 4))]), np.array([math.pi / 4])
+      )[0]
+      pos[k] = [x, y, tops[k] - origins[k, 2] + (0.032 + 0.008) / 2 / math.sqrt(2)]
+      kinds[k] = "corner_lying"
+  _put_pin(env, pos, quats)
+  drv.hold(5)
+  # Re-draw the goals of the forced worlds clear of their pins (the command drew them for the reset's pins).
+  cmd = env.command_manager.get_term("goal_pose")
+  with torch.inference_mode():
+    ids = torch.arange(min(16, n), device=env.device)
+    if len(ids):
+      cmd.offsets[ids] = cmd._draw_clear_of_object(ids)
+  goal = cmd.goal_surface.cpu().numpy() - origins
+  st = _pin_state(env)
+  quat = env.scene["object"].data.root_link_quat_w
+  with torch.inference_mode():
+    axis_w = mdp.pin_axis_canonical_w(env, quat).cpu().numpy()
+  standing0 = st["standing"].copy()
+  rng = np.random.default_rng(args.seed)
+  plan_err = [None] * n
+  tcp_g = np.zeros((n, 3))
+  jaw_axes = [None] * n
+  q_pre, q_grasp, q_up = (np.tile(kin.q_default, (n, 1)) for _ in range(3))
+
+  def seeds_from(q):
+    return [q] + [np.clip(q + rng.normal(0, 0.3, 7), kin.lo, kin.hi) for _ in range(5)]
+
+  for i in range(n):
+    top_z = st["pos"][i, 2] + st["top_over"][i]
+    if standing0[i]:
+      g = st["pos"][i] + np.array([0, 0, 0.045 + 0.020])
+      ax = None
+    else:
+      g = np.array([st["pos"][i, 0], st["pos"][i, 1], top_z + args.above_lying])
+      ax = axis_w[i] / max(np.linalg.norm(axis_w[i][:2]), 1e-9)
+      ax = np.array([ax[0], ax[1], 0.0])
+    jaw_axes[i] = ax
+    tcp_g[i] = g
+    a = _best(kin, g + np.array([0, 0, 0.10]), ax, seeds_from(kin.q_default))
+    b = _best(kin, g, ax, [a[0]] + seeds_from(a[0])[1:]) if a else None
+    if a is None or b is None:
+      plan_err[i] = "grasp"
+      continue
+    q_pre[i], q_grasp[i], q_up[i] = a[0], b[0], a[0]
+  ok = np.array([e is None for e in plan_err])
+  hold = lambda: np.where(ok[:, None], 0, 0)  # noqa: E731
+  del hold
+  drv.move(np.where(ok[:, None], q_pre, kin.q_default), jaw=0.0, steps=100)
+  drv.move(np.where(ok[:, None], q_grasp, q_pre), jaw=0.0, steps=50)
+  drv.hold(10, jaw=0.0)
+  for k in range(1, 51):
+    drv.step(None, jaw=np.where(ok, drv.jaw_closed * k / 50, 0.0))
+  drv.hold(15, jaw=np.where(ok, drv.jaw_closed, 0.0))
+  grasped, _ = _grasp_flags(env)
+  drv.move(
+    np.where(ok[:, None], q_up, drv.q_arm()),
+    jaw=np.where(ok, drv.jaw_closed, 0.0),
+    steps=50,
+  )
+  drv.hold(10, jaw=np.where(ok, drv.jaw_closed, 0.0))
+  st_l = _pin_state(env)
+  lifted = _grasp_flags(env)[0] & (st_l["z_min"] > 0.03)
+  # Carry: the tool point over the goal at the lift height, the hand's yaw kept (the jaw across a lying axis).
+  tcp = _tcp_env(env)
+  q_carry = drv.q_arm().copy()
+  for i in range(n):
+    if not ok[i]:
+      continue
+    off = tcp[i, :2] - st_l["pos"][i, :2]
+    c = np.array([goal[i, 0] + off[0], goal[i, 1] + off[1], tcp[i, 2]])
+    r = _best(kin, c, jaw_axes[i], seeds_from(q_up[i]))
+    if r is None:
+      plan_err[i] = "carry"
+      ok[i] = False
+      continue
+    q_carry[i] = r[0]
+  jaw_c = np.where(ok, drv.jaw_closed, 0.0)
+  drv.move(q_carry, jaw=jaw_c, steps=100)
+  drv.hold(25, jaw=jaw_c)
+  # Set down, closed loop on the pin's measured pose: its lowest point to 2 mm, its centre over the goal.
+  q_place = drv.q_arm().copy()
+  for _ in range(2):
+    st_c, tcp = _pin_state(env), _tcp_env(env)
+    for i in range(n):
+      if not ok[i]:
+        continue
+      tgt = tcp[i] + np.array(
+        [
+          goal[i, 0] - st_c["pos"][i, 0],
+          goal[i, 1] - st_c["pos"][i, 1],
+          0.002 - st_c["z_min"][i],
+        ]
+      )
+      r = _best(kin, tgt, jaw_axes[i], seeds_from(q_place[i]))
+      if r is None:
+        plan_err[i] = plan_err[i] or "place"
+        continue
+      q_place[i] = r[0]
+    drv.move(q_place, jaw=jaw_c, steps=40)
+    drv.hold(15, jaw=jaw_c)
+  st_p = _pin_state(env)
+  for k in range(1, 21):
+    drv.step(None, jaw=jaw_c * (1 - k / 20))
+  drv.hold(15, jaw=0.0)
+  tcp = _tcp_env(env)
+  q_ret = drv.q_arm().copy()
+  for i in range(n):
+    if not ok[i]:
+      continue
+    r = _best(kin, tcp[i] + np.array([0, 0, 0.10]), None, seeds_from(q_place[i]))
+    if r is not None:
+      q_ret[i] = r[0]
+  drv.move(q_ret, jaw=0.0, steps=50)
+  drv.move(np.tile(kin.q_default, (n, 1)), jaw=0.0, steps=100)
+  drv.hold(75, jaw=0.0)
+  st_e = _pin_state(env)
+  grasped_e, _ = _grasp_flags(env)
+  with torch.inference_mode():
+    rs = mdp.pin_rest_state(env, "object", "goal_pose")
+    rested = (
+      rs.rested(
+        torch.as_tensor(grasped_e, device=env.device),
+        pp.PLACE_RADIUS,
+        pp.PLACED_TOL[1],
+        pp.REST_SPEED,
+        pp.REST_ANGULAR_SPEED,
+      )
+      .cpu()
+      .numpy()
+    )
+    dxy = rs.goal_dxy.cpu().numpy()
+  rows = []
+  for i in range(n):
+    rows.append(
+      {
+        "kind": kinds[i],
+        "start": "standing" if standing0[i] else "lying",
+        "pin_xy": [round(float(v), 3) for v in st["pos"][i, :2] - shift[i]],
+        "goal_xy": [round(float(v), 3) for v in goal[i, :2] - shift[i]],
+        "plan_error": plan_err[i],
+        "grasped": bool(grasped[i]),
+        "lifted": bool(lifted[i]),
+        "zmin_before_open_mm": round(1e3 * float(st_p["z_min"][i]), 1),
+        "end": "standing" if st_e["standing"][i] else "lying",
+        "toppled": bool(standing0[i] and not st_e["standing"][i]),
+        "centre_error_cm": round(100 * float(dxy[i]), 2),
+        "success": bool(rested[i] and dxy[i] < pp.PLACE_RADIUS),
+      }
+    )
+  out = {"clipped_steps": drv.clipped, "rows": rows}
+  args.json.parent.mkdir(parents=True, exist_ok=True)
+  args.json.write_text(json.dumps(out, indent=1))
+  for kind in ("corner_standing", "corner_lying", "reset"):
+    g = [r for r in rows if r["kind"] == kind]
+    if not g:
+      continue
+    planned = [r for r in g if r["plan_error"] is None]
+    print(
+      f"{kind:16s}: {len(g)} worlds, planned {len(planned)}, grasped {sum(r['grasped'] for r in planned)}, "
+      f"lifted {sum(r['lifted'] for r in planned)}, SUCC {sum(r['success'] for r in g)} "
+      f"(of planned {sum(r['success'] for r in planned)}); toppled {sum(r['toppled'] for r in g)}; "
+      f"plan errors {sorted(set(r['plan_error'] for r in g if r['plan_error']))}"
+    )
+    for pose in ("standing", "lying"):
+      gp = [r for r in g if r["start"] == pose]
+      if gp and kind == "reset":
+        print(
+          f"   {pose}: {len(gp)}, SUCC {sum(r['success'] for r in gp)}, planned {sum(r['plan_error'] is None for r in gp)}"
+        )
+  print("clipped steps", drv.clipped)
+  return out
+
+
 def main() -> None:
   p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   sub = p.add_subparsers(dest="cmd", required=True)
@@ -737,10 +978,13 @@ def main() -> None:
   )
   s = sub.add_parser("summarize")
   s.add_argument("files", nargs="+")
-  for name in ("bench", "rest"):
+  for name in ("bench", "rest", "scripted"):
     b = sub.add_parser(name)
     b.add_argument("--json", type=pathlib.Path, required=True)
     b.add_argument("--device", default="cuda:0")
+    b.add_argument("--num-envs", type=int, default=80)
+    b.add_argument("--seed", type=int, default=0)
+    b.add_argument("--above-lying", type=float, default=0.020)
   args = p.parse_args()
   if args.cmd == "reach":
     reach(args)
@@ -748,6 +992,8 @@ def main() -> None:
     bench(args)
   elif args.cmd == "rest":
     rest(args)
+  elif args.cmd == "scripted":
+    scripted(args)
   else:
     _set_env()
     summarize(args)
