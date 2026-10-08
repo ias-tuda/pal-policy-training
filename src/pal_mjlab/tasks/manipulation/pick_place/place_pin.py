@@ -74,18 +74,26 @@ PLACED_TOL = (PLACE_RADIUS, 0.003)
 REST_SPEED = 0.02
 REST_ANGULAR_SPEED = 0.5
 #: M6 for the pin: the let-go's speed (m/s) and lowest-point height (m) graded; xy only gated (the release's at-goal
-#: test), the tilt not graded (any pose counts).
-M6_SPEED_STD = 0.05
-M6_HEIGHT_STD = 0.005
+#: test), the tilt not graded (any pose counts). Step 0 item 6's resting table (mujoco_warp, `results/S14-pin-place/
+#: step0/rest.json`): a lying pin let go from up to 30 mm at up to 20 cm/s rests within 1.7 cm; a standing one from up
+#: to 10 mm, tilted up to 12 deg, at up to 10 cm/s stays standing within 1.0 cm, and topples (6 cm) only at 20 cm/s
+#: with 8 deg or more -- so the grade keeps ~0.8 at 5 cm/s and 5 mm and falls to ~0.4 at 10 cm/s / 10 mm.
+M6_SPEED_STD = 0.10
+M6_HEIGHT_STD = 0.010
 M6_DIST_STD = 1.0
-#: The tool point over a lying pin's highest point at the grasp, m (plan §14.2's ``GRASP_ABOVE_TOP_LYING``).
+#: The tool point over a lying pin's highest point at the grasp, m (plan §14.2's ``GRASP_ABOVE_TOP_LYING``): step 0
+#: item 5 (`results/S14-pin-place/step0/bench_wp2.json`, the real gripper on mujoco_warp, the jaw across the axis): at
+#: 20 and 25 mm the fingers stay off the table through the close and the pin lifts 5 cm slipping 1.0-1.5 mm; at 10 and 15
+#: mm they touch the table (slip 3-8 mm); a jaw along the axis lifts nothing. J's 0.50 rad still releases it (the pads
+#: let go at 0.58-0.62 on opening).
 GRASP_ABOVE_TOP_LYING = 0.020
 #: The jaw-yaw term (lying pins): weight, the angle's width, the tool point's distance width.
 JAW_YAW_WEIGHT, JAW_YAW_STD, JAW_YAW_DIST_STD = 1.0, math.radians(20.0), 0.03
-#: GC (PS-SG; its weight `rewards.GC_WEIGHT`): the first-touch jaw angles (rad; standing: §12.1's bench,
-#: 0.546-0.587), the gate (m).
+#: GC (PS-SG; its weight `rewards.GC_WEIGHT`): the first-touch jaw angles (rad): standing 0.55 (§12.1's bench
+#: 0.546-0.587; step 0 item 5 on mujoco_warp 0.563-0.604), lying 0.58 (item 5: the jaw across the axis, 20 mm over the
+#: top, "x" 0.583-0.606, "+" 0.566-0.596), the gate (m).
 GC_Q_TOUCH = 0.55
-GC_Q_TOUCH_LYING = 0.55
+GC_Q_TOUCH_LYING = 0.58
 GC_XY_TOL, GC_Z_TOL = 0.015, 0.01
 #: M8's retreat: to 10 cm over the pin's top.
 RETREAT_CLEAR = 0.10
@@ -101,8 +109,20 @@ LIFT_FADE_STD = 0.05
 #: goal there would have the pin set down against its fingers.
 LEFT_HAND_KEEPOUT = (0.315, 0.485, 0.065, 0.215)
 RIGHT_HAND_KEEPOUT = (0.325, 0.475, -0.20, -0.085)
-START_KEEPOUT = (LEFT_HAND_KEEPOUT, RIGHT_HAND_KEEPOUT)
-GOAL_KEEPOUT = RIGHT_HAND_KEEPOUT
+#: Plan §14.1 *Rule* (a): where neither pose has a contact-free grasp, lift and retreat with the hand within 35 deg of
+#: vertical inside the WP arm's action box, at the 0.827 / 0.837 / 0.847 m tables -- WP's two right-hand corners, 19
+#: of its 330 2 cm cells (step 0 item 2, `results/S14-pin-place/step0/reach_box_summary.txt`): near the torso x <= 0.44,
+#: y <= -0.08 (and x 0.36, y -0.06), and far x >= 0.60, y <= -0.08 / x >= 0.62, y <= -0.06 / x 0.64, y <= 0.0. No pin
+#: starts and no goal is drawn there (the robot frame, the cells' half-width added).
+CUT = (
+  (0.30, 0.45, -0.20, -0.07),
+  (0.30, 0.37, -0.20, -0.05),
+  (0.59, 0.70, -0.20, -0.07),
+  (0.61, 0.70, -0.20, -0.05),
+  (0.63, 0.70, -0.20, 0.01),
+)
+START_KEEPOUT = (LEFT_HAND_KEEPOUT, RIGHT_HAND_KEEPOUT, *CUT)
+GOAL_KEEPOUT = (RIGHT_HAND_KEEPOUT, *CUT)
 #: The share of lying starts for ``PIN_START=mix`` (D14-6; 50 / 50 proposed).
 PIN_LIE_P = 0.5
 #: ``PIN_START``: the lying share each name gives (mix: `PIN_LIE_P` unless ``PIN_LIE_P`` is set).
@@ -117,7 +137,10 @@ class PlaceGoal:
   """The share of episodes whose pin starts lying (``PIN_START`` / ``PIN_LIE_P``)."""
   above_top_lying: float = GRASP_ABOVE_TOP_LYING
   start_keepout: tuple[tuple[float, float, float, float], ...] = START_KEEPOUT
-  goal_keepout: tuple[float, float, float, float] | None = GOAL_KEEPOUT
+  """Where a standing pin may not start (the hands and the cut)."""
+  lying_keepout: tuple[tuple[float, float, float, float], ...] = CUT
+  """Where a lying pin may not start (the cut only: it passes under the hands)."""
+  goal_keepout: tuple[tuple[float, float, float, float], ...] | None = GOAL_KEEPOUT
   jaw_yaw_weight: float = JAW_YAW_WEIGHT
   """The jaw-yaw term's weight; 0 drops it (D14-4 may)."""
 
@@ -162,6 +185,7 @@ def apply_place_goal(
       "lie_probability": code.lie_probability,
       "area_x": rel_x,
       "area_y": rel_y,
+      "keepout": code.lying_keepout,
     },
   )
   # Right after `reset_objects` (the dict keeps insertion order), before anything that reads the pin's pose.

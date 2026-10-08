@@ -229,6 +229,25 @@ def test_pin_start_names_the_lying_share(monkeypatch, start, share):
   assert cfg.events["reset_pin_start"].params["lie_probability"] == 0.3
 
 
+def test_wp_trains_the_wp_arm_and_a_wc_checkpoint_is_rescaled(monkeypatch):
+  """SPAWN=WP is WC's arm with arm 7 at its half-range cap (step 0 item 3); ``CKPT_SPAWN=WC`` (§12's IN, S10.2's
+  WX-a-H22) converts arm 7's actions exactly (decision 0003), nothing else."""
+  from pal_mjlab.tasks.manipulation.robots.kangaroo import (
+    KANGAROO_GRIPPERS_LEFT_ARM_WC,
+    KANGAROO_GRIPPERS_LEFT_ARM_WP,
+  )
+
+  wc, wp = (
+    a.action_scale
+    for a in (KANGAROO_GRIPPERS_LEFT_ARM_WC, KANGAROO_GRIPPERS_LEFT_ARM_WP)
+  )
+  assert {k for k in wp if wp[k] != wc[k]} == {r"arm_left_7_joint"}
+  assert wp[r"arm_left_7_joint"] == 2.35
+  _set_env(monkeypatch, CKPT_SPAWN="WC")
+  rl = kangaroo_pick_place_rl_cfg()
+  assert rl.rescale_actions_on_load == {r"arm_left_7_joint": pytest.approx(1.20 / 2.35)}
+
+
 def test_gc_is_ps_sgs_module(monkeypatch):
   cfg = _cfg(monkeypatch, REWARD=pp.PLACE_REWARD_GC)
   gc = cfg.rewards["grasp_closure"]
@@ -278,8 +297,8 @@ def _table_shift(env) -> torch.Tensor:
 
 def test_the_reset_draws_pin_and_goal_on_wp(monkeypatch):
   """3 resets x 64 envs: the pin's centre and the goal on WP about the shifted table, >= 10 cm apart; standing pins
-  outside both hands' keepouts and goals outside the right hand's (robot frame); about half the pins lying; the
-  goal on the table's surface."""
+  outside both hands' keepouts, no pin in WP's cut corners, goals outside the right hand's keepout and the cut (robot
+  frame); about half the pins lying; the goal on the table's surface."""
   cfg = _cfg(monkeypatch, num_envs=64)
   e = ManagerBasedRlEnv(cfg=cfg, device=get_test_device())
   try:
@@ -304,6 +323,7 @@ def test_the_reset_draws_pin_and_goal_on_wp(monkeypatch):
       standing = mdp.pin_standing(pin.data.root_link_quat_w)
       robot_xy = pin.data.root_link_pos_w[:, :2] - origin
       assert not bool((in_keepout(robot_xy, pp.START_KEEPOUT) & standing).any())
+      assert not bool(in_keepout(robot_xy, pp.CUT).any())
       assert not bool(in_keepout(goal[:, :2] - origin, pp.GOAL_KEEPOUT).any())
       top = surface_top_z(e, SceneEntityCfg("table"))
       assert torch.allclose(goal[:, 2], top, atol=1e-6)

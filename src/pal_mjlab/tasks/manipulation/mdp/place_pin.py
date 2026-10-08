@@ -47,6 +47,7 @@ from pal_mjlab.tasks.manipulation.mdp.commands import (
   SurfaceOffsetCommandCfg,
 )
 from pal_mjlab.tasks.manipulation.mdp.events import (
+  Keepout,
   _surface_centre_xy,
   in_keepout,
   surface_top_z,
@@ -255,8 +256,8 @@ class PinPlaceCommand(SurfaceOffsetCommand):
 
 @dataclass(kw_only=True)
 class PinPlaceCommandCfg(SurfaceOffsetCommandCfg):
-  goal_keepout: tuple[float, float, float, float] | None = None
-  """A box (x lo, x hi, y lo, y hi, the robot frame) the goal point is redrawn out of (as the pin's distance is);
+  goal_keepout: Keepout | None = None
+  """Boxes (x lo, x hi, y lo, y hi, the robot frame) the goal point is redrawn out of (as the pin's distance is);
   None for none."""
 
   #: M6's yaw grade has no reference here: the pin may end in any pose.
@@ -292,11 +293,12 @@ def reset_pin_start(
   area_x: tuple[float, float],
   area_y: tuple[float, float],
   drop: float = 0.0,
+  keepout: Keepout | None = None,
 ) -> None:
   """Plan §14's start: after `events.reset_objects_on_surface` has stood the pin on its foot (outside the start
   hand's keepout), lay a ``lie_probability`` share of the envs' pins down -- the "x" pose, the axis at a yaw
-  uniform in [0, pi), the centre uniform on the area (``area_x`` x ``area_y`` about the surface centre; the keepout
-  is for standing pins only), its lowest points ``drop`` over the table."""
+  uniform in [0, pi), the centre uniform on the area (``area_x`` x ``area_y`` about the surface centre) outside
+  ``keepout`` (the robot frame; redrawn, 64 rounds), its lowest points ``drop`` over the table."""
   n = len(env_ids)
   if n == 0 or lie_probability <= 0.0:
     return
@@ -312,6 +314,14 @@ def reset_pin_start(
   lo = torch.tensor([area_x[0], area_y[0]], device=device)
   hi = torch.tensor([area_x[1], area_y[1]], device=device)
   xy = centre + sample_uniform(lo, hi, (m, 2), device=device)
+  if keepout is not None:
+    origin = env.scene.env_origins[ids, :2]
+    for _ in range(64):
+      bad = in_keepout(xy - origin, keepout)
+      if not bool(bad.any()):
+        break
+      redraw = centre + sample_uniform(lo, hi, (m, 2), device=device)
+      xy = torch.where(bad.unsqueeze(-1), redraw, xy)
   quat = lying_quat(sample_uniform(0.0, math.pi, (m,), device=device))
   below, _ = pin_extent_z(quat)
   pose = torch.cat([xy, (top + below + drop).unsqueeze(-1), quat], dim=-1)
