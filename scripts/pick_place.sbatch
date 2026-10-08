@@ -245,6 +245,13 @@ for _pair in BASE_OBS:base CONTACT:contact; do
     S91_TAG="${S91_TAG},\"${_short}${_val}\""
   fi
 done
+# Plan S10.2 / S11.3: TABLE_DZ (mm) raises the table's top face from the baseline's height (22: the robot
+# cell's table, 0.837 m on baseline B). In the run name and the tags only when set.
+if [ -n "${TABLE_DZ:-}" ]; then
+  export TABLE_DZ
+  S11_NAME="${S11_NAME}_tabledz${TABLE_DZ}"
+  S11_TAG="${S11_TAG},\"tabledz${TABLE_DZ}\""
+fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -329,11 +336,17 @@ if grep -q BOX_BOX_EDGE_TOL .venv/lib/python*/site-packages/mujoco_warp/_src/col
 else
   echo "patch       mujoco_warp_boxbox.patch NOT applied"
   case "$GOAL" in
-    insert*)
+    insert*|place*)
       echo "Refusing to run: GOAL=$GOAL needs mujoco_warp_boxbox.patch (decision 0005)." >&2
       exit 1
       ;;
   esac
+fi
+# Decision 0005: mujoco_warp_box_box_depth.patch (box_box's bogus deep contacts dropped).
+if grep -q "Local patch (oppsie, 2026-10-08)" .venv/lib/python*/site-packages/mujoco_warp/_src/collision_primitive.py 2>/dev/null; then
+  echo "patch       mujoco_warp_box_box_depth.patch applied"
+else
+  echo "patch       mujoco_warp_box_box_depth.patch NOT applied (decision 0005: scripts/apply_mujoco_warp_patches.sh)"
 fi
 echo "=================="
 

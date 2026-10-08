@@ -372,6 +372,12 @@ STACK_TARGET_NOISE = 0.001
 BASE_RGBA = (0.2, 0.35, 0.8, 1.0)
 #: What the goal is (`GOAL`) and what may hold the jaw shut (`GATE`).
 GOALS = ("table", "stack")
+#: Plan S9.3: a stack's base drawn from a target area (``TARGET=WC``) keeps at least this much from
+#: the red cube, centre to centre, m -- the base's half-diagonal (3.5 cm) + the open hand's reach past
+#: the red cube's centre (~6 cm) + 2 cm; step 0 item 2 checks it against scripted grasps.
+STACK_MIN_SEPARATION = 0.12
+#: Rounds of redrawing the base before a straggler takes the area's corner farthest from the cube.
+STACK_AREA_REDRAWS = 64
 GATES = ("none", "stack")
 
 
@@ -458,15 +464,32 @@ def _apply_stack_goal(
   cfg: ManagerBasedRlEnvCfg,
   baseline: Baseline,
   robot_target: RobotFrameTarget | None = None,
+  target_area: SpawnBox | None = None,
 ) -> None:
   """Plan S9's `GOAL=stack` on a cfg built with both cubes: the red cube alone from the spawn
   box, the base from the target box, its terms, and the actor's goal through a tracker.
 
   With ``robot_target`` (plan S11's R-ST / R-ST-W) the base is spawned about T in the robot frame
-  instead of the baseline's table-relative box."""
+  instead of the baseline's table-relative box. With ``target_area`` (plan S9.3's ``TARGET=WC``) it
+  is drawn from the area, table-relative, at the area's yaw, at least `STACK_MIN_SEPARATION` from
+  the red cube (`mdp.reset_box_in_area`: redrawn, then the area's farthest corner)."""
   reset = cfg.events["reset_objects"]
   reset.params["asset_cfgs"] = [SceneEntityCfg(OBJECT)]
-  if robot_target is None:
+  base_func = mdp.reset_objects_on_surface
+  if target_area is not None:
+    cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
+    base_func = mdp.reset_box_in_area
+    base_params = {
+      "asset_cfg": SceneEntityCfg(BASE_OBJECT),
+      "object_name": OBJECT,
+      "area_x": (target_area.x[0] - cx, target_area.x[1] - cx),
+      "area_y": (target_area.y[0] - cy, target_area.y[1] - cy),
+      "yaw": target_area.yaw,
+      "min_distance": STACK_MIN_SEPARATION,
+      "redraws": STACK_AREA_REDRAWS,
+      "on_half_height": True,
+    }
+  elif robot_target is None:
     (tx, ty), half = baseline.target_xy, baseline.target_half_xy
     base_box = SpawnBox(
       x=(tx - half, tx + half),
@@ -474,10 +497,14 @@ def _apply_stack_goal(
       yaw=STACK_BASE_YAW,
       widen_at_dr_scene=False,
     )
-    base_params = {"pose_range": _object_pose_range(base_box)}
+    base_params = {
+      "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
+      "pose_range": _object_pose_range(base_box),
+    }
   else:
     (tx, ty), half = robot_target.xy, robot_target.base_half_xy
     base_params = {
+      "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
       "pose_range": {
         "x": (tx - half, tx + half),
         "y": (ty - half, ty + half),
@@ -490,13 +517,9 @@ def _apply_stack_goal(
     events[name] = term
     if name == "reset_objects":
       events["reset_base_object"] = EventTermCfg(
-        func=mdp.reset_objects_on_surface,
+        func=base_func,
         mode="reset",
-        params={
-          "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
-          "surface_cfg": SceneEntityCfg(TABLE),
-          **base_params,
-        },
+        params={"surface_cfg": SceneEntityCfg(TABLE), **base_params},
       )
   cfg.events = events
   actor = cfg.observations["actor"]
@@ -833,9 +856,6 @@ def make_pick_place_env_cfg(
       None is the goal on the table, every run before S10. With it ``goal`` stays ``table``.
       Plan S10.1: with a ``target_area`` the box is drawn from that area at any yaw, at least
       `box.BOX_MIN_SEPARATION` from the cube, and the let-go's yaw is graded against the box.
-    box_obs: plan S10.1's ``BOX_OBS`` (`box.BOX_OBS_NAMES`): ``goal`` -- the actor sees the goal point
-      computed from the box, S10 -- or ``pose``: the box's own position in that slot and its yaw
-      (cos 4 psi, sin 4 psi) appended, actor and critic. Needs ``box``.
     robot_target: plan S11's ``TARGET=T11`` / ``T11W`` (`ROBOT_TARGETS`): the table goal (L-T) or a
       stack goal's base (R-ST, R-ST-W) at the meeting point T, fixed in the robot frame; a stack goal
       then prices the base's displacement (`base_moved`) instead of its speed. None is every run
@@ -848,6 +868,9 @@ def make_pick_place_env_cfg(
     base_obs: plan S9.1's ``BASE_OBS`` (`BASE_OBS_NAMES`): ``goal`` is every run before S9.1,
       ``pose`` adds the stack base's yaw to the actor and the critic and grades the let-go's yaw
       against the base (`_apply_base_pose`). Needs ``GOAL=stack`` and ``TRACKER=split``.
+    box_obs: plan S10.1's ``BOX_OBS`` (`box.BOX_OBS_NAMES`): ``goal`` -- the actor sees the goal point
+      computed from the box, S10 -- or ``pose``: the box's own position in that slot and its yaw
+      (cos 4 psi, sin 4 psi) appended, actor and critic. Needs ``box``.
   """
   if box_obs not in BOX_OBS_NAMES:
     raise ValueError(f"unknown box observation {box_obs!r}; have {BOX_OBS_NAMES}")
@@ -908,10 +931,21 @@ def make_pick_place_env_cfg(
   if stack:
     if shape is not OBJECT_SHAPES["cube"]:
       raise ValueError("GOAL=stack stacks the 5 cm cube; SHAPE must be cube (plan S9)")
-    if target_area is not None:
+    if target_area is not None and target_area != spawn:
       raise ValueError(
-        "GOAL=stack puts the base in the baseline's target box or at T; TARGET must be "
-        "B, T11 or T11W"
+        "GOAL=stack with a TARGET area draws both cubes from that area (plan S9.3); SPAWN must "
+        "be the same area"
+      )
+    if target_area is not None and (
+      0.5
+      * math.hypot(
+        target_area.x[1] - target_area.x[0], target_area.y[1] - target_area.y[0]
+      )
+      < STACK_MIN_SEPARATION + 0.06
+    ):
+      raise ValueError(
+        "this TARGET area is too small to keep the base STACK_MIN_SEPARATION from every red cube "
+        "with room to spare (WCK: half-diagonal 7.8 cm); use WC (plan S9.3)"
       )
     if occlusion is not None:
       raise ValueError(
@@ -967,7 +1001,7 @@ def make_pick_place_env_cfg(
     action_mode=action_mode,
     command_obs=command_obs,
     goal_area=None
-    if target_area is None
+    if target_area is None or stack
     else _goal_area(
       target_area,
       BOX_MIN_SEPARATION
@@ -986,7 +1020,7 @@ def make_pick_place_env_cfg(
     object_friction=shape.friction,
   )
   if stack:
-    _apply_stack_goal(cfg, baseline, robot_target)
+    _apply_stack_goal(cfg, baseline, robot_target, target_area)
   if tracker == "split":
     _apply_tracker_split(cfg, stack)
   if base_obs == "pose":
@@ -1045,14 +1079,15 @@ def make_pick_place_env_cfg(
     )
   # Not part of any arm's comparison: every variant carries the same trunk penalty.
   cfg.rewards.update(trunk_clearance_rewards(robot))
-  if stack and robot_target is None:
+  if stack and robot_target is None and target_area is None:
     # Plan S9: the base is scenery the arm must work around, not through (the old stack cfg's).
     cfg.rewards["base_disturbance"] = RewardTermCfg(
       func=mdp.entity_lin_vel_l2, weight=-0.5, params={"entity_name": BASE_OBJECT}
     )
   elif stack:
     # Plan S11's R-ST: pushing the base off T costs (S9 measured `base_disturbance` at 0.0005 per
-    # episode and saw bases dragged 4-7 cm), S10's `box_moved` on the base.
+    # episode and saw bases dragged 4-7 cm), S10's `box_moved` on the base; plan S9.3's base on WC
+    # too.
     cfg.rewards["base_moved"] = RewardTermCfg(
       func=mdp.reference_displacement_penalty,
       weight=BASE_MOVED_WEIGHT,

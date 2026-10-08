@@ -224,6 +224,8 @@ def reset_box_in_area(
   yaw: float,
   min_distance: float,
   keepout: tuple[float, float, float, float] | None = None,
+  redraws: int = BOX_AREA_REDRAWS,
+  on_half_height: bool = False,
 ) -> None:
   """Plan S10.1: put the box down on the surface, its centre drawn uniformly from the area
   (``area_x`` x ``area_y``, relative to the surface centre -- table-relative, so DR-scene's table
@@ -237,7 +239,11 @@ def reset_box_in_area(
   which is at least ``min_distance`` away when the object was drawn where one is
   (`events.reset_objects_on_surface`'s ``goal_area``). Plan §12's ``keepout`` (x lo, x hi, y lo, y hi about the env
   origin, `events.reset_objects_on_surface`'s) is redrawn the same way; a corner straggler is not checked
-  against it."""
+  against it.
+
+  Plan S9.3 puts the stack's base cube down the same way: ``redraws`` rounds (64 there), and
+  ``on_half_height`` rests the entity on its own half-height above the top (a cube's origin is its
+  centre; the box's is its floor's underside, so the box keeps the default)."""
   n = len(env_ids)
   device = env.device
   box: Entity = env.scene[asset_cfg.name]
@@ -256,7 +262,7 @@ def reset_box_in_area(
       bad |= in_keepout(centre + off - origin, keepout)
     return bad
 
-  for _ in range(BOX_AREA_REDRAWS):
+  for _ in range(redraws):
     too_close = rejected(offsets)
     if not bool(too_close.any()):
       break
@@ -281,6 +287,8 @@ def reset_box_in_area(
   quat = quat_from_euler_xyz(
     zeros, zeros, sample_uniform(-yaw, yaw, (n,), device=device)
   )
+  if on_half_height:
+    top = top + object_half_height(env, asset_cfg.name, env_ids)
   pose = torch.cat([centre + offsets, top.unsqueeze(-1), quat], dim=-1)
   box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
   box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)

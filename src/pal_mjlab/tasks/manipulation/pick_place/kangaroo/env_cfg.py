@@ -38,7 +38,7 @@ Plan S7-4 adds `EFFORT` (`none` | `C` | `CTP`, `pick_place_env_cfg.EFFORT_BOUNDS
 the driven arm's effort. `C` clips the arm's targets to the joint range; `CTP` adds T -- the arm's
 effort limit lowered to 0.7 x effort on the plant, mirrored as a target band in the action term
 -- and P, the effort hinge. The plant half of T is built into the robot here, from the same code.
-Plan S7-6 adds `LAG` (`none` | `FP` | `JS` | `FP+JS`, `tabletop_env_cfg.LATENCY_MODELS`): the
+Plan S7-6 adds `LAG` (`none` | `FP` | `JS` | `FP+JS`; S7-11 adds `FP+JSW`, the servo down to twice as slow; `tabletop_env_cfg.LATENCY_MODELS`): the
 real robot's latencies -- `FP` the FoundationPose cube tracker's 5-8 steps on the cube pose,
 `JS` the jaw servo's lag behind its command. Unset is `none`, every run up to S7-5.
 `TOOL_SPEED=V0.5` is S7-4's V at 0.5 m/s. The release-by-jaw (J) and the retreat (M8) are reward
@@ -185,6 +185,7 @@ TABLE_DZ_ENV_VAR = "TABLE_DZ"
 ARM_HOME_ENV_VAR = "ARM_HOME"
 TRACKER_ENV_VAR = "TRACKER"
 HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
+HANDOFF_PARK_ENV_VAR = "HANDOFF_PARK"
 ARMS_ENV_VAR = "ARMS"
 HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
 START_ENV_VAR = "START"
@@ -392,11 +393,18 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     insert=insert,
   )
   _apply_contact(cfg)
+  park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
+    # Plan S9.3's `HANDOFF_PARK` names where it ends (home unset).
     left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
-    cfg.actions["joint_pos"] = mdp.with_handoff(
-      cfg.actions["joint_pos"], arms=(handoff_arm(left, +1.0, None),)
+    arm = dataclasses.replace(
+      handoff_arm(left, +1.0, None), park=mdp.HANDOFF_PARK_POSES[park]
+    )
+    cfg.actions["joint_pos"] = mdp.with_handoff(cfg.actions["joint_pos"], arms=(arm,))
+  elif park != "home":
+    raise ValueError(
+      "HANDOFF_PARK ends plan S11's up-out route; it needs HANDOFF_ROUTE=up-out"
     )
   return cfg
 
@@ -428,6 +436,7 @@ def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
   return make_bimanual_env_cfg(
     gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
     effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    baseline=_baseline_with_table(BASELINES[BIMANUAL_FIXED["BASELINE"]]),
     dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
     episode_length_s=_select_episode() or BIMANUAL_EPISODE_S,

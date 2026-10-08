@@ -68,6 +68,8 @@ def parse_args() -> argparse.Namespace:
   )
   p.add_argument(
     "--spawn",
+    "--cube",
+    dest="spawn",
     type=float,
     nargs=3,
     metavar=("X", "Y", "YAW_DEG"),
@@ -87,6 +89,14 @@ def parse_args() -> argparse.Namespace:
     metavar=("X", "Y", "YAW_DEG"),
     help="plan S10: the box's centre and yaw (env frame, table at its nominal place; it moves "
     "with the table). Use --settle-steps >= 9 so the box's 5-8 step tracker reports it",
+  )
+  p.add_argument(
+    "--base",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "YAW_DEG"),
+    help="plan S9.3: a stack goal's base cube, centre and yaw (env frame, table at its nominal "
+    "place; it moves with the table). Use --settle-steps >= 9 so the base's tracker reports it",
   )
   p.add_argument(
     "--table-offset",
@@ -197,6 +207,22 @@ def pin_start(env, ev, args: argparse.Namespace) -> dict[str, tuple[float, ...]]
     box.write_root_link_pose_to_sim(bpose)
     box.write_root_link_velocity_to_sim(torch.zeros_like(box.data.root_link_vel_w))
     env.command_manager.get_term(ev.COMMAND).box_start_xy[0] = bpose[0, :2]
+  if args.base is not None:
+    from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import BASE_OBJECT
+
+    x, y, yaw_deg = args.base
+    yaw = math.radians(yaw_deg)
+    base = env.scene[BASE_OBJECT]
+    bpose = base.data.root_link_pose_w.clone()
+    bpose[0, 0] = origin[0] + x + float(shift[0])
+    bpose[0, 1] = origin[1] + y + float(shift[1])
+    bpose[0, 3:7] = torch.tensor(
+      [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
+    )
+    base.write_root_link_pose_to_sim(bpose)
+    base.write_root_link_velocity_to_sim(torch.zeros_like(base.data.root_link_vel_w))
+    # `base_moved` measures from where the base started (`EntityOffsetCommand.reference_start_xy`).
+    env.command_manager.get_term(ev.COMMAND).reference_start_xy[0] = bpose[0, :2]
   obj = env.scene[ev.OBJECT]
   if args.spawn is not None:
     x, y, yaw_deg = args.spawn
@@ -284,11 +310,13 @@ def main() -> None:
 
   pinned = None
   if any(
-    v is not None for v in (args.spawn, args.target, args.table_offset, args.box)
+    v is not None
+    for v in (args.spawn, args.target, args.table_offset, args.box, args.base)
   ):
     if args.episodes != 1:
       raise ValueError(
-        "--spawn, --target, --box and --table-offset pin one episode: --episodes 1"
+        "--spawn / --cube, --target, --box, --base and --table-offset pin one episode: "
+        "--episodes 1"
       )
     pinned = pin_start(env, ev, args)
     print(

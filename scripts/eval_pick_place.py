@@ -143,6 +143,8 @@ from pal_mjlab.tasks.manipulation.pick_place.rewards import (
 from pal_mjlab.tasks.manipulation.robots import KANGAROO_GRIPPERS_LEFT_ARM
 from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   COMMAND,
+  JAW_SERVO_MAX_VEL,
+  JAW_SERVO_TAU,
   ROBOT,
   SUPPORT_SENSOR,
   TABLE,
@@ -304,6 +306,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     metavar=("ITER", "LS_ITER"),
     help="evaluate with the constraint solver at ITER / LS_ITER iterations instead of the training "
     "cfg's 10 / 20 (plan S10: 100 50 is converged for cube-on-box contacts, S7-9 step 0); eval only",
+  )
+  p.add_argument(
+    "--stress-jaw",
+    action="store_true",
+    help="plan S7-11 stress (a): the jaw servo slower than S7-6's -- its time constant x 2 "
+    "(0.22-0.38 s) and its speed limit x 0.5 (0.625-0.875 rad/s), the same absolute range for every "
+    "run (also one trained on LAG=FP+JSW). Needs LAG with JS",
+  )
+  p.add_argument(
+    "--stress-lag",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="plan S7-11 stress (b): the cube tracker's lag, control steps, drawn per episode in "
+    "[LO, HI] in place of LAG's 5-8 (e.g. 8 12 = 160-240 ms). Needs LAG with FP",
+  )
+  p.add_argument(
+    "--stress-friction",
+    type=float,
+    default=None,
+    metavar="MU",
+    help="plan S7-11 stress (c): the cube-table sliding friction MU (e.g. 0.4): the table top's "
+    "and the cube's sliding friction both set to MU. MuJoCo takes the larger of two geoms' "
+    "coefficients, so the table alone would leave the cube's DR draw (0.5-1.2); the pads keep "
+    "theirs (geom priority 2)",
   )
   p.add_argument(
     "--trace",
@@ -1606,6 +1634,61 @@ class OccTally:
     }
 
 
+#: Plan S9.3's ``sunk``: the red cube on the base lower than resting on it by more than this, mm.
+SUNK_MM = 3.0
+
+
+class _CubeHandContacts:
+  """Plan S9.3's return contact: whether an arm 4-7 / gripper collider of either arm touches either
+  cube, per env, from mujoco_warp's contact list (``dist`` <= 0). ``ok`` is False when the data has
+  no contact list to read."""
+
+  PATTERN = r"(arm_(left|right)_[4-7]|gripper_(left|right))_"
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    import re
+
+    m = env.sim.mj_model
+    self.ok = hasattr(env.sim, "wp_data")
+    robot = env.scene[ROBOT]
+    hand = [
+      int(g)
+      for g, name in zip(
+        robot.indexing.geom_ids.tolist(), robot.geom_names, strict=True
+      )
+      if re.match(self.PATTERN, name)
+    ]
+    cubes = [
+      int(g)
+      for name in (OBJECT, "base_object")
+      if name in env.scene.entities
+      for g in env.scene[name].indexing.geom_ids.tolist()
+    ]
+    self.hand = torch.zeros(m.ngeom, dtype=torch.bool, device=env.device)
+    self.cube = torch.zeros(m.ngeom, dtype=torch.bool, device=env.device)
+    self.hand[hand] = True
+    self.cube[cubes] = True
+    self.ok = self.ok and bool(hand) and bool(cubes)
+
+  def touching(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    import warp as wp
+
+    d = env.sim.wp_data
+    out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    n = int(wp.to_torch(d.nacon)[0])
+    if n == 0:
+      return out
+    geom = wp.to_torch(d.contact.geom)[:n].long()
+    world = wp.to_torch(d.contact.worldid)[:n].long()
+    dist = wp.to_torch(d.contact.dist)[:n]
+    a, b = geom[:, 0], geom[:, 1]
+    hit = ((self.hand[a] & self.cube[b]) | (self.hand[b] & self.cube[a])) & (
+      dist <= 0.0
+    )
+    out[world[hit]] = True
+    return out
+
+
 class StackTally:
   """Plan S9's reads on a stack goal (`GOAL=stack`), per episode.
 
@@ -1615,6 +1698,12 @@ class StackTally:
   ``OK`` and how many there were. The lock's steps (`GATE=stack`): armed (held, lifted, not OK)
   and refused (the policy asked to open while armed) -- the stall read. And the base cube's
   largest horizontal displacement from where it spawned.
+
+  Plan S9.3 adds, per episode: where the base and the red cube started (env frame, the base's yaw
+  folded to +/- 45 deg) for the read's bins; ``sunk`` -- at the end the red cube on the base (within
+  2.5 cm) but more than `SUNK_MM` lower than resting on it (decision 0004's sink); and return contact
+  -- the steps after the hand-off started on which an arm 4-7 / gripper collider of either arm
+  touches either cube.
   """
 
   NAMES = ("dxy", "height", "tilt", "yaw", "speed")
@@ -1634,15 +1723,46 @@ class StackTally:
     self.fresh = torch.ones(n, dtype=torch.bool, device=device)
     self.base0 = torch.zeros(n, 2, device=device)
     self.base_moved = zf()
+    #: Plan S9.3: base x, y, yaw and red cube x, y at the episode's start (env frame).
+    self.start = torch.zeros(n, 5, device=device)
+    self.top_dxy, self.top_dz = zf(), zf()
+    self.return_contact = zl()
+    self._contact = _CubeHandContacts(env)
     self.done: list[dict] = []
 
   @property
   def active(self) -> bool:
     return self.reference is not None
 
-  def step(self, env: ManagerBasedRlEnv, grasped: torch.Tensor) -> None:
+  def step(
+    self,
+    env: ManagerBasedRlEnv,
+    grasped: torch.Tensor,
+    handed: torch.Tensor | None = None,
+  ) -> None:
     from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
     from pal_mjlab.tasks.manipulation.mdp.stack import stack_state
+
+    origin = env.scene.env_origins[:, :2]
+    base_w = env.scene[self.reference].data.root_link_pos_w
+    cube_w = env.scene[OBJECT].data.root_link_pos_w
+    q = env.scene[self.reference].data.root_link_quat_w
+    base_yaw = torch.atan2(
+      2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+    )
+    now = torch.cat(
+      [
+        base_w[:, :2] - origin,
+        yaw_mod90(base_yaw).unsqueeze(-1),
+        cube_w[:, :2] - origin,
+      ],
+      dim=-1,
+    )
+    self.start = torch.where(self.fresh.unsqueeze(-1), now, self.start)
+    self.top_dxy = torch.norm(cube_w[:, :2] - base_w[:, :2], dim=-1)
+    self.top_dz = cube_w[:, 2] - base_w[:, 2]
+    if handed is not None and self._contact.ok:
+      self.return_contact += (handed & self._contact.touching(env)).long()
 
     lifted = getattr(env, _WAS_LIFTED, None)
     lifted = torch.zeros_like(grasped) if lifted is None else lifted
@@ -1678,6 +1798,19 @@ class StackTally:
       row["stack_lock_armed_steps"] = int(self.armed[i])
       row["stack_lock_refused_steps"] = int(self.refused[i])
       row["stack_base_moved_m"] = float(self.base_moved[i])
+      bx, by, byaw, cx, cy = self.start[i].tolist()
+      row.update(
+        stack_base_x=bx,
+        stack_base_y=by,
+        stack_base_yaw_deg=math.degrees(byaw),
+        stack_cube_x=cx,
+        stack_cube_y=cy,
+        stack_carry_cm=100 * math.hypot(bx - cx, by - cy),
+      )
+      on_top = float(self.top_dxy[i]) < 0.025
+      row["stack_end_dz_mm"] = 1e3 * float(self.top_dz[i])
+      row["stack_sunk"] = bool(on_top and 1e3 * float(self.top_dz[i]) < 50.0 - SUNK_MM)
+      row["stack_return_contact_steps"] = int(self.return_contact[i])
       self.done.append(row)
     for t in (self.prev, self.rel_ok, self.any_ok):
       t[env_ids] = False
@@ -1685,6 +1818,7 @@ class StackTally:
     self.armed[env_ids] = 0
     self.refused[env_ids] = 0
     self.base_moved[env_ids] = 0.0
+    self.return_contact[env_ids] = 0
     self.fresh[env_ids] = True
 
   def summarise(self, episodes: int) -> dict:
@@ -1712,6 +1846,12 @@ class StackTally:
       "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows)
       / n,
     }
+    out["stack_sunk"] = sum(r["stack_sunk"] for r in rows) / n
+    out["stack_return_contact"] = (
+      sum(r["stack_return_contact_steps"] > 0 for r in rows) / n
+      if self._contact.ok
+      else None
+    )
     armed = sorted(r["stack_lock_armed_steps"] for r in rows)
     if armed and armed[-1] > 0:
       out["stack_lock_armed_median_s"] = armed[len(armed) // 2] * STEP_DT_S
@@ -2168,7 +2308,85 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
       else s
       for s in cfg.scene.sensors
     )
+  apply_stress(cfg, args)
   return ManagerBasedRlEnv(cfg=cfg, device=args.device)
+
+
+#: Plan S7-11 stress (a): factors on the jaw servo's time constant and speed limit.
+STRESS_JAW_TAU = 2.0
+STRESS_JAW_SPEED = 0.5
+
+
+def apply_stress(cfg, args: argparse.Namespace) -> None:
+  """Plan S7-11's stress tests (step 0 item 4), eval only, outside S7-6's ``LAG=FP+JS`` range:
+  (a) a slower jaw servo, (b) a longer cube-tracker lag, (c) a slipperier table. Each raises
+  rather than silently doing nothing on an env without the model it changes."""
+  from mjlab.envs.mdp import dr
+  from mjlab.managers.event_manager import EventTermCfg
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+  if getattr(args, "stress_jaw", False):
+    act = cfg.actions["joint_pos"]
+    if getattr(act, "servo_joints", None) is None:
+      raise SystemExit("--stress-jaw needs the jaw servo model (LAG=JS or FP+JS)")
+    # From S7-6's servo (`JAW_SERVO_TAU` / `JAW_SERVO_MAX_VEL`), not the run's own: a run trained
+    # on the wide servo (``LAG=FP+JSW``) is stressed with the same absolute range as every other.
+    tau, vel = JAW_SERVO_TAU, JAW_SERVO_MAX_VEL
+    cfg.actions["joint_pos"] = dataclasses.replace(
+      act,
+      servo_tau=(tau[0] * STRESS_JAW_TAU, tau[1] * STRESS_JAW_TAU),
+      servo_max_vel=(vel[0] * STRESS_JAW_SPEED, vel[1] * STRESS_JAW_SPEED),
+    )
+  lag = getattr(args, "stress_lag", None)
+  if lag is not None:
+    lo, hi = lag
+    actor = cfg.observations["actor"]
+    terms = {}
+    for name, term in actor.terms.items():
+      if name in ("object_pos", "object_yaw"):
+        if term.params.get("lag") is None:
+          raise SystemExit(
+            "--stress-lag needs the cube tracker (LAG=FP or FP+JS, no OCC)"
+          )
+        term = dataclasses.replace(term, params={**term.params, "lag": (lo, hi)})
+      terms[name] = term
+    actor.terms = terms
+  mu = getattr(args, "stress_friction", None)
+  if mu is not None:
+    cfg.events["stress_table_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(TABLE, geom_names=("table_top",)),
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],
+        "ranges": (mu, mu),
+      },
+    )
+    cfg.events["object_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": SceneEntityCfg(OBJECT, geom_names=(f"{OBJECT}_geom",)),
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],
+        "ranges": (mu, mu),
+      },
+    )
+
+
+def stress_of(args: argparse.Namespace) -> dict:
+  """The stress conditions an eval ran under, for its JSON."""
+  out: dict = {}
+  if getattr(args, "stress_jaw", False):
+    out["jaw"] = {"tau_x": STRESS_JAW_TAU, "speed_x": STRESS_JAW_SPEED}
+  if getattr(args, "stress_lag", None) is not None:
+    out["lag_steps"] = list(args.stress_lag)
+  if getattr(args, "stress_friction", None) is not None:
+    out["cube_table_friction"] = args.stress_friction
+  return out
 
 
 def load_policy(args: argparse.Namespace, env: ManagerBasedRlEnv):
@@ -2759,7 +2977,7 @@ def main() -> None:
       tally.measure(flags["grasped"], dxy, dz)
       tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
       if stack.active:
-        stack.step(env, flags["grasped"])
+        stack.step(env, flags["grasped"], retreat.handed)
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
       jaw_thr = jaw_open_for(env)
       handed = retreat.step(
@@ -2905,6 +3123,7 @@ def main() -> None:
           "num_envs": args.num_envs,
           "seed": args.seed,
           "solver_iterations": args.solver_iterations,
+          "stress": stress_of(args),
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
