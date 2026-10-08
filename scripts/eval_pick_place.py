@@ -75,6 +75,13 @@ hand-off, the time from placed to it, the cube's displacement during the lift an
 whether it is still placed at the end, the time to home, and S7-4's success -- placed & lifted &
 J-released & lifted clear (>= `HANDOFF_CLEAR`) & still placed after the return.
 
+Plan S8.1: the ball on WC (``PregraspTally``, and the release-to-clear time)
+--------------------------------------------------------------------------------
+Per episode the object's radius and start, how far it moved before the first grasp (a pushed ball
+rolls), whether it was ever grasped, how many grasps began before the first lift, and the time from the
+J-release to lifting clear. Bins by goal position, carry, direction and radius are made from
+``episodes_detail`` afterwards (`results/S8.1-ball/read/read_table.py`).
+
 Plan S7-5: the goal tolerance split into xy and z, and the tilt at the let-go
 --------------------------------------------------------------------------------
 Every placed rate is read under both goal tolerances, whatever the run trained on: the 3-D
@@ -1111,6 +1118,7 @@ class RetreatTally:
     self.yaw_at_let_go = zf()
     self.clear_max = zf(float("-inf"))
     self.clear_run = zl()
+    self.clear_step = zl(-1)
     self.handed, self.hand_step, self.hand_by = zb(), zl(-1), zl()
     self.hand_xy = torch.zeros(num_envs, 2, device=device)
     self.hand_height = zf()
@@ -1176,6 +1184,9 @@ class RetreatTally:
     self.clear_run = torch.where(
       clear, self.clear_run + 1, torch.zeros_like(self.clear_run)
     )
+    self.clear_step = torch.where(
+      clear & (self.clear_step < 0), self.age, self.clear_step
+    )
     if self.handoff:
       by_lift = ~self.handed & (self.clear_run >= HANDOFF_STEPS)
       by_time = ~self.handed & ~by_lift & (self.age >= self.timeout_steps)
@@ -1215,6 +1226,10 @@ class RetreatTally:
         "placed_and_lifted_j": bool(self.placed_j[i]) and bool(self.lifted[i]),
         "lift_clear_max": float(self.clear_max[i]) if rel else None,
         "lifted_clear": clear,
+        # Plan S8.1: from the J-release to the TCP first `HANDOFF_CLEAR` over the object, jaw open.
+        "release_to_clear_s": (int(self.clear_step[i]) - int(self.rel_step[i])) * dt
+        if rel and int(self.clear_step[i]) >= 0
+        else None,
         "handoff_by": ("lift", "timeout")[int(self.hand_by[i]) - 1] if handed else None,
         "handoff_height": float(self.hand_height[i]) if handed else None,
         "placed_to_handoff_s": (hand - int(self.placed_j_step[i])) * dt
@@ -1258,7 +1273,13 @@ class RetreatTally:
       acc[env_ids] = False
     for acc in (self.age, self.clear_run, self.hand_by):
       acc[env_ids] = 0
-    for acc in (self.rel_step, self.placed_j_step, self.hand_step, self.home_step):
+    for acc in (
+      self.rel_step,
+      self.placed_j_step,
+      self.hand_step,
+      self.home_step,
+      self.clear_step,
+    ):
       acc[env_ids] = -1
     self.clear_max[env_ids] = float("-inf")
     self.tilt_at_let_go[env_ids] = 0.0
@@ -1277,6 +1298,7 @@ class RetreatTally:
       "placed_and_lifted_j": share("placed_and_lifted_j"),
       "lifted_clear": share("lifted_clear"),
       "lift_clear_max_median_m": median(vals("lift_clear_max")),
+      "release_to_clear_median_s": median(vals("release_to_clear_s")),
       "handoff_by_lift": by.count("lift") / n,
       "handoff_by_timeout": by.count("timeout") / n,
       "handoff_height_median_m": median(vals("handoff_height")),
@@ -1681,6 +1703,71 @@ class _CubeHandContacts:
     )
     out[world[hit]] = True
     return out
+
+
+class PregraspTally:
+  """Plan S8.1's pre-grasp reads (build item 3a, after S7-11's `PregraspTally`, eval-only): per episode the
+  object's radius / half-height at the start, how far it moved horizontally from its start before the first
+  grasp (to the episode's end if never grasped), and how many grasps began before the first lift (1 = the
+  first grasp held). A pushed ball rolls; S8's BALL s2 lost 9 % of its episodes to a ball swept out of reach.
+  Not ported: S7-11's jaw angle at arrival and hand-object yaw (`mdp.pregrasp`, not on this branch)."""
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    n, dev = env.num_envs, env.device
+    self.start = torch.zeros(n, 2, device=dev)
+    self.radius = torch.zeros(n, device=dev)
+    self.moved = torch.zeros(n, device=dev)
+    self.grasped_once = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.lifted = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.prev = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.onsets = torch.zeros(n, dtype=torch.long, device=dev)
+    self.done: list[dict] = []
+
+  def step(
+    self, env: ManagerBasedRlEnv, grasped: torch.Tensor, lifted: torch.Tensor
+  ) -> None:
+    xy = env.scene[OBJECT].data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      self.start = torch.where(fresh.unsqueeze(-1), xy, self.start)
+      self.radius = torch.where(fresh, object_half_height(env, OBJECT), self.radius)
+    before = ~self.grasped_once
+    self.moved = torch.where(before, torch.norm(xy - self.start, dim=-1), self.moved)
+    self.onsets += (grasped & ~self.prev & ~self.lifted).long()
+    self.grasped_once |= grasped
+    self.lifted |= lifted
+    self.prev = grasped.clone()
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      self.done.append(
+        {
+          "object_radius_m": float(self.radius[i]),
+          "start_x": float(self.start[i, 0]),
+          "start_y": float(self.start[i, 1]),
+          "moved_before_grasp_m": float(self.moved[i]),
+          "never_grasped": not bool(self.grasped_once[i]),
+          "grasps_before_lift": int(self.onsets[i]),
+        }
+      )
+    for t in (self.grasped_once, self.lifted, self.prev):
+      t[env_ids] = False
+    self.onsets[env_ids] = 0
+    self.moved[env_ids] = 0.0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    lifted = [r for r in rows if r["grasps_before_lift"] >= 1]
+    moved = sorted(r["moved_before_grasp_m"] for r in rows)
+    return {
+      "pre_never_grasped": sum(r["never_grasped"] for r in rows) / n,
+      "pre_moved_over_1cm": sum(m > 0.01 for m in moved) / n,
+      "pre_moved_over_3cm": sum(m > 0.03 for m in moved) / n,
+      "pre_moved_median_m": moved[len(moved) // 2] if moved else None,
+      "pre_first_try_grasp": sum(r["grasps_before_lift"] == 1 for r in lifted)
+      / max(len(lifted), 1),
+    }
 
 
 class StackTally:
@@ -2577,6 +2664,14 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"max TCP over cube top {fmt(result['lift_clear_max_median_m'])} (median)"
     )
     print(
+      f"    release -> lifted clear  {fmt(result['release_to_clear_median_s'], 's')} (median)"
+    )
+    print(
+      f"    pre-grasp (S8.1)         never grasped {result['pre_never_grasped']:6.1%}   moved > 1 / 3 cm "
+      f"{result['pre_moved_over_1cm']:6.1%} / {result['pre_moved_over_3cm']:6.1%}   first-try grasp "
+      f"{result['pre_first_try_grasp']:6.1%}"
+    )
+    print(
       f"    hand-off by lift / time  {result['handoff_by_lift']:6.1%} / "
       f"{result['handoff_by_timeout']:6.1%}"
     )
@@ -2733,6 +2828,7 @@ def main() -> None:
   lift = None if args.handoff_lift is None else VerticalRetreat(env, args.handoff_lift)
   occ = OccTally(args.num_envs, args.device)
   stack = StackTally(env)
+  pre = PregraspTally(env)
   box = BoxTally.from_env(env)
   arm = ArmTally.from_env(env)
   trace: list[dict[str, torch.Tensor]] = []
@@ -2750,6 +2846,7 @@ def main() -> None:
       tally.record(obj_pos, obj_yaw, table_offset, goal)
       flags = probe(env, grasp_sensor)
       tally.observe(**flags)
+      pre.step(env, flags["grasped"], flags["lifted"])
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
       tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
@@ -2838,6 +2935,7 @@ def main() -> None:
         if box is not None:  # before `retreat.finish` clears its per-episode state
           box.finish(finished, retreat.handed, retreat.released)
         tally.finish(finished)
+        pre.finish(finished)
         retreat.finish(
           finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
         )
@@ -2856,6 +2954,7 @@ def main() -> None:
 
   result = summarise(tally, env.step_dt, args.episodes)
   result.update(retreat.summarise(args.episodes))
+  result.update(pre.summarise(args.episodes))
   if occ.done:
     result.update(occ.summarise(args.episodes))
   if stack.active:
@@ -2897,8 +2996,8 @@ def main() -> None:
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o, **st, **a, **b}
-            for r, q, o, st, a, b in zip(
+            {**r, **q, **o, **st, **a, **b, **pg}
+            for r, q, o, st, a, b, pg in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
@@ -2906,6 +3005,7 @@ def main() -> None:
               arm.done[: args.episodes],
               (box.done[: args.episodes] if box is not None else None)
               or [{}] * args.episodes,
+              pre.done[: args.episodes],
               strict=True,
             )
           ],
