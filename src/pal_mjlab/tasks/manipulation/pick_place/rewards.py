@@ -584,6 +584,22 @@ def _m8(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   )
 
 
+# -- S8.1: RO, open the jaw after the release -------------------------------------------------
+#
+# `mdp.open_after_release` pays clip((θ_J(r) - q) / θ_J(r), 0, 1) while the ball is placed after a
+# J-release: 0 at J's threshold for its radius, 1 fully open. Weight 1 per step: an eighth of
+# `placed` (8 x q), half of M8's full retreat (2), so lifting clear still pays most (plan S8.1).
+RO_WEIGHT = 1.0
+
+
+def _ro(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["open_after_release"] = RewardTermCfg(
+    func=mdp.open_after_release,
+    weight=RO_WEIGHT,
+    params={**_gated(ctx), **_jaw_params(ctx)},
+  )
+
+
 def _s(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   rewards["set_down"] = RewardTermCfg(
     func=mdp.set_down_placed,
@@ -913,6 +929,7 @@ _MODULES = {
   "PT": _pt,
   "YG": _yg,
   "SAW": _saw,
+  "RO": _ro,
 }
 
 
@@ -925,7 +942,7 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("M7 pays M6's grade for a set-down only; it needs M6 before it")
   if "J" in modules and "M1" not in modules[: modules.index("J")]:
     raise ValueError("J redefines M1's release and placed; it needs M1 before it")
-  for name, needs in (("M8", ("J",)), ("S", ("M6", "J"))):
+  for name, needs in (("M8", ("J",)), ("S", ("M6", "J")), ("RO", ("J", "M8"))):
     if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
       raise ValueError(f"{name} needs {' and '.join(needs)} before it")
   if "M7" in modules and "S" in modules:
@@ -1032,6 +1049,12 @@ S14_ARMS = {
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S14_ARMS.items()})
 #: Arms with GC: they need plan §14's ``GOAL=place``.
 GC_ARMS = frozenset(S14_ARMS)
+#: The S8.1 arm (plan S8.1's WB-RO): S7-4's RCTP + RO. WB-R, WB-JW, WB-S and WB-L run RCTP itself on
+#: the ball (`SHAPE=ball-dr`) on WC.
+S81_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+RO": ("M1", "M2", "M3", "M6", "J", "M8", "RO"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S81_ARMS.items()})
 _MODULE_ARMS = {
   **S14_ARMS,
   **S52_ARMS,
@@ -1044,6 +1067,7 @@ _MODULE_ARMS = {
   **S79_ARMS,
   **S11_ARMS,
   **S91_ARMS,
+  **S81_ARMS,
 }
 #: Arms whose terms read the base cube (RG, SA, SAW): they need plan S9's `GOAL=stack`.
 STACK_ONLY_ARMS = frozenset(

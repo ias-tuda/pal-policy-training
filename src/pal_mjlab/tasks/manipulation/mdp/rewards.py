@@ -640,6 +640,46 @@ def pad_contact_after_release(
   return (latch.released & _pad_contact_any(env, grasp_sensor_name)).float()
 
 
+def open_after_release(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float | BySize | PerShape,
+  threshold: float = 0.05,
+  velocity_threshold: float = 0.05,
+) -> torch.Tensor:
+  """Plan S8.1's RO: how far past J's threshold the jaw has opened, clip((θ_J - q) / θ_J, 0, 1)
+  -- 0 at the threshold for this object (`resolve`, per radius for a ball), 1 fully open (q = 0)
+  -- paid while the object is placed after a J-release, the same test M8's `retreat_height`
+  uses. (B,)
+
+  Why: DEP1's BALL-c let go at 0.27 rad, just past a 6 cm ball's 0.225 threshold, where the pads
+  sit ~2 mm off the sphere on each side; a noisy lift from there is more often charged by M8's
+  `pad_contact` than paid by its retreat. Opening moves the pads away from the ball, so the term
+  cannot knock it off the goal; it only makes the precondition for a clean lift cheap to learn.
+  Nothing is paid while held or before the place, so it cannot pull the jaw open in the carry.
+  """
+  placed = _placed_bool(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    velocity_threshold,
+    support_sensor_name,
+    jaw_cfg,
+    jaw_open,
+  )
+  robot: Entity = env.scene[jaw_cfg.name]
+  q = robot.data.joint_pos[:, jaw_cfg.joint_ids][:, 0]
+  thr = resolve(env, jaw_open)
+  opened = ((thr - q) / thr).clamp(0.0, 1.0)
+  return opened * placed.float()
+
+
 def open_at_goal(
   env: ManagerBasedRlEnv,
   command_name: str,
