@@ -9,17 +9,26 @@ worlds, and some contacts fall below S8.1's floor of 0.8.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 
 import pytest
 import torch
 from conftest import get_test_device
 from mjlab.envs import ManagerBasedRlEnv
+from pal_mjlab.tasks.manipulation import tabletop_env_cfg as tt
+from pal_mjlab.tasks.manipulation.mdp.observations import _RELEASE, _WAS_LIFTED
+from pal_mjlab.tasks.manipulation.pick_place import pick_place_env_cfg as pp
+from pal_mjlab.tasks.manipulation.pick_place import rewards as rw
 from pal_mjlab.tasks.manipulation.pick_place.kangaroo import env_cfg as kenv
 from pal_mjlab.tasks.manipulation.pick_place.kangaroo.env_cfg import (
   kangaroo_pick_place_env_cfg,
 )
-from test_pick_place_s81 import _ALL, BALL_C, S81, _summary
+from pal_mjlab.tasks.manipulation.robots import (
+  KANGAROO_GRIPPERS_LEFT_ARM_WC,
+  kangaroo_grippers_left_arm,
+)
+from test_pick_place_s81 import _ALL, BALL_C, RCTP, S81, _summary, scripted
 
 LOW_TABLE, LOW_OBJECT = kenv.FRICTION_CODES["low"]
 
@@ -95,23 +104,6 @@ def test_the_draws_land_in_range_and_reach_below_08(monkeypatch):
 
 
 # -- RD ----------------------------------------------------------------------------------------
-
-import collections  # noqa: E402
-
-from pal_mjlab.tasks.manipulation import tabletop_env_cfg as tt  # noqa: E402
-from pal_mjlab.tasks.manipulation.mdp.observations import (  # noqa: E402
-  _RELEASE,
-  _WAS_LIFTED,
-)
-from pal_mjlab.tasks.manipulation.pick_place import (
-  pick_place_env_cfg as pp,  # noqa: E402
-)
-from pal_mjlab.tasks.manipulation.pick_place import rewards as rw  # noqa: E402
-from pal_mjlab.tasks.manipulation.robots import (  # noqa: E402
-  KANGAROO_GRIPPERS_LEFT_ARM_WC,
-  kangaroo_grippers_left_arm,
-)
-from test_pick_place_s81 import RCTP, scripted  # noqa: E402
 
 RD_ARM = f"{RCTP}+RD"
 
