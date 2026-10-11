@@ -68,6 +68,8 @@ def parse_args() -> argparse.Namespace:
   )
   p.add_argument(
     "--spawn",
+    "--cube",
+    dest="spawn",
     type=float,
     nargs=3,
     metavar=("X", "Y", "YAW_DEG"),
@@ -79,6 +81,22 @@ def parse_args() -> argparse.Namespace:
     nargs=2,
     metavar=("X", "Y"),
     help="the goal: env frame, table at its nominal place (a SurfaceOffsetCommand goal)",
+  )
+  p.add_argument(
+    "--box",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "YAW_DEG"),
+    help="plan S10: the box's centre and yaw (env frame, table at its nominal place; it moves "
+    "with the table). Use --settle-steps >= 9 so the box's 5-8 step tracker reports it",
+  )
+  p.add_argument(
+    "--base",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "YAW_DEG"),
+    help="plan S9.3: a stack goal's base cube, centre and yaw (env frame, table at its nominal "
+    "place; it moves with the table). Use --settle-steps >= 9 so the base's tracker reports it",
   )
   p.add_argument(
     "--table-offset",
@@ -174,6 +192,37 @@ def pin_start(env, ev, args: argparse.Namespace) -> dict[str, tuple[float, ...]]
       torch.tensor([0], device=env.device),
       torch.tensor([np.asarray(args.target) - table_xy0], dtype=torch.float32),
     )
+  if args.box is not None:
+    from pal_mjlab.tasks.manipulation.pick_place.box import BOX
+
+    x, y, yaw_deg = args.box
+    yaw = math.radians(yaw_deg)
+    box = env.scene[BOX]
+    bpose = box.data.root_link_pose_w.clone()
+    bpose[0, 0] = origin[0] + x + float(shift[0])
+    bpose[0, 1] = origin[1] + y + float(shift[1])
+    bpose[0, 3:7] = torch.tensor(
+      [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
+    )
+    box.write_root_link_pose_to_sim(bpose)
+    box.write_root_link_velocity_to_sim(torch.zeros_like(box.data.root_link_vel_w))
+    env.command_manager.get_term(ev.COMMAND).box_start_xy[0] = bpose[0, :2]
+  if args.base is not None:
+    from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import BASE_OBJECT
+
+    x, y, yaw_deg = args.base
+    yaw = math.radians(yaw_deg)
+    base = env.scene[BASE_OBJECT]
+    bpose = base.data.root_link_pose_w.clone()
+    bpose[0, 0] = origin[0] + x + float(shift[0])
+    bpose[0, 1] = origin[1] + y + float(shift[1])
+    bpose[0, 3:7] = torch.tensor(
+      [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=env.device
+    )
+    base.write_root_link_pose_to_sim(bpose)
+    base.write_root_link_velocity_to_sim(torch.zeros_like(base.data.root_link_vel_w))
+    # `base_moved` measures from where the base started (`EntityOffsetCommand.reference_start_xy`).
+    env.command_manager.get_term(ev.COMMAND).reference_start_xy[0] = bpose[0, :2]
   obj = env.scene[ev.OBJECT]
   if args.spawn is not None:
     x, y, yaw_deg = args.spawn
@@ -260,10 +309,14 @@ def main() -> None:
   fps = round(1.0 / env.step_dt)
 
   pinned = None
-  if args.spawn is not None or args.target is not None or args.table_offset is not None:
+  if any(
+    v is not None
+    for v in (args.spawn, args.target, args.table_offset, args.box, args.base)
+  ):
     if args.episodes != 1:
       raise ValueError(
-        "--spawn, --target and --table-offset pin one episode: --episodes 1"
+        "--spawn / --cube, --target, --box, --base and --table-offset pin one episode: "
+        "--episodes 1"
       )
     pinned = pin_start(env, ev, args)
     print(
@@ -295,6 +348,12 @@ def main() -> None:
   )
   if args.handoff_lift is not None and not args.handoff:
     raise ValueError("--handoff-lift needs --handoff")
+  if args.handoff_lift is not None and hasattr(
+    env.action_manager.get_term("joint_pos"), "start_handoff"
+  ):
+    raise ValueError(
+      "--handoff-lift is the IK lift; HANDOFF_ROUTE=up-out is plan S11's route -- pick one"
+    )
   lift = (
     None if args.handoff_lift is None else ev.VerticalRetreat(env, args.handoff_lift)
   )
@@ -325,7 +384,13 @@ def main() -> None:
         home_err,
       )
       actions = policy(obs)
-      if lift is not None:
+      route = env.action_manager.get_term("joint_pos")
+      up_out = args.handoff and hasattr(route, "start_handoff")
+      if up_out:
+        # Plan S11's up-out-home route (`HANDOFF_ROUTE=up-out`), as `eval_pick_place.py` runs it:
+        # the action term takes the arm over from the hand-off on; the policy's actions pass unread.
+        route.start_handoff("left", handed)
+      elif lift is not None:
         actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
       elif args.handoff:
         # Action 0 is home with the jaw open for an absolute action; for plan S7-8's delta
@@ -338,7 +403,13 @@ def main() -> None:
       status = (
         (
           "position controller: "
-          + ("home" if lift is None or bool(lift.home[0]) else "lift")
+          + (
+            "up-out-home"
+            if up_out
+            else "home"
+            if lift is None or bool(lift.home[0])
+            else "lift"
+          )
           if bool(handed[0])
           else "policy"
         )

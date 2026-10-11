@@ -65,10 +65,47 @@ Plan S7-11 adds `PREGRASP` (`none` | `watch` | `NP` | `JO` | `G` | `S` | `OVR`,
 `pregrasp.PREGRASP_CODES`): the jaw open before the grasp -- a push penalty (NP), the jaw angle
 priced on the approach (JO), a cap on the commanded jaw outside the grasp window (G; OVR is the
 deployer's eval-only version), or NP + JO + the grasp's yaw alignment (S). Unset is `none`.
+Plan S10 adds the box goals to `GOAL` (`box` | `box-ny` | `box-rim` | `box-dr`, `box.BOX_GOALS`): the
+cube goes into an open box standing in baseline B's target box -- BX, without the yaw grade, with a rim
+penalty, with the box's size and mass drawn. One variable for S9's and S10's goals; unset is `table`.
+Plan S10.1 puts the box on an area (`TARGET=WC` with a box `GOAL`: the box drawn from the area at any yaw,
+clear of the cube) and adds `BOX_OBS` (`goal` | `pose`, `box.BOX_OBS_NAMES`): the actor sees the goal point
+computed from the box (S10's, unset) or the box's own position and yaw; a resume widens the loaded actor
+and critic for the appended yaw. `CKPT_SPAWN` names the spawn whose arm a checkpoint was trained with when it
+is not this run's (`W2` for a W2 box checkpoint on `SPAWN=WC`, whose arm 1 / arm 4 action scales differ): every
+load -- a resume's, an eval's -- then converts the actor to this env's scales (`runner.rescale_actions`).
+Plan S10.2 adds `TABLE_DZ` (mm): the table's top face raised (or lowered) by that much from the
+baseline's height. The real robot cell's table stands about 22 mm above baseline B's 0.815 m (Siwei,
+2026-10-06, on the robot), so `TABLE_DZ=22` trains on 0.837 m. Everything else that touches the table
+reads its live surface (spawns, the target, the box, the rewards, DR-scene's +/-1 cm on top), so the
+height is this one number. Unset or 0 is the baseline's table exactly; |TABLE_DZ| above 50 mm raises.
+Plan §12 (`pick-place-insert-plan.md`) adds the insert codes to `GOAL` (`insert` | `insert-t` | `insert-na` |
+`insert-lad`, `insert.INSERT_GOALS`) and the pin to `SHAPE` (`pin`): push the cross pin through a socket block
+drawn from `TARGET=WC`, on RCTP; the two only go together.
+Plan §14 adds `GOAL=place` (`place_pin.PLACE_GOALS`) and the wide pin area `WP` (`SPAWN=WP TARGET=WP`): pick the
+pin up standing or lying and put it down at a goal point, in any pose. `PIN_START` (`mix` | `stand` | `lie`,
+`place_pin.PIN_STARTS`) names the start poses, `PIN_LIE_P` the lying share for `mix` (0.5 unset); both need
+`GOAL=place`. PS-SG's grasp closure is the reward module GC (`REWARD=...+GC`).
+Plan §15 adds `GOAL=ball-seat` (`ball_seat.BALL_SEAT_GOALS`) and the Ø 50 mm ball to `SHAPE` (`ball50` | `ball50-dr`, Ø 48-52
+mm): pick the ball on `WC` and drop it into the chamfer of §12's block drawn on `WC` at any yaw; §12's 42 / 46 layout.
+Plan S11 (two arms) adds `ARM_HOME` (`default` | `mirror`: the right arm's home, Claudius's or the
+left home's mirror image), `TARGET=T11` | `T11W` (the meeting point T in the robot frame: L-T's goal,
+or R-ST's / R-ST-W's base with `GOAL=stack`), `TRACKER` (`B` | `split`: the 6 + 4 mm bias split, the
+base through its own tracker), `HANDOFF_ROUTE` (`none` | `up-out`: the up-out-home controller in the
+action term, for the eval to start) and `ARMS` (`left` | `both`): `both` is JOINT, one policy for
+both arms (`pick_place/bimanual.py`), with `HANDOFF_TRAIN` (`none` | `left`) and `START` (`scratch` |
+`mixed`). Unset is every run before S11.
+Plan S9.1 adds `BASE_OBS` (`goal` | `pose`, `pick_place_env_cfg.BASE_OBS_NAMES`): on a stack goal the actor
+sees the goal on the base (every run before S9.1) or also the base's yaw, with M6's yaw grade taken
+against the base. And `CONTACT` (`box` | `ccd`, `CONTACT_FLAGS`), the one selector whose unset value
+is not the old one: ``box`` sends box-box pairs to mujoco_warp's ``box_box`` collider (decision 0004,
+`tabletop_env_cfg.SIM_DISABLE_FLAGS`); ``ccd`` gives back the GJK/EPA path every run before S9.1
+trained on, to re-read those runs on their own physics.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 
@@ -81,25 +118,55 @@ from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
 from pal_mjlab.tasks.manipulation import mdp
 from pal_mjlab.tasks.manipulation.mdp.occlusion import OBJ_OBS_FLAG, OCC_VIEWS, occ_cfg
 from pal_mjlab.tasks.manipulation.pick_place.arm_table import ARM_TABLE_CODES
+from pal_mjlab.tasks.manipulation.pick_place.ball_seat import (
+  BALL_SEAT_GOALS,
+  BallSeatGoal,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  EPISODE_S as BIMANUAL_EPISODE_S,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  STARTS as BIMANUAL_STARTS,
+)
+from pal_mjlab.tasks.manipulation.pick_place.bimanual import (
+  handoff_arm,
+  make_bimanual_env_cfg,
+)
+from pal_mjlab.tasks.manipulation.pick_place.box import (
+  BOX_GOALS,
+  BOX_OBS_NAMES,
+  BoxGoal,
+)
+from pal_mjlab.tasks.manipulation.pick_place.insert import INSERT_GOALS, InsertGoal
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
+  BASE_OBS_NAMES,
   BASELINES,
   EFFORT_BOUNDS,
   GATES,
   GOALS,
   OBJECT_SHAPES,
+  ROBOT_TARGETS,
   SPAWN_BOXES,
   TARGET_AREAS,
   TOOL_SPEED_CAPS,
+  TRACKERS,
   make_pick_place_env_cfg,
+)
+from pal_mjlab.tasks.manipulation.pick_place.place_pin import (
+  PIN_STARTS,
+  PLACE_GOALS,
+  PlaceGoal,
 )
 from pal_mjlab.tasks.manipulation.pick_place.pregrasp import PREGRASP_CODES
 from pal_mjlab.tasks.manipulation.pick_place.rewards import REWARD_VARIANTS
 from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
+  ARM_HOMES,
   KANGAROO_GRIPPERS_LEFT_ARM,
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
   KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  KANGAROO_GRIPPERS_LEFT_ARM_WP,
   kangaroo_grippers_left_arm,
 )
 from pal_mjlab.tasks.manipulation.runner import ManipulationRunnerCfg
@@ -133,6 +200,23 @@ GATE_ENV_VAR = "GATE"
 CRITIC_OBS_ENV_VAR = "CRITIC_OBS"
 ARM_TABLE_ENV_VAR = "ARM_TABLE"
 PREGRASP_ENV_VAR = "PREGRASP"
+BOX_FEET_ENV_VAR = "BOX_FEET"
+BOX_OBS_ENV_VAR = "BOX_OBS"
+CKPT_SPAWN_ENV_VAR = "CKPT_SPAWN"
+TABLE_DZ_ENV_VAR = "TABLE_DZ"
+ARM_HOME_ENV_VAR = "ARM_HOME"
+TRACKER_ENV_VAR = "TRACKER"
+HANDOFF_ROUTE_ENV_VAR = "HANDOFF_ROUTE"
+HANDOFF_PARK_ENV_VAR = "HANDOFF_PARK"
+ARMS_ENV_VAR = "ARMS"
+HANDOFF_TRAIN_ENV_VAR = "HANDOFF_TRAIN"
+START_ENV_VAR = "START"
+BASE_OBS_ENV_VAR = "BASE_OBS"
+CONTACT_ENV_VAR = "CONTACT"
+INSERT_HOLE_D_ENV_VAR = "INSERT_HOLE_D"
+INSERT_FRICTION_ENV_VAR = "INSERT_FRICTION"
+PIN_START_ENV_VAR = "PIN_START"
+PIN_LIE_P_ENV_VAR = "PIN_LIE_P"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -158,6 +242,43 @@ DEFAULT_CRITIC_OBS = "base"
 CRITIC_OBS_NAMES = {"base": False, "q": True}
 DEFAULT_ARM_TABLE = "none"
 DEFAULT_PREGRASP = "none"
+DEFAULT_BOX_OBS = "goal"
+#: The largest table offset `TABLE_DZ` may ask for, mm (plan S10.2): a guard against a value in metres
+#: or centimetres, not a reach limit.
+TABLE_DZ_MAX_MM = 50.0
+DEFAULT_ARM_HOME = "default"
+DEFAULT_TRACKER = "B"
+DEFAULT_BASE_OBS = "goal"
+#: What `CONTACT` may be, and the disable flags each keeps out of `SIM_DISABLE_FLAGS` (decision 0004):
+#: ``box`` the tabletop default, ``ccd`` mujoco_warp's own default (nativeccd on) -- every run before
+#: plan S9.1.
+CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
+DEFAULT_CONTACT = "box"
+#: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
+HANDOFF_ROUTES = ("none", "up-out")
+ARMS_NAMES = ("left", "both")
+HANDOFF_TRAINS = ("none", "left")
+#: The reward name JOINT's runs carry (`REWARD`): its two halves are fixed, L-T's and R-ST's
+#: (`bimanual.LEFT_REWARD` / `RIGHT_REWARD`), so the name only labels the run.
+BIMANUAL_REWARD = "S11-BI"
+#: What JOINT is built on (BS11, plan S11); every other selector must be unset or this.
+BIMANUAL_FIXED = {
+  "SLEW": "stack",
+  "BASELINE": "B",
+  "SPAWN": "W2",
+  "ACTION": "abs",
+  "CMD_OBS": "act",
+  "TOOL_SPEED": "none",
+  "OCC": "none",
+  "SHAPE": "cube",
+  "GOAL": "table",
+  "GATE": "none",
+  "TARGET": "T11",
+  "TRACKER": "split",
+  "ARM_HOME": "mirror",
+  "CRITIC_OBS": "q",
+  "HANDOFF_ROUTE": "up-out",
+}
 #: What `SLEW` reads for the stack task's speeds (plan S7-8), in place of a factor.
 SLEW_STACK = "stack"
 #: What `CMD_OBS` may be: the raw last action (today's) or the commanded target.
@@ -170,6 +291,9 @@ SPAWN_ROBOTS = {
   "W2": KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
   "WC": KANGAROO_GRIPPERS_LEFT_ARM_WC,
   "WCK": KANGAROO_GRIPPERS_LEFT_ARM_WCK,
+  # Plan §14: WC's arm with the wrist roll widened (step 0 item 3).
+  "WP": KANGAROO_GRIPPERS_LEFT_ARM_WP,
+  "WCP": KANGAROO_GRIPPERS_LEFT_ARM_WP,
 }
 
 
@@ -246,17 +370,25 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   plant is the `GAINS` code's, with the `EFFORT` code's arm effort limit; G0 with no effort
   bound is exactly the spawn box's arm.
   """
+  if _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both":
+    return _apply_contact(_bimanual_env_cfg(play))
   spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
   tool_speed = _select(TOOL_SPEED_ENV_VAR, DEFAULT_TOOL_SPEED, TOOL_SPEED_CAPS)
   effort = EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)]
   slew, stack_speed = _select_slew()
   action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
-  return make_pick_place_env_cfg(
+  goal, box, insert = _select_goal()
+  target = _select(TARGET_ENV_VAR, DEFAULT_TARGET, (*TARGET_AREAS, *ROBOT_TARGETS))
+  for name in (HANDOFF_TRAIN_ENV_VAR, START_ENV_VAR):
+    if os.environ.get(name) is not None:
+      raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
+  cfg = make_pick_place_env_cfg(
     kangaroo_grippers_left_arm(
       _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
       SPAWN_ROBOTS[spawn],
       arm_effort_scale=effort.effort_scale,
+      right_home=_select(ARM_HOME_ENV_VAR, DEFAULT_ARM_HOME, ARM_HOMES),
     ),
     gripper_name="left",
     spawn=SPAWN_BOXES[spawn],
@@ -264,18 +396,20 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     dr=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
     play=play,
     action_slew_rate_scale=slew,
-    baseline=BASELINES[baseline],
+    baseline=_baseline_with_table(BASELINES[baseline]),
     tool_speed_cap=TOOL_SPEED_CAPS[tool_speed],
     effort=effort,
     latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
     occlusion=_select_occlusion(),
-    target_area=TARGET_AREAS[_select(TARGET_ENV_VAR, DEFAULT_TARGET, TARGET_AREAS)],
+    target_area=TARGET_AREAS.get(target),
+    robot_target=ROBOT_TARGETS.get(target),
+    tracker=_select(TRACKER_ENV_VAR, DEFAULT_TRACKER, TRACKERS),
     episode_length_s=_select_episode(),
     stack_speed=stack_speed,
     action_mode=action,
     command_obs=_select_command_obs(action),
     shape=OBJECT_SHAPES[_select(SHAPE_ENV_VAR, DEFAULT_SHAPE, OBJECT_SHAPES)],
-    goal=_select(GOAL_ENV_VAR, DEFAULT_GOAL, GOALS),
+    goal=goal,
     gate=_select(GATE_ENV_VAR, DEFAULT_GATE, GATES),
     critic_release=_critic_release(),
     arm_table=ARM_TABLE_CODES[
@@ -284,7 +418,176 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     pregrasp=PREGRASP_CODES[
       _select(PREGRASP_ENV_VAR, DEFAULT_PREGRASP, PREGRASP_CODES)
     ],
+    box=box,
+    box_obs=_select_box_obs(),
+    base_obs=_select(BASE_OBS_ENV_VAR, DEFAULT_BASE_OBS, BASE_OBS_NAMES),
+    insert=insert,
+    place=_select_place(),
+    ball_seat=_select_ball_seat(),
   )
+  _apply_contact(cfg)
+  park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
+  if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
+    # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
+    # Plan S9.3's `HANDOFF_PARK` names where it ends (home unset).
+    left = KANGAROO_GRIPPERS_LEFT_ARM.gripper("left")
+    arm = dataclasses.replace(
+      handoff_arm(left, +1.0, None), park=mdp.HANDOFF_PARK_POSES[park]
+    )
+    cfg.actions["joint_pos"] = mdp.with_handoff(cfg.actions["joint_pos"], arms=(arm,))
+  elif park != "home":
+    raise ValueError(
+      "HANDOFF_PARK ends plan S11's up-out route; it needs HANDOFF_ROUTE=up-out"
+    )
+  return cfg
+
+
+def _apply_contact(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
+  """`CONTACT`: drop the disable flags the named contact model keeps on (decision 0004)."""
+  keep_on = CONTACT_FLAGS[_select(CONTACT_ENV_VAR, DEFAULT_CONTACT, CONTACT_FLAGS)]
+  cfg.sim.mujoco.disableflags = tuple(
+    f for f in cfg.sim.mujoco.disableflags if f not in keep_on
+  )
+  return cfg
+
+
+def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
+  """Plan S11's JOINT (`ARMS=both`, `pick_place/bimanual.py`). Its plant, DR, latency, arm-table
+  code and episode come from `GAINS`, `EFFORT`, `DR`, `LAG`, `ARM_TABLE` and `EPISODE_S` (15 s if
+  unset); everything else is fixed by BS11 (`BIMANUAL_FIXED`), and a variable set to anything else
+  raises rather than train something the run's name does not say."""
+  reward = os.environ.get(REWARD_ENV_VAR)
+  if reward not in (None, BIMANUAL_REWARD):
+    raise ValueError(
+      f"{REWARD_ENV_VAR}={reward!r}: JOINT's reward is fixed (L-T's and R-ST's halves); set "
+      f"{BIMANUAL_REWARD!r} or unset it"
+    )
+  for name, value in BIMANUAL_FIXED.items():
+    got = os.environ.get(name)
+    if got is not None and got != value:
+      raise ValueError(f"{ARMS_ENV_VAR}=both is built on {name}={value}; got {got!r}")
+  return make_bimanual_env_cfg(
+    gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
+    effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    baseline=_baseline_with_table(BASELINES[BIMANUAL_FIXED["BASELINE"]]),
+    dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
+    latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
+    episode_length_s=_select_episode() or BIMANUAL_EPISODE_S,
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    handoff_train=_select(HANDOFF_TRAIN_ENV_VAR, "left", HANDOFF_TRAINS) == "left",
+    start=_select(START_ENV_VAR, "scratch", BIMANUAL_STARTS),
+    play=play,
+  )
+
+
+def _select_table_dz() -> float:
+  """Plan S10.2's ``TABLE_DZ``: the table's offset from the baseline's height, in metres (the variable is
+  in mm). Unset is 0."""
+  raw = os.environ.get(TABLE_DZ_ENV_VAR)
+  if raw is None:
+    return 0.0
+  try:
+    value = float(raw)
+  except ValueError:
+    value = float("nan")
+  if not abs(value) <= TABLE_DZ_MAX_MM:  # also catches nan
+    raise ValueError(
+      f"{TABLE_DZ_ENV_VAR}={raw!r} is not a table offset in mm within +/-{TABLE_DZ_MAX_MM:g}. Set it "
+      "to e.g. 22 (the robot cell's table, plan S10.2), or unset it for the baseline's table."
+    )
+  return value / 1000.0
+
+
+def _baseline_with_table(baseline):
+  """The baseline with its table moved by ``TABLE_DZ``; the same object when the offset is 0, so an
+  unset variable resolves to the baseline's cfg exactly."""
+  dz = _select_table_dz()
+  if dz == 0.0:
+    return baseline
+  return dataclasses.replace(baseline, table_top_z=round(baseline.table_top_z + dz, 6))
+
+
+def _select_box_obs() -> str:
+  """Plan S10.1's ``BOX_OBS``: what the actor observes of the box (`box.BOX_OBS_NAMES`)."""
+  return _select(BOX_OBS_ENV_VAR, DEFAULT_BOX_OBS, BOX_OBS_NAMES)
+
+
+def _select_goal() -> tuple[str, BoxGoal | None, InsertGoal | None]:
+  """`GOAL`: plan S9's goal (`GOALS`: ``table`` | ``stack``), plan S10's box (`box.BOX_GOALS`) and plan §12's
+  insert (`insert.INSERT_GOALS`), one variable for all. A box or insert name is the table goal plus that box /
+  block. ``BOX_FEET=0`` builds the box with the flat floor every run of `0ba3f60` trained on (to re-read those
+  runs on their own box); unset or 1 the corner feet (S10 report §8)."""
+  name = _select(
+    GOAL_ENV_VAR,
+    DEFAULT_GOAL,
+    (*GOALS, *BOX_GOALS, *INSERT_GOALS, *PLACE_GOALS, *BALL_SEAT_GOALS),
+  )
+  feet = os.environ.get(BOX_FEET_ENV_VAR, "1")
+  if feet not in ("0", "1"):
+    raise ValueError(f"{BOX_FEET_ENV_VAR}={feet!r} is not 0 or 1")
+  if name in GOALS:
+    return name, None, None
+  if name in PLACE_GOALS or name in BALL_SEAT_GOALS:
+    return DEFAULT_GOAL, None, None
+  if name in INSERT_GOALS:
+    return DEFAULT_GOAL, None, _insert_overrides(INSERT_GOALS[name])
+  box = BOX_GOALS[name]
+  if box is None or feet == "1":
+    return DEFAULT_GOAL, box, None
+  return DEFAULT_GOAL, dataclasses.replace(box, feet=False), None
+
+
+def _select_ball_seat() -> BallSeatGoal | None:
+  """Plan §15's ``GOAL=ball-seat`` (`ball_seat.BALL_SEAT_GOALS`); None for any other goal."""
+  return BALL_SEAT_GOALS.get(os.environ.get(GOAL_ENV_VAR, DEFAULT_GOAL))
+
+
+def _select_place() -> PlaceGoal | None:
+  """Plan §14's ``GOAL=place`` (`place_pin.PLACE_GOALS`), with ``PIN_START`` (`place_pin.PIN_STARTS`) and, for
+  ``mix``, ``PIN_LIE_P`` (the lying share, 0-1) applied; None for any other goal, where both must be unset."""
+  name = os.environ.get(GOAL_ENV_VAR, DEFAULT_GOAL)
+  start = os.environ.get(PIN_START_ENV_VAR)
+  share = os.environ.get(PIN_LIE_P_ENV_VAR)
+  if name not in PLACE_GOALS:
+    for var, value in ((PIN_START_ENV_VAR, start), (PIN_LIE_P_ENV_VAR, share)):
+      if value is not None:
+        raise ValueError(f"{var} is plan §14's pin start; it needs GOAL=place")
+    return None
+  code = PLACE_GOALS[name]
+  start = _select(PIN_START_ENV_VAR, "mix", PIN_STARTS)
+  p = PIN_STARTS[start]
+  if share is not None:
+    if start != "mix":
+      raise ValueError(
+        f"{PIN_LIE_P_ENV_VAR} sets the lying share of PIN_START=mix, not {start}"
+      )
+    p = float(share)
+    if not 0.0 <= p <= 1.0:
+      raise ValueError(f"{PIN_LIE_P_ENV_VAR}={share!r} is not a share in [0, 1]")
+  return dataclasses.replace(code, lie_probability=p)
+
+
+def _insert_overrides(code: InsertGoal) -> InsertGoal:
+  """Plan §12.1's finalist re-reads (eval only): ``INSERT_HOLE_D`` the hole's diameter in mm (37.5 / 38.5; the
+  chamfer kept) and ``INSERT_FRICTION`` the pin's and the block's sliding friction (0.3 / 0.6). Unset, the code
+  as trained."""
+  hole = os.environ.get(INSERT_HOLE_D_ENV_VAR)
+  friction = os.environ.get(INSERT_FRICTION_ENV_VAR)
+  if hole is not None:
+    if not 30.0 <= float(hole) <= 45.0:
+      raise ValueError(
+        f"{INSERT_HOLE_D_ENV_VAR}={hole!r} is not a hole diameter in mm (30-45)"
+      )
+    code = dataclasses.replace(code, hole_d=round(float(hole) * 1e-3, 6))
+  if friction is not None:
+    if not 0.05 <= float(friction) <= 2.0:
+      raise ValueError(
+        f"{INSERT_FRICTION_ENV_VAR}={friction!r} is not a sliding friction (0.05-2)"
+      )
+    code = dataclasses.replace(code, friction=float(friction))
+  return code
 
 
 def _critic_release() -> bool:
@@ -310,6 +613,36 @@ def kangaroo_pick_place_rl_cfg() -> ManipulationRunnerCfg:
   """The PPO recipe named by the environment. See `rl_cfg.PPO_RECIPES`."""
   recipe = _select(PPO_ENV_VAR, DEFAULT_PPO, PPO_RECIPES)
   cfg = PPO_RECIPES[recipe]("kangaroo_pick_place")
-  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9).
-  cfg.widen_critic_on_resume = _critic_release()
+  # PQ resumes from checkpoints whose critic had two inputs fewer (plan S7-9); plan S10.1's box pose
+  # from W2 box checkpoints without the box's yaw (actor and critic) and, from BX-RIM, without PQ.
+  # JOINT trains from scratch (plan S11).
+  # Plan §12's insert from a box checkpoint (IN-FT): the actor +2 (the pin's tilt), the critic +3 (and the
+  # box's yaw, from a checkpoint without it).
+  both = _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both"
+  # Plan §14's place from an insert checkpoint: the same widths (no change); from a box checkpoint as IN-FT.
+  # Plan §15's ball seat: §12's layout, so from an insert checkpoint no change, from a box one as IN-FT.
+  insert = not both and (
+    _select_goal()[2] is not None
+    or _select_place() is not None
+    or _select_ball_seat() is not None
+  )
+  box_pose = not both and (_select_box_obs() == "pose" or insert)
+  cfg.widen_critic_on_resume = False if both else (_critic_release() or box_pose)
+  cfg.widen_actor_on_resume = box_pose
+  cfg.rescale_actions_on_load = _ckpt_action_ratio()
   return cfg
+
+
+def _ckpt_action_ratio() -> dict[str, float] | None:
+  """Plan S10.1's ``CKPT_SPAWN``: joint regex -> (the checkpoint's arm's action scale / this run's), for
+  the joints whose scales differ; None when unset or the same arm."""
+  ckpt = os.environ.get(CKPT_SPAWN_ENV_VAR)
+  if ckpt is None:
+    return None
+  ckpt = _select(CKPT_SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
+  spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
+  old, new = SPAWN_ROBOTS[ckpt].action_scale, SPAWN_ROBOTS[spawn].action_scale
+  if set(old) != set(new):
+    raise ValueError(f"CKPT_SPAWN={ckpt} and SPAWN={spawn} scale different joints")
+  ratio = {k: old[k] / new[k] for k in new if old[k] != new[k]}
+  return ratio or None

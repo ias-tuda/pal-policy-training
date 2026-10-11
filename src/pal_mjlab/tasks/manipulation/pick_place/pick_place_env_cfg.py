@@ -39,19 +39,52 @@ from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
   ArmTableCfg,
   apply_arm_table,
 )
+from pal_mjlab.tasks.manipulation.pick_place.ball_seat import (
+  BALL_MIN_SEPARATION,
+  BALL_SEAT_RADIUS,
+  BALL_SEAT_RADIUS_RANGE,
+  BALL_SEAT_REWARD,
+  BallSeatGoal,
+  append_critic_ball_seat,
+  apply_ball_seat_goal,
+)
+from pal_mjlab.tasks.manipulation.pick_place.box import (
+  BOX_MIN_SEPARATION,
+  BOX_OBS_NAMES,
+  BoxGoal,
+  append_critic_box_yaw,
+  apply_box_goal,
+)
+from pal_mjlab.tasks.manipulation.pick_place.insert import (
+  INSERT_REWARD,
+  PIN_MIN_SEPARATION,
+  InsertGoal,
+  append_critic_insert,
+  apply_insert_goal,
+)
+from pal_mjlab.tasks.manipulation.pick_place.place_pin import (
+  PLACE_REWARDS,
+  PlaceGoal,
+  append_critic_place,
+  apply_place_goal,
+)
 from pal_mjlab.tasks.manipulation.pick_place.pregrasp import (
   PregraspCfg,
   apply_pregrasp,
 )
 from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  BALL50_JAW_OPEN_BY_RADIUS,
   BALL_JAW_OPEN_BY_RADIUS,
   BASE_OBJECT,
   DEFAULT_EPISODE_LENGTH_S,
   EPISODE_LENGTH_S,
+  GC_ARMS,
   JAW_OPEN,
   NO_SUCCESS_TERMINATION,
+  PIN_JAW_OPEN,
   REQUIRE_LIFTED,
   STACK_ONLY_ARMS,
+  YAW_GRADED_ARMS,
   RewardContext,
   build_rewards,
   effort_hinge_reward,
@@ -69,6 +102,7 @@ from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   LatencyModelCfg,
   ToolSpeedCapCfg,
   apply_play_overrides,
+  arm_joint_regex,
   make_tabletop_env_cfg,
   trunk_clearance_rewards,
 )
@@ -143,6 +177,16 @@ SPAWN_BOXES = {
   "WCK": SpawnBox(
     x=(0.40, 0.52), y=(0.16, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
   ),
+  # Plan §14's wide pin area (D14-1, Siwei 2026-10-08 13:47: "区域按草案的二倍"): WC grown 4 cm forward and back,
+  # 6 cm left and right -- 28 x 42 cm, 2.0 x WC -- for the pin's start and its goal (`GOAL=place`).
+  "WP": SpawnBox(
+    x=(0.36, 0.64), y=(-0.10, 0.32), yaw=math.pi / 4, widen_at_dr_scene=False
+  ),
+  # ... and plan §14's area control PS-INC: WC's area with WP's arm (the lying pin's wrist roll), so that the code
+  # differs from PS-IN by the area alone (`TARGET=WC`).
+  "WCP": SpawnBox(
+    x=(0.40, 0.60), y=(-0.04, 0.26), yaw=math.pi / 4, widen_at_dr_scene=False
+  ),
 }
 
 #: Where the target is drawn from, by name (`TARGET`, plan S7-8). ``B``: baseline B's small box.
@@ -154,6 +198,7 @@ TARGET_AREAS: dict[str, SpawnBox | None] = {
   "B": None,
   "WC": SPAWN_BOXES["WC"],
   "WCK": SPAWN_BOXES["WCK"],
+  "WP": SPAWN_BOXES["WP"],
 }
 TARGET_MIN_SEPARATION = 0.10
 
@@ -288,6 +333,11 @@ class ObjectShape:
   rolling_scale: tuple[float, float] | None = None
   """BALL-DR's factor on the ball's rolling friction, drawn log-uniformly per world."""
 
+  friction: tuple[float, float] | None = None
+  """`DR-object`'s range for the object's sliding friction (``abs``); None is the cube's 0.5-1.2. Plan
+  §12's pin keeps its own 0.4: its friction is the pin-block pair's (the element-wise max), which plan
+  §0.4 sized the chamfer for, and DR-object's range would make it 0.5-1.2 (IN-DR draws it, phase 2)."""
+
 
 #: BALL-DR (plan S8): the ball's diameter 5.5-6.5 cm and its rolling friction x (0.5, 2). The mass
 #: (30-100 g) and sliding friction come with `DR-object`, which every run here has.
@@ -315,6 +365,26 @@ OBJECT_SHAPES = {
     jaw_open=PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS),
     geoms=(f"{OBJECT}_geom", scene.mixed_ball_geom_name(OBJECT)),
     ball_probability=0.5,
+  ),
+  # Plan §15: the Ø 50 mm ball (D15-1 open), and PB-DR's Ø 48-52 mm with its rolling friction drawn as BALL-DR's. The
+  # mass and the sliding friction are DR-object's, as for every ball.
+  "ball50": ObjectShape(
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT, radius=BALL_SEAT_RADIUS)},
+    jaw_open=BALL50_JAW_OPEN_BY_RADIUS,
+  ),
+  "ball50-dr": ObjectShape(
+    objects={OBJECT: scene.get_ball_cfg(name=OBJECT, radius=BALL_SEAT_RADIUS)},
+    jaw_open=BALL50_JAW_OPEN_BY_RADIUS,
+    ball_probability=1.0,
+    ball_radius=BALL_SEAT_RADIUS_RANGE,
+    rolling_scale=BALL_DR_ROLLING_SCALE,
+  ),
+  # Plan §12: the cross pin (`scene.get_pin_spec`, its origin at its centre), standing on its foot.
+  "pin": ObjectShape(
+    objects={OBJECT: scene.get_pin_cfg(name=OBJECT)},
+    jaw_open=PIN_JAW_OPEN,
+    geoms=scene.pin_geom_names(OBJECT),
+    friction=(scene.PIN_BLOCK_FRICTION, scene.PIN_BLOCK_FRICTION),
   ),
 }
 
@@ -347,7 +417,81 @@ STACK_TARGET_NOISE = 0.001
 BASE_RGBA = (0.2, 0.35, 0.8, 1.0)
 #: What the goal is (`GOAL`) and what may hold the jaw shut (`GATE`).
 GOALS = ("table", "stack")
+#: Plan S9.3: a stack's base drawn from a target area (``TARGET=WC``) keeps at least this much from
+#: the red cube, centre to centre, m -- the base's half-diagonal (3.5 cm) + the open hand's reach past
+#: the red cube's centre (~6 cm) + 2 cm; step 0 item 2 checks it against scripted grasps.
+STACK_MIN_SEPARATION = 0.12
+#: Rounds of redrawing the base before a straggler takes the area's corner farthest from the cube.
+STACK_AREA_REDRAWS = 64
 GATES = ("none", "stack")
+
+
+# -- Plan S11: the meeting point T, and the stack on a base at T --------------------------------
+#
+# `pick-place-v1-objects-plan.md`, *S11 -- two arms* (Siwei 2026-10-02): the left arm places cube A
+# at T, the right stacks cube B on it. Both arms reach only a 4 x 8 cm strip on the centre line
+# (S7-8 Part B's planner map and its mirror), so T = (0.45, 0.00) +/- 1 cm, fixed in the robot frame
+# -- ``base_link`` sits at the env origin with yaw 0, so the env frame -- while DR-scene shifts the
+# table +/-2 cm under it; the goal's z still follows the table top.
+#
+# SEQ trains both arms' skills on the left arm (`TARGET=T11` / `T11W`):
+# * ``GOAL=table`` (L-T): the goal is T +/- 1 cm.
+# * ``GOAL=stack`` (R-ST, run on the right arm through the mirror map): the base cube A is spawned at
+#   T, +/- 1.5 cm and yaw +/- 20 deg -- the plan's placeholder until L-T's let-gos are measured (step
+#   0 item 6) -- or wide (R-ST-W, ``T11W``: +/- 2.5 cm, +/- 45 deg); its yaw is not observed (L19).
+#   S9's `base_disturbance` (0.0005 per episode, S9's read) gives way to `base_moved`, S10's
+#   `box_moved` on the base: -2 x min(displacement / 2 cm, 1) per step.
+T11_XY = (0.45, 0.00)
+
+
+@dataclasses.dataclass(frozen=True)
+class RobotFrameTarget:
+  """Plan S11's T: a goal, or a stack goal's base, fixed in the robot frame (`TARGET=T11*`)."""
+
+  xy: tuple[float, float]
+  """T, env frame (= robot frame), m."""
+
+  half_xy: float | None
+  """Half-width of the box a table goal is drawn from about T, m; None: not a table goal (T11W)."""
+
+  base_half_xy: float
+  """Half-width of the box a stack goal's base is spawned in about T, m."""
+
+  base_yaw: float
+  """Half-range of the base's yaw about 0, rad (unobserved)."""
+
+
+#: The ``TARGET`` names of plan S11 (`TARGET_AREAS` holds the others).
+ROBOT_TARGETS = {
+  "T11": RobotFrameTarget(
+    xy=T11_XY, half_xy=0.01, base_half_xy=0.015, base_yaw=math.radians(20.0)
+  ),
+  "T11W": RobotFrameTarget(
+    xy=T11_XY, half_xy=None, base_half_xy=0.025, base_yaw=math.radians(45.0)
+  ),
+}
+#: `base_moved`'s weight at a displacement of `BASE_MOVED_SCALE` or more (S10's `box_moved`).
+BASE_MOVED_WEIGHT = -2.0
+BASE_MOVED_SCALE = 0.02
+
+#: The tracker models by name (`TRACKER`). ``B``: baseline B's (DR-obs') 8 mm per-episode bias on
+#: the cube, and on a stack goal S9's +/- 4 mm on the base's goal, unlagged -- every run before S11.
+#: ``split``: plans S9 / S10's split, a 6 mm bias shared by every tracked object (one camera) plus
+#: 4 mm of each object's own, 2 mm of jitter, and on a stack goal the base seen through its own
+#: tracker at the cube's lag (`mdp.stack_goal_position_tracked_b`) -- plan S11's BS11.
+TRACKERS = ("B", "split")
+
+#: Plan S9.1's ``BASE_OBS`` (decision D3): what the actor sees of a stack goal's base -- the goal on
+#: top of it, every run before S9.1 -- or also the base's yaw (SC-Y), as S10.1's ``BOX_OBS=pose``
+#: shows the box's: (cos 4 psi, sin 4 psi) relative to the robot base through the base's tracker
+#: (`mdp.box_yaw_b`), appended last to the actor and the critic (live there), and M6's yaw grade
+#: (YG) then taken against the base (`EntityOffsetCommandCfg.yaw_reference`). The goal slot keeps
+#: the goal on top of the base: the base's position plus the stacking height, the same information.
+BASE_OBS_NAMES = ("goal", "pose")
+#: SC-Y's tracked base yaw: S10.1's box numbers (`box.BOX_YAW_BIAS` / `BOX_YAW_NOISE` there) --
+#: baseline B's cube yaw bias, rad, per episode, and a per-step jitter, rad.
+BASE_YAW_BIAS = 0.03
+BASE_YAW_NOISE = 0.02
 
 
 def _stack_command_cfg():
@@ -361,30 +505,66 @@ def _stack_command_cfg():
   )
 
 
-def _apply_stack_goal(cfg: ManagerBasedRlEnvCfg, baseline: Baseline) -> None:
+def _apply_stack_goal(
+  cfg: ManagerBasedRlEnvCfg,
+  baseline: Baseline,
+  robot_target: RobotFrameTarget | None = None,
+  target_area: SpawnBox | None = None,
+) -> None:
   """Plan S9's `GOAL=stack` on a cfg built with both cubes: the red cube alone from the spawn
-  box, the base from the target box, its terms, and the actor's goal through a tracker."""
+  box, the base from the target box, its terms, and the actor's goal through a tracker.
+
+  With ``robot_target`` (plan S11's R-ST / R-ST-W) the base is spawned about T in the robot frame
+  instead of the baseline's table-relative box. With ``target_area`` (plan S9.3's ``TARGET=WC``) it
+  is drawn from the area, table-relative, at the area's yaw, at least `STACK_MIN_SEPARATION` from
+  the red cube (`mdp.reset_box_in_area`: redrawn, then the area's farthest corner)."""
   reset = cfg.events["reset_objects"]
   reset.params["asset_cfgs"] = [SceneEntityCfg(OBJECT)]
-  (tx, ty), half = baseline.target_xy, baseline.target_half_xy
-  base_box = SpawnBox(
-    x=(tx - half, tx + half),
-    y=(ty - half, ty + half),
-    yaw=STACK_BASE_YAW,
-    widen_at_dr_scene=False,
-  )
+  base_func = mdp.reset_objects_on_surface
+  if target_area is not None:
+    cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
+    base_func = mdp.reset_box_in_area
+    base_params = {
+      "asset_cfg": SceneEntityCfg(BASE_OBJECT),
+      "object_name": OBJECT,
+      "area_x": (target_area.x[0] - cx, target_area.x[1] - cx),
+      "area_y": (target_area.y[0] - cy, target_area.y[1] - cy),
+      "yaw": target_area.yaw,
+      "min_distance": STACK_MIN_SEPARATION,
+      "redraws": STACK_AREA_REDRAWS,
+      "on_half_height": True,
+    }
+  elif robot_target is None:
+    (tx, ty), half = baseline.target_xy, baseline.target_half_xy
+    base_box = SpawnBox(
+      x=(tx - half, tx + half),
+      y=(ty - half, ty + half),
+      yaw=STACK_BASE_YAW,
+      widen_at_dr_scene=False,
+    )
+    base_params = {
+      "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
+      "pose_range": _object_pose_range(base_box),
+    }
+  else:
+    (tx, ty), half = robot_target.xy, robot_target.base_half_xy
+    base_params = {
+      "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
+      "pose_range": {
+        "x": (tx - half, tx + half),
+        "y": (ty - half, ty + half),
+        "yaw": (-robot_target.base_yaw, robot_target.base_yaw),
+      },
+      "frame": "env",
+    }
   events = {}
   for name, term in cfg.events.items():
     events[name] = term
     if name == "reset_objects":
       events["reset_base_object"] = EventTermCfg(
-        func=mdp.reset_objects_on_surface,
+        func=base_func,
         mode="reset",
-        params={
-          "asset_cfgs": [SceneEntityCfg(BASE_OBJECT)],
-          "surface_cfg": SceneEntityCfg(TABLE),
-          "pose_range": _object_pose_range(base_box),
-        },
+        params={"surface_cfg": SceneEntityCfg(TABLE), **base_params},
       )
   cfg.events = events
   actor = cfg.observations["actor"]
@@ -422,6 +602,95 @@ def _stack_gate_cfg(old, grasp_sensor: str, jaw_regex: str):
   )
 
 
+def _apply_tracker_split(cfg: ManagerBasedRlEnvCfg, stack: bool) -> None:
+  """Plan S11's ``TRACKER=split`` (BS11's tracker row; S10's `box.apply_box_goal` model): the cube's
+  position on the actor carries a per-episode bias split into a shared 6 mm and its own 4 mm and 2 mm
+  of jitter (`mdp.object_position_biased_b`, in place of the 8 mm "abs" bias), and on a stack goal
+  the actor's goal is the base's pose through its own tracker, at the cube's lag, with the shared
+  bias and its own (`mdp.stack_goal_position_tracked_b`, in place of S9's unlagged +/- 4 mm). The
+  critic keeps the live poses. The cube's yaw keeps its own noise model."""
+  from pal_mjlab.tasks.manipulation.pick_place.box import (
+    TRACKER_OWN_BIAS,
+    TRACKER_SHARED_BIAS,
+  )
+  from pal_mjlab.tasks.manipulation.tabletop_env_cfg import _DR_OBS_OBJECT_POS_NOISE
+
+  actor = cfg.observations["actor"].terms
+  obj_term = actor["object_pos"]
+  if obj_term.func is not mdp.object_position_b:
+    raise ValueError(
+      "TRACKER=split replaces the actor's object_pos term; it is "
+      f"{obj_term.func.__name__} (occlusion is not built for it)"
+    )
+  lag = obj_term.params.get("lag")
+  jitter = Unoise(n_min=-_DR_OBS_OBJECT_POS_NOISE, n_max=_DR_OBS_OBJECT_POS_NOISE)
+  actor["object_pos"] = dataclasses.replace(
+    obj_term,
+    func=mdp.object_position_biased_b,
+    params={**obj_term.params, "bias_key": OBJECT},
+    noise=jitter,
+  )
+  keys = (OBJECT,)
+  if stack:
+    keys = (OBJECT, BASE_OBJECT)
+    actor["target_pos"] = ObservationTermCfg(
+      func=mdp.stack_goal_position_tracked_b,
+      params={
+        "base_name": BASE_OBJECT,
+        "object_name": OBJECT,
+        "bias_key": BASE_OBJECT,
+        "lag": lag,
+      },
+      noise=jitter,
+    )
+  cfg.events["reset_tracker_bias"] = EventTermCfg(
+    func=mdp.reset_tracker_bias,
+    mode="reset",
+    params={"shared": TRACKER_SHARED_BIAS, "own": TRACKER_OWN_BIAS, "keys": keys},
+  )
+
+
+def _apply_base_pose(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Plan S9.1's ``BASE_OBS=pose`` (`BASE_OBS_NAMES`), the actor's half and the yaw grade's
+  reference: the base's tracked yaw appended to the actor, lagged like the base's position (the
+  split tracker's ``lag``), with its own per-episode bias and jitter; M6's yaw grade against the
+  base. The critic's live yaw is appended by `_append_critic_base_yaw`, after PQ's inputs."""
+  actor = cfg.observations["actor"].terms
+  target = actor["target_pos"]
+  if target.func is not mdp.stack_goal_position_tracked_b:
+    raise ValueError(
+      "BASE_OBS=pose observes the base through the split tracker; set TRACKER=split"
+    )
+  actor["base_yaw"] = ObservationTermCfg(
+    func=mdp.box_yaw_b,
+    params={
+      "box_name": BASE_OBJECT,
+      "bias_key": BASE_OBJECT,
+      "noise": BASE_YAW_NOISE,
+      "lag": target.params.get("lag"),
+    },
+  )
+  cfg.events["reset_tracker_yaw_bias"] = EventTermCfg(
+    func=mdp.reset_tracker_yaw_bias,
+    mode="reset",
+    params={"half": BASE_YAW_BIAS, "keys": (BASE_OBJECT,)},
+  )
+  cfg.commands[COMMAND] = dataclasses.replace(
+    cfg.commands[COMMAND], yaw_reference=BASE_OBJECT
+  )
+
+
+def _append_critic_base_yaw(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Plan S9.1's ``BASE_OBS=pose``, the critic's half: the base's live yaw, last."""
+  critic = cfg.observations["critic"]
+  critic.terms = {
+    **critic.terms,
+    "base_yaw": ObservationTermCfg(
+      func=mdp.box_yaw_b, params={"box_name": BASE_OBJECT}
+    ),
+  }
+
+
 def _object_pose_range(spawn: SpawnBox) -> dict[str, tuple[float, float]]:
   """Spawn box for ``mdp.reset_objects_on_surface``, which samples about the table centre.
 
@@ -437,14 +706,15 @@ def _object_pose_range(spawn: SpawnBox) -> dict[str, tuple[float, float]]:
   }
 
 
-def _goal_area(area: SpawnBox) -> dict:
+def _goal_area(area: SpawnBox, distance: float = TARGET_MIN_SEPARATION) -> dict:
   """``reset_objects_on_surface``'s ``goal_area`` for a target area: its x and y about the table
-  centre, and `TARGET_MIN_SEPARATION`."""
+  centre, and the distance the goal keeps from the cube (`TARGET_MIN_SEPARATION`; plan S10.1's box,
+  `box.BOX_MIN_SEPARATION`)."""
   cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
   return {
     "x": (area.x[0] - cx, area.x[1] - cx),
     "y": (area.y[0] - cy, area.y[1] - cy),
-    "distance": TARGET_MIN_SEPARATION,
+    "distance": distance,
   }
 
 
@@ -454,6 +724,7 @@ def _command_cfg(
   table_top_z: float = scene.TABLE_TOP_Z,
   target_half_xy: float = 0.0,
   target_area: SpawnBox | None = None,
+  robot_target: RobotFrameTarget | None = None,
 ):
   """The goal: a point on the table, expressed in whichever way the DR level allows.
 
@@ -473,7 +744,25 @@ def _command_cfg(
 
   A ``target_area`` (plan S7-8, `TARGET_AREAS`) replaces the box: the goal is drawn from the
   area, table-relative, at least `TARGET_MIN_SEPARATION` from the cube (`mdp.SurfaceOffsetCommand`).
+
+  A ``robot_target`` (plan S11's T, `ROBOT_TARGETS`) is drawn once per episode from its box in the
+  robot frame (``frame="env"``): the table moves under it, the height follows the table top.
   """
+  if robot_target is not None:
+    if robot_target.half_xy is None:
+      raise ValueError(
+        "this robot-frame target is a stack base's spawn, not a table goal"
+      )
+    return mdp.SurfaceOffsetCommandCfg(
+      entity_name=OBJECT,
+      surface_name=TABLE,
+      offset=robot_target.xy,
+      offset_range=(robot_target.half_xy, robot_target.half_xy),
+      frame="env",
+      resampling_time_range=(1e9, 1e9),
+      success_threshold=GOAL_THRESHOLD,
+      debug_vis=True,
+    )
   if target_area is not None:
     cx, cy = scene.TABLE_POS[0], scene.TABLE_POS[1]
     return mdp.SurfaceOffsetCommandCfg(
@@ -563,6 +852,14 @@ def make_pick_place_env_cfg(
   critic_release: bool = False,
   arm_table: ArmTableCfg | None = None,
   pregrasp: PregraspCfg | None = None,
+  box: BoxGoal | None = None,
+  box_obs: str = "goal",
+  robot_target: RobotFrameTarget | None = None,
+  tracker: str = "B",
+  base_obs: str = "goal",
+  insert: InsertGoal | None = None,
+  place: PlaceGoal | None = None,
+  ball_seat: BallSeatGoal | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Pick-and-place on a target on the table.
 
@@ -604,7 +901,129 @@ def make_pick_place_env_cfg(
       `arm_table.ARM_TABLE_CODES`; None is every run before S7-10.
     pregrasp: plan S7-11's ``PREGRASP`` -- the jaw open before the grasp (NP, JO, G, S, OVR). See
       `pregrasp.PREGRASP_CODES`; None is every run before S7-11.
+    box: plan S10's box goal (``GOAL=box`` | ``box-ny`` | ``box-rim`` | ``box-dr``, `box.BOX_GOALS`) --
+      put the cube into a box standing where the baseline's target box is (`box.apply_box_goal`);
+      None is the goal on the table, every run before S10. With it ``goal`` stays ``table``.
+      Plan S10.1: with a ``target_area`` the box is drawn from that area at any yaw, at least
+      `box.BOX_MIN_SEPARATION` from the cube, and the let-go's yaw is graded against the box.
+    robot_target: plan S11's ``TARGET=T11`` / ``T11W`` (`ROBOT_TARGETS`): the table goal (L-T) or a
+      stack goal's base (R-ST, R-ST-W) at the meeting point T, fixed in the robot frame; a stack goal
+      then prices the base's displacement (`base_moved`) instead of its speed. None is every run
+      before S11.
+    tracker: plan S11's ``TRACKER`` (`TRACKERS`): ``B`` is every run before S11, ``split`` the
+      shared + own bias with the base through its own tracker (`_apply_tracker_split`).
+    insert: plan §12's insert goal (``GOAL=insert`` | ``insert-t`` | ``insert-na`` | ``insert-lad``,
+      `insert.INSERT_GOALS`) -- push the pin (``shape`` pin) through a socket block drawn from ``target_area``
+      (`insert.apply_insert_goal`); needs RCTP, no box, no occlusion, the table goal. None is every run before §12.
+    place: plan §14's place goal (``GOAL=place``, `place_pin.PLACE_GOALS`) -- pick the pin (``shape`` pin) up from
+      ``target_area`` standing or lying and put it down at a goal point drawn from it, in any pose
+      (`place_pin.apply_place_goal`); needs RCTP (or RCTP + GC), no box, no occlusion, the table goal. None is every
+      run before §14.
+    ball_seat: plan §15's ball seat (``GOAL=ball-seat``, `ball_seat.BALL_SEAT_GOALS`) -- drop the Ø 50 mm ball
+      (``shape`` ball50 / ball50-dr) into the chamfer of §12's block drawn from ``target_area``
+      (`ball_seat.apply_ball_seat_goal`); needs RCTP, no box, no occlusion, the table goal. None is every run before §15.
+    base_obs: plan S9.1's ``BASE_OBS`` (`BASE_OBS_NAMES`): ``goal`` is every run before S9.1,
+      ``pose`` adds the stack base's yaw to the actor and the critic and grades the let-go's yaw
+      against the base (`_apply_base_pose`). Needs ``GOAL=stack`` and ``TRACKER=split``.
+    box_obs: plan S10.1's ``BOX_OBS`` (`box.BOX_OBS_NAMES`): ``goal`` -- the actor sees the goal point
+      computed from the box, S10 -- or ``pose``: the box's own position in that slot and its yaw
+      (cos 4 psi, sin 4 psi) appended, actor and critic. Needs ``box``.
   """
+  if box_obs not in BOX_OBS_NAMES:
+    raise ValueError(f"unknown box observation {box_obs!r}; have {BOX_OBS_NAMES}")
+  if box_obs != "goal" and box is None:
+    raise ValueError("BOX_OBS=pose observes the box; it needs a box GOAL (plan S10.1)")
+  if tracker not in TRACKERS:
+    raise ValueError(f"unknown tracker {tracker!r}; have {TRACKERS}")
+  if base_obs not in BASE_OBS_NAMES:
+    raise ValueError(f"unknown base_obs {base_obs!r}; have {BASE_OBS_NAMES}")
+  if base_obs == "pose" and goal != "stack":
+    raise ValueError("BASE_OBS=pose observes a stack goal's base; it needs GOAL=stack")
+  if goal == "stack" and reward in YAW_GRADED_ARMS and base_obs != "pose":
+    raise ValueError(
+      f"{reward} grades the let-go's yaw; on a stack goal that is against the base, whose yaw "
+      "the actor sees only with BASE_OBS=pose (plan S9.1's SC-Y)"
+    )
+  if robot_target is not None and (
+    target_area is not None or box is not None or occlusion is not None
+  ):
+    raise ValueError(
+      "plan S11's T replaces the target; TARGET is one name, and the box and the occlusion "
+      "model are not built for it"
+    )
+  if tracker == "split" and (box is not None or occlusion is not None):
+    raise ValueError(
+      "TRACKER=split is the box's own model already, and not built for OCC"
+    )
+  if insert is not None and (
+    shape is not OBJECT_SHAPES["pin"]
+    or target_area is None
+    or box is not None
+    or box_obs != "goal"
+    or occlusion is not None
+    or goal != "table"
+    or robot_target is not None
+    or tracker != "B"
+    or reward != INSERT_REWARD
+  ):
+    raise ValueError(
+      f"plan §12's insert is built for the pin (SHAPE=pin) on a target area (TARGET=WC), {INSERT_REWARD}, "
+      "no box GOAL / BOX_OBS, no OCC, no stack goal, no robot-frame target and the default TRACKER (the "
+      "block brings its own tracker split)"
+    )
+  if place is not None and (
+    insert is not None
+    or shape is not OBJECT_SHAPES["pin"]
+    or target_area is None
+    or box is not None
+    or box_obs != "goal"
+    or occlusion is not None
+    or goal != "table"
+    or robot_target is not None
+    or tracker != "B"
+    or reward not in PLACE_REWARDS
+  ):
+    raise ValueError(
+      f"plan §14's place is built for the pin (SHAPE=pin) on a target area (TARGET=WP), {PLACE_REWARDS}, no "
+      "insert / box GOAL, no BOX_OBS, no OCC, no stack goal, no robot-frame target and the default TRACKER"
+    )
+  if ball_seat is not None and (
+    insert is not None
+    or place is not None
+    or shape not in (OBJECT_SHAPES["ball50"], OBJECT_SHAPES["ball50-dr"])
+    or target_area is None
+    or box is not None
+    or box_obs != "goal"
+    or occlusion is not None
+    or goal != "table"
+    or robot_target is not None
+    or tracker != "B"
+    or reward != BALL_SEAT_REWARD
+  ):
+    raise ValueError(
+      f"plan §15's ball seat is built for the Ø 50 mm ball (SHAPE=ball50 | ball50-dr) on a target area (TARGET=WC), "
+      f"{BALL_SEAT_REWARD}, no insert / place / box GOAL, no BOX_OBS, no OCC, no stack goal, no robot-frame target and "
+      "the default TRACKER (the block brings its own tracker split)"
+    )
+  if (
+    shape in (OBJECT_SHAPES["ball50"], OBJECT_SHAPES["ball50-dr"]) and ball_seat is None
+  ):
+    raise ValueError("SHAPE=ball50 is plan §15's ball; it needs GOAL=ball-seat")
+  if reward in GC_ARMS and place is None:
+    raise ValueError(
+      f"{reward}'s GC reads the pin's grasp point; it needs GOAL=place (plan §14)"
+    )
+  if shape is OBJECT_SHAPES["pin"] and insert is None and place is None:
+    raise ValueError(
+      "SHAPE=pin is plan §12's pin; it needs an insert GOAL (or plan §14's GOAL=place)"
+    )
+  if box is not None and (
+    shape is not OBJECT_SHAPES["cube"] or occlusion is not None or goal != "table"
+  ):
+    raise ValueError(
+      "plan S10's box is built for the 5 cm cube, no occlusion model and no stack goal; SHAPE, "
+      "OCC or the stack GOAL is set"
+    )
   if goal not in GOALS:
     raise ValueError(f"unknown goal {goal!r}; have {GOALS}")
   if gate not in GATES:
@@ -613,9 +1032,21 @@ def make_pick_place_env_cfg(
   if stack:
     if shape is not OBJECT_SHAPES["cube"]:
       raise ValueError("GOAL=stack stacks the 5 cm cube; SHAPE must be cube (plan S9)")
-    if target_area is not None:
+    if target_area is not None and target_area != spawn:
       raise ValueError(
-        "GOAL=stack puts the base in the baseline's target box; TARGET must be B"
+        "GOAL=stack with a TARGET area draws both cubes from that area (plan S9.3); SPAWN must "
+        "be the same area"
+      )
+    if target_area is not None and (
+      0.5
+      * math.hypot(
+        target_area.x[1] - target_area.x[0], target_area.y[1] - target_area.y[0]
+      )
+      < STACK_MIN_SEPARATION + 0.06
+    ):
+      raise ValueError(
+        "this TARGET area is too small to keep the base STACK_MIN_SEPARATION from every red cube "
+        "with room to spare (WCK: half-diagonal 7.8 cm); use WC (plan S9.3)"
       )
     if occlusion is not None:
       raise ValueError(
@@ -623,6 +1054,8 @@ def make_pick_place_env_cfg(
       )
     if baseline.target_half_xy <= 0.0:
       raise ValueError("GOAL=stack needs a baseline with a target box (BASELINE=B)")
+  if robot_target is not None and robot_target.half_xy is None and not stack:
+    raise ValueError("TARGET=T11W is R-ST-W's wide base; it needs GOAL=stack")
   if gate == "stack" and not stack:
     raise ValueError(
       "GATE=stack is the release condition on the base cube; it needs GOAL=stack"
@@ -643,7 +1076,12 @@ def make_pick_place_env_cfg(
     command_cfg=_stack_command_cfg()
     if stack
     else _command_cfg(
-      target_xy, dr, baseline.table_top_z, baseline.target_half_xy, target_area
+      target_xy,
+      dr,
+      baseline.table_top_z,
+      baseline.target_half_xy,
+      target_area,
+      robot_target,
     ),
     object_pose_range=_object_pose_range(spawn),
     dr_level=dr,
@@ -663,7 +1101,18 @@ def make_pick_place_env_cfg(
     stack_speed=stack_speed,
     action_mode=action_mode,
     command_obs=command_obs,
-    goal_area=None if target_area is None else _goal_area(target_area),
+    goal_area=None
+    if target_area is None or stack
+    else _goal_area(
+      target_area,
+      BOX_MIN_SEPARATION
+      if box is not None
+      else PIN_MIN_SEPARATION
+      if insert is not None
+      else BALL_MIN_SEPARATION
+      if ball_seat is not None
+      else TARGET_MIN_SEPARATION,
+    ),
     objects={
       OBJECT: scene.get_cube_cfg(name=OBJECT),
       BASE_OBJECT: scene.get_cube_cfg(name=BASE_OBJECT, rgba=BASE_RGBA),
@@ -671,9 +1120,14 @@ def make_pick_place_env_cfg(
     if stack
     else shape.objects,
     object_geoms=shape.geoms,
+    object_friction=shape.friction,
   )
   if stack:
-    _apply_stack_goal(cfg, baseline)
+    _apply_stack_goal(cfg, baseline, robot_target, target_area)
+  if tracker == "split":
+    _apply_tracker_split(cfg, stack)
+  if base_obs == "pose":
+    _apply_base_pose(cfg)
   if shape.ball_probability is not None:
     # Before `reset_objects`, which places the object at its half-height above the table, and
     # before the goal command resamples at the half-height of this episode's shape.
@@ -704,9 +1158,7 @@ def make_pick_place_env_cfg(
 
   gripper = robot.gripper(gripper_name)
   grasp_sensor = gripper.contact_sensor_name
-  arm_regex = tuple(
-    p for p in robot.action_joint_regex if not re.fullmatch(p, gripper.finger_joint)
-  )
+  arm_regex = arm_joint_regex(robot, gripper)
 
   # The whole reward dict comes from the named variant, replacing the base cfg's. Replacing
   # rather than patching is what makes the arms of the comparison comparable: two variants
@@ -730,10 +1182,19 @@ def make_pick_place_env_cfg(
     )
   # Not part of any arm's comparison: every variant carries the same trunk penalty.
   cfg.rewards.update(trunk_clearance_rewards(robot))
-  if stack:
+  if stack and robot_target is None and target_area is None:
     # Plan S9: the base is scenery the arm must work around, not through (the old stack cfg's).
     cfg.rewards["base_disturbance"] = RewardTermCfg(
       func=mdp.entity_lin_vel_l2, weight=-0.5, params={"entity_name": BASE_OBJECT}
+    )
+  elif stack:
+    # Plan S11's R-ST: pushing the base off T costs (S9 measured `base_disturbance` at 0.0005 per
+    # episode and saw bases dragged 4-7 cm), S10's `box_moved` on the base; plan S9.3's base on WC
+    # too.
+    cfg.rewards["base_moved"] = RewardTermCfg(
+      func=mdp.reference_displacement_penalty,
+      weight=BASE_MOVED_WEIGHT,
+      params={"command_name": COMMAND, "scale": BASE_MOVED_SCALE},
     )
   if gate == "stack":
     cfg.actions["joint_pos"] = _stack_gate_cfg(
@@ -746,9 +1207,70 @@ def make_pick_place_env_cfg(
   if pregrasp is not None and pregrasp.gate_cap is not None and gate != "none":
     raise ValueError("PREGRASP's gate and GATE=stack are two action terms; pick one")
   apply_pregrasp(cfg, gripper, pregrasp)
+  # Plan S10: the box, last of the reward edits, so that it sees every term reading the
+  # release latch.
+  apply_box_goal(
+    cfg,
+    gripper,
+    box,
+    target_xy,
+    baseline.target_half_xy,
+    baseline.table_top_z,
+    GOAL_THRESHOLD,
+    # The target area is the box's only with a box; without one it is S7-8's goal area, built above.
+    area=None if target_area is None or box is None else (target_area.x, target_area.y),
+    pose_obs=box_obs == "pose",
+  )
+  if insert is not None:
+    # Plan §12: after every other reward edit, so that it sees RCTP's terms as built.
+    assert target_area is not None
+    apply_insert_goal(
+      cfg,
+      gripper,
+      insert,
+      (target_area.x, target_area.y),
+      baseline.table_top_z,
+      GOAL_THRESHOLD,
+    )
+  if place is not None:
+    # Plan §14: as §12's, after every other reward edit.
+    assert target_area is not None
+    apply_place_goal(
+      cfg,
+      gripper,
+      place,
+      (target_area.x, target_area.y),
+      GOAL_THRESHOLD,
+      SceneEntityCfg(ROBOT, site_names=gripper.pad_sites),
+    )
+  if ball_seat is not None:
+    # Plan §15: as §12's, after every other reward edit.
+    assert target_area is not None
+    apply_ball_seat_goal(
+      cfg,
+      gripper,
+      ball_seat,
+      (target_area.x, target_area.y),
+      baseline.table_top_z,
+      GOAL_THRESHOLD,
+    )
   cfg.curriculum = reward_curriculum_cfg()
   if critic_release:
     _add_critic_release(cfg)
+  if box_obs == "pose":
+    # Plan S10.1: last, after PQ's inputs (`box.append_critic_box_yaw`).
+    append_critic_box_yaw(cfg)
+  if base_obs == "pose":
+    _append_critic_base_yaw(cfg)
+  if insert is not None:
+    # Plan §12: last, after PQ's inputs (`insert.append_critic_insert`).
+    append_critic_insert(cfg, insert)
+  if place is not None:
+    # Plan §14: §12's three slots, last (`place_pin.append_critic_place`).
+    append_critic_place(cfg, grasp_sensor)
+  if ball_seat is not None:
+    # Plan §15: §12's three slots, last (`ball_seat.append_critic_ball_seat`).
+    append_critic_ball_seat(cfg, ball_seat, grasp_sensor)
 
   success_params = {
     "command_name": COMMAND,

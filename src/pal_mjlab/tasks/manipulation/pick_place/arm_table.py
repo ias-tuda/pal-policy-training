@@ -91,7 +91,9 @@ def arm_body_regex(gripper: GripperCfg) -> str:
   return f"{match.group(1)}_{ARM_LINKS}_link"
 
 
-def make_arm_table_sensor(gripper: GripperCfg) -> ContactSensorCfg:
+def make_arm_table_sensor(
+  gripper: GripperCfg, name: str = ARM_TABLE_SENSOR
+) -> ContactSensorCfg:
   """Arm 1-6 vs the table, one slot per link (its strongest contact), with a force history so
   that `illegal_contact`'s force threshold applies -- without a history it returns ``found``
   and ignores the threshold (mjlab ``terminations.py``).
@@ -101,7 +103,7 @@ def make_arm_table_sensor(gripper: GripperCfg) -> ContactSensorCfg:
   seen by AC, AT or the eval (found by the positive control, which read 0 N on a forearm driven
   2 cm into the table in 3 of 16 envs, and 600-15 000 N in the others)."""
   return ContactSensorCfg(
-    name=ARM_TABLE_SENSOR,
+    name=name,
     primary=ContactMatch(mode="body", pattern=arm_body_regex(gripper), entity=ROBOT),
     secondary=ContactMatch(mode="body", pattern=TABLE, entity=TABLE),
     fields=("found", "force"),
@@ -112,21 +114,28 @@ def make_arm_table_sensor(gripper: GripperCfg) -> ContactSensorCfg:
 
 
 def apply_arm_table(
-  cfg: ManagerBasedRlEnvCfg, gripper: GripperCfg, code: ArmTableCfg | None
+  cfg: ManagerBasedRlEnvCfg,
+  gripper: GripperCfg,
+  code: ArmTableCfg | None,
+  prefix: str = "",
 ) -> None:
-  """Add a code's sensor, rewards and termination to a built pick-and-place cfg, in place."""
+  """Add a code's sensor, rewards and termination to a built pick-and-place cfg, in place.
+
+  ``prefix`` goes in front of the sensor's, the terms' and the termination's names: plan S11's
+  JOINT adds the right arm's beside the left's (``right_``)."""
   if code is None:
     return
+  sensor = prefix + ARM_TABLE_SENSOR
   if code.sensor or code.contact_weight or code.terminate_force is not None:
-    cfg.scene.sensors = (*cfg.scene.sensors, make_arm_table_sensor(gripper))
+    cfg.scene.sensors = (*cfg.scene.sensors, make_arm_table_sensor(gripper, sensor))
   if code.contact_weight:
-    cfg.rewards["arm_table_contact"] = RewardTermCfg(
+    cfg.rewards[prefix + "arm_table_contact"] = RewardTermCfg(
       func=mdp.contact_penalty,
       weight=code.contact_weight,
-      params={"sensor_name": ARM_TABLE_SENSOR, "force_threshold": code.contact_force},
+      params={"sensor_name": sensor, "force_threshold": code.contact_force},
     )
   if code.clearance_weight:
-    cfg.rewards["arm_table_clearance"] = RewardTermCfg(
+    cfg.rewards[prefix + "arm_table_clearance"] = RewardTermCfg(
       func=mdp.table_clearance_penalty,
       weight=code.clearance_weight,
       params={
@@ -136,7 +145,7 @@ def apply_arm_table(
       },
     )
   if code.terminate_force is not None:
-    cfg.terminations["arm_table_force"] = TerminationTermCfg(
+    cfg.terminations[prefix + "arm_table_force"] = TerminationTermCfg(
       func=illegal_contact,
-      params={"sensor_name": ARM_TABLE_SENSOR, "force_threshold": code.terminate_force},
+      params={"sensor_name": sensor, "force_threshold": code.terminate_force},
     )

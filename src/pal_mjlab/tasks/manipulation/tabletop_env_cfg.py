@@ -141,6 +141,16 @@ SIM_TIMESTEP = 0.002
 DECIMATION = 10
 CONTROL_DT = SIM_TIMESTEP * DECIMATION
 
+#: MuJoCo disable flags of every tabletop task. ``nativeccd`` off is what sends box-box pairs (the
+#: cubes, the table top and legs, the box's walls) to mujoco_warp's dedicated ``box_box`` collider,
+#: as CPU MuJoCo does; with it on (mujoco_warp's default, every run before plan S9.1) they go through
+#: GJK/EPA + multicontact, which under a pressing hand returns one contact where CPU MuJoCo returns
+#: four, and a cube held down on a cube sank 1.1-1.7 cm into it, the base 1.5-2.6 cm into the table
+#: (CPU MuJoCo on the same model, state and controls: 1.3 / 2.2 mm; 100 solver iterations, impratio 1
+#: or a pyramidal cone did not help). In mujoco_warp the flag changes only box-box pairs; the pads,
+#: arm and torso are meshes and capsules. Measured 2026-10-05 on the S9 stack renders (decision 0004).
+SIM_DISABLE_FLAGS = ("nativeccd",)
+
 #: Plan S7-8's stack-task speeds (`SLEW=stack`): the arm at a fraction of the URDF speed
 #: (`robots.kangaroo.KANGAROO_GRIPPERS`' `joint_velocity_limits`) per joint group, the jaw at
 #: 0.03 rad per control step (1.5 rad/s). Claudius's recipe (`origin/faster-moves` b236d62,
@@ -479,6 +489,7 @@ def make_tabletop_env_cfg(
   command_obs: bool = False,
   goal_area: dict | None = None,
   object_geoms: tuple[str, ...] | None = None,
+  object_friction: tuple[float, float] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -539,6 +550,9 @@ def make_tabletop_env_cfg(
       raw last action. Still 8-D.
     object_geoms: the manipulated object's geom names, for the DR of its friction (`DR-object`);
       None is the one geom ``{OBJECT}_geom`` a cube and a ball have. Plan S8's MIX has two.
+    object_friction: `DR-object`'s range for the object's sliding friction (abs, uniform); None is
+      `_DR_OBJECT_FRICTION`, every object before plan §12. The pin's sets its pair with the socket
+      block (the element-wise max, L10), so it keeps its own value (`pick_place_env_cfg`'s ``pin``).
   """
   if observation_set not in OBSERVATION_SETS:
     raise ValueError(
@@ -605,10 +619,9 @@ def make_tabletop_env_cfg(
     "actor": ObservationGroupCfg(dict(actor_terms), enable_corruption=True),
     "critic": ObservationGroupCfg(dict(actor_terms), enable_corruption=False),
   }
-  # The arm's joints: the action joints but the jaw.
-  arm_regex = tuple(
-    p for p in robot.action_joint_regex if not re.fullmatch(p, gripper.finger_joint)
-  )
+  # The arm's joints: the action joints but the jaws.
+  jaw_joints = action_jaw_joints(robot, gripper)
+  arm_regex = arm_joint_regex(robot, gripper)
   if observation_set == "B":
     observations = _deployable_observations(
       action_joints,
@@ -657,14 +670,16 @@ def make_tabletop_env_cfg(
     if robot.joint_velocity_limits is None:
       raise ValueError("stack_speed needs the robot's joint_velocity_limits")
     rate_limit = stack_arm_rate_limit(robot.joint_velocity_limits)
-    rate_limit[re.escape(gripper.finger_joint)] = STACK_JAW_STEP
+    for jaw in jaw_joints:
+      rate_limit[re.escape(jaw)] = STACK_JAW_STEP
   else:
     rate_limit = {
       pattern: limit * CONTROL_DT * action_slew_rate_scale
       for pattern, limit in (robot.joint_velocity_limits or {}).items()
     }
     if jaw_slew_rate is not None:
-      rate_limit[re.escape(gripper.finger_joint)] = jaw_slew_rate
+      for jaw in jaw_joints:
+        rate_limit[re.escape(jaw)] = jaw_slew_rate
   # Plan S7-4's bounds on the arm's final target (C, T); `mdp.RateLimitedJointPositionAction`.
   bounds = {}
   if arm_range_clip:
@@ -672,7 +687,7 @@ def make_tabletop_env_cfg(
   if arm_effort_band:
     bounds["effort_band_joints"] = arm_regex
   if latency.jaw_servo:
-    bounds["servo_joints"] = (re.escape(gripper.finger_joint),)
+    bounds["servo_joints"] = tuple(re.escape(jaw) for jaw in jaw_joints)
     bounds["servo_tau"] = latency.servo_tau
     bounds["servo_max_vel"] = latency.servo_max_vel
   if bounds and not rate_limit:
@@ -944,6 +959,7 @@ def make_tabletop_env_cfg(
         ls_iterations=20,
         impratio=10,
         cone="elliptic",
+        disableflags=SIM_DISABLE_FLAGS,
       ),
     ),
     decimation=DECIMATION,
@@ -956,12 +972,36 @@ def make_tabletop_env_cfg(
       action_joints,
       spawn_widening=dr_spawn_widening,
       object_geoms=object_geoms,
+      object_friction=object_friction,
     )
   if latency.tracker_lag is not None:
     _apply_tracker_lag(cfg, latency.tracker_lag)
   if occlusion is not None:
     _apply_occlusion(cfg, occlusion, latency, tcp, gripper.finger_joint)
   return cfg
+
+
+def action_jaw_joints(
+  robot: ManipulationRobotCfg, gripper: GripperCfg
+) -> tuple[str, ...]:
+  """The jaws the policy drives: every gripper's finger joint the action space names (plan S11's
+  JOINT drives both; a one-arm task, one), else ``gripper``'s alone."""
+  jaws = tuple(
+    g.finger_joint
+    for g in robot.grippers
+    if any(re.fullmatch(p, g.finger_joint) for p in robot.action_joint_regex)
+  )
+  return jaws or (gripper.finger_joint,)
+
+
+def arm_joint_regex(
+  robot: ManipulationRobotCfg, gripper: GripperCfg
+) -> tuple[str, ...]:
+  """The action joint patterns but the jaws' (`action_jaw_joints`): the driven arms' joints."""
+  jaws = action_jaw_joints(robot, gripper)
+  return tuple(
+    p for p in robot.action_joint_regex if not any(re.fullmatch(p, jaw) for jaw in jaws)
+  )
 
 
 def trunk_clearance_rewards(
@@ -1130,6 +1170,7 @@ def apply_dr_level(
   object_name: str = OBJECT,
   spawn_widening: bool = True,
   object_geoms: tuple[str, ...] | None = None,
+  object_friction: tuple[float, float] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """Set the environment's domain randomisation to a named rung, in place.
 
@@ -1157,7 +1198,7 @@ def apply_dr_level(
         "operation": "abs",
         "distribution": "uniform",
         "axes": [0],  # sliding only; torsional friction is the pads' business.
-        "ranges": _DR_OBJECT_FRICTION,
+        "ranges": _DR_OBJECT_FRICTION if object_friction is None else object_friction,
       },
     )
     cfg.events["object_mass"] = EventTermCfg(

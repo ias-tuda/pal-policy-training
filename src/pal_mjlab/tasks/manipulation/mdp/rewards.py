@@ -266,6 +266,8 @@ def release_quality_of(
   tilt_std: float | None = None,
   speed: torch.Tensor | None = None,
   speed_std: float | None = None,
+  yaw: torch.Tensor | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """q = floor + (1 - floor) * G_dist_std(dxy) * G_height_std(max(height - height_free, 0)).
 
@@ -277,6 +279,10 @@ def release_quality_of(
   Plan S7-9's PT multiplies the graded part by G_tilt_std(tilt) * G_speed_std(speed), the
   object's tilt (rad) and speed (m/s) at the let-go, when ``tilt_std`` / ``speed_std`` are set.
   Inside the ``(1 - floor)`` part, so the floor still keeps a poor release worth something.
+
+  Plan S10's BX: with ``yaw_std``, also x G_yaw_std(yaw), ``yaw`` the object's |yaw mod 90 deg| at
+  the release (`observations.yaw_error_mod_90`) -- a cube let go turned 45 deg off the box's axes
+  has 4.6 mm to each wall instead of 15.
   """
   near = torch.exp(-torch.square(dxy / dist_std))
   low = torch.exp(-torch.square((height - height_free).clamp_min(0.0) / height_std))
@@ -287,6 +293,9 @@ def release_quality_of(
   if speed_std is not None:
     assert speed is not None
     graded = graded * torch.exp(-torch.square(speed / speed_std))
+  if yaw_std is not None:
+    assert yaw is not None, "a yaw grade needs the release's yaw"
+    graded = graded * torch.exp(-torch.square(yaw / yaw_std))
   return floor + (1.0 - floor) * graded
 
 
@@ -323,6 +332,7 @@ def release_quality(
   require_ok: bool = False,
   tilt_std: float | None = None,
   speed_std: float | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """The grade of the latest release after `was_lifted` (plan S7, module M6); ``floor`` if
   there has been none this episode. ``jaw_cfg`` / ``jaw_open``: a release is the jaw opening
@@ -362,6 +372,8 @@ def release_quality(
     tilt_std,
     latch.rel_speed,
     speed_std,
+    latch.yaw,
+    yaw_std,
   )
   paid = latch.released
   if set_down_steps > 0:
@@ -389,6 +401,7 @@ def released_at_goal_graded(
   require_ok: bool = False,
   tilt_std: float | None = None,
   speed_std: float | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """`released_at_goal` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -425,6 +438,7 @@ def released_at_goal_graded(
     require_ok,
     tilt_std,
     speed_std,
+    yaw_std,
   )
 
 
@@ -447,6 +461,7 @@ def object_placed_graded(
   require_ok: bool = False,
   tilt_std: float | None = None,
   speed_std: float | None = None,
+  yaw_std: float | None = None,
 ) -> torch.Tensor:
   """`object_placed` (gated on `was_lifted`) x `release_quality` (plan S7, module M6).
 
@@ -481,6 +496,7 @@ def object_placed_graded(
     require_ok,
     tilt_std,
     speed_std,
+    yaw_std,
   )
 
 
@@ -624,6 +640,46 @@ def pad_contact_after_release(
   return (latch.released & _pad_contact_any(env, grasp_sensor_name)).float()
 
 
+def open_after_release(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float | BySize | PerShape,
+  threshold: float = 0.05,
+  velocity_threshold: float = 0.05,
+) -> torch.Tensor:
+  """Plan S8.1's RO: how far past J's threshold the jaw has opened, clip((θ_J - q) / θ_J, 0, 1)
+  -- 0 at the threshold for this object (`resolve`, per radius for a ball), 1 fully open (q = 0)
+  -- paid while the object is placed after a J-release, the same test M8's `retreat_height`
+  uses. (B,)
+
+  Why: DEP1's BALL-c let go at 0.27 rad, just past a 6 cm ball's 0.225 threshold, where the pads
+  sit ~2 mm off the sphere on each side; a noisy lift from there is more often charged by M8's
+  `pad_contact` than paid by its retreat. Opening moves the pads away from the ball, so the term
+  cannot knock it off the goal; it only makes the precondition for a clean lift cheap to learn.
+  Nothing is paid while held or before the place, so it cannot pull the jaw open in the carry.
+  """
+  placed = _placed_bool(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    threshold,
+    velocity_threshold,
+    support_sensor_name,
+    jaw_cfg,
+    jaw_open,
+  )
+  robot: Entity = env.scene[jaw_cfg.name]
+  q = robot.data.joint_pos[:, jaw_cfg.joint_ids][:, 0]
+  thr = resolve(env, jaw_open)
+  opened = ((thr - q) / thr).clamp(0.0, 1.0)
+  return opened * placed.float()
+
+
 def open_at_goal(
   env: ManagerBasedRlEnv,
   command_name: str,
@@ -678,6 +734,7 @@ def stack_alignment(
   grasp_sensor_name: str,
   support_sensor_name: str,
   near: float = 0.03,
+  widths: tuple[float, float, float, float | None, float] | None = None,
 ) -> torch.Tensor:
   """Plan S9's SA: how close the held cube is to the release condition ``OK``, as the product of
   one Gaussian per quantity with its bound as the width, prod_i exp(-(x_i / bound_i)^2), paid
@@ -686,17 +743,28 @@ def stack_alignment(
 
   The gradient towards ``OK`` beside the lock (ST-GA): with the lock alone the policy is paid
   nothing until it happens to satisfy all five at once and can open.
+
+  ``widths`` (dxy m, height m, tilt rad, yaw rad or None to drop it, speed m/s) replaces the
+  ``OK`` bounds as the Gaussians' widths: plan S9.1's SC-SAw (`pick_place.rewards.SAW_WIDTHS`), whose
+  let-gos sit far outside ``OK`` (S9 and DEP1 measured SA at ~0 per episode, L15).
   """
   state = stack_state(env, object_name, reference_name, command_name)
-  score = torch.exp(
-    -(
-      torch.square(state.dxy / OK_DXY)
-      + torch.square(state.height / OK_HEIGHT)
-      + torch.square(state.tilt / OK_TILT)
-      + torch.square(state.yaw / OK_YAW)
-      + torch.square(state.speed / OK_SPEED)
-    )
+  w_dxy, w_height, w_tilt, w_yaw, w_speed = widths or (
+    OK_DXY,
+    OK_HEIGHT,
+    OK_TILT,
+    OK_YAW,
+    OK_SPEED,
   )
+  exponent = (
+    torch.square(state.dxy / w_dxy)
+    + torch.square(state.height / w_height)
+    + torch.square(state.tilt / w_tilt)
+    + torch.square(state.speed / w_speed)
+  )
+  if w_yaw is not None:
+    exponent = exponent + torch.square(state.yaw / w_yaw)
+  score = torch.exp(-exponent)
   held = _grasped_bool(env, grasp_sensor_name) & _was_lifted_bool(
     env, grasp_sensor_name, support_sensor_name
   )

@@ -306,6 +306,39 @@ def _on_surface_bool(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
 #: Attribute on the env holding the `was_lifted` episode latch.
 _WAS_LIFTED = "_pp_was_lifted"
 
+#: The grasp sensor whose latches keep the plain attributes (`_WAS_LIFTED`, `_RELEASE`): the left
+#: gripper's (`GripperCfg.contact_sensor_name`), the one every single-arm task drives, and what the
+#: tests and `scripts/eval_pick_place.py` read. Plan S11's JOINT has a second arm with a grasp
+#: sensor -- and a cube -- of its own; its latches live under `latch_attr`'s suffixed names, so
+#: the two arms' lifts and releases are never confused.
+PRIMARY_GRASP_SENSOR = "left_pad_contact"
+#: Attribute on the env listing every latch attribute made, for the reset events.
+_LATCH_ATTRS = "_pp_latch_attrs"
+
+
+def latch_attr(base: str, grasp_sensor_name: str) -> str:
+  """The env attribute of latch ``base`` (`_WAS_LIFTED` or `_RELEASE`) for a grasp sensor: ``base``
+  itself for `PRIMARY_GRASP_SENSOR`, ``base:<sensor>`` for any other (plan S11)."""
+  if grasp_sensor_name == PRIMARY_GRASP_SENSOR:
+    return base
+  return f"{base}:{grasp_sensor_name}"
+
+
+def _remember_latch(env: ManagerBasedRlEnv, attr: str) -> None:
+  attrs = getattr(env, _LATCH_ATTRS, None)
+  if attrs is None:
+    attrs = set()
+    setattr(env, _LATCH_ATTRS, attrs)
+  attrs.add(attr)
+
+
+def latch_attrs(env: ManagerBasedRlEnv, base: str) -> list[str]:
+  """Every attribute of latch ``base`` this env has made so far, the plain one first if it is
+  there (`events.reset_was_lifted` / `reset_release_latch` clear them all)."""
+  attrs = getattr(env, _LATCH_ATTRS, set())
+  keyed = sorted(a for a in attrs if a.startswith(base + ":"))
+  return ([base] if hasattr(env, base) else []) + keyed
+
 
 def _was_lifted_bool(
   env: ManagerBasedRlEnv, grasp_sensor_name: str, support_sensor_name: str
@@ -329,10 +362,12 @@ def _was_lifted_bool(
   the goal is the same state whether it was carried or slid. The reward still separates the
   two *trajectories*, so the gradient is right; it is the value function that pays.
   """
-  latch = getattr(env, _WAS_LIFTED, None)
+  attr = latch_attr(_WAS_LIFTED, grasp_sensor_name)
+  latch = getattr(env, attr, None)
   if latch is None or latch.shape[0] != env.num_envs:
     latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    setattr(env, _WAS_LIFTED, latch)
+    setattr(env, attr, latch)
+    _remember_latch(env, attr)
   lifted = _grasped_bool(env, grasp_sensor_name) & ~_on_surface_bool(
     env, support_sensor_name
   )
@@ -371,6 +406,11 @@ class ReleaseLatch:
   ``rel_on_table``, ``rel_speed`` and ``rel_dwell`` are the surface contact, the object's
   speed and that dwell at the latest release, ``tilt`` its tilt then (`object_tilt`, plan S7-9).
   ``step`` is the env step of the last update.
+
+  Plan S10: ``yaw`` is the object's yaw error at the latest release, |yaw mod 90 deg| in rad
+  (0 = its faces aligned with the world's -- the table's and the box's -- axes; a cube only), for
+  BX's yaw grade; ``surface`` the surface the height is measured from, (entity, geom names), so
+  that every reader of one env's latch measures it from the same one (plan S10's box: its rim).
   """
 
   grasped: torch.Tensor
@@ -383,6 +423,8 @@ class ReleaseLatch:
   rel_on_table: torch.Tensor
   rel_speed: torch.Tensor
   rel_dwell: torch.Tensor
+  yaw: torch.Tensor | None = None
+  surface: tuple | None = None
   step: int = -1
   # Plan S7-9's PT: the object's tilt (`object_tilt`) at the latest release, taken with the rest.
   tilt: torch.Tensor | None = None
@@ -404,6 +446,7 @@ class ReleaseLatch:
   rel_ok: torch.Tensor | None = None
   pend_ok: torch.Tensor | None = None
   pend_tilt: torch.Tensor | None = None
+  pend_yaw: torch.Tensor | None = None
 
 
 def object_tilt(env: ManagerBasedRlEnv, object_name: str) -> torch.Tensor:
@@ -419,6 +462,34 @@ def object_tilt(env: ManagerBasedRlEnv, object_name: str) -> torch.Tensor:
     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
   )
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
+
+
+def yaw_error_mod_90(
+  quat_w: torch.Tensor, reference_quat_w: torch.Tensor | None = None
+) -> torch.Tensor:
+  """|yaw mod 90 deg| of a world orientation, rad in [0, pi/4]: how far a cube's faces are turned
+  off the world's axes (plan S10: the box sits at yaw 0 +/- 5 deg, unobserved, so alignment is
+  paid against the axes the actor does observe) -- or, given ``reference_quat_w``, off that
+  orientation's axes: |wrap_90(psi - psi_ref)| (plan S10.1: against the box, which stands at any
+  yaw). (B,)"""
+  _, _, yaw = euler_xyz_from_quat(quat_w)
+  if reference_quat_w is not None:
+    _, _, ref = euler_xyz_from_quat(reference_quat_w)
+    yaw = yaw - ref
+  quarter = torch.pi / 2
+  return torch.abs(yaw - quarter * torch.round(yaw / quarter))
+
+
+def yaw_reference_quat(
+  env: ManagerBasedRlEnv, command_name: str
+) -> torch.Tensor | None:
+  """The world orientation M6's yaw grade measures against: the entity the goal command names in
+  its cfg's ``yaw_reference`` (plan S10.1, `box.BoxGoalCommandCfg`), or None for the world's axes. (B, 4)"""
+  term = env.command_manager.get_term(command_name)
+  name = getattr(term.cfg, "yaw_reference", None)
+  if name is None:
+    return None
+  return env.scene[name].data.root_link_quat_w
 
 
 def _release_latch(
@@ -463,6 +534,10 @@ def _release_latch(
   the same way `SurfaceOffsetCommand` places its goal, so it follows a moving table. On a stack
   goal (plan S9: `EntityOffsetCommand` with ``stack_on_top``) it is the goal's own z -- the cube
   resting on the base -- and ``rel_ok`` records whether `stack.StackState.ok` held at the let-go.
+  Plan S10 passes the box's walls as ``surface_cfg`` (`events.surface_top_z` with named geoms), so the
+  height is the object's bottom above the rim; every reader must pass the same surface. A goal command
+  with a ``rest_centre_z()`` (plan §14's `place_pin.PinPlaceCommand`) gives the resting height itself: the pin's
+  centre over its lowest point in its current pose, standing or lying.
 
   M7's set-down (plan S7-2): a *touchdown* is the first held-on-surface update after the held
   object was lifted `SET_DOWN_CLEARANCE` clear. The dwell counts only after a touchdown within
@@ -480,7 +555,12 @@ def _release_latch(
       jaw_open if isinstance(jaw_open, (PerShape, BySize)) else float(jaw_open),
     )
   )
-  latch = getattr(env, _RELEASE, None)
+  surface = (
+    surface_cfg.name,
+    None if surface_cfg.geom_names is None else tuple(surface_cfg.geom_names),
+  )
+  attr = latch_attr(_RELEASE, grasp_sensor_name)
+  latch = getattr(env, attr, None)
   if latch is None or latch.released.shape[0] != env.num_envs:
     no = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     zero = torch.zeros(env.num_envs, device=env.device)
@@ -496,6 +576,8 @@ def _release_latch(
       rel_on_table=no.clone(),
       rel_speed=zero.clone(),
       rel_dwell=count.clone(),
+      yaw=zero.clone(),
+      surface=surface,
       jaw=jaw,
       rel_ok=no.clone(),
       pend_ok=no.clone(),
@@ -508,11 +590,19 @@ def _release_latch(
       latch.pend_on_table, latch.pend_speed = no.clone(), zero.clone()
       latch.pend_dwell = count.clone()
       latch.pend_tilt = zero.clone()
-    setattr(env, _RELEASE, latch)
+      latch.pend_yaw = zero.clone()
+    setattr(env, attr, latch)
+    _remember_latch(env, attr)
   if latch.jaw != jaw:
     raise ValueError(
       f"the release latch was built with jaw={latch.jaw}, read with jaw={jaw}: every "
       "reader of one env's latch must define the release the same way"
+    )
+  if latch.surface != surface:
+    raise ValueError(
+      f"the release latch was built with surface={latch.surface}, read with "
+      f"surface={surface}: every reader of one env's latch must measure the release height "
+      "from the same surface (plan S10: the box's rim)"
     )
   if latch.step == env.common_step_counter:
     return latch
@@ -524,7 +614,13 @@ def _release_latch(
   goal = env.command_manager.get_term(command_name).command
   pos = obj.data.root_link_pos_w
   reference = stack_command_reference(env, command_name)
-  if reference is None:
+  rest = getattr(env.command_manager.get_term(command_name), "rest_centre_z", None)
+  if reference is None and rest is not None:
+    # Plan §14's pin (`place_pin.PinPlaceCommand`): its centre's resting height in its current pose, so the
+    # height is the lowest point's over the table, standing or lying.
+    rest_z = rest()
+    ok = torch.zeros_like(let_go)
+  elif reference is None:
     rest_z = surface_top_z(env, surface_cfg) + object_half_height(env, object_name)
     ok = torch.zeros_like(let_go)
   else:
@@ -535,9 +631,12 @@ def _release_latch(
   on_table = _on_surface_bool(env, support_sensor_name)
   height = pos[:, 2] - rest_z
   tilt = object_tilt(env, object_name)
+  yaw = yaw_error_mod_90(
+    obj.data.root_link_quat_w, yaw_reference_quat(env, command_name)
+  )
   if jaw is None:
     opened = let_go
-    now = (dxy, height, on_table, speed, latch.dwell, ok, tilt)
+    now = (dxy, height, on_table, speed, latch.dwell, ok, tilt, yaw)
   else:
     assert jaw_cfg is not None and jaw_open is not None
     # The pads' let-go is held until the jaw opens; a jaw that opens with none pending (it
@@ -552,6 +651,7 @@ def _release_latch(
     latch.pend_dwell = w(latch.dwell, latch.pend_dwell)
     latch.pend_ok = w(ok, latch.pend_ok)
     latch.pend_tilt = w(tilt, latch.pend_tilt)
+    latch.pend_yaw = w(yaw, latch.pend_yaw)
     latch.pend = latch.pend | let_go
     released_now = _jaw_open_bool(env, jaw_cfg, jaw_open) & ~grasped
     opened = latch.jaw_closed & released_now & was_lifted
@@ -564,6 +664,7 @@ def _release_latch(
       torch.where(p, latch.pend_dwell, latch.dwell),
       torch.where(p, latch.pend_ok, ok),
       torch.where(p, latch.pend_tilt, tilt),
+      torch.where(p, latch.pend_yaw, yaw),
     )
     latch.pend = latch.pend & ~opened
     latch.jaw_closed = ~released_now
@@ -574,6 +675,7 @@ def _release_latch(
   latch.rel_dwell = torch.where(opened, now[4], latch.rel_dwell)
   latch.rel_ok = torch.where(opened, now[5], latch.rel_ok)
   latch.tilt = torch.where(opened, now[6], latch.tilt)
+  latch.yaw = torch.where(opened, now[7], latch.yaw)
   latch.released |= opened
   latch.grasped = grasped
   # M7's dwell, after the release has been recorded with the count up to the last update.

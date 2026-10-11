@@ -533,6 +533,20 @@ BALL_JAW_OPEN_BY_RADIUS = BySize(
 )
 #: ... and at the nominal radius (BALL, BALL-EQ, the eval's prints and tests).
 BALL_JAW_OPEN = 0.225
+#: J's threshold for plan §15's Ø 48-52 mm ball (``SHAPE=ball50`` / ``ball50-dr``), its touch angle minus 0.05 by the same
+#: rule, per radius. Plan §15 step 0 item 3's bench (`scripts/gripper_bench.py --stimulus touch --shape ball50 --pose
+#: topdown --gains G20`, `../results/S15-ball-seat/step0/bench/ball50-topdown.json`): a Ø 50 ball first touched at 0.387 rad
+#: with the pads at its centre (0.376 / 0.383 / 0.394 at -10 / -5 / +5 mm), held at 0.397-0.424, ~48 N per pad; Ø 48 / 52
+#: by S8's 0.012 rad per mm of diameter (touch 0.411 / 0.363).
+BALL50_JAW_OPEN_BY_RADIUS = BySize(
+  radii=(0.024, 0.025, 0.026), values=(0.361, 0.337, 0.313)
+)
+#: J's threshold for plan §12's cross pin, rad: its touch angle minus 0.05 (the cube's and the ball's rule). The
+#: gripper bench (`scripts/gripper_bench.py --stimulus touch --shape pin --pose topdown`, G20, plan §12 step 0 item 2,
+#: `../results/S12-insert/step0/bench/`) first touches the pin at 0.546-0.563 rad with its plate ends to the pads
+#: (32 mm, pad midpoint 0-35 mm over its centre; held at 0.554-0.572, ~31 N per pad) and at 0.587 turned 45 deg
+#: (28.3 mm across the sharp sim plates; held at 0.601). 0.50 is below every touch.
+PIN_JAW_OPEN = 0.50
 M8_CLEAR_HEIGHT = 0.05  # m (plan S7-4 revision 2: was 8 cm)
 M8_RETREAT_WEIGHT = 2.0
 M8_CONTACT_WEIGHT = -1.0
@@ -575,6 +589,22 @@ def _m8(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
   latched.pop("threshold")
   rewards["pad_contact"] = RewardTermCfg(
     func=mdp.pad_contact_after_release, weight=M8_CONTACT_WEIGHT, params=latched
+  )
+
+
+# -- S8.1: RO, open the jaw after the release -------------------------------------------------
+#
+# `mdp.open_after_release` pays clip((θ_J(r) - q) / θ_J(r), 0, 1) while the ball is placed after a
+# J-release: 0 at J's threshold for its radius, 1 fully open. Weight 1 per step: an eighth of
+# `placed` (8 x q), half of M8's full retreat (2), so lifting clear still pays most (plan S8.1).
+RO_WEIGHT = 1.0
+
+
+def _ro(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["open_after_release"] = RewardTermCfg(
+    func=mdp.open_after_release,
+    weight=RO_WEIGHT,
+    params={**_gated(ctx), **_jaw_params(ctx)},
   )
 
 
@@ -819,7 +849,75 @@ def _pt(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
     )
 
 
+# -- S11: YG, the yaw grade on the let-go (plan S11's L-T: A's yaw) -----------------------------
+#
+# Plan S11 (Siwei 2026-10-02): the left arm puts cube A down at T for the right to stack on, so A's
+# yaw matters to the right (its SA pays alignment against A). L-T grades it as S10's BX graded the
+# cube into the box: M6's graded part x G(|yaw mod 90 deg|, 10 deg) at the let-go
+# (`observations.yaw_error_mod_90`, the release latch's ``yaw``). In S10 it put 50-73 % of let-gos
+# within 10 deg at no cost in success (S10 report §7).
+YG_YAW_STD = math.radians(10.0)
+
+
+def _yg(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  for name in _graded_terms(rewards, "YG"):
+    term = rewards[name]
+    rewards[name] = RewardTermCfg(
+      func=term.func, weight=term.weight, params={**term.params, "yaw_std": YG_YAW_STD}
+    )
+
+
+# -- S9.1: SAW, SA with widths a let-go can reach (plan S9.1's SC-SAw) ---------------------------
+#
+# SA was dead (L15): it paid 0.0000 per episode in DEP1 STSA-c's eval sums and ~2e-5 in R-ST's
+# training logs, because its Gaussians have the `OK` bounds as widths and the policies let go far
+# outside them. SAW widens them and drops the yaw (the base's yaw is not observed in SC-SAw). The
+# widths and the weight are plan S9.1 step 0 item 4's, measured on DEP1 STSA-c s1 @ 3000 at T11W
+# (`results/S9.1-stack/step0/saw_diag.py`, 16 episodes): it holds the cube within 3 cm of the goal
+# ~9 steps per episode, 2.5 cm up, tilted 22 deg, at 12 cm/s, 1.9 cm off. The plan's first widths
+# (2 cm, 2 cm, 20 deg, 0.10 m/s) paid 0.12 per episode there -- weight 20 for 1 % of the return,
+# past the L5 cap -- so, as the plan says, widened again: 3 cm (xy), 3 cm (height), 30 deg (tilt),
+# 0.15 m/s (speed) pay 0.87 per episode at weight 1, and weight 6 is ~2 % of that policy's 20 s
+# eval return (251). A hold over the base still earns less per step than the placed state (the
+# scripted stack: 11.96 + 6 < 24.66; `tests/test_pick_place_s91.py`).
+SAW_WIDTHS = (0.03, 0.03, math.radians(30.0), None, 0.15)
+SAW_WEIGHT = 6.0
+
+
+def _saw(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  _sa(rewards, ctx)
+  term = rewards["stack_align"]
+  rewards["stack_align"] = RewardTermCfg(
+    func=term.func,
+    weight=SAW_WEIGHT,
+    params={**term.params, "widths": SAW_WIDTHS},
+  )
+
+
+# -- Plan §14: GC, the jaw's closure at the grasp point (code PS-SG) --------------------------------
+#
+# §12.1's scratch runs found the 32 mm pin's grasp late or never: the jaw closed to 0.24 of the 0.55 rad the pin
+# needs (R-I, §13.1). GC pays clip(q_jaw / q_touch, 0, 1) while the tool point is at the pin's grasp point and the
+# pin is not yet grasped or lifted (`mdp.grasp_closure`). The term is built here with the jaw and the sensors; the
+# pin's grasp point and touch angles come from ``GOAL=place`` (`place_pin.apply_place_goal`), which it needs.
+GC_WEIGHT = 1.0
+
+
+def _gc(rewards: dict[str, RewardTermCfg], ctx: RewardContext) -> None:
+  rewards["grasp_closure"] = RewardTermCfg(
+    func=mdp.grasp_closure,
+    weight=GC_WEIGHT,
+    params={
+      "jaw_cfg": ctx.jaw,
+      "asset_cfg": ctx.tcp,
+      "grasp_sensor_name": ctx.grasp_sensor,
+      "support_sensor_name": SUPPORT_SENSOR,
+    },
+  )
+
+
 _MODULES = {
+  "GC": _gc,
   "M1": _m1,
   "M2": _m2,
   "M3": _m3,
@@ -837,6 +935,9 @@ _MODULES = {
   "SA": _sa,
   "PXY": _pxy,
   "PT": _pt,
+  "YG": _yg,
+  "SAW": _saw,
+  "RO": _ro,
 }
 
 
@@ -849,7 +950,7 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("M7 pays M6's grade for a set-down only; it needs M6 before it")
   if "J" in modules and "M1" not in modules[: modules.index("J")]:
     raise ValueError("J redefines M1's release and placed; it needs M1 before it")
-  for name, needs in (("M8", ("J",)), ("S", ("M6", "J"))):
+  for name, needs in (("M8", ("J",)), ("S", ("M6", "J")), ("RO", ("J", "M8"))):
     if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
       raise ValueError(f"{name} needs {' and '.join(needs)} before it")
   if "M7" in modules and "S" in modules:
@@ -864,9 +965,12 @@ def _s52_arm(modules: tuple[str, ...]):
     raise ValueError("EQ is a term beside M1's; it needs M1 in the arm")
   if "RG" in modules and "M6" not in modules[: modules.index("RG")]:
     raise ValueError("RG pays M6's grade for an OK let-go only; it needs M6 before it")
-  if "SA" in modules and "M1" not in modules:
-    raise ValueError("SA is a term beside M1's; it needs M1 in the arm")
-  for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",))):
+  for name in ("SA", "SAW"):
+    if name in modules and "M1" not in modules:
+      raise ValueError(f"{name} is a term beside M1's; it needs M1 in the arm")
+  if "SA" in modules and "SAW" in modules:
+    raise ValueError("SAW is SA with other widths; pick one")
+  for name, needs in (("PXY", ("M2", "M6")), ("PT", ("M6",)), ("YG", ("M6",))):
     if name in modules and not all(n in modules[: modules.index(name)] for n in needs):
       raise ValueError(f"{name} needs {' and '.join(needs)} before it")
 
@@ -934,7 +1038,33 @@ S79_ARMS = {
   f"{S52_BASE}+M1+M2+M3+M6+J+M8+PT": ("M1", "M2", "M3", "M6", "J", "M8", "PT"),
 }
 REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S79_ARMS.items()})
+#: The S11 arm (plan S11's L-T): S7-4's RCTP + YG, A's yaw graded at the let-go. R-ST / R-ST-W run
+#: S9's RCTP + SA on a stack goal at T (`TARGET=T11*`); JOINT builds its own (`pick_place/bimanual.py`).
+S11_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+YG": ("M1", "M2", "M3", "M6", "J", "M8", "YG"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S11_ARMS.items()})
+#: The S9.1 arm (plan S9.1's SC-SAw): S7-4's RCTP + SAW. SC and SC-FT run RCTP itself on the stack goal
+#: at T; SC-Y runs S11's RCTP + YG there with the base's yaw observed (`BASE_OBS=pose`).
+S91_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+SAW": ("M1", "M2", "M3", "M6", "J", "M8", "SAW"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S91_ARMS.items()})
+#: The §14 arm (plan §14's PS-SG): S7-4's RCTP + GC. Every other §14 code runs RCTP itself on ``GOAL=place``.
+S14_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+GC": ("M1", "M2", "M3", "M6", "J", "M8", "GC"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S14_ARMS.items()})
+#: Arms with GC: they need plan §14's ``GOAL=place``.
+GC_ARMS = frozenset(S14_ARMS)
+#: The S8.1 arm (plan S8.1's WB-RO): S7-4's RCTP + RO. WB-R, WB-JW, WB-S and WB-L run RCTP itself on
+#: the ball (`SHAPE=ball-dr`) on WC.
+S81_ARMS = {
+  f"{S52_BASE}+M1+M2+M3+M6+J+M8+RO": ("M1", "M2", "M3", "M6", "J", "M8", "RO"),
+}
+REWARD_VARIANTS.update({name: _s52_arm(mods) for name, mods in S81_ARMS.items()})
 _MODULE_ARMS = {
+  **S14_ARMS,
   **S52_ARMS,
   **S7_ARMS,
   **S72_ARMS,
@@ -943,9 +1073,16 @@ _MODULE_ARMS = {
   **S8_ARMS,
   **S9_ARMS,
   **S79_ARMS,
+  **S11_ARMS,
+  **S91_ARMS,
+  **S81_ARMS,
 }
-#: Arms whose terms read the base cube (RG, SA): they need plan S9's `GOAL=stack`.
-STACK_ONLY_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if {"RG", "SA"} & set(m))
+#: Arms whose terms read the base cube (RG, SA, SAW): they need plan S9's `GOAL=stack`.
+STACK_ONLY_ARMS = frozenset(
+  n for n, m in _MODULE_ARMS.items() if {"RG", "SA", "SAW"} & set(m)
+)
+#: Arms that grade the let-go's yaw (YG): on a stack goal, against the base (plan S9.1's SC-Y).
+YAW_GRADED_ARMS = frozenset(n for n, m in _MODULE_ARMS.items() if "YG" in m)
 
 #: Arms whose release is the jaw opening (plan S7-4's J): the eval and the scripts read it.
 JAW_RELEASE = frozenset(n for n, m in _MODULE_ARMS.items() if "J" in m)

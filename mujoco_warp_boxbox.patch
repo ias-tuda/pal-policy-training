@@ -1,0 +1,22 @@
+--- a/mujoco_warp/_src/collision_primitive_core.py
++++ b/mujoco_warp/_src/collision_primitive_core.py
+@@ -23,6 +23,10 @@
+ from mujoco_warp._src.math import safe_div
+ from mujoco_warp._src.types import MJ_MAXVAL
+ from mujoco_warp._src.types import MJ_MINVAL
++
++# float32: an edge-edge axis must beat the best face axis by this much (m) to be taken, or a box resting on a
++# box (an edge x edge axis that is the face normal, at the same ~0 separation) takes the edge branch by rounding
++BOX_BOX_EDGE_TOL = wp.constant(1.0e-6)
+ 
+ wp.set_module_options({"enable_backward": False})
+ 
+@@ -693,7 +697,7 @@
+         return contact_dist, contact_pos, contact_normals
+ 
+       # Track minimum separation and which edge-edge pair it occurs on
+-      if c3 < separation * (1.0 - 1e-12):
++      if c3 < separation - BOX_BOX_EDGE_TOL:
+         separation = c3
+         # Determine which corners/edges are closest
+         cle1 = 0

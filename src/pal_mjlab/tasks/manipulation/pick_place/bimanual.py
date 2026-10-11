@@ -1,0 +1,567 @@
+"""Plan S11's JOINT (`ARMS=both`): one policy drives both arms -- the left places the blue cube A
+at T, the right stacks the red cube B on it (`pick-place-v1-objects-plan.md`, *S11*, BI-J / BI-JM).
+
+The cfg is built from the parts the one-arm codes use, so that a JOINT run differs from SEQ's L-T
+and R-ST by the coupling and nothing else:
+
+* the **left half** is L-T exactly -- `make_pick_place_env_cfg` with `TARGET=T11`, `TRACKER=split`,
+  RCTP + YG, PQ, AH10 -- built on the two-arm robot (`robots.kangaroo_grippers_both_arms`: 16-D
+  action, both arms at W2's scales, T on both, the right home mirrored), so the action term, the
+  regularisers, the effort hinge and the trunk penalty already span both arms;
+* the **right half** is R-ST's reward arm (RCTP + SA) built for the right gripper and renamed onto
+  cube B and its goal on top of A (`COMMAND_B`, an `EntityOffsetCommand` that follows A), with the
+  right's own sensors, AH10 and PQ pair;
+* the **couplings** (the plan's three): the right's stack terms pay only while A is placed
+  (`mdp.when_base_placed`); the left's hand-off runs inside training (`HANDOFF_TRAIN=left`,
+  `mdp.handoff`); the arms are kept apart (HH: `mdp.arm_arm_clearance_penalty` and a contact
+  sensor between the two forearm-to-fingertip subtrees).
+
+The actor is 73-D: both arms' joint positions (16) and velocities (14), the last action (16), both
+TCPs' positions and orientations (14), A's and B's tracked positions and yaws (10) and T (3). The
+critic adds both grasps, both PQ pairs, "A placed" and whether the left is handed off.
+
+``START=mixed`` (BI-JM): half the episodes begin with A already placed at T -- +/- 1 cm, yaw +/- 20
+deg, the left's ``was_lifted`` and release latched at that pose -- and the left arm handed off at
+home, so the stack is practised from the first iteration.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import inspect
+import math
+import re
+
+import torch
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
+from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
+from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
+
+from pal_mjlab.tasks.manipulation import mdp, scene
+from pal_mjlab.tasks.manipulation.mdp.handoff import (
+  START_HOME,
+  HandoffArmCfg,
+  HandoffTriggerCfg,
+  with_handoff,
+)
+from pal_mjlab.tasks.manipulation.pick_place.arm_table import (
+  ArmTableCfg,
+  apply_arm_table,
+)
+from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
+  BASE_RGBA,
+  BASELINES,
+  EFFORT_BOUNDS,
+  GOAL_THRESHOLD,
+  ROBOT_TARGETS,
+  SPAWN_BOXES,
+  Baseline,
+  EffortBound,
+  SpawnBox,
+  _object_pose_range,
+  make_pick_place_env_cfg,
+)
+from pal_mjlab.tasks.manipulation.pick_place.rewards import (
+  BASE_OBJECT,
+  JAW_OPEN,
+  RewardContext,
+  build_rewards,
+)
+from pal_mjlab.tasks.manipulation.robots import kangaroo_grippers_both_arms
+from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
+  COMMAND,
+  DECIMATION,
+  LATENCY_MODELS,
+  OBJECT,
+  ROBOT,
+  SUPPORT_SENSOR,
+  TABLE,
+  LatencyModelCfg,
+  make_grasp_sensor,
+  make_hand_ground_sensor,
+  make_hand_surface_sensor,
+)
+
+#: Cube B, the right's: its entity, its goal on top of A, and its contact with the table.
+CUBE_B = "cube_b"
+COMMAND_B = "goal_b"
+SUPPORT_SENSOR_B = "cube_b_table_contact"
+#: The arm-arm contact sensor (HH).
+ARM_ARM_SENSOR = "arm_arm_contact"
+#: The colours: A blue (the base), B red (the carried one), as S9's two cubes.
+CUBE_B_RGBA = (0.8, 0.2, 0.2, 1.0)
+
+#: The two halves' reward arms: L-T's and R-ST's (`pick_place.rewards`).
+LEFT_REWARD = "R-C-strict+M1+M2+M3+M6+J+M8+YG"
+RIGHT_REWARD = "R-C-strict+M1+M2+M3+M6+J+M8+SA"
+#: The right's terms that wait for A (coupling 1).
+GATED_RIGHT = ("goal", "goal_near", "release", "placed", "stack_align", "retreat")
+#: The terms both halves would carry: kept once, over both arms (the left's ctx names them).
+SHARED = ("action_rate_l2", "joint_pos_limits", "joint_vel_hinge")
+
+#: B's spawn box: W2's mirror image through y = 0 (the right's own W2).
+W2_MIRROR = SpawnBox(
+  x=SPAWN_BOXES["W2"].x,
+  y=(-SPAWN_BOXES["W2"].y[1], -SPAWN_BOXES["W2"].y[0]),
+  yaw=SPAWN_BOXES["W2"].yaw,
+  widen_at_dr_scene=False,
+)
+
+#: HH (coupling 3): the clearance penalty starts `HH_MARGIN` before contact and reaches 1 there,
+#: weight `HH_CLEARANCE_WEIGHT`; contact above `HH_CONTACT_FORCE` costs `HH_CONTACT_WEIGHT` per step.
+HH_MARGIN = 0.05
+HH_CLEARANCE_WEIGHT = -5.0
+HH_CONTACT_WEIGHT = -10.0
+HH_CONTACT_FORCE = 1.0
+
+#: The left's hand-off in training: the eval's trigger, or this far into the episode (s).
+LEFT_HANDOFF_TIMEOUT_S = 9.0
+#: BI-JM's placed-A start: the share of episodes, A about T (+/- m, the T draw's own +/- 1 cm keeps
+#: |A - T| inside the 2.5 cm "at T"), its yaw (+/- rad; the plan's placeholder before step 0's
+#: L-T measurement).
+MIXED_SHARE = 0.5
+MIXED_A_HALF_XY = 0.01
+MIXED_A_YAW = math.radians(20.0)
+
+#: The JOINT episode, s (plan: 15 s until the overlapped script sets it).
+EPISODE_S = 15.0
+#: ``START`` names.
+STARTS = ("scratch", "mixed")
+
+
+def _rename(value, mapping: dict[str, str]):
+  """A reward parameter with its entity / command / sensor names moved onto the right half's."""
+  if isinstance(value, str):
+    return mapping.get(value, value)
+  if isinstance(value, SceneEntityCfg) and value.name in mapping:
+    return dataclasses.replace(value, name=mapping[value.name])
+  return value
+
+
+def _right_rewards(robot, right) -> dict[str, RewardTermCfg]:
+  """R-ST's reward arm for the right gripper on cube B, its stack goal on A. Renamed, not rebuilt:
+  the same builders as every one-arm arm, so the halves cannot drift apart."""
+  ctx = RewardContext(
+    tcp=SceneEntityCfg(ROBOT, site_names=(right.tcp_site,)),
+    action_joints=SceneEntityCfg(
+      ROBOT, joint_names=(r"arm_right_[1-7]_joint", re.escape(right.finger_joint))
+    ),
+    grasp_sensor=right.contact_sensor_name,
+    surface_sensor=right.surface_sensor_name,
+    threshold=GOAL_THRESHOLD,
+    jaw=SceneEntityCfg(ROBOT, joint_names=(re.escape(right.finger_joint),)),
+    jaw_open=JAW_OPEN,
+    pads=SceneEntityCfg(ROBOT, site_names=right.pad_sites),
+  )
+  mapping = {
+    OBJECT: CUBE_B,
+    BASE_OBJECT: OBJECT,
+    COMMAND: COMMAND_B,
+    SUPPORT_SENSOR: SUPPORT_SENSOR_B,
+  }
+  out = {}
+  for name, term in build_rewards(RIGHT_REWARD, ctx).items():
+    if name in SHARED:
+      continue
+    params = {k: _rename(v, mapping) for k, v in term.params.items()}
+    out[name] = RewardTermCfg(func=term.func, weight=term.weight, params=params)
+  return out
+
+
+def _gate_params(left_placed: RewardTermCfg) -> dict:
+  """`mdp.when_base_placed`'s ``gate_*`` parameters: the left's "placed" predicate (L-T's J and
+  `was_lifted`, at T within the goal tolerance, still)."""
+  p = left_placed.params
+  return {
+    "gate_command_name": p["command_name"],
+    "gate_object_name": p["object_name"],
+    "gate_grasp_sensor_name": p["grasp_sensor_name"],
+    "gate_support_sensor_name": p["support_sensor_name"],
+    "gate_jaw_cfg": p["jaw_cfg"],
+    "gate_jaw_open": p["jaw_open"],
+    "gate_threshold": p["threshold"],
+    "gate_velocity_threshold": p.get("velocity_threshold", 0.05),
+  }
+
+
+def _pq_terms(placed: RewardTermCfg, prefix: str) -> dict[str, ObservationTermCfg]:
+  wanted = inspect.signature(mdp.release_quality).parameters
+  params = {k: v for k, v in placed.params.items() if k in wanted}
+  return {
+    f"{prefix}release_grade": ObservationTermCfg(func=mdp.release_grade, params=params),
+    f"{prefix}release_latched": ObservationTermCfg(
+      func=mdp.release_latched, params=params
+    ),
+  }
+
+
+def _support_sensor(object_name: str, name: str) -> ContactSensorCfg:
+  return ContactSensorCfg(
+    name=name,
+    primary=ContactMatch(mode="body", pattern=object_name, entity=object_name),
+    secondary=ContactMatch(mode="body", pattern=TABLE, entity=TABLE),
+    fields=("found",),
+    reduce="none",
+    num_slots=1,
+    history_length=1,
+  )
+
+
+def _arm_arm_sensor() -> ContactSensorCfg:
+  """The left arm from its forearm (link 4) to the fingertips against the right's, the whole
+  control step, the strongest contact (HH's contact term)."""
+  return ContactSensorCfg(
+    name=ARM_ARM_SENSOR,
+    primary=ContactMatch(mode="subtree", pattern="arm_left_4_link", entity=ROBOT),
+    secondary=ContactMatch(mode="subtree", pattern="arm_right_4_link", entity=ROBOT),
+    fields=("found", "force"),
+    reduce="maxforce",
+    num_slots=1,
+    history_length=DECIMATION,
+  )
+
+
+def place_a_at_t(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  share: float,
+  half_xy: float,
+  yaw: float,
+  arm: str,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float,
+) -> None:
+  """Reset event, BI-JM's mixed start: in a ``share`` of ``env_ids`` put cube A down at T (+/-
+  ``half_xy``, yaw +/- ``yaw``, the robot frame), latch the left's `was_lifted` and its release
+  there (the grade of a let-go at that pose), and start the left arm handed off at home (the
+  action term reads `handoff.START_HOME` at its reset, which runs after this event). The release
+  latch's parameters are the left's ``placed`` term's, flat, so the event manager resolves them."""
+  from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+  from pal_mjlab.tasks.manipulation.mdp.observations import (
+    _WAS_LIFTED,
+    _release_latch,
+    _remember_latch,
+    latch_attr,
+    yaw_error_mod_90,
+  )
+  from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
+
+  n = len(env_ids)
+  device = env.device
+  pick = torch.rand(n, device=device) < share
+  start = getattr(env, START_HOME, None)
+  if start is None:
+    start = {}
+    setattr(env, START_HOME, start)
+  if arm not in start:
+    start[arm] = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+  start[arm][env_ids] = pick
+  ids = env_ids[pick]
+  if len(ids) == 0:
+    return
+  m = len(ids)
+  tx, ty = ROBOT_TARGETS["T11"].xy
+  origin = env.scene.env_origins[ids, :2]
+  xy = (
+    origin
+    + torch.tensor([tx, ty], device=device)
+    + sample_uniform(-half_xy, half_xy, (m, 2), device=device)
+  )
+  top = surface_top_z(env, surface_cfg)[ids]
+  z = top + object_half_height(env, object_name, ids)
+  zeros = torch.zeros(m, device=device)
+  quat = quat_from_euler_xyz(
+    zeros, zeros, sample_uniform(-yaw, yaw, (m,), device=device)
+  )
+  cube = env.scene[object_name]
+  cube.write_root_link_pose_to_sim(
+    torch.cat([xy, z.unsqueeze(-1), quat], dim=-1), env_ids=ids
+  )
+  cube.write_root_link_velocity_to_sim(torch.zeros(m, 6, device=device), env_ids=ids)
+
+  attr = latch_attr(_WAS_LIFTED, grasp_sensor_name)
+  lifted = getattr(env, attr, None)
+  if lifted is None:
+    lifted = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+    setattr(env, attr, lifted)
+    _remember_latch(env, attr)
+  lifted[ids] = True
+  latch = _release_latch(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
+  # Let go where it stands: on the table, still, 0 high; dxy against T's centre (the drawn T is
+  # unknown until the command resamples, after the reset events).
+  latch.released[ids] = True
+  latch.grasped[ids] = False
+  latch.dxy[ids] = torch.norm(
+    xy - origin - torch.tensor([tx, ty], device=device), dim=-1
+  )
+  latch.height[ids] = 0.0
+  latch.rel_on_table[ids] = True
+  latch.rel_speed[ids] = 0.0
+  latch.yaw[ids] = yaw_error_mod_90(quat)
+  if latch.jaw is not None:
+    latch.jaw_closed[ids] = False
+    latch.pend[ids] = False
+
+
+def make_bimanual_env_cfg(
+  gains: str = "G20",
+  effort: EffortBound = EFFORT_BOUNDS["CTP"],
+  dr_level: str = "DR-scene",
+  latency: LatencyModelCfg = LATENCY_MODELS["FP+JS"],
+  baseline: Baseline = BASELINES["B"],
+  episode_length_s: float = EPISODE_S,
+  arm_table: ArmTableCfg | None = None,
+  handoff_train: bool = True,
+  start: str = "scratch",
+  critic_release: bool = True,
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Plan S11's JOINT cfg (BI-J: ``start="scratch"``, BI-JM: ``"mixed"``); see the module docstring.
+  ``handoff_train`` is ``HANDOFF_TRAIN=left``: the left's up-out-home hand-off on its own trigger in
+  training (the eval starts the right's); off, the controller is there for the eval to start."""
+  if start not in STARTS:
+    raise ValueError(f"unknown start {start!r}; have {STARTS}")
+  if not critic_release:
+    raise ValueError("JOINT's critic carries both PQ pairs (BS11); CRITIC_OBS=q")
+  robot = kangaroo_grippers_both_arms(gains, arm_effort_scale=effort.effort_scale)
+  left, right = robot.gripper("left"), robot.gripper("right")
+  cfg = make_pick_place_env_cfg(
+    robot,
+    gripper_name="left",
+    spawn=SPAWN_BOXES["W2"],
+    dr=dr_level,
+    reward=LEFT_REWARD,
+    play=False,
+    baseline=baseline,
+    effort=effort,
+    latency=latency,
+    episode_length_s=episode_length_s,
+    stack_speed=True,
+    arm_table=arm_table,
+    critic_release=True,
+    robot_target=ROBOT_TARGETS["T11"],
+    tracker="split",
+  )
+
+  # -- Cube B: entity, spawn (mirror(W2), table-relative like W2), DR, sensors, goal. ----------
+  cfg.scene.entities = {
+    **cfg.scene.entities,
+    OBJECT: scene.get_cube_cfg(name=OBJECT, rgba=BASE_RGBA),
+    CUBE_B: scene.get_cube_cfg(name=CUBE_B, rgba=CUBE_B_RGBA),
+  }
+  events = {}
+  for name, term in cfg.events.items():
+    events[name] = term
+    if name == "reset_objects":
+      events["reset_cube_b"] = EventTermCfg(
+        func=mdp.reset_objects_on_surface,
+        mode="reset",
+        params={
+          "asset_cfgs": [SceneEntityCfg(CUBE_B)],
+          "surface_cfg": SceneEntityCfg(TABLE),
+          "pose_range": _object_pose_range(W2_MIRROR),
+        },
+      )
+  cfg.events = events
+  for name in ("object_friction", "object_mass"):
+    term = cfg.events.get(name)
+    if term is None:
+      continue
+    asset = term.params["asset_cfg"]
+    cfg.events[f"cube_b_{name.split('_')[1]}"] = dataclasses.replace(
+      term,
+      params={
+        **term.params,
+        "asset_cfg": SceneEntityCfg(
+          CUBE_B,
+          geom_names=(f"{CUBE_B}_geom",) if asset.geom_names else None,
+          body_names=(CUBE_B,) if asset.body_names else None,
+        ),
+      },
+    )
+  cfg.events["reset_tracker_bias"].params["keys"] = (OBJECT, CUBE_B)
+  cfg.scene.sensors = (
+    *cfg.scene.sensors,
+    make_grasp_sensor(right, CUBE_B),
+    _support_sensor(CUBE_B, SUPPORT_SENSOR_B),
+    make_hand_ground_sensor(right),
+    make_hand_surface_sensor(right),
+    _arm_arm_sensor(),
+  )
+  cfg.commands[COMMAND_B] = mdp.EntityOffsetCommandCfg(
+    entity_name=CUBE_B,
+    reference_name=OBJECT,
+    stack_on_top=True,
+    resampling_time_range=(1e9, 1e9),
+    success_threshold=GOAL_THRESHOLD,
+    debug_vis=True,
+  )
+  cfg.terminations["cube_b_dropped"] = dataclasses.replace(
+    cfg.terminations["object_dropped"],
+    params={**cfg.terminations["object_dropped"].params, "entity_name": CUBE_B},
+  )
+  if "out_of_reach" in cfg.terminations:
+    reach = cfg.terminations["out_of_reach"]
+    reach.params["entity_names"] = (OBJECT, CUBE_B)
+
+  # -- Observations: the 73-D actor and its critic. -------------------------------------------
+  actor = cfg.observations["actor"]
+  critic = cfg.observations["critic"]
+  a = actor.terms
+  tcp_r = SceneEntityCfg(ROBOT, site_names=(right.tcp_site,))
+  b_pos = dataclasses.replace(
+    a["object_pos"],
+    params={**a["object_pos"].params, "object_name": CUBE_B, "bias_key": CUBE_B},
+  )
+  b_yaw = dataclasses.replace(
+    a["object_yaw"], params={**a["object_yaw"].params, "object_name": CUBE_B}
+  )
+  order = (
+    "joint_pos",
+    "joint_vel",
+    "actions",
+    "tcp_pos",
+    "tcp_quat",
+    "tcp_pos_right",
+    "tcp_quat_right",
+    "object_pos",
+    "object_yaw",
+    "object_b_pos",
+    "object_b_yaw",
+    "target_pos",
+  )
+  extra = {
+    "tcp_pos_right": dataclasses.replace(a["tcp_pos"], params={"asset_cfg": tcp_r}),
+    "tcp_quat_right": dataclasses.replace(a["tcp_quat"], params={"asset_cfg": tcp_r}),
+    "object_b_pos": b_pos,
+    "object_b_yaw": b_yaw,
+  }
+  actor.terms = {name: a.get(name) or extra[name] for name in order}
+  c = critic.terms
+  live = {
+    "tcp_pos_right": dataclasses.replace(c["tcp_pos"], params={"asset_cfg": tcp_r}),
+    "tcp_quat_right": dataclasses.replace(c["tcp_quat"], params={"asset_cfg": tcp_r}),
+    "object_b_pos": dataclasses.replace(
+      c["object_pos"], params={**c["object_pos"].params, "object_name": CUBE_B}
+    ),
+    "object_b_yaw": dataclasses.replace(
+      c["object_yaw"], params={**c["object_yaw"].params, "object_name": CUBE_B}
+    ),
+  }
+  critic_terms = {name: c.get(name) or live[name] for name in order}
+  critic_terms["grasped"] = c["grasped"]
+  critic_terms["grasped_right"] = ObservationTermCfg(
+    func=mdp.is_grasped, params={"sensor_name": right.contact_sensor_name}
+  )
+
+  # -- Rewards: the left half is L-T's; the right half R-ST's, gated on A; HH; AH10 right. ------
+  right_rewards = _right_rewards(robot, right)
+  gate = _gate_params(cfg.rewards["placed"])
+  critic_terms.update(_pq_terms(cfg.rewards["placed"], ""))
+  critic_terms.update(_pq_terms(right_rewards["placed"], "right_"))
+  critic_terms["base_placed"] = ObservationTermCfg(
+    func=mdp.base_placed_obs,
+    params={k.removeprefix("gate_"): v for k, v in gate.items()},
+  )
+  critic_terms["left_handed_off"] = ObservationTermCfg(
+    func=mdp.handoff_active, params={"arm": "left"}
+  )
+  critic.terms = critic_terms
+  for name, term in right_rewards.items():
+    if name in GATED_RIGHT:
+      term = RewardTermCfg(
+        func=mdp.when_base_placed,
+        weight=term.weight,
+        params={**term.params, "inner": term.func, **gate},
+      )
+    cfg.rewards[f"right_{name}"] = term
+  apply_arm_table(cfg, right, arm_table, prefix="right_")
+  cfg.rewards["arm_arm_clearance"] = RewardTermCfg(
+    func=mdp.arm_arm_clearance_penalty,
+    weight=HH_CLEARANCE_WEIGHT,
+    params={"margin": HH_MARGIN},
+  )
+  cfg.rewards["arm_arm_contact"] = RewardTermCfg(
+    func=mdp.contact_penalty,
+    weight=HH_CONTACT_WEIGHT,
+    params={"sensor_name": ARM_ARM_SENSOR, "force_threshold": HH_CONTACT_FORCE},
+  )
+
+  # -- The hand-off controller on both arms; the left's own trigger in training. ---------------
+  p = cfg.rewards["placed"].params
+  trigger = HandoffTriggerCfg(
+    command_name=p["command_name"],
+    object_name=p["object_name"],
+    grasp_sensor_name=p["grasp_sensor_name"],
+    support_sensor_name=p["support_sensor_name"],
+    surface_cfg=p["surface_cfg"],
+    jaw_cfg=p["jaw_cfg"],
+    jaw_open=p["jaw_open"],
+    timeout_s=LEFT_HANDOFF_TIMEOUT_S,
+  )
+  cfg.actions["joint_pos"] = with_handoff(
+    cfg.actions["joint_pos"],
+    arms=(
+      handoff_arm(left, +1.0, trigger if handoff_train else None),
+      handoff_arm(right, -1.0, None),
+    ),
+  )
+  if start == "mixed":
+    cfg.events["start_a_placed"] = EventTermCfg(
+      func=place_a_at_t,
+      mode="reset",
+      params={
+        "share": MIXED_SHARE,
+        "half_xy": MIXED_A_HALF_XY,
+        "yaw": MIXED_A_YAW,
+        "arm": "left",
+        **{
+          k: p[k]
+          for k in (
+            "command_name",
+            "object_name",
+            "grasp_sensor_name",
+            "support_sensor_name",
+            "surface_cfg",
+            "jaw_cfg",
+            "jaw_open",
+          )
+        },
+      },
+    )
+  if play:
+    from pal_mjlab.tasks.manipulation.tabletop_env_cfg import apply_play_overrides
+
+    apply_play_overrides(cfg)
+  return cfg
+
+
+def handoff_arm(gripper, side: float, trigger) -> HandoffArmCfg:
+  """A gripper's arm for the hand-off controller (`mdp.handoff`)."""
+  s = gripper.name
+  return HandoffArmCfg(
+    name=s,
+    arm_joints=tuple(f"arm_{s}_{i}_joint" for i in range(1, 8)),
+    jaw_joint=gripper.finger_joint,
+    tcp_site=gripper.tcp_site,
+    side=side,
+    trigger=trigger,
+  )

@@ -145,7 +145,8 @@ if [ "$SHAPE" != "cube" ]; then
 fi
 
 # Plan S9 (`pick_place/kangaroo/env_cfg.py`, `pick_place_env_cfg.GOALS` / `GATES`): GOAL is where the cube goes --
-# table (every run up to S8) | stack (on a blue base cube in B's target box) -- and GATE what may hold the jaw shut --
+# table (every run up to S8) | stack (on a blue base cube in B's target box) | box | box-ny | box-rim | box-dr (plan
+# S10: into an open box standing in B's target box) -- and GATE what may hold the jaw shut --
 # none | stack (the lock: no opening while the held cube is not aligned, low and slow over the base). In the run name
 # and the tags only when set, so every earlier run's name still reads the same.
 GOAL="${GOAL:-table}"
@@ -174,6 +175,32 @@ if [ "$CRITIC_OBS" != "base" ]; then
   S79_NAME="_critic${CRITIC_OBS}"
   S79_TAG=",\"critic${CRITIC_OBS}\""
 fi
+# Plan S10.1 (`pick_place/box.py`): BOX_OBS is what the actor sees of the box -- goal (the goal point
+# computed from the box, every S10 / DEP1 run) | pose (the box's position and its yaw as (cos 4psi,
+# sin 4psi); a resume widens the loaded actor and critic). The box on the wide area is TARGET=WC with a
+# box GOAL. In the run name and the tags only when set.
+BOX_OBS="${BOX_OBS:-goal}"
+export BOX_OBS
+if [ "$BOX_OBS" != "goal" ]; then
+  S79_NAME="${S79_NAME}_boxobs${BOX_OBS}"
+  S79_TAG="${S79_TAG},\"boxobs${BOX_OBS}\""
+fi
+# Plan S10.1: CKPT_SPAWN names the spawn whose arm the RESUME checkpoint was trained with when its action
+# scales are not this run's (W2 box checkpoints on SPAWN=WC): the loaded actor is converted to this run's
+# scales (`runner.rescale_actions`). In the run name and the tags only when set.
+if [ -n "${CKPT_SPAWN:-}" ]; then
+  export CKPT_SPAWN
+  S79_NAME="${S79_NAME}_ckpt${CKPT_SPAWN}"
+  S79_TAG="${S79_TAG},\"ckpt${CKPT_SPAWN}\""
+fi
+
+# Plan S10.2: TABLE_DZ (mm) raises the table's top face from the baseline's height (22: the robot cell's
+# table, 0.837 m on baseline B). In the run name and the tags only when set.
+if [ -n "${TABLE_DZ:-}" ]; then
+  export TABLE_DZ
+  S79_NAME="${S79_NAME}_tabledz${TABLE_DZ}"
+  S79_TAG="${S79_TAG},\"tabledz${TABLE_DZ}\""
+fi
 
 # Plan S7-10 (`pick_place/arm_table.py`): ARM_TABLE (none | watch | AC | AH | AT | AH10 -- arm 1-6 against
 # the table: a sensor only, a contact penalty, + a clearance penalty, or + a termination on a hard
@@ -192,6 +219,55 @@ if [ -n "${PREGRASP:-}" ]; then
   S78_NAME="${S78_NAME}_pre${PREGRASP}"
   S78_TAG="${S78_TAG},\"pre${PREGRASP}\""
 fi
+# Plan S11 (two arms; `pick_place/kangaroo/env_cfg.py`, `pick_place/bimanual.py`): ARM_HOME (default | mirror: the
+# right arm's home), TRACKER (B | split: the 6 + 4 mm bias split, the base through its own tracker), HANDOFF_ROUTE
+# (none | up-out: the hand-off controller in the action term, for the eval), ARMS (left | both: JOINT, one policy
+# for both arms), HANDOFF_TRAIN (none | left) and START (scratch | mixed), JOINT's. TARGET=T11 / T11W is TARGET's
+# (above). Exported when set; in the run name and the tags only when set.
+S11_NAME=""
+S11_TAG=""
+for _pair in ARM_HOME:home TRACKER:trk HANDOFF_ROUTE:route ARMS:arms HANDOFF_TRAIN:hot START:start; do
+  _var=${_pair%%:*}
+  _short=${_pair##*:}
+  _val="${!_var:-}"
+  if [ -n "$_val" ]; then
+    export "${_var?}"
+    S11_NAME="${S11_NAME}_${_short}${_val}"
+    S11_TAG="${S11_TAG},\"${_short}${_val}\""
+  fi
+done
+
+# Plan S9.1 (`pick_place/kangaroo/env_cfg.py`): BASE_OBS (goal | pose: SC-Y, the stack base's yaw on the actor and
+# the yaw grade against the base) and CONTACT (box | ccd, decision 0004: unset is box-box through mujoco_warp's
+# box_box collider; ccd gives back the GJK/EPA path every run before S9.1 trained on). Exported when set; in the
+# run name and the tags only when set.
+S91_NAME=""
+S91_TAG=""
+for _pair in BASE_OBS:base CONTACT:contact; do
+  _var=${_pair%%:*}
+  _short=${_pair##*:}
+  _val="${!_var:-}"
+  if [ -n "$_val" ]; then
+    export "${_var?}"
+    S91_NAME="${S91_NAME}_${_short}${_val}"
+    S91_TAG="${S91_TAG},\"${_short}${_val}\""
+  fi
+done
+# (S9.3's copy of the TABLE_DZ block sat here; the merge into siwei-s14-pin-place keeps §12's, above, so a run name
+# carries `_tabledz22` once, as §12's and S10.2's do.)
+# Plan §14 (`pick_place/place_pin.py`): PIN_START (mix | stand | lie, the pin's start poses) and PIN_LIE_P (the lying
+# share of mix). Exported when set; in the run name and the tags only when set.
+for _pair in PIN_START:pin PIN_LIE_P:liep; do
+  _var=${_pair%%:*}
+  _short=${_pair##*:}
+  _val="${!_var:-}"
+  if [ -n "$_val" ]; then
+    export "${_var?}"
+    S91_NAME="${S91_NAME}_${_short}${_val}"
+    S91_TAG="${S91_TAG},\"${_short}${_val}\""
+  fi
+done
+
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
 
@@ -224,7 +300,8 @@ if ! uv run --extra cu128 python -c \
   echo "Refusing to run: REWARD=$REWARD DR=$DR PPO=$PPO SLEW=$SLEW BASELINE=$BASELINE" \
     "SPAWN=$SPAWN TOOL_SPEED=$TOOL_SPEED GAINS=$GAINS EFFORT=$EFFORT LAG=$LAG OCC=$OCC" \
     "OBJ_OBS=$OBJ_OBS ACTION=$ACTION CMD_OBS=${CMD_OBS:-(default)} TARGET=$TARGET" \
-    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} PREGRASP=${PREGRASP:-(default)} did not validate." >&2
+    "EPISODE_S=${EPISODE_S:-(default)} SHAPE=$SHAPE GOAL=$GOAL GATE=$GATE CRITIC_OBS=$CRITIC_OBS ARM_TABLE=${ARM_TABLE:-(default)} PREGRASP=${PREGRASP:-(default)} BOX_OBS=$BOX_OBS TABLE_DZ=${TABLE_DZ:-(default)}" \
+    "S11:${S11_NAME:-(none)} S9.1/§14:${S91_NAME:-(none)} did not validate." >&2
   tail -3 "$REPO/.reward_check.$$" >&2
   rm -f "$REPO/.reward_check.$$"
   exit 1
@@ -251,7 +328,10 @@ echo "slew        $SLEW"
 echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}   pregrasp ${PREGRASP:-(default)}"
-echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS"
+echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}   table_dz ${TABLE_DZ:-(none)}"
+echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}"
+echo "s9.1        base_obs ${BASE_OBS:-(default)}   contact ${CONTACT:-(default: box)}"
+echo "s14         pin_start ${PIN_START:-(default)}   pin_lie_p ${PIN_LIE_P:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
 echo "node        $(hostname)   gpu $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '?')"
@@ -263,6 +343,26 @@ if grep -qE '^[[:space:]]+warp_util[.]check_toolkit_driver[(][)]' \
   echo "patch       mujoco_warp_io.patch NOT applied"
 else
   echo "patch       mujoco_warp_io.patch applied, or upstream moved -- check"
+fi
+# Decision 0005 (plan §12): mujoco_warp 3.11's box_box takes an edge-edge axis for a box resting on a box by
+# float32 rounding and returns a contact up to 0.5 m deep (it popped 2 of 8 pins at the first reset). Every insert
+# GOAL refuses to train without mujoco_warp_boxbox.patch (scripts/apply_mujoco_warp_boxbox_patch.sh .venv).
+if grep -q BOX_BOX_EDGE_TOL .venv/lib/python*/site-packages/mujoco_warp/_src/collision_primitive_core.py 2>/dev/null; then
+  echo "patch       mujoco_warp_boxbox.patch applied (decision 0005)"
+else
+  echo "patch       mujoco_warp_boxbox.patch NOT applied"
+  case "$GOAL" in
+    insert*|place*|ball-seat*)
+      echo "Refusing to run: GOAL=$GOAL needs mujoco_warp_boxbox.patch (decision 0005)." >&2
+      exit 1
+      ;;
+  esac
+fi
+# Decision 0005: mujoco_warp_box_box_depth.patch (box_box's bogus deep contacts dropped).
+if grep -q "Local patch (oppsie, 2026-10-08)" .venv/lib/python*/site-packages/mujoco_warp/_src/collision_primitive.py 2>/dev/null; then
+  echo "patch       mujoco_warp_box_box_depth.patch applied"
+else
+  echo "patch       mujoco_warp_box_box_depth.patch NOT applied (decision 0005: scripts/apply_mujoco_warp_patches.sh)"
 fi
 echo "=================="
 
@@ -277,5 +377,5 @@ exec uv run --extra cu128 train "$TASK" \
   --agent.logger wandb \
   --agent.wandb-project "$WANDB_PROJECT" \
   --agent.experiment-name "$EXPERIMENT" \
-  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}${S8_NAME}${S9_NAME}${S79_NAME}_n${NUM_ENVS}_seed${SEED}" \
-  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$S8_TAG$S9_TAG$S79_TAG$RESUME_TAG)"
+  --agent.run-name "pp_${RUN_TAG}_${REWARD}_${DR}_${PPO}_slew${SLEW}_${BASELINE}_${SPAWN}_tool${TOOL_SPEED}_${GAINS}_eff${EFFORT}${LAG_NAME}${OCC_NAME}${S78_NAME}${S8_NAME}${S9_NAME}${S79_NAME}${S11_NAME}${S91_NAME}_n${NUM_ENVS}_seed${SEED}" \
+  --agent.wandb-tags "(\"ias\",\"pick-place-v0\",\"$RUN_TAG\",\"$REWARD\",\"$DR\",\"$PPO\",\"slew$SLEW\",\"base$BASELINE\",\"spawn$SPAWN\",\"tool$TOOL_SPEED\",\"$GAINS\",\"eff$EFFORT\"$LAG_TAG$OCC_TAG$S78_TAG$S8_TAG$S9_TAG$S79_TAG$S11_TAG$S91_TAG$RESUME_TAG)"

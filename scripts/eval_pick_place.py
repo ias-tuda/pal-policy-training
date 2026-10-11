@@ -87,12 +87,35 @@ hand-off, the time from placed to it, the cube's displacement during the lift an
 whether it is still placed at the end, the time to home, and S7-4's success -- placed & lifted &
 J-released & lifted clear (>= `HANDOFF_CLEAR`) & still placed after the return.
 
+Plan S8.1: the ball on WC (``PregraspTally``, and the release-to-clear time)
+--------------------------------------------------------------------------------
+Per episode the object's radius and start, how far it moved before the first grasp (a pushed ball
+rolls), whether it was ever grasped, how many grasps began before the first lift, and the time from the
+J-release to lifting clear. Bins by goal position, carry, direction and radius are made from
+``episodes_detail`` afterwards (`results/S8.1-ball/read/read_table.py`).
+
 Plan S7-5: the goal tolerance split into xy and z, and the tilt at the let-go
 --------------------------------------------------------------------------------
 Every placed rate is read under both goal tolerances, whatever the run trained on: the 3-D
 distance below `GOAL_THRESHOLD` (every run to S7-4) and S7-5's Z, `GOAL_TOL_XYZ` (xy < 2 cm and
 |dz| < 2 cm) -- ``*_z`` keys -- so an S7-5 number stays comparable with S7-4's. Beside them, the
 cube's tilt at the pads' let-go: the angle between the vertical and the nearest face normal.
+
+Plan S10: the box (``GOAL=box*``, `BoxTally`)
+--------------------------------------------------------------------------------
+When the scene has plan S10's box, beside every read above: the cube in the box at the end of
+the episode -- after the hand-off's return with ``--handoff`` (the headline, with
+``--handoff-lift 0.05``: the fingers go straight up out of the box before the arm turns home) --
+and S10's success (J-released after the lift, handed off, in the box at the end); bounce-outs
+(in the box at some step after the J-release, out at the end); the hand and the cube on a box wall
+while the cube is held; the box's displacement at the end; and the let-go's xy offset, height
+above the rim and yaw error (|yaw mod 90 deg|), from the reward's own release latch. Arm 1-6 on
+the table is plan S7-10's `ArmTally`.
+
+Plan S10.1 (the box on the wide area, at any yaw): the let-go's yaw error is against the box
+(|wrap_90(psi_cube - psi_box)|, the latch's own), and S10's success is also binned by where the box
+stood (`BOX_POSITION_BINS`), its yaw (`BOX_YAW_BINS_DEG`) and the carry from the cube's spawn to the
+box (`BOX_CARRY_BINS_CM`): ``box_by_position`` / ``box_by_yaw`` / ``box_by_carry``.
 
 Horizon
 --------------------------------------------------------------------------------
@@ -185,7 +208,19 @@ JAW_OPEN_BY_SHAPE = PerShape(cube=JAW_OPEN, ball=BALL_JAW_OPEN_BY_RADIUS)
 
 def jaw_open_for(env: ManagerBasedRlEnv) -> float | torch.Tensor:
   """J's threshold for ``env``'s object: `JAW_OPEN` for a cube (a float, as every run before S8),
-  `BALL_JAW_OPEN` for a ball, per env for plan S8's MIX."""
+  `BALL_JAW_OPEN` for a ball, per env for plan S8's MIX; plan §12's pin (two boxes, a "cube" to
+  `shapes.shape_kind`) its own `rewards.PIN_JAW_OPEN`, whenever the scene has the socket block or plan §14's
+  place goal."""
+  from pal_mjlab.tasks.manipulation import mdp
+  from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK
+  from pal_mjlab.tasks.manipulation.pick_place.rewards import PIN_JAW_OPEN
+
+  term = env.command_manager.get_term(COMMAND)
+  if isinstance(term, mdp.BallSeatCommand):
+    # Plan §15's ball: its own J per radius (`rewards.BALL50_JAW_OPEN_BY_RADIUS`), as the release term reads it.
+    return resolve(env, env.cfg.rewards["release"].params["jaw_open"])
+  if BLOCK in env.scene.entities or isinstance(term, mdp.PinPlaceCommand):
+    return PIN_JAW_OPEN
   return resolve(env, JAW_OPEN_BY_SHAPE)
 
 
@@ -307,6 +342,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     "before it: play mode turns corruption off); on (as trained: joint and cube-tracker bias and "
     "jitter); on-no-object (as trained but the cube's position / yaw noise off). The tracker lag "
     "is LAG's, not this flag's",
+  )
+  p.add_argument(
+    "--solver-iterations",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("ITER", "LS_ITER"),
+    help="evaluate with the constraint solver at ITER / LS_ITER iterations instead of the training "
+    "cfg's 10 / 20 (plan S10: 100 50 is converged for cube-on-box contacts, S7-9 step 0); eval only",
   )
   p.add_argument(
     "--stress-jaw",
@@ -1238,6 +1282,7 @@ class RetreatTally:
     self.yaw_at_let_go = zf()
     self.clear_max = zf(float("-inf"))
     self.clear_run = zl()
+    self.clear_step = zl(-1)
     self.handed, self.hand_step, self.hand_by = zb(), zl(-1), zl()
     self.hand_xy = torch.zeros(num_envs, 2, device=device)
     self.hand_height = zf()
@@ -1303,6 +1348,9 @@ class RetreatTally:
     self.clear_run = torch.where(
       clear, self.clear_run + 1, torch.zeros_like(self.clear_run)
     )
+    self.clear_step = torch.where(
+      clear & (self.clear_step < 0), self.age, self.clear_step
+    )
     if self.handoff:
       by_lift = ~self.handed & (self.clear_run >= HANDOFF_STEPS)
       by_time = ~self.handed & ~by_lift & (self.age >= self.timeout_steps)
@@ -1342,6 +1390,10 @@ class RetreatTally:
         "placed_and_lifted_j": bool(self.placed_j[i]) and bool(self.lifted[i]),
         "lift_clear_max": float(self.clear_max[i]) if rel else None,
         "lifted_clear": clear,
+        # Plan S8.1: from the J-release to the TCP first `HANDOFF_CLEAR` over the object, jaw open.
+        "release_to_clear_s": (int(self.clear_step[i]) - int(self.rel_step[i])) * dt
+        if rel and int(self.clear_step[i]) >= 0
+        else None,
         "handoff_by": ("lift", "timeout")[int(self.hand_by[i]) - 1] if handed else None,
         "handoff_height": float(self.hand_height[i]) if handed else None,
         "placed_to_handoff_s": (hand - int(self.placed_j_step[i])) * dt
@@ -1385,7 +1437,13 @@ class RetreatTally:
       acc[env_ids] = False
     for acc in (self.age, self.clear_run, self.hand_by):
       acc[env_ids] = 0
-    for acc in (self.rel_step, self.placed_j_step, self.hand_step, self.home_step):
+    for acc in (
+      self.rel_step,
+      self.placed_j_step,
+      self.hand_step,
+      self.home_step,
+      self.clear_step,
+    ):
       acc[env_ids] = -1
     self.clear_max[env_ids] = float("-inf")
     self.tilt_at_let_go[env_ids] = 0.0
@@ -1404,6 +1462,7 @@ class RetreatTally:
       "placed_and_lifted_j": share("placed_and_lifted_j"),
       "lifted_clear": share("lifted_clear"),
       "lift_clear_max_median_m": median(vals("lift_clear_max")),
+      "release_to_clear_median_s": median(vals("release_to_clear_s")),
       "handoff_by_lift": by.count("lift") / n,
       "handoff_by_timeout": by.count("timeout") / n,
       "handoff_height_median_m": median(vals("handoff_height")),
@@ -1755,6 +1814,126 @@ class OccTally:
     }
 
 
+#: Plan S9.3's ``sunk``: the red cube on the base lower than resting on it by more than this, mm.
+SUNK_MM = 3.0
+
+
+class _CubeHandContacts:
+  """Plan S9.3's return contact: whether an arm 4-7 / gripper collider of either arm touches either
+  cube, per env, from mujoco_warp's contact list (``dist`` <= 0). ``ok`` is False when the data has
+  no contact list to read."""
+
+  PATTERN = r"(arm_(left|right)_[4-7]|gripper_(left|right))_"
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    import re
+
+    m = env.sim.mj_model
+    self.ok = hasattr(env.sim, "wp_data")
+    robot = env.scene[ROBOT]
+    hand = [
+      int(g)
+      for g, name in zip(
+        robot.indexing.geom_ids.tolist(), robot.geom_names, strict=True
+      )
+      if re.match(self.PATTERN, name)
+    ]
+    cubes = [
+      int(g)
+      for name in (OBJECT, "base_object")
+      if name in env.scene.entities
+      for g in env.scene[name].indexing.geom_ids.tolist()
+    ]
+    self.hand = torch.zeros(m.ngeom, dtype=torch.bool, device=env.device)
+    self.cube = torch.zeros(m.ngeom, dtype=torch.bool, device=env.device)
+    self.hand[hand] = True
+    self.cube[cubes] = True
+    self.ok = self.ok and bool(hand) and bool(cubes)
+
+  def touching(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    import warp as wp
+
+    d = env.sim.wp_data
+    out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    n = int(wp.to_torch(d.nacon)[0])
+    if n == 0:
+      return out
+    geom = wp.to_torch(d.contact.geom)[:n].long()
+    world = wp.to_torch(d.contact.worldid)[:n].long()
+    dist = wp.to_torch(d.contact.dist)[:n]
+    a, b = geom[:, 0], geom[:, 1]
+    hit = ((self.hand[a] & self.cube[b]) | (self.hand[b] & self.cube[a])) & (
+      dist <= 0.0
+    )
+    out[world[hit]] = True
+    return out
+
+
+class StartTally:
+  """Plan S8.1's start / pre-grasp reads (build item 3a; S7-11's `PregraspTally` reads the jaw and the push): per episode the
+  object's radius / half-height at the start, how far it moved horizontally from its start before the first
+  grasp (to the episode's end if never grasped), and how many grasps began before the first lift (1 = the
+  first grasp held). A pushed ball rolls; S8's BALL s2 lost 9 % of its episodes to a ball swept out of reach.
+  Not ported: S7-11's jaw angle at arrival and hand-object yaw (`mdp.pregrasp`, not on this branch)."""
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    n, dev = env.num_envs, env.device
+    self.start = torch.zeros(n, 2, device=dev)
+    self.radius = torch.zeros(n, device=dev)
+    self.moved = torch.zeros(n, device=dev)
+    self.grasped_once = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.lifted = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.prev = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.onsets = torch.zeros(n, dtype=torch.long, device=dev)
+    self.done: list[dict] = []
+
+  def step(
+    self, env: ManagerBasedRlEnv, grasped: torch.Tensor, lifted: torch.Tensor
+  ) -> None:
+    xy = env.scene[OBJECT].data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      self.start = torch.where(fresh.unsqueeze(-1), xy, self.start)
+      self.radius = torch.where(fresh, object_half_height(env, OBJECT), self.radius)
+    before = ~self.grasped_once
+    self.moved = torch.where(before, torch.norm(xy - self.start, dim=-1), self.moved)
+    self.onsets += (grasped & ~self.prev & ~self.lifted).long()
+    self.grasped_once |= grasped
+    self.lifted |= lifted
+    self.prev = grasped.clone()
+
+  def finish(self, env_ids: torch.Tensor) -> None:
+    for i in env_ids.tolist():
+      self.done.append(
+        {
+          "object_radius_m": float(self.radius[i]),
+          "start_x": float(self.start[i, 0]),
+          "start_y": float(self.start[i, 1]),
+          "moved_before_grasp_m": float(self.moved[i]),
+          "never_grasped": not bool(self.grasped_once[i]),
+          "grasps_before_lift": int(self.onsets[i]),
+        }
+      )
+    for t in (self.grasped_once, self.lifted, self.prev):
+      t[env_ids] = False
+    self.onsets[env_ids] = 0
+    self.moved[env_ids] = 0.0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    lifted = [r for r in rows if r["grasps_before_lift"] >= 1]
+    moved = sorted(r["moved_before_grasp_m"] for r in rows)
+    return {
+      "pre_never_grasped": sum(r["never_grasped"] for r in rows) / n,
+      "pre_moved_over_1cm": sum(m > 0.01 for m in moved) / n,
+      "pre_moved_over_3cm": sum(m > 0.03 for m in moved) / n,
+      "pre_moved_median_m": moved[len(moved) // 2] if moved else None,
+      "pre_first_try_grasp": sum(r["grasps_before_lift"] == 1 for r in lifted)
+      / max(len(lifted), 1),
+    }
+
+
 class StackTally:
   """Plan S9's reads on a stack goal (`GOAL=stack`), per episode.
 
@@ -1764,6 +1943,12 @@ class StackTally:
   ``OK`` and how many there were. The lock's steps (`GATE=stack`): armed (held, lifted, not OK)
   and refused (the policy asked to open while armed) -- the stall read. And the base cube's
   largest horizontal displacement from where it spawned.
+
+  Plan S9.3 adds, per episode: where the base and the red cube started (env frame, the base's yaw
+  folded to +/- 45 deg) for the read's bins; ``sunk`` -- at the end the red cube on the base (within
+  2.5 cm) but more than `SUNK_MM` lower than resting on it (decision 0004's sink); and return contact
+  -- the steps after the hand-off started on which an arm 4-7 / gripper collider of either arm
+  touches either cube.
   """
 
   NAMES = ("dxy", "height", "tilt", "yaw", "speed")
@@ -1783,15 +1968,46 @@ class StackTally:
     self.fresh = torch.ones(n, dtype=torch.bool, device=device)
     self.base0 = torch.zeros(n, 2, device=device)
     self.base_moved = zf()
+    #: Plan S9.3: base x, y, yaw and red cube x, y at the episode's start (env frame).
+    self.start = torch.zeros(n, 5, device=device)
+    self.top_dxy, self.top_dz = zf(), zf()
+    self.return_contact = zl()
+    self._contact = _CubeHandContacts(env)
     self.done: list[dict] = []
 
   @property
   def active(self) -> bool:
     return self.reference is not None
 
-  def step(self, env: ManagerBasedRlEnv, grasped: torch.Tensor) -> None:
+  def step(
+    self,
+    env: ManagerBasedRlEnv,
+    grasped: torch.Tensor,
+    handed: torch.Tensor | None = None,
+  ) -> None:
     from pal_mjlab.tasks.manipulation.mdp.observations import _WAS_LIFTED
     from pal_mjlab.tasks.manipulation.mdp.stack import stack_state
+
+    origin = env.scene.env_origins[:, :2]
+    base_w = env.scene[self.reference].data.root_link_pos_w
+    cube_w = env.scene[OBJECT].data.root_link_pos_w
+    q = env.scene[self.reference].data.root_link_quat_w
+    base_yaw = torch.atan2(
+      2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+    )
+    now = torch.cat(
+      [
+        base_w[:, :2] - origin,
+        yaw_mod90(base_yaw).unsqueeze(-1),
+        cube_w[:, :2] - origin,
+      ],
+      dim=-1,
+    )
+    self.start = torch.where(self.fresh.unsqueeze(-1), now, self.start)
+    self.top_dxy = torch.norm(cube_w[:, :2] - base_w[:, :2], dim=-1)
+    self.top_dz = cube_w[:, 2] - base_w[:, 2]
+    if handed is not None and self._contact.ok:
+      self.return_contact += (handed & self._contact.touching(env)).long()
 
     lifted = getattr(env, _WAS_LIFTED, None)
     lifted = torch.zeros_like(grasped) if lifted is None else lifted
@@ -1827,6 +2043,19 @@ class StackTally:
       row["stack_lock_armed_steps"] = int(self.armed[i])
       row["stack_lock_refused_steps"] = int(self.refused[i])
       row["stack_base_moved_m"] = float(self.base_moved[i])
+      bx, by, byaw, cx, cy = self.start[i].tolist()
+      row.update(
+        stack_base_x=bx,
+        stack_base_y=by,
+        stack_base_yaw_deg=math.degrees(byaw),
+        stack_cube_x=cx,
+        stack_cube_y=cy,
+        stack_carry_cm=100 * math.hypot(bx - cx, by - cy),
+      )
+      on_top = float(self.top_dxy[i]) < 0.025
+      row["stack_end_dz_mm"] = 1e3 * float(self.top_dz[i])
+      row["stack_sunk"] = bool(on_top and 1e3 * float(self.top_dz[i]) < 50.0 - SUNK_MM)
+      row["stack_return_contact_steps"] = int(self.return_contact[i])
       self.done.append(row)
     for t in (self.prev, self.rel_ok, self.any_ok):
       t[env_ids] = False
@@ -1834,6 +2063,7 @@ class StackTally:
     self.armed[env_ids] = 0
     self.refused[env_ids] = 0
     self.base_moved[env_ids] = 0.0
+    self.return_contact[env_ids] = 0
     self.fresh[env_ids] = True
 
   def summarise(self, episodes: int) -> dict:
@@ -1861,6 +2091,12 @@ class StackTally:
       "stack_base_moved_over_5mm": sum(r["stack_base_moved_m"] > 0.005 for r in rows)
       / n,
     }
+    out["stack_sunk"] = sum(r["stack_sunk"] for r in rows) / n
+    out["stack_return_contact"] = (
+      sum(r["stack_return_contact_steps"] > 0 for r in rows) / n
+      if self._contact.ok
+      else None
+    )
     armed = sorted(r["stack_lock_armed_steps"] for r in rows)
     if armed and armed[-1] > 0:
       out["stack_lock_armed_median_s"] = armed[len(armed) // 2] * STEP_DT_S
@@ -1873,8 +2109,998 @@ class StackTally:
     return out
 
 
+#: Plan S10.1's box bins, env frame, m: near the torso, far, across the centre line (overlapping
+#: filters, each with its own n), and the rest; the box's yaw folded to +/- 45 deg; the carry, cube
+#: spawn to box centre (>= `box.BOX_MIN_SEPARATION`).
+BOX_POSITION_BINS = {
+  "near_torso": lambda x, y: x < 0.45 and y < 0.10,
+  "far": lambda x, y: x > 0.55,
+  "across_centre": lambda x, y: y < 0.0,
+  "other": lambda x, y: not (x < 0.45 and y < 0.10) and x <= 0.55 and y >= 0.0,
+}
+BOX_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+BOX_CARRY_BINS_CM = ((0, 16), (16, 20), (20, 30), (30, 99))
+
 #: The control step, s (`tabletop_env_cfg.CONTROL_DT`), for the stack tally's lock times.
 STEP_DT_S = 0.02
+
+
+class BoxTally:
+  """Plan S10's reads, per episode, beside `Tally` (see the module docstring). ``None`` from
+  `from_env` when the scene has no box."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> BoxTally | None:
+    from pal_mjlab.tasks.manipulation.pick_place.box import BOX
+
+    if BOX not in env.scene.entities:
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation.pick_place import box
+
+    self.box = box
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda: torch.zeros(n, device=dev)  # noqa: E731
+    self.in_box, self.in_box_after = zb(), zb()
+    self.hand_wall_held, self.cube_wall_held, self.hand_wall = zb(), zb(), zb()
+    self.displacement = zf()
+    self.rel_dxy, self.rel_height, self.rel_yaw, self.released = zf(), zf(), zf(), zb()
+    #: Plan S10.1: each episode's box (x, y, env frame; yaw, rad) and cube spawn (x, y) at its start.
+    self.start = torch.zeros(n, 5, device=dev)
+    self.done: list[dict] = []
+
+  def step(
+    self, env: ManagerBasedRlEnv, grasped: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` is
+    `RetreatTally.released` (the jaw opened after the lift)."""
+    from pal_mjlab.tasks.manipulation import mdp
+
+    b = self.box
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      origin = env.scene.env_origins[:, :2]
+      box_e = env.scene[b.BOX]
+      q = box_e.data.root_link_quat_w
+      yaw = torch.atan2(
+        2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+        1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2),
+      )
+      now = torch.cat(
+        [
+          box_e.data.root_link_pos_w[:, :2] - origin,
+          yaw_mod90(yaw).unsqueeze(-1),
+          env.scene[OBJECT].data.root_link_pos_w[:, :2] - origin,
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
+    self.in_box = mdp.object_in_box_bool(env, OBJECT, b.BOX, b.BOX_WALLS)
+    self.in_box_after |= self.in_box & j_released
+    hit = lambda name: env.scene[name].data.found.bool().any(dim=-1)  # noqa: E731
+    hand, cube = hit(b.BOX_WALL_HAND_SENSOR), hit(b.BOX_WALL_OBJECT_SENSOR)
+    self.hand_wall |= hand
+    self.hand_wall_held |= hand & grasped
+    self.cube_wall_held |= cube & grasped
+    self.displacement = env.command_manager.get_term(COMMAND).box_displacement()
+    latch = getattr(env, "_pp_release", None)
+    if latch is not None and latch.yaw is not None:
+      self.released = latch.released.clone()
+      self.rel_dxy, self.rel_height = latch.dxy.clone(), latch.height.clone()
+      self.rel_yaw = latch.yaw.clone()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      row = {
+        "in_box_end": bool(self.in_box[i]),
+        "box_success": bool(self.in_box[i] & handed[i] & j_released[i]),
+        "bounce_out": bool(self.in_box_after[i] & ~self.in_box[i]),
+        "hand_wall_held": bool(self.hand_wall_held[i]),
+        "cube_wall_held": bool(self.cube_wall_held[i]),
+        "hand_wall_any": bool(self.hand_wall[i]),
+        "box_moved_mm": 1e3 * float(self.displacement[i]),
+        "latch_released": bool(self.released[i]),
+        "release_dxy_cm": 100 * float(self.rel_dxy[i]),
+        "release_above_rim_cm": 100 * float(self.rel_height[i]),
+        "release_yaw_deg": math.degrees(float(self.rel_yaw[i])),
+      }
+      bx_, by_, byaw, cx_, cy_ = self.start[i].tolist()
+      row.update(
+        box_x=bx_,
+        box_y=by_,
+        box_yaw_deg=math.degrees(byaw),
+        box_carry_cm=100 * math.hypot(bx_ - cx_, by_ - cy_),
+      )
+      self.done.append(row)
+      for t in (
+        self.in_box_after,
+        self.hand_wall_held,
+        self.cube_wall_held,
+        self.hand_wall,
+      ):
+        t[i] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k: sum(bool(r[k]) for r in rows) / n  # noqa: E731
+    rel = [r for r in rows if r["latch_released"]]
+    med = lambda k: float(np.median([r[k] for r in rel])) if rel else float("nan")  # noqa: E731
+    out = {
+      "box_in_box_end": share("in_box_end"),
+      "box_success": share("box_success"),
+      "box_bounce_out": share("bounce_out"),
+      "box_hand_wall_held": share("hand_wall_held"),
+      "box_cube_wall_held": share("cube_wall_held"),
+      "box_moved_mm_median": float(np.median([r["box_moved_mm"] for r in rows]))
+      if rows
+      else float("nan"),
+      "box_release_dxy_cm_median": med("release_dxy_cm"),
+      "box_release_above_rim_cm_median": med("release_above_rim_cm"),
+      "box_release_yaw_deg_median": med("release_yaw_deg"),
+      "box_release_yaw_under_10deg": (
+        sum(r["release_yaw_deg"] < 10 for r in rel) / len(rel) if rel else float("nan")
+      ),
+    }
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {
+          "n": len(g),
+          "box_success": sum(r["box_success"] for r in g) / len(g) if g else None,
+        }
+        for name, g in groups.items()
+      }
+
+    # Plan S10.1's bins (env frame): by where the box is, by its yaw, by how far the cube is carried.
+    out["box_by_position"] = bins(
+      {
+        name: [r for r in rows if test(r["box_x"], r["box_y"])]
+        for name, test in BOX_POSITION_BINS.items()
+      }
+    )
+    out["box_by_yaw"] = bins(
+      {
+        f"{lo}-{hi}deg": [r for r in rows if lo <= abs(r["box_yaw_deg"]) < hi]
+        for lo, hi in BOX_YAW_BINS_DEG
+      }
+    )
+    out["box_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["box_carry_cm"] < hi]
+        for lo, hi in BOX_CARRY_BINS_CM
+      }
+    )
+    return out
+
+
+#: Plan §12.1's insert bins (*Reads*): the block's position (near the torso x < 0.45, far x > 0.55, across the
+#: centre line y < 0, the rest), its yaw folded to +/- 45 deg, the pin's yaw likewise, and the carry, pin spawn to
+#: block centre (>= `insert.PIN_MIN_SEPARATION`), cm.
+INSERT_POSITION_BINS = {
+  "near_torso": lambda x, y: x < 0.45,
+  "far": lambda x, y: x > 0.55,
+  "across_centre": lambda x, y: y < 0.0,
+  "middle": lambda x, y: 0.45 <= x <= 0.55 and y >= 0.0,
+}
+INSERT_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+INSERT_CARRY_BINS_CM = ((0, 20), (20, 30), (30, 99))
+#: A jam (plan §12 *Reward*, read only): held, the pin on the block, not seated and slower than `JAM_SPEED`
+#: (m/s) for `JAM_S` seconds in a row.
+JAM_SPEED = 0.01
+JAM_S = 1.0
+
+
+class InsertTally:
+  """Plan §12's reads, per episode, beside `Tally` (plan §12 *Reads and bars*): ``seated`` at the end -- after the
+  hand-off's return with ``--handoff`` (the headline) -- and §12's success (J-released after the lift, handed off,
+  seated at the end); seated at the J-release; the pin bottom's offset from the hole's axis at its first contact
+  with the block while held (the chamfer's catch), and its depth and tilt at the J-release; jams; the peak
+  pin-block contact force while held; the block's displacement; the time to the first seated step; and §12.1's bins.
+  ``None`` from `from_env` when the scene has no socket block."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> InsertTally | None:
+    from pal_mjlab.tasks.manipulation.pick_place.insert import BLOCK
+
+    if BLOCK not in env.scene.entities or not (
+      "depth" in env.cfg.rewards or "ladder" in env.cfg.rewards
+    ):
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation.pick_place import insert
+
+    self.ins = insert
+    ins_cfg = env.cfg.rewards.get("ladder") or env.cfg.rewards["depth"]
+    self.geo = {
+      "block_height": ins_cfg.params["block_height"],
+      "hole_d": ins_cfg.params["hole_d"],
+    }
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda v=0.0: torch.full((n,), v, device=dev)  # noqa: E731
+    self.seated, self.seated_at_release, self.rel_seen = zb(), zb(), zb()
+    self.rel_depth, self.rel_tilt = zf(float("nan")), zf(float("nan"))
+    self.touched, self.touch_offset = zb(), zf(float("nan"))
+    self.jam_run, self.jammed = zf(), zb()
+    self.peak_force = zf()
+    self.first_seated = zf(-1.0)
+    self.displacement = zf()
+    self.hand_block = zb()
+    #: Each episode's block (x, y, env frame; |yaw| folded, rad), pin spawn (x, y) and |pin yaw| folded.
+    self.start = torch.zeros(n, 6, device=dev)
+    self.step_dt = env.step_dt
+    self.done: list[dict] = []
+
+  def step(
+    self, env: ManagerBasedRlEnv, grasped: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` is
+    `RetreatTally.released` (the jaw opened after the lift)."""
+    from pal_mjlab.tasks.manipulation import mdp
+
+    b = self.ins
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      origin = env.scene.env_origins[:, :2]
+      blk, pin = env.scene[b.BLOCK], env.scene[OBJECT]
+
+      def yaw_of(q):
+        return torch.atan2(
+          2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+          1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2),
+        )
+
+      now = torch.cat(
+        [
+          blk.data.root_link_pos_w[:, :2] - origin,
+          yaw_mod90(yaw_of(blk.data.root_link_quat_w)).unsqueeze(-1),
+          pin.data.root_link_pos_w[:, :2] - origin,
+          yaw_mod90(yaw_of(pin.data.root_link_quat_w)).unsqueeze(-1),
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
+    st = mdp.insert_state(env, OBJECT, b.BLOCK, **self.geo)
+    self.seated = st.seated()
+    age = env.episode_length_buf.float() * self.step_dt
+    self.first_seated = torch.where(
+      self.seated & (self.first_seated < 0), age, self.first_seated
+    )
+    rel_now = j_released & ~self.rel_seen
+    self.seated_at_release |= rel_now & self.seated
+    self.rel_depth = torch.where(rel_now, st.depth, self.rel_depth)
+    self.rel_tilt = torch.where(rel_now, st.tilt, self.rel_tilt)
+    self.rel_seen |= j_released
+    sensor = env.scene[b.BLOCK_PIN_SENSOR].data
+    touch = sensor.found.bool().any(dim=-1)
+    first = touch & grasped & ~self.touched
+    self.touch_offset = torch.where(first, st.offset, self.touch_offset)
+    self.touched |= touch & grasped
+    if sensor.force is not None:
+      f = torch.norm(sensor.force.reshape(env.num_envs, -1, 3), dim=-1).amax(-1)
+      self.peak_force = torch.maximum(self.peak_force, f * grasped.float())
+    slow = torch.norm(env.scene[OBJECT].data.root_link_lin_vel_w, dim=-1) < JAM_SPEED
+    stuck = grasped & touch & ~self.seated & slow
+    self.jam_run = torch.where(
+      stuck, self.jam_run + self.step_dt, torch.zeros_like(self.jam_run)
+    )
+    self.jammed |= self.jam_run >= JAM_S
+    self.hand_block |= env.scene[b.BLOCK_HAND_SENSOR].data.found.bool().any(dim=-1)
+    self.displacement = env.command_manager.get_term(COMMAND).box_displacement()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      bx_, by_, byaw, px_, py_, pyaw = self.start[i].tolist()
+      self.done.append(
+        {
+          "seated_end": bool(self.seated[i]),
+          "insert_success": bool(self.seated[i] & handed[i] & j_released[i]),
+          "seated_at_release": bool(self.seated_at_release[i]),
+          "j_released": bool(j_released[i]),
+          "release_depth_mm": 1e3 * float(self.rel_depth[i]),
+          "release_tilt_deg": math.degrees(float(self.rel_tilt[i])),
+          "touched_block_held": bool(self.touched[i]),
+          "first_touch_offset_mm": 1e3 * float(self.touch_offset[i]),
+          "jammed": bool(self.jammed[i]),
+          "peak_pin_block_force_N": float(self.peak_force[i]),
+          "time_to_seat_s": float(self.first_seated[i]),
+          "hand_on_block": bool(self.hand_block[i]),
+          "block_moved_mm": 1e3 * float(self.displacement[i]),
+          "block_x": bx_,
+          "block_y": by_,
+          "block_yaw_deg": math.degrees(byaw),
+          "pin_yaw_deg": math.degrees(pyaw),
+          "carry_cm": 100 * math.hypot(bx_ - px_, by_ - py_),
+        }
+      )
+      self.seated_at_release[i] = False
+      self.rel_seen[i] = False
+      self.rel_depth[i] = float("nan")
+      self.rel_tilt[i] = float("nan")
+      self.touched[i] = False
+      self.touch_offset[i] = float("nan")
+      self.jam_run[i] = 0.0
+      self.jammed[i] = False
+      self.peak_force[i] = 0.0
+      self.first_seated[i] = -1.0
+      self.hand_block[i] = False
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k: sum(bool(r[k]) for r in rows) / n  # noqa: E731
+
+    def med(k, sel=None):
+      v = [r[k] for r in rows if (sel is None or sel(r)) and not math.isnan(r[k])]
+      return float(np.median(v)) if v else float("nan")
+
+    out = {
+      "insert_success": share("insert_success"),
+      "insert_seated_end": share("seated_end"),
+      "insert_seated_at_release": share("seated_at_release"),
+      "insert_j_released": share("j_released"),
+      "insert_jammed": share("jammed"),
+      "insert_hand_on_block": share("hand_on_block"),
+      "insert_block_moved_mm_median": med("block_moved_mm"),
+      "insert_first_touch_offset_mm_median": med("first_touch_offset_mm"),
+      "insert_release_depth_mm_median": med("release_depth_mm"),
+      "insert_release_tilt_deg_median": med("release_tilt_deg"),
+      "insert_peak_force_N_median": med(
+        "peak_pin_block_force_N", lambda r: r["touched_block_held"]
+      ),
+      "insert_time_to_seat_s_median": med(
+        "time_to_seat_s", lambda r: r["time_to_seat_s"] >= 0
+      ),
+    }
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {
+          "n": len(g),
+          "insert_success": sum(r["insert_success"] for r in g) / len(g) if g else None,
+        }
+        for name, g in groups.items()
+      }
+
+    out["insert_by_position"] = bins(
+      {
+        name: [r for r in rows if test(r["block_x"], r["block_y"])]
+        for name, test in INSERT_POSITION_BINS.items()
+      }
+    )
+    for key, field in (
+      ("insert_by_block_yaw", "block_yaw_deg"),
+      ("insert_by_pin_yaw", "pin_yaw_deg"),
+    ):
+      out[key] = bins(
+        {
+          f"{lo}-{hi}deg": [r for r in rows if lo <= abs(r[field]) < hi]
+          for lo, hi in INSERT_YAW_BINS_DEG
+        }
+      )
+    out["insert_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["carry_cm"] < hi]
+        for lo, hi in INSERT_CARRY_BINS_CM
+      }
+    )
+    return out
+
+
+#: Plan §14's bins (build item 6): where the pin starts and the goal is (the robot frame): WC's part, and the ring
+#: `WP` adds around it; x in 3 cm steps; the carry; its direction; a standing pin's yaw and a lying pin's axis.
+PLACE_POSITION_BINS = {
+  "wc": lambda x, y: 0.40 <= x <= 0.60 and -0.04 <= y <= 0.26,
+  "far_x>0.60": lambda x, y: x > 0.60,
+  "near_x<0.40": lambda x, y: x < 0.40,
+  "right_y<-0.04": lambda x, y: y < -0.04,
+  "left_y>0.26": lambda x, y: y > 0.26,
+}
+PLACE_X_BINS = tuple(
+  (round(0.36 + 0.03 * k, 2), round(0.39 + 0.03 * k, 2)) for k in range(10)
+)
+PLACE_CARRY_BINS_CM = ((10, 20), (20, 30), (30, 40), (40, 99))
+PLACE_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+PLACE_AXIS_BINS_DEG = ((0, 30), (30, 60), (60, 91))
+#: A pin pushed this far (m) before the first grasp counts as pushed (`PregraspTally`'s 1 cm).
+PREGRASP_PUSH = 0.01
+
+
+class PlaceTally:
+  """Plan §14's reads, per episode, beside `Tally` (plan §14.7 *Reported*, build item 6): SUCC -- the pin rests on
+  the table (`place_pin.PinRestState.rested`: not held, its lowest point within 3 mm of the table, still) with its
+  centre within 2 cm of the goal after the hand-off's return, the policy having let go by itself (J-released) --, by
+  start pose; the end pose; topples (standing -> lying not in the hand) by phase; the centre's final error; the
+  let-go's speed and lowest-point height; regrasps; time to place; held at the hand-off; never grasped; and the
+  pre-grasp reads (pin pushed > 1 cm or knocked over before the first grasp, the jaw at arrival, a first-try grasp).
+  ``None`` from `from_env` when the goal is not ``GOAL=place``."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> PlaceTally | None:
+    from pal_mjlab.tasks.manipulation import mdp
+
+    if not isinstance(env.command_manager.get_term(COMMAND), mdp.PinPlaceCommand):
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation import mdp
+    from pal_mjlab.tasks.manipulation.pick_place import place_pin
+
+    self.mdp, self.pp = mdp, place_pin
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda v=0.0: torch.full((n,), v, device=dev)  # noqa: E731
+    self.rested, self.standing, self.prev_standing = zb(), zb(), zb()
+    self.dxy = zf()
+    self.ever_grasped, self.prev_grasped, self.lifted_once = zb(), zb(), zb()
+    self.grasps = torch.zeros(n, dtype=torch.long, device=dev)
+    self.topple = {k: zb() for k in ("pregrasp", "carry", "letgo", "return")}
+    self.pushed, self.knocked = zb(), zb()
+    self.arrive_q = zf(float("nan"))
+    self.rel_seen = zb()
+    self.rel_speed, self.rel_zmin = zf(float("nan")), zf(float("nan"))
+    self.letgo_seen = zb()
+    self.first_rested = zf(-1.0)
+    self.held_at_handoff, self.handed_prev = zb(), zb()
+    #: Each episode's start: pin (x, y, env frame), standing, |yaw| folded (standing) or axis from x (lying), goal (x, y).
+    self.start = torch.zeros(n, 6, device=dev)
+    self.step_dt = env.step_dt
+    self.done: list[dict] = []
+
+  def step(
+    self,
+    env: ManagerBasedRlEnv,
+    grasped: torch.Tensor,
+    j_released: torch.Tensor,
+    handed: torch.Tensor,
+    jaw_q: torch.Tensor,
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` / ``handed`` are
+    `RetreatTally`'s."""
+    mdp = self.mdp
+    pin = env.scene[OBJECT]
+    q = pin.data.root_link_quat_w
+    origin = env.scene.env_origins[:, :2]
+    st = mdp.pin_rest_state(env, OBJECT, COMMAND)
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      axis = mdp.pin_axis_canonical_w(env, q)
+      yaw = yaw_mod90(mdp.yaw_relative_to_base(env, q)).abs()
+      axis_deg = torch.atan2(axis[:, 1], axis[:, 0]).abs()
+      axis_deg = torch.minimum(axis_deg, math.pi - axis_deg)
+      goal = env.command_manager.get_term(COMMAND).goal_surface[:, :2] - origin
+      now = torch.cat(
+        [
+          pin.data.root_link_pos_w[:, :2] - origin,
+          st.standing.float().unsqueeze(-1),
+          torch.where(st.standing, yaw, axis_deg).unsqueeze(-1),
+          goal,
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
+      self.prev_standing = torch.where(fresh, st.standing, self.prev_standing)
+    rested = st.rested(
+      grasped,
+      self.pp.PLACE_RADIUS,
+      self.pp.PLACED_TOL[1],
+      self.pp.REST_SPEED,
+      self.pp.REST_ANGULAR_SPEED,
+    )
+    self.rested, self.standing, self.dxy = rested, st.standing, st.goal_dxy
+    onset = grasped & ~self.prev_grasped
+    self.grasps += onset.long()
+    lifted_now = grasped & (st.z_min > 0.01)
+    self.lifted_once |= lifted_now
+    # Topples: standing -> lying with the pin not in the hand, by phase.
+    toppled = self.prev_standing & ~st.standing & ~grasped
+    phase_pre = ~self.ever_grasped
+    phase_ret = handed
+    phase_let = j_released & ~handed
+    phase_carry = self.ever_grasped & ~j_released & ~handed
+    for key, ph in (
+      ("pregrasp", phase_pre),
+      ("carry", phase_carry),
+      ("letgo", phase_let),
+      ("return", phase_ret),
+    ):
+      self.topple[key] |= toppled & ph
+    # Pre-grasp: pushed / knocked before the first grasp; the jaw when the tool point first reaches the grasp point.
+    moved = torch.norm(
+      pin.data.root_link_pos_w[:, :2] - origin - self.start[:, :2], dim=-1
+    )
+    self.pushed |= phase_pre & (moved > PREGRASP_PUSH)
+    self.knocked |= phase_pre & toppled
+    gp = mdp.pin_grasp_point_w(env, OBJECT, 0.020, self.pp.GRASP_ABOVE_TOP_LYING)
+    robot = env.scene[ROBOT]
+    tcp = robot.data.site_pos_w[:, robot.site_names.index(TCP_SITE)]
+    arrive = (torch.norm(tcp - gp, dim=-1) < 0.02) & torch.isnan(self.arrive_q)
+    self.arrive_q = torch.where(arrive, jaw_q, self.arrive_q)
+    # The let-go: the pads' last contact after the lift, its speed and lowest point.
+    letgo = self.prev_grasped & ~grasped & self.lifted_once & ~self.letgo_seen
+    self.rel_speed = torch.where(letgo, st.speed, self.rel_speed)
+    self.rel_zmin = torch.where(letgo, st.z_min, self.rel_zmin)
+    self.letgo_seen |= letgo
+    # A later regrasp re-arms the let-go.
+    self.letgo_seen &= ~(onset & self.lifted_once)
+    age = env.episode_length_buf.float() * self.step_dt
+    self.first_rested = torch.where(
+      rested & self.lifted_once & (self.first_rested < 0), age, self.first_rested
+    )
+    self.held_at_handoff |= handed & ~self.handed_prev & grasped
+    self.handed_prev = handed.clone()
+    self.ever_grasped |= grasped
+    self.prev_grasped = grasped.clone()
+    self.prev_standing = st.standing.clone()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      px, py, stand, ang, gx, gy = self.start[i].tolist()
+      self.done.append(
+        {
+          "place_success": bool(self.rested[i] & handed[i] & j_released[i]),
+          "rested_end": bool(self.rested[i]),
+          "start_pose": "standing" if stand > 0.5 else "lying",
+          "end_pose": "standing" if bool(self.standing[i]) else "lying",
+          "centre_error_cm": 100 * float(self.dxy[i]),
+          "j_released": bool(j_released[i]),
+          "never_grasped": not bool(self.ever_grasped[i]),
+          "grasps": int(self.grasps[i]),
+          "first_try_grasp": bool(self.ever_grasped[i])
+          and int(self.grasps[i]) == 1
+          and bool(self.lifted_once[i]),
+          "held_at_handoff": bool(self.held_at_handoff[i]),
+          "topple_pregrasp": bool(self.topple["pregrasp"][i]),
+          "topple_carry": bool(self.topple["carry"][i]),
+          "topple_letgo": bool(self.topple["letgo"][i]),
+          "topple_return": bool(self.topple["return"][i]),
+          "pushed_pregrasp": bool(self.pushed[i]),
+          "knocked_pregrasp": bool(self.knocked[i]),
+          "jaw_at_arrival": float(self.arrive_q[i]),
+          "letgo_speed_cm_s": 100 * float(self.rel_speed[i]),
+          "letgo_zmin_mm": 1e3 * float(self.rel_zmin[i]),
+          "time_to_place_s": float(self.first_rested[i]),
+          "pin_x": px,
+          "pin_y": py,
+          "goal_x": gx,
+          "goal_y": gy,
+          "start_angle_deg": math.degrees(ang),
+          "carry_cm": 100 * math.hypot(gx - px, gy - py),
+        }
+      )
+      for t in self.topple.values():
+        t[i] = False
+      for t in (
+        self.ever_grasped,
+        self.prev_grasped,
+        self.lifted_once,
+        self.pushed,
+        self.knocked,
+        self.letgo_seen,
+        self.held_at_handoff,
+        self.handed_prev,
+      ):
+        t[i] = False
+      self.grasps[i] = 0
+      self.arrive_q[i] = float("nan")
+      self.rel_speed[i] = float("nan")
+      self.rel_zmin[i] = float("nan")
+      self.first_rested[i] = -1.0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k, g=rows: sum(bool(r[k]) for r in g) / max(len(g), 1)  # noqa: E731
+
+    def med(k, sel=None):
+      v = [r[k] for r in rows if (sel is None or sel(r)) and not math.isnan(r[k])]
+      return float(np.median(v)) if v else float("nan")
+
+    def ok(r):
+      return r["place_success"]
+
+    out = {
+      "place_success": share("place_success"),
+      "place_rested_end": share("rested_end"),
+      "place_j_released": share("j_released"),
+      "place_never_grasped": share("never_grasped"),
+      "place_first_try_grasp": share("first_try_grasp"),
+      "place_held_at_handoff": share("held_at_handoff"),
+      "place_regrasp": sum(r["grasps"] > 1 for r in rows) / n,
+      "place_pushed_pregrasp": share("pushed_pregrasp"),
+      "place_knocked_pregrasp": share("knocked_pregrasp"),
+      "place_jaw_at_arrival_median": med("jaw_at_arrival"),
+      "place_centre_error_cm_median": med("centre_error_cm"),
+      "place_within_1cm": sum(
+        r["centre_error_cm"] < 1 and r["rested_end"] for r in rows
+      )
+      / n,
+      "place_within_2cm": sum(
+        r["centre_error_cm"] < 2 and r["rested_end"] for r in rows
+      )
+      / n,
+      "place_within_5cm": sum(
+        r["centre_error_cm"] < 5 and r["rested_end"] for r in rows
+      )
+      / n,
+      "place_letgo_speed_cm_s_median": med("letgo_speed_cm_s"),
+      "place_letgo_zmin_mm_median": med("letgo_zmin_mm"),
+      "place_time_to_place_s_median": med(
+        "time_to_place_s", lambda r: r["time_to_place_s"] >= 0
+      ),
+      "place_end_standing": sum(r["end_pose"] == "standing" for r in rows if ok(r))
+      / max(sum(ok(r) for r in rows), 1),
+    }
+    for key in ("topple_pregrasp", "topple_carry", "topple_letgo", "topple_return"):
+      out[f"place_{key}"] = share(key)
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {"n": len(g), "place_success": share("place_success", g) if g else None}
+        for name, g in groups.items()
+      }
+
+    out["place_by_start_pose"] = bins(
+      {p: [r for r in rows if r["start_pose"] == p] for p in ("standing", "lying")}
+    )
+    for key, (xk, yk) in (("pin", ("pin_x", "pin_y")), ("goal", ("goal_x", "goal_y"))):
+      out[f"place_by_{key}_position"] = bins(
+        {
+          name: [r for r in rows if t(r[xk], r[yk])]
+          for name, t in PLACE_POSITION_BINS.items()
+        }
+      )
+      out[f"place_by_{key}_x"] = bins(
+        {
+          f"{lo:.2f}-{hi:.2f}": [r for r in rows if lo <= r[xk] < hi]
+          for lo, hi in PLACE_X_BINS
+        }
+      )
+    out["place_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["carry_cm"] < hi]
+        for lo, hi in PLACE_CARRY_BINS_CM
+      }
+    )
+
+    def direction(r):
+      dx, dy = r["goal_x"] - r["pin_x"], r["goal_y"] - r["pin_y"]
+      return "forward-back" if abs(dx) > abs(dy) else ("left" if dy > 0 else "right")
+
+    out["place_by_direction"] = bins(
+      {
+        d: [r for r in rows if direction(r) == d]
+        for d in ("right", "left", "forward-back")
+      }
+    )
+    out["place_by_standing_yaw"] = bins(
+      {
+        f"{lo}-{hi}deg": [
+          r
+          for r in rows
+          if r["start_pose"] == "standing" and lo <= r["start_angle_deg"] < hi
+        ]
+        for lo, hi in PLACE_YAW_BINS_DEG
+      }
+    )
+    out["place_by_lying_axis"] = bins(
+      {
+        f"{lo}-{hi}deg": [
+          r
+          for r in rows
+          if r["start_pose"] == "lying" and lo <= r["start_angle_deg"] < hi
+        ]
+        for lo, hi in PLACE_AXIS_BINS_DEG
+      }
+    )
+    return out
+
+
+#: Plan §15's bins (build item 3): the block's and the ball's position (the robot frame) near the torso / middle / far and
+#: right of the centre line; x in 3 cm steps over WC; the carry; the block's yaw.
+SEAT_POSITION_BINS = {
+  "near_x<0.45": lambda x, y: x < 0.45,
+  "middle": lambda x, y: 0.45 <= x <= 0.55,
+  "far_x>0.55": lambda x, y: x > 0.55,
+  "right_y<0": lambda x, y: y < 0.0,
+}
+SEAT_X_BINS = tuple(
+  (round(0.39 + 0.03 * k, 2), round(0.42 + 0.03 * k, 2)) for k in range(8)
+)
+SEAT_CARRY_BINS_CM = ((14, 20), (20, 30), (30, 99))
+SEAT_YAW_BINS_DEG = ((0, 15), (15, 30), (30, 46))
+#: A ball whose centre is below the block's top face is off the block; one over it within this of the axis is on it.
+SEAT_ON_BLOCK = 0.045
+#: A let-go this far (m, xy from the axis) from the block, out of the hand for this many steps, is a drop in the carry.
+SEAT_CARRY_DROP = 0.05
+SEAT_DROP_STEPS = 10
+
+
+class SeatTally:
+  """Plan §15's reads, per episode, beside `Tally` (plan §15.7 *Reported*, build item 3): SUCC -- after the hand-off's
+  return the ball rests in the seat (`mdp.ball_seat.SeatState.seated`, slower than `SEAT_SPEED`, no pad on it), the
+  policy let go by itself (J-released) and the block moved < 1 cm --; seated at any step after the let-go vs at the end
+  (the return knocking it); the end state (seated / on the block's land / off the block / held); the let-go's xy
+  offset from the axis, the ball's bottom over the block's top and its speed; drops in the carry; regrasps after a
+  roll-off; never grasped; held at the hand-off; the block moved; the hand on the block; and the bins.
+  ``None`` from `from_env` when the goal is not ``GOAL=ball-seat``."""
+
+  @classmethod
+  def from_env(cls, env: ManagerBasedRlEnv) -> SeatTally | None:
+    from pal_mjlab.tasks.manipulation import mdp
+
+    if not isinstance(env.command_manager.get_term(COMMAND), mdp.BallSeatCommand):
+      return None
+    return cls(env)
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    from pal_mjlab.tasks.manipulation import mdp, scene
+    from pal_mjlab.tasks.manipulation.pick_place import ball_seat, insert
+
+    self.mdp, self.bs, self.ins = mdp, ball_seat, insert
+    self.block_h = scene.BLOCK_HEIGHT
+    self.seat = env.command_manager.get_term(COMMAND).cfg.seat
+    n, dev = env.num_envs, env.device
+    zb = lambda: torch.zeros(n, dtype=torch.bool, device=dev)  # noqa: E731
+    zf = lambda v=0.0: torch.full((n,), v, device=dev)  # noqa: E731
+    self.seated, self.ever_seated, self.held, self.on_block = zb(), zb(), zb(), zb()
+    self.offset, self.dz = zf(), zf()
+    self.ever_grasped, self.prev_grasped, self.lifted_once = zb(), zb(), zb()
+    self.grasps_after_letgo = torch.zeros(n, dtype=torch.long, device=dev)
+    self.first_letgo, self.rel_committed = zb(), zb()
+    nan = float("nan")
+    self.rel_offset, self.rel_bottom, self.rel_speed = zf(nan), zf(nan), zf(nan)
+    self.pend_offset, self.pend_bottom, self.pend_speed = zf(nan), zf(nan), zf(nan)
+    self.out_run = torch.zeros(n, dtype=torch.long, device=dev)
+    self.carry_drop = zb()
+    self.held_at_handoff, self.handed_prev = zb(), zb()
+    self.hand_block = zb()
+    self.displacement = zf()
+    self.first_seated = zf(-1.0)
+    #: Each episode's start: block (x, y, env frame), |block yaw| folded, ball (x, y), radius.
+    self.start = torch.zeros(n, 6, device=dev)
+    self.step_dt = env.step_dt
+    self.done: list[dict] = []
+
+  def step(
+    self,
+    env: ManagerBasedRlEnv,
+    grasped: torch.Tensor,
+    j_released: torch.Tensor,
+    handed: torch.Tensor,
+  ) -> None:
+    """At the top of a control step, on the state the policy acts on; ``j_released`` / ``handed`` are
+    `RetreatTally`'s."""
+    from pal_mjlab.tasks.manipulation.mdp.observations import _pad_contact_any
+
+    mdp, b = self.mdp, self.ins
+    ball, blk = env.scene[OBJECT], env.scene[b.BLOCK]
+    origin = env.scene.env_origins[:, :2]
+    fresh = env.episode_length_buf == 0
+    if bool(fresh.any()):
+      yaw = yaw_mod90(mdp.yaw_relative_to_base(env, blk.data.root_link_quat_w)).abs()
+      now = torch.cat(
+        [
+          blk.data.root_link_pos_w[:, :2] - origin,
+          yaw.unsqueeze(-1),
+          ball.data.root_link_pos_w[:, :2] - origin,
+          object_half_height(env, OBJECT).unsqueeze(-1),
+        ],
+        dim=-1,
+      )
+      self.start = torch.where(fresh.unsqueeze(-1), now, self.start)
+    st = mdp.seat_state(env, OBJECT, b.BLOCK, self.block_h, self.seat)
+    speed = torch.norm(ball.data.root_link_lin_vel_w, dim=-1)
+    pads = _pad_contact_any(env, env.cfg.rewards["grasp"].params["sensor_name"])
+    self.seated = st.seated() & (speed < self.bs.SEAT_SPEED) & ~grasped & ~pads
+    self.held = grasped
+    self.on_block = (st.centre_b[:, 2] > self.block_h) & (st.offset < SEAT_ON_BLOCK)
+    self.offset, self.dz = st.offset, st.dz
+    onset = grasped & ~self.prev_grasped
+    self.lifted_once |= grasped & (st.centre_b[:, 2] > st.radius + 0.01)
+    self.grasps_after_letgo += (onset & self.first_letgo).long()
+    # The let-go as training's release latch takes it (`observations._release_latch` with J): the pads' last let-go
+    # before the jaw opened, committed when `RetreatTally` first sees the J-release.
+    letgo = self.prev_grasped & ~grasped & self.lifted_once
+    self.pend_offset = torch.where(letgo, st.offset, self.pend_offset)
+    self.pend_bottom = torch.where(letgo, st.bottom_over_top, self.pend_bottom)
+    self.pend_speed = torch.where(letgo, speed, self.pend_speed)
+    commit = j_released & ~self.rel_committed
+    self.rel_offset = torch.where(commit, self.pend_offset, self.rel_offset)
+    self.rel_bottom = torch.where(commit, self.pend_bottom, self.rel_bottom)
+    self.rel_speed = torch.where(commit, self.pend_speed, self.rel_speed)
+    self.rel_committed |= j_released
+    # A drop in the carry: out of the hand for `SEAT_DROP_STEPS` after the lift, before the J-release, having left the
+    # hand more than `SEAT_CARRY_DROP` from the axis (a grasp flag flickering for a step mid-carry is not one).
+    self.out_run = torch.where(
+      ~grasped & self.lifted_once & ~j_released,
+      self.out_run + 1,
+      torch.zeros_like(self.out_run),
+    )
+    self.carry_drop |= (self.out_run >= SEAT_DROP_STEPS) & (
+      self.pend_offset > SEAT_CARRY_DROP
+    )
+    self.first_letgo |= letgo
+    self.ever_seated |= self.seated & j_released
+    age = env.episode_length_buf.float() * self.step_dt
+    self.first_seated = torch.where(
+      self.seated & j_released & (self.first_seated < 0), age, self.first_seated
+    )
+    self.held_at_handoff |= handed & ~self.handed_prev & grasped
+    self.handed_prev = handed.clone()
+    self.ever_grasped |= grasped
+    self.prev_grasped = grasped.clone()
+    self.hand_block |= env.scene[b.BLOCK_HAND_SENSOR].data.found.bool().any(dim=-1)
+    self.displacement = env.command_manager.get_term(COMMAND).box_displacement()
+
+  def finish(
+    self, env_ids: torch.Tensor, handed: torch.Tensor, j_released: torch.Tensor
+  ) -> None:
+    for i in env_ids.tolist():
+      bx_, by_, byaw, px_, py_, radius = self.start[i].tolist()
+      seated = bool(self.seated[i])
+      moved = float(self.displacement[i])
+      end = (
+        "held"
+        if bool(self.held[i])
+        else "seated"
+        if seated
+        else "land"
+        if bool(self.on_block[i])
+        else "off"
+      )
+      self.done.append(
+        {
+          "seat_success": seated
+          and bool(handed[i])
+          and bool(j_released[i])
+          and moved < 0.01,
+          "seated_end": seated,
+          "ever_seated": bool(self.ever_seated[i]),
+          "end_state": end,
+          "end_offset_mm": 1e3 * float(self.offset[i]),
+          "end_dz_mm": 1e3 * float(self.dz[i]),
+          "j_released": bool(j_released[i]),
+          "never_grasped": not bool(self.ever_grasped[i]),
+          "regrasps_after_letgo": int(self.grasps_after_letgo[i]),
+          "carry_drop": bool(self.carry_drop[i]),
+          "held_at_handoff": bool(self.held_at_handoff[i]),
+          "letgo_offset_mm": 1e3 * float(self.rel_offset[i]),
+          "letgo_bottom_over_top_mm": 1e3 * float(self.rel_bottom[i]),
+          "letgo_speed_cm_s": 100 * float(self.rel_speed[i]),
+          "time_to_seat_s": float(self.first_seated[i]),
+          "hand_on_block": bool(self.hand_block[i]),
+          "block_moved_mm": 1e3 * moved,
+          "block_x": bx_,
+          "block_y": by_,
+          "block_yaw_deg": math.degrees(byaw),
+          "ball_x": px_,
+          "ball_y": py_,
+          "ball_radius_mm": 1e3 * radius,
+          "carry_cm": 100 * math.hypot(bx_ - px_, by_ - py_),
+        }
+      )
+      for t in (
+        self.ever_seated,
+        self.ever_grasped,
+        self.prev_grasped,
+        self.lifted_once,
+        self.rel_committed,
+        self.first_letgo,
+        self.carry_drop,
+        self.held_at_handoff,
+        self.handed_prev,
+        self.hand_block,
+      ):
+        t[i] = False
+      self.grasps_after_letgo[i] = 0
+      self.out_run[i] = 0
+      self.pend_offset[i] = float("nan")
+      self.pend_bottom[i] = float("nan")
+      self.pend_speed[i] = float("nan")
+      self.rel_offset[i] = float("nan")
+      self.rel_bottom[i] = float("nan")
+      self.rel_speed[i] = float("nan")
+      self.first_seated[i] = -1.0
+
+  def summarise(self, episodes: int) -> dict:
+    rows = self.done[:episodes]
+    n = max(len(rows), 1)
+    share = lambda k, g=rows: sum(bool(r[k]) for r in g) / max(len(g), 1)  # noqa: E731
+
+    def med(k, sel=None):
+      v = [r[k] for r in rows if (sel is None or sel(r)) and not math.isnan(r[k])]
+      return float(np.median(v)) if v else float("nan")
+
+    released = [r for r in rows if not math.isnan(r["letgo_offset_mm"])]
+    env_ = self.bs.ENVELOPE
+    out = {
+      "seat_success": share("seat_success"),
+      "seat_seated_end": share("seated_end"),
+      "seat_ever_seated": share("ever_seated"),
+      "seat_knocked_after_seated": sum(
+        r["ever_seated"] and not r["seated_end"] for r in rows
+      )
+      / n,
+      "seat_j_released": share("j_released"),
+      "seat_never_grasped": share("never_grasped"),
+      "seat_carry_drop": share("carry_drop"),
+      "seat_held_at_handoff": share("held_at_handoff"),
+      "seat_regrasp_after_letgo": sum(r["regrasps_after_letgo"] > 0 for r in rows) / n,
+      "seat_hand_on_block": share("hand_on_block"),
+      "seat_block_moved_mm_median": med("block_moved_mm"),
+      "seat_block_moved_over_1cm": sum(r["block_moved_mm"] >= 10 for r in rows) / n,
+      "seat_letgo_offset_mm_median": med("letgo_offset_mm"),
+      "seat_letgo_bottom_over_top_mm_median": med("letgo_bottom_over_top_mm"),
+      "seat_letgo_speed_cm_s_median": med("letgo_speed_cm_s"),
+      "seat_letgo_in_envelope": sum(
+        r["letgo_offset_mm"] <= 1e3 * env_[0]
+        and r["letgo_bottom_over_top_mm"] <= 1e3 * env_[1]
+        and r["letgo_speed_cm_s"] <= 100 * env_[2]
+        for r in released
+      )
+      / max(len(released), 1),
+      "seat_time_to_seat_s_median": med(
+        "time_to_seat_s", lambda r: r["time_to_seat_s"] >= 0
+      ),
+    }
+    for state in ("seated", "land", "off", "held"):
+      out[f"seat_end_{state}"] = sum(r["end_state"] == state for r in rows) / n
+
+    def bins(groups: dict) -> dict:
+      return {
+        name: {"n": len(g), "seat_success": share("seat_success", g) if g else None}
+        for name, g in groups.items()
+      }
+
+    for key, (xk, yk) in (
+      ("block", ("block_x", "block_y")),
+      ("ball", ("ball_x", "ball_y")),
+    ):
+      out[f"seat_by_{key}_position"] = bins(
+        {
+          name: [r for r in rows if t(r[xk], r[yk])]
+          for name, t in SEAT_POSITION_BINS.items()
+        }
+      )
+      out[f"seat_by_{key}_x"] = bins(
+        {
+          f"{lo:.2f}-{hi:.2f}": [r for r in rows if lo <= r[xk] < hi]
+          for lo, hi in SEAT_X_BINS
+        }
+      )
+    out["seat_by_carry"] = bins(
+      {
+        f"{lo}-{hi}cm": [r for r in rows if lo <= r["carry_cm"] < hi]
+        for lo, hi in SEAT_CARRY_BINS_CM
+      }
+    )
+    out["seat_by_block_yaw"] = bins(
+      {
+        f"{lo}-{hi}deg": [r for r in rows if lo <= abs(r["block_yaw_deg"]) < hi]
+        for lo, hi in SEAT_YAW_BINS_DEG
+      }
+    )
+    out["seat_by_radius"] = bins(
+      {
+        f"{lo}-{hi}mm": [r for r in rows if lo <= r["ball_radius_mm"] < hi]
+        for lo, hi in ((23.9, 24.5), (24.5, 25.5), (25.5, 26.1))
+      }
+    )
+    return out
 
 
 def handoff_action(env: ManagerBasedRlEnv, zero: torch.Tensor) -> torch.Tensor:
@@ -2245,6 +3471,8 @@ def build_env(args: argparse.Namespace) -> ManagerBasedRlEnv:
         else term
         for name, term in actor.terms.items()
       }
+  if getattr(args, "solver_iterations", None):
+    cfg.sim.mujoco.iterations, cfg.sim.mujoco.ls_iterations = args.solver_iterations
   if getattr(args, "plant", False):
     # The support sensor records contact only (`found`); the set-down read needs its force
     # too. A sensor field is read-only on the physics, and `found` -- what every other read
@@ -2390,6 +3618,19 @@ def tilt(env: ManagerBasedRlEnv) -> torch.Tensor:
     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1
   )
   return torch.acos(row.abs().amax(-1).clamp(max=1.0))
+
+
+def reference_yaw(env: ManagerBasedRlEnv) -> torch.Tensor | float:
+  """The world yaw the let-go's yaw is read against: the box's on plan S10.1's wide area (the goal
+  command's ``yaw_reference``), else 0 -- the world's axes, every earlier read. (B,) or 0"""
+  from pal_mjlab.tasks.manipulation.mdp import yaw_reference_quat
+
+  q = yaw_reference_quat(env, COMMAND)
+  if q is None:
+    return 0.0
+  return torch.atan2(
+    2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2)
+  )
 
 
 def yaw_mod90(yaw: torch.Tensor) -> torch.Tensor:
@@ -2733,6 +3974,14 @@ def report(result: dict, rewards: dict[str, float], args: argparse.Namespace) ->
       f"max TCP over cube top {fmt(result['lift_clear_max_median_m'])} (median)"
     )
     print(
+      f"    release -> lifted clear  {fmt(result['release_to_clear_median_s'], 's')} (median)"
+    )
+    print(
+      f"    pre-grasp (S8.1)         never grasped {result['pre_never_grasped']:6.1%}   moved > 1 / 3 cm "
+      f"{result['pre_moved_over_1cm']:6.1%} / {result['pre_moved_over_3cm']:6.1%}   first-try grasp "
+      f"{result['pre_first_try_grasp']:6.1%}"
+    )
+    print(
       f"    hand-off by lift / time  {result['handoff_by_lift']:6.1%} / "
       f"{result['handoff_by_timeout']:6.1%}"
     )
@@ -2919,6 +4168,12 @@ def main() -> None:
   )
   if args.handoff_lift is not None and not args.handoff:
     raise SystemExit("--handoff-lift needs --handoff")
+  if args.handoff_lift is not None and hasattr(
+    env.action_manager.get_term("joint_pos"), "start_handoff"
+  ):
+    raise SystemExit(
+      "--handoff-lift is the IK lift; HANDOFF_ROUTE=up-out is plan S11's route -- pick one"
+    )
   if args.handoff_lift is not None and isinstance(
     env.action_manager.get_term("joint_pos"), DeltaRateLimitedJointPositionAction
   ):
@@ -2937,6 +4192,11 @@ def main() -> None:
     else RiseReturn(env)
   )
   stack = StackTally(env)
+  stt = StartTally(env)
+  box = BoxTally.from_env(env)
+  insert = InsertTally.from_env(env)
+  place = PlaceTally.from_env(env)
+  seat = SeatTally.from_env(env)
   arm = ArmTally.from_env(env)
   pre = PregraspTally(env)
   trace: list[dict[str, torch.Tensor]] = []
@@ -2954,11 +4214,12 @@ def main() -> None:
       tally.record(obj_pos, obj_yaw, table_offset, goal)
       flags = probe(env, grasp_sensor)
       tally.observe(**flags)
+      stt.step(env, flags["grasped"], flags["lifted"])
       dxy, dz = geometry(env)
       tally.measure(flags["grasped"], dxy, dz)
       tally.measure_grasp_height(flags["grasped"], pad_height_above_object(env))
       if stack.active:
-        stack.step(env, flags["grasped"])
+        stack.step(env, flags["grasped"], retreat.handed)
       jaw_q, tcp_above, home_err = retreat_state(env, arm_ids, jaw_id)
       jaw_thr = jaw_open_for(env)
       handed = retreat.step(
@@ -2973,8 +4234,16 @@ def main() -> None:
         placed_jz=flags["placed_and_lifted_z"] & (jaw_q < jaw_thr),
         tilt=tilt(env),
         jaw_open_below=jaw_thr,
-        yaw=yaw_mod90(obj_yaw),
+        yaw=yaw_mod90(obj_yaw - reference_yaw(env)),
       )
+      if box is not None:
+        box.step(env, flags["grasped"], retreat.released)
+      if insert is not None:
+        insert.step(env, flags["grasped"], retreat.released)
+      if place is not None:
+        place.step(env, flags["grasped"], retreat.released, retreat.handed, jaw_q)
+      if seat is not None:
+        seat.step(env, flags["grasped"], retreat.released, retreat.handed)
       if plant is not None:
         plant.measure_env(
           carrying=flags["lifted"],
@@ -3028,7 +4297,12 @@ def main() -> None:
         goal,
       )
       actions = policy(obs)
-      if lift is not None:
+      route = env.action_manager.get_term("joint_pos")
+      if args.handoff and hasattr(route, "start_handoff"):
+        # Plan S11's up-out-home route (`HANDOFF_ROUTE=up-out`, `mdp.handoff`): the action term
+        # takes the arm over from this step on; the policy's actions pass through unread.
+        route.start_handoff("left", handed)
+      elif lift is not None:
         actions = lift.act(handed, retreat.hand_step, retreat.age, tcp_above, actions)
       elif args.handoff:
         # The position controller, through the action term's slew (and its tool cap and
@@ -3045,7 +4319,16 @@ def main() -> None:
       finished = torch.nonzero(dones, as_tuple=False).flatten()
       if finished.numel():
         n_before = len(tally.done)
+        if box is not None:  # before `retreat.finish` clears its per-episode state
+          box.finish(finished, retreat.handed, retreat.released)
+        if insert is not None:
+          insert.finish(finished, retreat.handed, retreat.released)
+        if place is not None:
+          place.finish(finished, retreat.handed, retreat.released)
+        if seat is not None:
+          seat.finish(finished, retreat.handed, retreat.released)
         tally.finish(finished)
+        stt.finish(finished)
         retreat.finish(
           finished, [r["placed_and_lifted"] for r in tally.done[n_before:]]
         )
@@ -3069,6 +4352,7 @@ def main() -> None:
   result = summarise(tally, env.step_dt, args.episodes)
   result.update(retreat.summarise(args.episodes))
   result.update(jawt.summarise(args.episodes))
+  result.update(stt.summarise(args.episodes))
   if occ.done:
     result.update(occ.summarise(args.episodes))
   if stack.active:
@@ -3088,6 +4372,18 @@ def main() -> None:
     result.update(plant.summarise(args.episodes))
   result.update(arm.summarise(args.episodes))
   result.update(pre.summarise(args.episodes))
+  if box is not None:
+    result.update(box.summarise(args.episodes))
+    print("\nplan S10 (box): " + json.dumps(box.summarise(args.episodes)))
+  if insert is not None:
+    result.update(insert.summarise(args.episodes))
+    print("\nplan §12 (insert): " + json.dumps(insert.summarise(args.episodes)))
+  if place is not None:
+    result.update(place.summarise(args.episodes))
+    print("\nplan §14 (place): " + json.dumps(place.summarise(args.episodes)))
+  if seat is not None:
+    result.update(seat.summarise(args.episodes))
+    print("\nplan §15 (ball seat): " + json.dumps(seat.summarise(args.episodes)))
   rewards = {k: sum(v) / len(v) for k, v in reward_sums.items()}
   report(result, rewards, args)
 
@@ -3111,18 +4407,28 @@ def main() -> None:
           "task": args.task,
           "num_envs": args.num_envs,
           "seed": args.seed,
+          "solver_iterations": args.solver_iterations,
           "stress": stress_of(args),
           **result,
           "reward_terms": rewards,
           "episodes_detail": [
-            {**r, **q, **o, **j, **st, **a, **pr}
-            for r, q, o, j, st, a, pr in zip(
+            {**r, **q, **o, **j, **st, **a, **b, **ins, **pl, **pg, **se, **pr}
+            for r, q, o, j, st, a, b, ins, pl, pg, se, pr in zip(
               tally.done[: args.episodes],
               retreat.done[: args.episodes],
               occ.done[: args.episodes] or [{}] * args.episodes,
               jawt.done[: args.episodes],
               stack.done[: args.episodes] or [{}] * args.episodes,
               arm.done[: args.episodes],
+              (box.done[: args.episodes] if box is not None else None)
+              or [{}] * args.episodes,
+              (insert.done[: args.episodes] if insert is not None else None)
+              or [{}] * args.episodes,
+              (place.done[: args.episodes] if place is not None else None)
+              or [{}] * args.episodes,
+              stt.done[: args.episodes],
+              (seat.done[: args.episodes] if seat is not None else None)
+              or [{}] * args.episodes,
               pre.done[: args.episodes],
               strict=True,
             )
