@@ -23,6 +23,29 @@ critic adds both grasps, both PQ pairs, "A placed" and whether the left is hande
 ``START=mixed`` (BI-JM): half the episodes begin with A already placed at T -- +/- 1 cm, yaw +/- 20
 deg, the left's ``was_lifted`` and release latched at that pose -- and the left arm handed off at
 home, so the stack is practised from the first iteration.
+
+Plan S11.2 (`pick-place-s11-bimanual-plan.md`) adds, each default-off:
+
+* ``reward="S12-BI"``: the task terms of both halves give way to two stage-replacing ladders and a
+  one-off cost for pushing A, coupled through the A_latched latch (`mdp.ladder`); HH's clearance margin
+  stops at the left's hand-off; the critic sees A_latched; metrics log each level's share of the steps.
+* ``handoff_train="both"``: the right hands off on its own trigger in training too (J-release and the
+  TCP 3 cm over B's top for 5 steps), so the ladder's R5 is reachable.
+* ``start="hold"``: `HOLD_SHARE` of the episodes start from a snapshot of the SEQ chain with B in the
+  right hand 2-6 cm over A (`hold_start`, the bank from `scripts/s112_hold_bank.py`), `PLACED_SHARE` with
+  A placed and B on the table (BI-JM's start), the rest from scratch.
+* ``right_target="gated"`` (BI-F's actor): an actor term ``right_target`` after the 73 -- the wait point
+  before A_latched, A's tracked top after (`mdp.right_target_gated`) -- for the factored policy's right
+  half (`tasks.manipulation.bimanual_policy`).
+
+Plan S11.4 (`pick-place-s11-bimanual-plan.md`, *S11.4*) adds, each default-off:
+
+* ``hold_mix``: the hold starts' (hold, A placed) shares in place of `HOLD_SHARE` / `PLACED_SHARE` (BI-H-RS).
+* ``hh_term``: arm-arm contact above that force (N) ends the episode -- a termination ``arm_arm_force``
+  (`illegal_contact` on HH's sensor, whose history spans the control step), not a time-out (BI-F2-T).
+* ``right_gate="clear"`` (with the gated right target only): the right's goal stays the wait point until A is
+  latched *and* the left's hand-off is on its home leg (past the out leg); its gated reward terms pay from the
+  same moment, and the critic gets ``left_home`` for the factored policy's right KL mask (BI-F2-G).
 """
 
 from __future__ import annotations
@@ -35,9 +58,11 @@ import re
 import torch
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, sample_uniform
 
@@ -120,6 +145,9 @@ HH_CONTACT_FORCE = 1.0
 
 #: The left's hand-off in training: the eval's trigger, or this far into the episode (s).
 LEFT_HANDOFF_TIMEOUT_S = 9.0
+#: Plan S11.2 decision 5: the right's training hand-off (``HANDOFF_TRAIN=both``) on its own release and lift, or at this
+#: time-out -- a safety net that pays no release, leave or success level (`mdp.right_ladder`).
+RIGHT_HANDOFF_TIMEOUT_S = 14.0
 #: BI-JM's placed-A start: the share of episodes, A about T (+/- m, the T draw's own +/- 1 cm keeps
 #: |A - T| inside the 2.5 cm "at T"), its yaw (+/- rad; the plan's placeholder before step 0's
 #: L-T measurement).
@@ -130,7 +158,33 @@ MIXED_A_YAW = math.radians(20.0)
 #: The JOINT episode, s (plan: 15 s until the overlapped script sets it).
 EPISODE_S = 15.0
 #: ``START`` names.
-STARTS = ("scratch", "mixed")
+STARTS = ("scratch", "mixed", "hold")
+#: ``REWARD`` names (plan S11.2): S11's gated sum, or the ladders.
+REWARDS = ("S11-BI", "S12-BI")
+#: ``HANDOFF_TRAIN`` names: which arms hand off on their own trigger in training.
+HANDOFF_TRAINS = ("none", "left", "both")
+#: Plan S11.2's hold starts: the shares of the episodes that start with B in the right hand over A (a SEQ
+#: snapshot) and with A placed and B on the table; the rest start from scratch.
+HOLD_SHARE = 0.3
+PLACED_SHARE = 0.2
+#: Plan S11.4's ``RIGHT_GATE`` names: the right's goal opens at A_latched (S11.2), or once the left is also home-bound.
+RIGHT_GATES = ("latch", "clear")
+#: The termination ``hh_term`` adds.
+ARM_ARM_TERM = "arm_arm_force"
+#: `hold_start`'s per-episode label (`_pp_start_kind`), for the metrics.
+START_KINDS = {"scratch": 0, "placed": 1, "hold": 2}
+#: The terms `S12-BI` replaces by the ladders: each half's task terms (the left's, and the right's with
+#: `right_`), and SA.
+LADDER_REPLACES = (
+  "reach",
+  "grasp",
+  "lift",
+  "goal",
+  "goal_near",
+  "release",
+  "placed",
+  "retreat",
+)
 
 
 def _rename(value, mapping: dict[str, str]):
@@ -245,6 +299,41 @@ def place_a_at_t(
   there (the grade of a let-go at that pose), and start the left arm handed off at home (the
   action term reads `handoff.START_HOME` at its reset, which runs after this event). The release
   latch's parameters are the left's ``placed`` term's, flat, so the event manager resolves them."""
+  pick = torch.rand(len(env_ids), device=env.device) < share
+  _start_home(env, arm, env_ids, pick)
+  ids = env_ids[pick]
+  if len(ids) == 0:
+    return
+  _put_a_at_t(
+    env, ids, half_xy, yaw, None, None,
+    (command_name, object_name, grasp_sensor_name, support_sensor_name, surface_cfg, jaw_cfg, jaw_open),
+  )  # fmt: skip
+
+
+def _start_home(
+  env: ManagerBasedRlEnv, arm: str, env_ids: torch.Tensor, pick: torch.Tensor
+) -> None:
+  """Mark ``env_ids[pick]`` to start with ``arm`` handed off at home (`handoff.START_HOME`), the rest not."""
+  start = getattr(env, START_HOME, None)
+  if start is None:
+    start = {}
+    setattr(env, START_HOME, start)
+  if arm not in start:
+    start[arm] = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  start[arm][env_ids] = pick
+
+
+def _put_a_at_t(
+  env: ManagerBasedRlEnv,
+  ids: torch.Tensor,
+  half_xy: float,
+  yaw: float,
+  xy: torch.Tensor | None,
+  quat: torch.Tensor | None,
+  latch_params: tuple,
+) -> None:
+  """Put cube A down on the table -- at ``xy`` (env frame, (N, 2)) with ``quat``, or about T (+/- ``half_xy``,
+  yaw +/- ``yaw``) -- and latch the left's `was_lifted` and its release there, as a let-go at that pose."""
   from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
   from pal_mjlab.tasks.manipulation.mdp.observations import (
     _WAS_LIFTED,
@@ -255,33 +344,30 @@ def place_a_at_t(
   )
   from pal_mjlab.tasks.manipulation.mdp.shapes import object_half_height
 
-  n = len(env_ids)
+  (
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  ) = latch_params
   device = env.device
-  pick = torch.rand(n, device=device) < share
-  start = getattr(env, START_HOME, None)
-  if start is None:
-    start = {}
-    setattr(env, START_HOME, start)
-  if arm not in start:
-    start[arm] = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
-  start[arm][env_ids] = pick
-  ids = env_ids[pick]
-  if len(ids) == 0:
-    return
   m = len(ids)
   tx, ty = ROBOT_TARGETS["T11"].xy
   origin = env.scene.env_origins[ids, :2]
-  xy = (
-    origin
-    + torch.tensor([tx, ty], device=device)
-    + sample_uniform(-half_xy, half_xy, (m, 2), device=device)
-  )
+  t_xy = torch.tensor([tx, ty], device=device)
+  if xy is None:
+    xy = t_xy + sample_uniform(-half_xy, half_xy, (m, 2), device=device)
+  xy = origin + xy
   top = surface_top_z(env, surface_cfg)[ids]
   z = top + object_half_height(env, object_name, ids)
-  zeros = torch.zeros(m, device=device)
-  quat = quat_from_euler_xyz(
-    zeros, zeros, sample_uniform(-yaw, yaw, (m,), device=device)
-  )
+  if quat is None:
+    zeros = torch.zeros(m, device=device)
+    quat = quat_from_euler_xyz(
+      zeros, zeros, sample_uniform(-yaw, yaw, (m,), device=device)
+    )
   cube = env.scene[object_name]
   cube.write_root_link_pose_to_sim(
     torch.cat([xy, z.unsqueeze(-1), quat], dim=-1), env_ids=ids
@@ -309,9 +395,7 @@ def place_a_at_t(
   # unknown until the command resamples, after the reset events).
   latch.released[ids] = True
   latch.grasped[ids] = False
-  latch.dxy[ids] = torch.norm(
-    xy - origin - torch.tensor([tx, ty], device=device), dim=-1
-  )
+  latch.dxy[ids] = torch.norm(xy - origin - t_xy, dim=-1)
   latch.height[ids] = 0.0
   latch.rel_on_table[ids] = True
   latch.rel_speed[ids] = 0.0
@@ -319,6 +403,145 @@ def place_a_at_t(
   if latch.jaw is not None:
     latch.jaw_closed[ids] = False
     latch.pend[ids] = False
+
+
+_BANK_CACHE = "_pp_hold_bank"
+#: A hold start keeps B where the snapshot had it, in the hand, and puts A on this episode's table, so B's gap over A
+#: moves by the table's height change (DR-scene: +/- 1 cm). Rows are drawn until the gap lands in this range, m.
+HOLD_GAP = (0.01, 0.07)
+HOLD_DRAWS = 16
+
+
+def load_hold_bank(env: ManagerBasedRlEnv, path: str) -> dict:
+  """The SEQ-chain snapshot bank (`scripts/s112_hold_bank.py`) on the env's device, checked against this env's
+  joint and action-target names. Cached on the env."""
+  bank = getattr(env, _BANK_CACHE, None)
+  if bank is not None:
+    return bank
+  raw = torch.load(path, map_location=env.device, weights_only=False)
+  robot = env.scene[ROBOT]
+  term = env.action_manager.get_term("joint_pos")
+  if list(raw["joint_names"]) != list(robot.joint_names):
+    raise ValueError(f"{path}: joint names differ from this env's robot")
+  targets = [n.split("/")[-1] for n in term.target_names]
+  if list(raw["target_names"]) != targets:
+    raise ValueError(f"{path}: action targets {raw['target_names']} != {targets}")
+  if len(raw["step"]) == 0:
+    raise ValueError(f"{path}: an empty bank")
+  setattr(env, _BANK_CACHE, raw)
+  return raw
+
+
+def _pick_rows(
+  env: ManagerBasedRlEnv, ids: torch.Tensor, bank: dict, surface_cfg: SceneEntityCfg
+) -> torch.Tensor:
+  """A bank row per env of ``ids`` whose B-over-A gap stays in `HOLD_GAP` on this episode's table: `HOLD_DRAWS`
+  random candidates each, the first that fits, else the candidate with the gap nearest the range. (N,)"""
+  from pal_mjlab.tasks.manipulation.mdp.events import surface_top_z
+
+  device = env.device
+  top = surface_top_z(env, surface_cfg)[ids] - env.scene.env_origins[ids, 2]
+  cand = torch.randint(0, len(bank["step"]), (len(ids), HOLD_DRAWS), device=device)
+  # A rests at top + its half-height; B's bottom stays where it was.
+  gap = (bank["b_pos"][cand, 2] - 0.025) - (top.unsqueeze(-1) + 0.05)
+  lo, hi = HOLD_GAP
+  fits = (gap >= lo) & (gap <= hi)
+  miss = (lo - gap).clamp_min(0.0) + (gap - hi).clamp_min(0.0)
+  first = torch.where(fits.any(-1), fits.float().argmax(-1), miss.argmin(-1))
+  return cand.gather(1, first.unsqueeze(-1)).squeeze(-1)
+
+
+def hold_start(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  bank_path: str,
+  hold_share: float,
+  placed_share: float,
+  half_xy: float,
+  yaw: float,
+  target_command_name: str,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float,
+) -> None:
+  """Reset event, plan S11.2's ``START=hold``: of ``env_ids``, ``hold_share`` start from a snapshot of the SEQ
+  chain -- the robot's joints, A, B (in the right hand, 2-6 cm over A) and the action term's targets and jaw
+  servos as saved, the left handed off and going home, the episode clock and T as in the snapshot
+  (`handoff.START_STATE`) -- ``placed_share`` with A placed at T and the left home (BI-JM's start), the rest
+  from scratch. A is put on this episode's table (DR-scene moves it); B keeps its place in the hand. The
+  latch parameters are the left's ``placed`` term's. Runs after every other reset event."""
+  from pal_mjlab.tasks.manipulation.mdp.handoff import START_STATE
+
+  device = env.device
+  n = len(env_ids)
+  u = torch.rand(n, device=device)
+  hold = u < hold_share
+  placed = (u >= hold_share) & (u < hold_share + placed_share)
+  kind = getattr(env, "_pp_start_kind", None)
+  if kind is None:
+    kind = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+    env._pp_start_kind = kind
+  kind[env_ids] = torch.where(
+    hold,
+    START_KINDS["hold"],
+    torch.where(placed, START_KINDS["placed"], START_KINDS["scratch"]),
+  )
+  _start_home(env, "left", env_ids, hold | placed)
+  latch_params = (
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
+  if bool(placed.any()):
+    _put_a_at_t(env, env_ids[placed], half_xy, yaw, None, None, latch_params)
+
+  state = getattr(env, START_STATE, None)
+  term = env.action_manager.get_term("joint_pos")
+  if state is None:
+    servo = (
+      term._servo
+      if term._servo_idx is not None
+      else torch.zeros(env.num_envs, 0, device=device)
+    )
+    state = {
+      "mask": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
+      "target": torch.zeros_like(term._last_target),
+      "servo": torch.zeros_like(servo),
+      "clock": torch.zeros(env.num_envs, dtype=torch.long, device=device),
+      "goal_offset": torch.zeros(env.num_envs, 2, device=device),
+      "command": target_command_name,
+    }
+    setattr(env, START_STATE, state)
+  state["mask"][env_ids] = hold
+  ids = env_ids[hold]
+  if len(ids) == 0:
+    return
+  bank = load_hold_bank(env, bank_path)
+  rows = _pick_rows(env, ids, bank, surface_cfg)
+  robot = env.scene[ROBOT]
+  robot.write_joint_state_to_sim(bank["q"][rows], bank["qd"][rows], env_ids=ids)
+  origin = env.scene.env_origins[ids]
+  _put_a_at_t(
+    env, ids, 0.0, 0.0, bank["a_pos"][rows, :2], bank["a_quat"][rows], latch_params
+  )
+  b = env.scene[CUBE_B]
+  b.write_root_link_pose_to_sim(
+    torch.cat([origin + bank["b_pos"][rows], bank["b_quat"][rows]], dim=-1), env_ids=ids
+  )
+  b.write_root_link_velocity_to_sim(bank["b_vel"][rows], env_ids=ids)
+  state["target"][ids] = bank["target"][rows]
+  if state["servo"].shape[1]:
+    state["servo"][ids] = bank["servo"][rows]
+  state["clock"][ids] = bank["step"][rows]
+  state["goal_offset"][ids] = bank["goal_offset"][rows]
 
 
 def make_bimanual_env_cfg(
@@ -329,16 +552,43 @@ def make_bimanual_env_cfg(
   baseline: Baseline = BASELINES["B"],
   episode_length_s: float = EPISODE_S,
   arm_table: ArmTableCfg | None = None,
-  handoff_train: bool = True,
+  handoff_train: str = "left",
   start: str = "scratch",
   critic_release: bool = True,
   play: bool = False,
+  reward: str = "S11-BI",
+  hold_bank: str | None = None,
+  right_target: str = "plain",
+  hold_mix: tuple[float, float] | None = None,
+  hh_term: float | None = None,
+  right_gate: str = "latch",
 ) -> ManagerBasedRlEnvCfg:
-  """Plan S11's JOINT cfg (BI-J: ``start="scratch"``, BI-JM: ``"mixed"``); see the module docstring.
-  ``handoff_train`` is ``HANDOFF_TRAIN=left``: the left's up-out-home hand-off on its own trigger in
-  training (the eval starts the right's); off, the controller is there for the eval to start."""
+  """Plan S11's JOINT cfg (BI-J: ``start="scratch"``, BI-JM: ``"mixed"``) and plan S11.2's codes; see the
+  module docstring. ``handoff_train`` is ``HANDOFF_TRAIN``: ``left`` the left's up-out-home hand-off on its
+  own trigger in training (the eval starts the right's), ``both`` the right's too, ``none`` the controller is
+  there for the eval to start. ``hold_bank`` is the snapshot file ``start="hold"`` draws from. ``hold_mix``,
+  ``hh_term`` and ``right_gate`` are plan S11.4's (module docstring)."""
   if start not in STARTS:
     raise ValueError(f"unknown start {start!r}; have {STARTS}")
+  if reward not in REWARDS:
+    raise ValueError(f"unknown reward {reward!r}; have {REWARDS}")
+  if handoff_train not in HANDOFF_TRAINS:
+    raise ValueError(f"unknown handoff_train {handoff_train!r}; have {HANDOFF_TRAINS}")
+  if right_target not in ("plain", "gated"):
+    raise ValueError(f"unknown right_target {right_target!r}; have ('plain', 'gated')")
+  if (start == "hold") != (hold_bank is not None):
+    raise ValueError("START=hold needs a snapshot bank (HOLD_BANK), and only it does")
+  if right_gate not in RIGHT_GATES:
+    raise ValueError(f"unknown right_gate {right_gate!r}; have {RIGHT_GATES}")
+  if right_gate == "clear" and right_target != "gated":
+    raise ValueError("right_gate='clear' gates the gated right target (INIT=seq)")
+  if hold_mix is not None:
+    if start != "hold":
+      raise ValueError("hold_mix is START=hold's")
+    if not (min(hold_mix) >= 0.0 and sum(hold_mix) <= 1.0):
+      raise ValueError(f"hold_mix {hold_mix} is not two shares summing to at most 1")
+  if hh_term is not None and not hh_term > 0.0:
+    raise ValueError(f"hh_term {hh_term!r} is not a positive force (N)")
   if not critic_release:
     raise ValueError("JOINT's critic carries both PQ pairs (BS11); CRITIC_OBS=q")
   robot = kangaroo_grippers_both_arms(gains, arm_effort_scale=effort.effort_scale)
@@ -484,13 +734,42 @@ def make_bimanual_env_cfg(
   critic_terms["left_handed_off"] = ObservationTermCfg(
     func=mdp.handoff_active, params={"arm": "left"}
   )
+  clear = right_gate == "clear"
+  if clear:
+    critic_terms["left_home"] = ObservationTermCfg(
+      func=mdp.handoff_home, params={"arm": "left"}
+    )
+  if reward == "S12-BI" or right_target == "gated":
+    # A_latched for the critic; with INIT=seq also the KL mask of the right half (`bimanual_policy.JointPPO`).
+    critic_terms["a_latched"] = ObservationTermCfg(
+      func=mdp.a_latched, params={"gate": _gate_dict(gate)}
+    )
   critic.terms = critic_terms
+  if right_target == "gated":
+    actor.terms["right_target"] = ObservationTermCfg(
+      func=mdp.right_target_gated,
+      params={
+        "base_name": OBJECT,
+        "object_name": CUBE_B,
+        "bias_key": OBJECT,
+        "lag": a["object_pos"].params.get("lag"),
+        "target_command_name": COMMAND,
+        "gate": _gate_dict(gate),
+        **({"left_home": True} if clear else {}),
+      },
+      noise=a["object_pos"].noise,
+    )
   for name, term in right_rewards.items():
     if name in GATED_RIGHT:
       term = RewardTermCfg(
         func=mdp.when_base_placed,
         weight=term.weight,
-        params={**term.params, "inner": term.func, **gate},
+        params={
+          **term.params,
+          "inner": term.func,
+          **gate,
+          **({"gate_left_home": True} if clear else {}),
+        },
       )
     cfg.rewards[f"right_{name}"] = term
   apply_arm_table(cfg, right, arm_table, prefix="right_")
@@ -504,24 +783,36 @@ def make_bimanual_env_cfg(
     weight=HH_CONTACT_WEIGHT,
     params={"sensor_name": ARM_ARM_SENSOR, "force_threshold": HH_CONTACT_FORCE},
   )
+  if hh_term is not None:
+    cfg.terminations[ARM_ARM_TERM] = TerminationTermCfg(
+      func=mdp.illegal_contact,
+      params={"sensor_name": ARM_ARM_SENSOR, "force_threshold": float(hh_term)},
+    )
+  left_placed = cfg.rewards["placed"]
+  right_placed = right_rewards["placed"]
+  rp = right_placed.params
+  right_gate = {
+    "command_name": rp["command_name"],
+    "object_name": rp["object_name"],
+    "grasp_sensor_name": rp["grasp_sensor_name"],
+    "support_sensor_name": rp["support_sensor_name"],
+    "jaw_cfg": rp["jaw_cfg"],
+    "jaw_open": rp["jaw_open"],
+    "threshold": rp["threshold"],
+    "velocity_threshold": 0.05,
+  }
+  if reward == "S12-BI":
+    _apply_ladders(cfg, left, right, left_placed, gate)
 
-  # -- The hand-off controller on both arms; the left's own trigger in training. ---------------
-  p = cfg.rewards["placed"].params
-  trigger = HandoffTriggerCfg(
-    command_name=p["command_name"],
-    object_name=p["object_name"],
-    grasp_sensor_name=p["grasp_sensor_name"],
-    support_sensor_name=p["support_sensor_name"],
-    surface_cfg=p["surface_cfg"],
-    jaw_cfg=p["jaw_cfg"],
-    jaw_open=p["jaw_open"],
-    timeout_s=LEFT_HANDOFF_TIMEOUT_S,
-  )
+  # -- The hand-off controller on both arms; the left's own trigger in training (and the right's). --
+  p = left_placed.params
+  trigger = _trigger(p, LEFT_HANDOFF_TIMEOUT_S)
+  right_trigger = _trigger(right_placed.params, RIGHT_HANDOFF_TIMEOUT_S)
   cfg.actions["joint_pos"] = with_handoff(
     cfg.actions["joint_pos"],
     arms=(
-      handoff_arm(left, +1.0, trigger if handoff_train else None),
-      handoff_arm(right, -1.0, None),
+      handoff_arm(left, +1.0, trigger if handoff_train != "none" else None),
+      handoff_arm(right, -1.0, right_trigger if handoff_train == "both" else None),
     ),
   )
   if start == "mixed":
@@ -547,11 +838,164 @@ def make_bimanual_env_cfg(
         },
       },
     )
+  if start == "hold":
+    cfg.events["start_hold"] = EventTermCfg(
+      func=hold_start,
+      mode="reset",
+      params={
+        "bank_path": hold_bank,
+        "hold_share": HOLD_SHARE if hold_mix is None else float(hold_mix[0]),
+        "placed_share": PLACED_SHARE if hold_mix is None else float(hold_mix[1]),
+        "half_xy": MIXED_A_HALF_XY,
+        "yaw": MIXED_A_YAW,
+        "target_command_name": COMMAND,
+        **{
+          k: p[k]
+          for k in (
+            "command_name",
+            "object_name",
+            "grasp_sensor_name",
+            "support_sensor_name",
+            "surface_cfg",
+            "jaw_cfg",
+            "jaw_open",
+          )
+        },
+      },
+    )
+    for kind, k in START_KINDS.items():
+      cfg.metrics[f"start_{kind}"] = MetricsTermCfg(
+        func=mdp.start_kind_is, params={"kind": k}, reduce="last"
+      )
+      cfg.metrics[f"tower_{kind}"] = MetricsTermCfg(
+        func=mdp.tower_of_start,
+        params={"kind": k, "gate": _gate_dict(gate), "right_gate": right_gate},
+        reduce="last",
+      )
+  if reward == "S12-BI" or right_target == "gated":
+    # The A latch and the ladders' freezes clear at a reset, before any start event can set them: every code
+    # whose terms read the latch (S12-BI; INIT=seq's gated right target and its KL mask). BI-F (S11-BI +
+    # INIT=seq, batch 2) trained without it: A_latched stayed set from an env's first latch on.
+    cfg.events = {
+      "reset_ladder_state": EventTermCfg(func=mdp.reset_ladder_state, mode="reset"),
+      **cfg.events,
+    }
+  if (
+    reward == "S12-BI"
+    or start == "hold"
+    or right_target == "gated"
+    or handoff_train == "both"
+  ):
+    # Plan S11.2: every code logs the tower (both returns' state) as its episodes end, whatever its reward.
+    cfg.metrics["tower_standing"] = MetricsTermCfg(
+      func=mdp.tower_standing,
+      params={"gate": _gate_dict(gate), "right_gate": right_gate},
+      reduce="last",
+    )
   if play:
     from pal_mjlab.tasks.manipulation.tabletop_env_cfg import apply_play_overrides
 
     apply_play_overrides(cfg)
   return cfg
+
+
+def _gate_dict(gate: dict) -> dict:
+  """`_gate_params`' ``gate_*`` keys as `mdp.base_placed_bool`'s own (a nested dict: the latch functions take it
+  whole)."""
+  return {k.removeprefix("gate_"): v for k, v in gate.items()}
+
+
+def _trigger(p: dict, timeout_s: float) -> HandoffTriggerCfg:
+  """An arm's training hand-off trigger from its ``placed`` term's parameters."""
+  return HandoffTriggerCfg(
+    command_name=p["command_name"],
+    object_name=p["object_name"],
+    grasp_sensor_name=p["grasp_sensor_name"],
+    support_sensor_name=p["support_sensor_name"],
+    surface_cfg=p["surface_cfg"],
+    jaw_cfg=p["jaw_cfg"],
+    jaw_open=p["jaw_open"],
+    timeout_s=timeout_s,
+  )
+
+
+def _apply_ladders(cfg, left, right, left_placed: RewardTermCfg, gate: dict) -> None:
+  """Plan S11.2's ``S12-BI`` on a JOINT cfg built with S11-BI: both halves' task terms (`LADDER_REPLACES`, the
+  right's SA) give way to the two ladders and A's one-off displacement cost (`mdp.ladder`); HH's clearance
+  margin stops at the left's hand-off; metrics for each level's share of the steps. The regularisers, P,
+  the trunk and arm-table terms, the hand-table contacts, M8's pad contact after a release and HH's
+  contact stay as they are."""
+  from pal_mjlab.tasks.manipulation.mdp import ladder
+
+  drop = {
+    *LADDER_REPLACES,
+    *(f"right_{n}" for n in LADDER_REPLACES),
+    "right_stack_align",
+  }
+  missing = sorted(n for n in drop if n not in cfg.rewards)
+  if missing:
+    raise ValueError(f"S12-BI replaces terms this cfg does not have: {missing}")
+  for name in drop:
+    del cfg.rewards[name]
+  g = _gate_dict(gate)
+  lp = left_placed.params
+  wanted = inspect.signature(mdp.release_quality).parameters
+  grade = {k: v for k, v in lp.items() if k in wanted}
+  table = SceneEntityCfg(TABLE)
+  cfg.rewards["left_ladder"] = RewardTermCfg(
+    func=mdp.left_ladder,
+    weight=ladder.LADDER_SCALE,
+    params={
+      "object_name": OBJECT,
+      "command_name": COMMAND,
+      "tcp_cfg": SceneEntityCfg(ROBOT, site_names=(left.tcp_site,)),
+      "grasp_sensor_name": left.contact_sensor_name,
+      "support_sensor_name": SUPPORT_SENSOR,
+      "surface_cfg": table,
+      "jaw_cfg": SceneEntityCfg(ROBOT, joint_names=(re.escape(left.finger_joint),)),
+      "jaw_open": JAW_OPEN,
+      "grade": grade,
+      "gate": g,
+    },
+  )
+  cfg.rewards["right_ladder"] = RewardTermCfg(
+    func=mdp.right_ladder,
+    weight=ladder.LADDER_SCALE,
+    params={
+      "object_name": CUBE_B,
+      "base_name": OBJECT,
+      "command_name": COMMAND_B,
+      "tcp_cfg": SceneEntityCfg(ROBOT, site_names=(right.tcp_site,)),
+      "grasp_sensor_name": right.contact_sensor_name,
+      "support_sensor_name": SUPPORT_SENSOR_B,
+      "surface_cfg": table,
+      "jaw_cfg": SceneEntityCfg(ROBOT, joint_names=(re.escape(right.finger_joint),)),
+      "jaw_open": JAW_OPEN,
+      "target_command_name": COMMAND,
+      "gate": g,
+    },
+  )
+  cfg.rewards["a_displaced"] = RewardTermCfg(
+    func=mdp.a_displaced, weight=ladder.A_MOVED_WEIGHT, params={"gate": g}
+  )
+  cfg.rewards["arm_arm_clearance"] = RewardTermCfg(
+    func=mdp.arm_arm_clearance_before_left_handoff,
+    weight=HH_CLEARANCE_WEIGHT,
+    params={"margin": HH_MARGIN},
+  )
+  for arm, levels in (("right", range(6)), ("left", range(4))):
+    for k in levels:
+      cfg.metrics[f"{arm}_level_{k}"] = MetricsTermCfg(
+        func=mdp.ladder_level_is, params={"arm": arm, "level": k}
+      )
+  cfg.metrics["a_latched_at_end"] = MetricsTermCfg(
+    func=mdp.a_latched_flag,
+    params={"gate": g},
+    reduce="last",
+  )
+  cfg.metrics["tower_at_end"] = MetricsTermCfg(
+    func=mdp.ladder_level_is, params={"arm": "right", "level": 5}, reduce="last"
+  )
 
 
 def handoff_arm(gripper, side: float, trigger) -> HandoffArmCfg:

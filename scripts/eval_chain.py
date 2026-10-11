@@ -313,7 +313,7 @@ def chain(args) -> dict:
     "lt": str(args.lt),
     "rst": str(args.rst),
     "seed": args.seed,
-    **summarise(rows),
+    **summarise(rows, args.right_timeout),
   }
   for k, v in result.items():
     print(f"{k:36s} {v}")

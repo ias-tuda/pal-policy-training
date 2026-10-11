@@ -107,6 +107,7 @@ def when_base_placed(
   gate_jaw_open: float,
   gate_threshold: float,
   gate_velocity_threshold: float,
+  gate_left_home: bool = False,
   **params,
 ) -> torch.Tensor:
   """``inner(env, **params)`` while the base is placed (`base_placed_bool` on the ``gate_*``
@@ -114,7 +115,8 @@ def when_base_placed(
   ``release``, ``placed`` (and M6's grade in them), SA and M8's retreat pay only while A is placed,
   so placing A switches terms on and can never lower the total (L5 by construction), and knocking
   A off T stops the right's stack income. Every parameter is a top-level one, so the manager
-  resolves both sets' entity cfgs."""
+  resolves both sets' entity cfgs. ``gate_left_home`` (plan S11.4's ``RIGHT_GATE=clear``): also only once the
+  left's hand-off has reached its home leg (past the out leg, clear of the column above T)."""
   gate = base_placed_bool(
     env,
     gate_command_name,
@@ -126,6 +128,8 @@ def when_base_placed(
     gate_threshold,
     gate_velocity_threshold,
   )
+  if gate_left_home:
+    gate = gate & handoff_home_bool(env, "left")
   return inner(env, **params) * gate.float()
 
 
@@ -139,6 +143,20 @@ def handoff_active(env: ManagerBasedRlEnv, arm: str) -> torch.Tensor:
   input -- the policy's columns for that arm do nothing then. (B, 1)"""
   term = env.action_manager.get_term("joint_pos")
   return (term.phase[:, term.arm_index(arm)] > 0).float().unsqueeze(-1)
+
+
+def handoff_home_bool(env: ManagerBasedRlEnv, arm: str) -> torch.Tensor:
+  """Whether ``arm``'s hand-off is on its home leg (`handoff.HOME`: up and out are done, or the episode started
+  there). (B,)"""
+  from pal_mjlab.tasks.manipulation.mdp.handoff import HOME
+
+  term = env.action_manager.get_term("joint_pos")
+  return term.phase[:, term.arm_index(arm)] == HOME
+
+
+def handoff_home(env: ManagerBasedRlEnv, arm: str) -> torch.Tensor:
+  """`handoff_home_bool` as a critic input -- plan S11.4's ``RIGHT_GATE=clear`` KL mask reads it. (B, 1)"""
+  return handoff_home_bool(env, arm).float().unsqueeze(-1)
 
 
 # -- JOINT: the arms keep apart (HH) -------------------------------------------------------------
