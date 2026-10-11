@@ -680,6 +680,42 @@ def open_after_release(
   return opened * placed.float()
 
 
+def released_object_motion(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  object_name: str,
+  grasp_sensor_name: str,
+  support_sensor_name: str,
+  surface_cfg: SceneEntityCfg,
+  jaw_cfg: SceneEntityCfg,
+  jaw_open: float | BySize | PerShape,
+  speed_scale: float = 0.05,
+) -> torch.Tensor:
+  """Plan S8.2's RD: the object's horizontal speed as a fraction of ``speed_scale`` (m/s), capped at 1, while it
+  is not held after this episode's J-release; weight it negative. (B,)
+
+  Why: S8.1's finalists lost 5-7 % of their slow-jaw episodes to a ball placed within 1 cm and then dragged
+  1-2 cm while the hand lifted with the jaw still opening, ending outside the goal (S8.1 report). `placed` stops
+  paying only once the ball is 2.5 cm off; this prices the drag (and a let-go that leaves the ball rolling) from
+  the first millimetre. A placed ball at rest costs nothing, and nothing is charged while held or before the
+  release, so the carry is untouched.
+  """
+  latch = _release_latch(
+    env,
+    command_name,
+    object_name,
+    grasp_sensor_name,
+    support_sensor_name,
+    surface_cfg,
+    jaw_cfg,
+    jaw_open,
+  )
+  obj: Entity = env.scene[object_name]
+  speed = torch.norm(obj.data.root_link_lin_vel_w[:, :2], dim=-1)
+  free = latch.released & ~_grasped_bool(env, grasp_sensor_name)
+  return (speed / speed_scale).clamp(0.0, 1.0) * free.float()
+
+
 def open_at_goal(
   env: ManagerBasedRlEnv,
   command_name: str,

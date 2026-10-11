@@ -267,6 +267,12 @@ for _pair in PIN_START:pin PIN_LIE_P:liep; do
     S91_TAG="${S91_TAG},\"${_short}${_val}\""
   fi
 done
+# Plan S8.2: FRICTION (low: table top and object sliding friction drawn from 0.3) -- in the run name.
+if [ -n "${FRICTION:-}" ]; then
+  export FRICTION
+  S11_NAME="${S11_NAME}_fric${FRICTION}"
+  S11_TAG="${S11_TAG},\"fric${FRICTION}\""
+fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -329,7 +335,7 @@ echo "baseline    $BASELINE   spawn $SPAWN   tool speed $TOOL_SPEED"
 echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_OBS   occ_flag ${OCC_FLAG:-(default)}"
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}   pregrasp ${PREGRASP:-(default)}"
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}   table_dz ${TABLE_DZ:-(none)}"
-echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}"
+echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}   friction ${FRICTION:-(default)}"
 echo "s9.1        base_obs ${BASE_OBS:-(default)}   contact ${CONTACT:-(default: box)}"
 echo "s14         pin_start ${PIN_START:-(default)}   pin_lie_p ${PIN_LIE_P:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"

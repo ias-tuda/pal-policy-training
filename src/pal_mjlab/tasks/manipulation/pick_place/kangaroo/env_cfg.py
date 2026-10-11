@@ -110,6 +110,7 @@ import math
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from pal_mjlab.robots.pal_kangaroo.kangaroo_constants import (
   DEFAULT_TABLETOP_GAINS,
@@ -174,6 +175,7 @@ from pal_mjlab.tasks.manipulation.tabletop_env_cfg import (
   ACTION_MODES,
   DR_LEVELS,
   LATENCY_MODELS,
+  TABLE,
 )
 
 #: Environment variables read at registration. Named as the plan names them.
@@ -217,6 +219,7 @@ INSERT_HOLE_D_ENV_VAR = "INSERT_HOLE_D"
 INSERT_FRICTION_ENV_VAR = "INSERT_FRICTION"
 PIN_START_ENV_VAR = "PIN_START"
 PIN_LIE_P_ENV_VAR = "PIN_LIE_P"
+FRICTION_ENV_VAR = "FRICTION"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -426,6 +429,7 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ball_seat=_select_ball_seat(),
   )
   _apply_contact(cfg)
+  _apply_friction(cfg)
   park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
@@ -447,6 +451,42 @@ def _apply_contact(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   keep_on = CONTACT_FLAGS[_select(CONTACT_ENV_VAR, DEFAULT_CONTACT, CONTACT_FLAGS)]
   cfg.sim.mujoco.disableflags = tuple(
     f for f in cfg.sim.mujoco.disableflags if f not in keep_on
+  )
+  return cfg
+
+
+#: Plan S8.2's `FRICTION`: per-world sliding-friction draws (abs, uniform) for the table top and the object.
+#: MuJoCo uses the larger of two geoms' coefficients, so with DR-object's object draw (0.5-1.2) and the table's
+#: fixed 0.8 (`scene.TABLE_TOP`) no run up to S8.1 ever trained an object-table contact below 0.8; ``low`` draws
+#: both from 0.3, so the contact spans 0.3-1.2 (S8.1's WB-JW lost 10-21 points at 0.4, `--stress-friction`).
+#: The pads keep their own (geom priority 2).
+FRICTION_CODES: dict[str, tuple[tuple[float, float], tuple[float, float]] | None] = {
+  "default": None,
+  "low": ((0.3, 1.0), (0.3, 1.2)),
+}
+
+
+def _apply_friction(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
+  """`FRICTION`: replace DR-object's object friction draw and add a table-top draw (`FRICTION_CODES`)."""
+  code = FRICTION_CODES[_select(FRICTION_ENV_VAR, "default", FRICTION_CODES)]
+  if code is None:
+    return cfg
+  obj = cfg.events.get("object_friction")
+  if obj is None:
+    raise ValueError(
+      f"{FRICTION_ENV_VAR} widens DR-object's object friction draw; it needs DR at DR-object or above"
+    )
+  table, objr = code
+  cfg.events["object_friction"] = dataclasses.replace(
+    obj, params={**obj.params, "ranges": objr}
+  )
+  cfg.events["table_friction"] = dataclasses.replace(
+    obj,
+    params={
+      **obj.params,
+      "asset_cfg": SceneEntityCfg(TABLE, geom_names=("table_top",)),
+      "ranges": table,
+    },
   )
   return cfg
 
