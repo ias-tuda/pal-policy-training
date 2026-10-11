@@ -231,6 +231,26 @@ KANGAROO_GRIPPERS_LEFT_ARM_WP = dataclasses.replace(
 )
 
 
+# Plan §13's L-H (`pick-place-insert-plan.md` §13.1, step 0 item 1, 2026-10-07): the side grasp of the 56 mm socket
+# block -- the hand horizontal, pointing forward (+/- 60 deg), the pads 40-50 mm over the 0.837 m table -- and its hold at
+# H (0.45, 0.00, table + 0.10). The S5.0 rule (1.5 x the largest excursion from home over the contact-free plans of the
+# block on x 0.40-0.55, y 0.08-0.26 at yaw 0/15/30/45 deg -- pregrasp, grasp, lift, H -- rounded up to 0.05 rad, never
+# below WC's, capped at half the joint's range): arm 2, 3, 5 and 7 widen (the horizontal hand turns the upper arm out and
+# the forearm over), arm 3 / 5 / 6 hit the cap (`results/S13-insert/step0/reach_x3.json`).
+KANGAROO_GRIPPERS_LEFT_ARM_SIDE = dataclasses.replace(
+  KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
+  action_scale={
+    r"arm_left_1_joint": 2.35,
+    r"arm_left_2_joint": 1.25,
+    r"arm_left_3_joint": 2.60,
+    r"arm_left_4_joint": 1.79,
+    r"arm_left_5_joint": 2.60,
+    r"arm_left_6_joint": 2.40,
+    r"arm_left_7_joint": 2.50,
+    r"gripper_left_finger_joint": _JAW_CLOSED - _JAW_OPEN,
+  },
+)
+
 # -- Plan S11: two arms -----------------------------------------------------------------------
 #
 # The right arm is the left arm's mirror image through the robot's sagittal plane (y -> -y): with
@@ -306,15 +326,16 @@ def kangaroo_grippers_both_arms(
   gains: str = DEFAULT_TABLETOP_GAINS,
   arm_effort_scale: float | None = None,
   right_home: str = "mirror",
+  base: ManipulationRobotCfg = KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
 ) -> ManipulationRobotCfg:
-  """`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE` on gain code ``gains``, with plan S7-4's T on both arms
-  (``arm_effort_scale``) and the right arm's home ``right_home`` (plan S11: ``mirror``)."""
+  """``base`` (`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE`, or plan §13's `both_arms_scales`) on gain code ``gains``, with
+  plan S7-4's T on both arms (``arm_effort_scale``) and the right arm's home ``right_home`` (plan S11: ``mirror``)."""
   if gains not in TABLETOP_GAINS:
     raise ValueError(
       f"unknown tabletop gain code {gains!r}; have {tuple(TABLETOP_GAINS)}"
     )
   return dataclasses.replace(
-    KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
+    base,
     entity_cfg_fn=_with_right_home(
       functools.partial(
         get_kangaroo_grippers_tabletop_robot_cfg,
@@ -324,6 +345,21 @@ def kangaroo_grippers_both_arms(
       ),
       right_home,
     ),
+  )
+
+
+def both_arms_scales(
+  left: ManipulationRobotCfg, right: ManipulationRobotCfg
+) -> ManipulationRobotCfg:
+  """`KANGAROO_GRIPPERS_BOTH_ARMS_WIDE` with the left arm at ``left``'s action scales and the right at ``right``'s (both
+  one-arm cfgs of the left arm; the right's scales are the left's, a scale being a half-width about the mirrored home).
+  Plan §13's chain: the left runs L-H (`KANGAROO_GRIPPERS_LEFT_ARM_SIDE`), the right R-I mirrored (`..._WC`)."""
+  return dataclasses.replace(
+    KANGAROO_GRIPPERS_BOTH_ARMS_WIDE,
+    action_scale={
+      **left.action_scale,
+      **{k.replace("left", "right"): v for k, v in right.action_scale.items()},
+    },
   )
 
 

@@ -101,6 +101,8 @@ against the base. And `CONTACT` (`box` | `ccd`, `CONTACT_FLAGS`), the one select
 is not the old one: ``box`` sends box-box pairs to mujoco_warp's ``box_box`` collider (decision 0004,
 `tabletop_env_cfg.SIM_DISABLE_FLAGS`); ``ccd`` gives back the GJK/EPA path every run before S9.1
 trained on, to re-read those runs on their own physics.
+Plan S11.3 applies `TABLE_DZ` to the two-arm env too (`ARMS=both`, which `eval_chain.py` and `eval_bimanual.py`
+build), so a chain is read on the same table as its one-arm skills.
 """
 
 from __future__ import annotations
@@ -138,7 +140,12 @@ from pal_mjlab.tasks.manipulation.pick_place.box import (
   BOX_OBS_NAMES,
   BoxGoal,
 )
+from pal_mjlab.tasks.manipulation.pick_place.hold import HOLD_CODES, apply_hold
 from pal_mjlab.tasks.manipulation.pick_place.insert import INSERT_GOALS, InsertGoal
+from pal_mjlab.tasks.manipulation.pick_place.insert_held import (
+  HOLD_CODES as HELD_INSERT_CODES,
+)
+from pal_mjlab.tasks.manipulation.pick_place.insert_held import apply_held_insert
 from pal_mjlab.tasks.manipulation.pick_place.pick_place_env_cfg import (
   BASE_OBS_NAMES,
   BASELINES,
@@ -164,6 +171,7 @@ from pal_mjlab.tasks.manipulation.rl_cfg import PPO_RECIPES
 from pal_mjlab.tasks.manipulation.robots import (
   ARM_HOMES,
   KANGAROO_GRIPPERS_LEFT_ARM,
+  KANGAROO_GRIPPERS_LEFT_ARM_SIDE,
   KANGAROO_GRIPPERS_LEFT_ARM_WC,
   KANGAROO_GRIPPERS_LEFT_ARM_WCK,
   KANGAROO_GRIPPERS_LEFT_ARM_WIDE,
@@ -220,6 +228,7 @@ INSERT_FRICTION_ENV_VAR = "INSERT_FRICTION"
 PIN_START_ENV_VAR = "PIN_START"
 PIN_LIE_P_ENV_VAR = "PIN_LIE_P"
 FRICTION_ENV_VAR = "FRICTION"
+S13_ENV_VAR = "S13"
 
 #: What a run with no variable set gets: C1's reward and rung, and C1r/C2r's PPO recipe.
 DEFAULT_REWARD = "R-A"
@@ -257,6 +266,14 @@ DEFAULT_BASE_OBS = "goal"
 #: plan S9.1.
 CONTACT_FLAGS = {"box": (), "ccd": ("nativeccd",)}
 DEFAULT_CONTACT = "box"
+#: Plan §13.1's one-arm skills (`S13`): ``L-H`` / ``L-HP`` / ``L-H2``, the left's side grasp and hold of the socket
+#: block at H (`pick_place/hold.py`, on the `SPAWN=WC` cfg with the side-grasp arm); ``R-I`` / ``R-I-W`` / ``R-I2``, the
+#: right's insertion into the block held at H by a stand-in hand (`pick_place/insert_held.py`, on ``GOAL=insert``,
+#: trained on the left arm and run mirrored). Unset is none.
+S13_CODES = ("none", *HOLD_CODES, *HELD_INSERT_CODES)
+#: ``ARMS=both S13=CHAIN``: plan §13.1's chain eval env, L-H on the left and R-I mirrored on the right
+#: (`pick_place/insert_chain.py`); its plant from `GAINS`, `EFFORT`, `DR`, `LAG`, `ARM_TABLE`, `TABLE_DZ`, `EPISODE_S`.
+S13_CHAIN = "CHAIN"
 #: Plan S11's selectors: the hand-off controller in the action term (eval), and JOINT's.
 HANDOFF_ROUTES = ("none", "up-out")
 ARMS_NAMES = ("left", "both")
@@ -374,6 +391,8 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   bound is exactly the spawn box's arm.
   """
   if _select(ARMS_ENV_VAR, "left", ARMS_NAMES) == "both":
+    if os.environ.get(S13_ENV_VAR) == S13_CHAIN:
+      return _apply_contact(_insert_chain_env_cfg(play))
     return _apply_contact(_bimanual_env_cfg(play))
   spawn = _select(SPAWN_ENV_VAR, DEFAULT_SPAWN, SPAWN_BOXES)
   baseline = _select(BASELINE_ENV_VAR, DEFAULT_BASELINE, BASELINES)
@@ -383,13 +402,33 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   action = _select(ACTION_ENV_VAR, DEFAULT_ACTION, ACTION_MODES)
   goal, box, insert = _select_goal()
   target = _select(TARGET_ENV_VAR, DEFAULT_TARGET, (*TARGET_AREAS, *ROBOT_TARGETS))
+  s13 = _select(S13_ENV_VAR, "none", S13_CODES)
+  arm = SPAWN_ROBOTS[spawn]
+  if s13 in HOLD_CODES:
+    if (
+      spawn != "WC"
+      or target != DEFAULT_TARGET
+      or goal != DEFAULT_GOAL
+      or box is not None
+      or insert is not None
+    ):
+      raise ValueError(
+        f"{S13_ENV_VAR}={s13} is built on SPAWN=WC with TARGET and GOAL unset (H is its goal); got "
+        f"SPAWN={spawn}, TARGET={target}, GOAL={os.environ.get(GOAL_ENV_VAR)}"
+      )
+    arm = KANGAROO_GRIPPERS_LEFT_ARM_SIDE
+  if s13 in HELD_INSERT_CODES and (insert is None or insert.ladder):
+    raise ValueError(
+      f"{S13_ENV_VAR}={s13} is built on GOAL=insert (IN's terms; plan §13.1); got "
+      f"GOAL={os.environ.get(GOAL_ENV_VAR)}"
+    )
   for name in (HANDOFF_TRAIN_ENV_VAR, START_ENV_VAR):
     if os.environ.get(name) is not None:
       raise ValueError(f"{name} is JOINT's (plan S11); it needs {ARMS_ENV_VAR}=both")
   cfg = make_pick_place_env_cfg(
     kangaroo_grippers_left_arm(
       _select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
-      SPAWN_ROBOTS[spawn],
+      arm,
       arm_effort_scale=effort.effort_scale,
       right_home=_select(ARM_HOME_ENV_VAR, DEFAULT_ARM_HOME, ARM_HOMES),
     ),
@@ -430,6 +469,12 @@ def kangaroo_pick_place_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
   _apply_contact(cfg)
   _apply_friction(cfg)
+  if s13 in HOLD_CODES:
+    apply_hold(cfg, KANGAROO_GRIPPERS_LEFT_ARM.gripper("left"), HOLD_CODES[s13])
+  if s13 in HELD_INSERT_CODES:
+    apply_held_insert(
+      cfg, KANGAROO_GRIPPERS_LEFT_ARM.gripper("left"), HELD_INSERT_CODES[s13]
+    )
   park = _select(HANDOFF_PARK_ENV_VAR, "home", mdp.HANDOFF_PARK_POSES)
   if _select(HANDOFF_ROUTE_ENV_VAR, "none", HANDOFF_ROUTES) == "up-out":
     # Plan S11's hand-off route, for the eval to start (`mdp.handoff`); training is unchanged by it.
@@ -489,6 +534,30 @@ def _apply_friction(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     },
   )
   return cfg
+
+
+def _insert_chain_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:
+  """Plan §13.1's chain env (`pick_place/insert_chain.py`), BS12's plant (the baseline B table raised by
+  `TABLE_DZ`)."""
+  from pal_mjlab.tasks.manipulation.pick_place.insert_chain import (
+    EPISODE_S as CHAIN_EPISODE_S,
+  )
+  from pal_mjlab.tasks.manipulation.pick_place.insert_chain import (
+    make_insert_chain_env_cfg,
+  )
+
+  return make_insert_chain_env_cfg(
+    gains=_select(GAINS_ENV_VAR, DEFAULT_GAINS, TABLETOP_GAINS),
+    effort=EFFORT_BOUNDS[_select(EFFORT_ENV_VAR, DEFAULT_EFFORT, EFFORT_BOUNDS)],
+    dr_level=_select(DR_ENV_VAR, DEFAULT_DR, DR_LEVELS),
+    latency=LATENCY_MODELS[_select(LAG_ENV_VAR, DEFAULT_LAG, LATENCY_MODELS)],
+    baseline=_baseline_with_table(BASELINES["B"]),
+    episode_length_s=_select_episode() or CHAIN_EPISODE_S,
+    arm_table=ARM_TABLE_CODES[
+      _select(ARM_TABLE_ENV_VAR, DEFAULT_ARM_TABLE, ARM_TABLE_CODES)
+    ],
+    play=play,
+  )
 
 
 def _bimanual_env_cfg(play: bool) -> ManagerBasedRlEnvCfg:

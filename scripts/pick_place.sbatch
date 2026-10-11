@@ -273,6 +273,13 @@ if [ -n "${FRICTION:-}" ]; then
   S11_NAME="${S11_NAME}_fric${FRICTION}"
   S11_TAG="${S11_TAG},\"fric${FRICTION}\""
 fi
+# Plan §13.1 (`pick_place/hold.py`, `pick_place/insert_held.py`): S13 (L-H | L-HP | R-I | R-I-W), the two-arm
+# insert's one-arm skills. Exported when set; in the run name and the tags only when set.
+if [ -n "${S13:-}" ]; then
+  export S13
+  S91_NAME="${S91_NAME}_s13${S13}"
+  S91_TAG="${S91_TAG},\"s13${S13}\""
+fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-oppsie-pick-place-v0}"
 EXPERIMENT="${EXPERIMENT:-kangaroo_pick_place}"
@@ -336,7 +343,7 @@ echo "gains       $GAINS   effort $EFFORT   lag $LAG   occ $OCC   obj_obs $OBJ_O
 echo "action      $ACTION   cmd_obs ${CMD_OBS:-(default)}   target $TARGET   episode_s ${EPISODE_S:-(default)}   arm_table ${ARM_TABLE:-(default)}   pregrasp ${PREGRASP:-(default)}"
 echo "shape       $SHAPE   goal $GOAL   gate $GATE   critic_obs $CRITIC_OBS   box_obs $BOX_OBS   box_feet ${BOX_FEET:-(default)}   ckpt_spawn ${CKPT_SPAWN:-(none)}   table_dz ${TABLE_DZ:-(none)}"
 echo "s11         arm_home ${ARM_HOME:-(default)}   tracker ${TRACKER:-(default)}   handoff_route ${HANDOFF_ROUTE:-(default)}   arms ${ARMS:-(default)}   handoff_train ${HANDOFF_TRAIN:-(default)}   start ${START:-(default)}   friction ${FRICTION:-(default)}"
-echo "s9.1        base_obs ${BASE_OBS:-(default)}   contact ${CONTACT:-(default: box)}"
+echo "s9.1        base_obs ${BASE_OBS:-(default)}   contact ${CONTACT:-(default: box)}   s13 ${S13:-(none)}"
 echo "s14         pin_start ${PIN_START:-(default)}   pin_lie_p ${PIN_LIE_P:-(default)}"
 echo "extra args  ${EXTRA_ARGS:-(none)}"
 echo "resume      ${RESUME:-(none)}"
@@ -363,6 +370,11 @@ else
       exit 1
       ;;
   esac
+  # Plan §13.1's codes carry the socket block (on the table, in the hand, welded at H) and the pin.
+  if [ -n "${S13:-}" ]; then
+    echo "Refusing to run: S13=$S13 needs mujoco_warp_boxbox.patch (decision 0005)." >&2
+    exit 1
+  fi
 fi
 # Decision 0005: mujoco_warp_box_box_depth.patch (box_box's bogus deep contacts dropped).
 if grep -q "Local patch (oppsie, 2026-10-08)" .venv/lib/python*/site-packages/mujoco_warp/_src/collision_primitive.py 2>/dev/null; then
