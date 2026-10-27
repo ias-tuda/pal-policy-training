@@ -4,7 +4,7 @@ S2's exit criterion: build the environment at each level and assert that the ran
 fields differ across environments, and that at DR0 they do not. The test is written against
 the *compiled model*, not against the config, because a DR term that is present in the event
 dict and silently does nothing is exactly the failure this is here to catch -- and there is
-precedent for it in this repo (see CLAUDE.md on geoms re-enabled after compile).
+precedent for it in this repo (geoms re-enabled after compile).
 
 Four environments each, on the test device. The levels are cumulative, so each row of
 ``EXPECTED`` is the full set of fields that should vary at that rung.

@@ -28,7 +28,7 @@ per joint, and the loaded policy commands exactly the targets it commanded befor
 (`rescale_actions`). Applied on every load, the resume's and an eval's alike.
 
 These pieces live here rather than as edits to mjlab or rsl_rl, which are read-mostly
-dependencies (CLAUDE.md, *External Dependencies*): a cfg subclass that adds the field and a
+dependencies: a cfg subclass that adds the field and a
 runner subclass that acts on it, in the one place the manipulation tasks already share.
 """
 

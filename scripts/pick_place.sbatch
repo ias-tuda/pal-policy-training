@@ -3,7 +3,7 @@
 #
 # One job is one seed. A multi-seed campaign is N of these, not one multi-GPU job:
 # the resource block below is single-GPU and is user-specified -- do not change it
-# without asking (CLAUDE.md, *Job submission -- IAS cluster*).
+# without asking.
 #
 #   sbatch --export=ALL,SEED=1,NUM_ENVS=256,MAX_ITERATIONS=200,RUN_TAG=c0 \
 #          --job-name=pp_c0_s1 \

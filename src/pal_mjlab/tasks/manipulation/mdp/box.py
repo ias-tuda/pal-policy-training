@@ -378,7 +378,7 @@ def reset_tracker_bias(
   """Draw this episode's tracker biases (plan S9/S10's split): one shared by every tracked
   object -- the camera's -- uniform in +/- ``shared`` per axis, and one per object in ``keys``,
   uniform in +/- ``own``. A fresh draw per reset, not an accumulation (the "abs" lesson of
-  mjlab's additive-bias noise, CLAUDE.md)."""
+  mjlab's additive-bias noise: with its default "add" the bias random-walks across episodes)."""
   bias = _tracker_bias(env)
   n = len(env_ids)
   for key, half in (("shared", shared), *((k, own) for k in keys)):
