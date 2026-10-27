@@ -48,6 +48,9 @@ select = ["E4", "E7", "E9", "F", "I", "B"]
 [project.entry-points."mjlab.tasks"]
 pal_mjlab = "pal_mjlab.tasks"
 
+[project.scripts]
+export-policy = "pal_mjlab.scripts.export_policy:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = [

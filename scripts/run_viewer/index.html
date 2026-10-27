@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Viewer</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --line: #e2e1dc; --ink: #1d1d1b; --ink2: #5b5a55; --muted: #8a8983;
+  --accent: #2f6fdb; --accent-soft: #e5edfb; --grid: #ecebe6;
+  --ok: #1f8a4c; --info: #2f6fdb; --warn: #b7791f; --bad: #c43d3d; --none: #b9b8b1;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151514; --panel: #1e1e1c; --line: #33332f; --ink: #ecebe6; --ink2: #b3b2ab; --muted: #85847d;
+    --accent: #6b9ef0; --accent-soft: #22324d; --grid: #2a2a27;
+    --ok: #4cc07c; --info: #6b9ef0; --warn: #e0a84a; --bad: #ec6b6b; --none: #5a5953;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.4 system-ui, sans-serif; height: 100vh; display: flex; overflow: hidden; }
+button, select, input { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+select, input[type=text], input[type=search], input[type=number] { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* sidebar */
+#side { width: 330px; min-width: 330px; border-right: 1px solid var(--line); display: flex; flex-direction: column; background: var(--panel); }
+#side header { padding: 10px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+#side header .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+#search { flex: 1; }
+#runs { overflow-y: auto; flex: 1; }
+.exp { padding: 8px 10px 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); position: sticky; top: 0; background: var(--panel); }
+.run { padding: 5px 10px; cursor: pointer; display: grid; grid-template-columns: 18px 1fr auto; gap: 2px 6px; border-left: 3px solid transparent; }
+.run:hover { background: var(--bg); }
+.run.sel { background: var(--accent-soft); border-left-color: var(--accent); }
+.run .star { cursor: pointer; color: var(--muted); }
+.run .star.on { color: var(--warn); }
+.run .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run .meta { grid-column: 2 / 4; color: var(--muted); font-size: 11px; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 4px; vertical-align: middle; }
+
+/* main */
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#runpane { padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+#runhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+#label { font-size: 16px; font-weight: 600; outline: none; border-bottom: 1px dashed transparent; min-width: 60px; }
+#label:hover, #label:focus { border-bottom-color: var(--line); }
+#label:empty::before { content: attr(data-placeholder); color: var(--muted); font-weight: 400; }
+.warnline { color: var(--warn); font-size: 12px; }
+#chartwrap { display: flex; gap: 10px; align-items: flex-start; margin-top: 6px; }
+#chart { flex: 1; min-width: 0; position: relative; }
+#chart svg { width: 100%; height: 170px; display: block; }
+#tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; font-size: 12px; display: none; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+#chips { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 6px; max-height: 92px; overflow-y: auto; }
+.chip { font-family: ui-monospace, monospace; font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); cursor: pointer; user-select: none; display: inline-flex; gap: 3px; align-items: center; }
+.chip:hover { border-color: var(--accent); }
+.chip .ic { font-size: 10px; }
+.chip.local .ic { color: var(--ok); } .chip.cluster .ic { color: var(--info); } .chip.rendering .ic { color: var(--warn); } .chip.failed .ic { color: var(--bad); } .chip.none .ic { color: var(--none); }
+.chip.marked { border-color: var(--warn); }
+.chip .mk { color: var(--warn); }
+.chip.ingrid { background: var(--accent-soft); }
+#legend { display: flex; gap: 12px; font-size: 11px; color: var(--ink2); margin-top: 4px; flex-wrap: wrap; align-items: center; }
+#actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; align-items: center; }
+
+/* grid */
+#gridbar { display: flex; gap: 8px; align-items: center; padding: 6px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+#grid { flex: 1; overflow-y: auto; padding: 10px 14px; display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(var(--tile, 420px), 1fr)); align-content: start; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+.tile .th { display: flex; gap: 6px; align-items: center; padding: 4px 8px; font-size: 12px; }
+.tile .th .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile .th button { padding: 0 6px; }
+.tile video { width: 100%; display: block; background: #000; aspect-ratio: 4 / 3; }
+.tile .ph { aspect-ratio: 4 / 3; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; color: var(--ink2); background: var(--bg); padding: 10px; text-align: center; }
+.tile .ph pre { max-width: 100%; max-height: 90px; overflow: auto; font-size: 10px; text-align: left; margin: 0; color: var(--muted); white-space: pre-wrap; }
+#empty { color: var(--muted); padding: 30px; grid-column: 1 / -1; text-align: center; }
+
+/* jobs */
+#jobs { border-top: 1px solid var(--line); background: var(--panel); max-height: 32vh; overflow-y: auto; }
+#jobs summary { padding: 6px 14px; cursor: pointer; font-size: 12px; color: var(--ink2); }
+.job { padding: 4px 14px; border-top: 1px solid var(--grid); display: grid; grid-template-columns: 90px 90px 1fr; gap: 8px; font-size: 12px; }
+.job pre { grid-column: 1 / -1; margin: 0; font-size: 10px; color: var(--muted); white-space: pre-wrap; max-height: 80px; overflow: auto; }
+.st-RUNNING, .st-PENDING, .st-SUBMITTING { color: var(--warn); } .st-COMPLETED { color: var(--ok); } .st-FAILED, .st-CANCELLED, .st-TIMEOUT, .st-OUT_OF_MEMORY { color: var(--bad); }
+#toast { position: fixed; bottom: 14px; right: 14px; background: var(--ink); color: var(--bg); padding: 7px 12px; border-radius: 6px; display: none; max-width: 480px; z-index: 9; }
+kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; font-size: 11px; }
+</style>
+</head>
+<body>
+<aside id="side">
+  <header>
+    <div class="row"><input id="search" type="search" placeholder="Filter: name, label, id, task …"><button id="rescan" title="Re-read runs, checkpoints and videos from the cluster">⟳ Rescan</button></div>
+    <div class="row">
+      <label><input type="checkbox" id="fStar"> starred</label>
+      <label><input type="checkbox" id="fActive"> training</label>
+      <label><input type="checkbox" id="fLabel"> labeled</label>
+      <span class="muted" id="count"></span>
+    </div>
+    <div class="row"><button id="bulk" title="For every run in the list below: render the best checkpoint (by the plotted scalar, smoothed) and the latest one, unless their videos exist">Render best + latest of listed runs</button></div>
+  </header>
+  <div id="runs"></div>
+</aside>
+<main id="main">
+  <section id="runpane">
+    <div class="muted" id="norun">Select a run on the left.</div>
+    <div id="runinfo" hidden>
+      <div id="runhead">
+        <span id="label" contenteditable="true" spellcheck="false" data-placeholder="add a label…"></span>
+        <span class="mono" id="runname"></span>
+        <span class="mono muted" id="runmeta"></span>
+      </div>
+      <div class="warnline" id="commitwarn"></div>
+      <div id="chartwrap">
+        <div id="chart"><svg id="svg"></svg><div id="tip"></div></div>
+        <div style="display:flex;flex-direction:column;gap:6px;width:230px">
+          <select id="tag" title="Scalar to plot"></select>
+          <label class="muted" title="Moving average window, in iterations">smooth <input type="number" id="smooth" value="100" min="0" step="50" style="width:70px"> it</label>
+          <span class="muted" id="best"></span>
+        </div>
+      </div>
+      <div id="chips"></div>
+      <div id="legend">
+        <span><span style="color:var(--ok)">●</span> video here</span>
+        <span><span style="color:var(--info)">▲</span> video on cluster</span>
+        <span><span style="color:var(--warn)">◐</span> rendering</span>
+        <span><span style="color:var(--bad)">✕</span> render failed</span>
+        <span><span style="color:var(--none)">○</span> no video</span>
+        <span class="muted">click: show in grid · alt+click: mark ★ · click the curve: nearest checkpoint</span>
+      </div>
+      <div id="actions">
+        <button id="aMarked">Show ★ marked</button>
+        <button id="aSpread">Show 6 spread</button>
+        <button id="aBest">Show best + latest</button>
+        <label class="muted">episodes/video <input type="number" id="episodes" value="1" min="1" max="10" style="width:48px"></label>
+      </div>
+    </div>
+  </section>
+  <div id="gridbar">
+    <button id="gPlay" class="primary">▶ Play all</button>
+    <button id="gRestart">⏮ Restart all</button>
+    <select id="gSpeed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option></select>
+    <label><input type="checkbox" id="gLoop" checked> loop</label>
+    <label class="muted">size <input type="range" id="gSize" min="240" max="900" value="420"></label>
+    <button id="gClear">Clear grid</button>
+    <span class="muted"><kbd>space</kbd> play/pause · <kbd>r</kbd> restart · <kbd>,</kbd><kbd>.</kbd> frame step · <kbd>[</kbd><kbd>]</kbd> speed</span>
+  </div>
+  <div id="grid"><div id="empty">Click checkpoints to compare their videos here.</div></div>
+  <details id="jobs"><summary id="jobsum">Render jobs</summary><div id="joblist"></div></details>
+</main>
+<div id="toast"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const store = { get(k, d) { try { const v = localStorage.getItem('rv.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+                set(k, v) { try { localStorage.setItem('rv.' + k, JSON.stringify(v)); } catch {} } };
+let D = null;             // index payload
+let listed = [];          // runs currently shown in the sidebar
+let jobs = [], batching = {};
+let sel = store.get('sel', null);
+let grid = store.get('grid', []);   // [{key, it}]
+const curveCache = {};
+let curve = null;         // {tag, pts:[[it,v]]}
+
+function toast(msg, ms = 3500) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = 'none', ms); }
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const run = (key) => D.runs.find(r => r.key === key);
+const label = (r) => D.labels[r.key] || '';
+const marks = (key) => D.marks[key] || {};
+const short = (r) => label(r) || r.name;
+
+// ---------------------------------------------------------------- status
+function status(key, it) {
+  const r = run(key);
+  if (!r) return 'none';
+  if (r.local_videos.includes(it)) return 'local';
+  const js = jobs.filter(j => j.key === key && j.iterations.includes(it));
+  if ((batching[key] || []).includes(it) || js.some(j => ['SUBMITTING', 'PENDING', 'RUNNING'].includes(j.status))) return 'rendering';
+  if (r.videos.includes(it)) return 'cluster';
+  const last = js[js.length - 1];
+  if (last && last.status !== 'COMPLETED') return 'failed';
+  return 'none';
+}
+const ICON = { local: '●', cluster: '▲', rendering: '◐', failed: '✕', none: '○' };
+const STCOL = { local: 'var(--ok)', cluster: 'var(--info)', rendering: 'var(--warn)', failed: 'var(--bad)', none: 'var(--none)' };
+
+// ---------------------------------------------------------------- run list
+function renderRuns() {
+  const q = $('search').value.toLowerCase().trim();
+  const fs = $('fStar').checked, fa = $('fActive').checked, fl = $('fLabel').checked;
+  store.set('filters', { q, fs, fa, fl });
+  const list = D.runs.filter(r => {
+    if (fs && !D.starred.includes(r.key)) return false;
+    if (fa && !r.active) return false;
+    if (fl && !label(r)) return false;
+    if (!q) return true;
+    const hay = [r.name, label(r), r.wandb_id, r.task, r.experiment, r.seed].join(' ').toLowerCase();
+    return q.split(/\s+/).every(w => hay.includes(w));
+  });
+  $('count').textContent = `${list.length}/${D.runs.length}`;
+  listed = list;
+  const byExp = {};
+  for (const r of list) (byExp[r.experiment] ||= []).push(r);
+  const box = $('runs'); box.innerHTML = '';
+  for (const exp of Object.keys(byExp).sort()) {
+    const h = document.createElement('div'); h.className = 'exp'; h.textContent = exp; box.appendChild(h);
+    for (const r of byExp[exp]) {
+      const el = document.createElement('div');
+      el.className = 'run' + (r.key === sel ? ' sel' : '');
+      const starred = D.starred.includes(r.key);
+      const nv = r.local_videos.length, rv = r.videos.length;
+      el.innerHTML = `<span class="star ${starred ? 'on' : ''}" title="star">${starred ? '★' : '☆'}</span>
+        <span class="title" title="${r.name}">${r.active ? '<span class="dot" title="checkpoint written in the last 30 min"></span>' : ''}${esc(short(r))}</span>
+        <span class="mono muted">${r.wandb_id || ''}</span>
+        <span class="meta">${label(r) ? esc(r.name) + ' · ' : ''}s${r.seed ?? '?'} · ${r.started.slice(5, 16).replace('T', ' ')} · ${r.checkpoints.length} ckpts, last ${r.checkpoints.at(-1)}${rv || nv ? ` · ${Math.max(rv, nv)} videos` : ''}</span>`;
+      el.onclick = (e) => {
+        if (e.target.classList.contains('star')) { toggleStar(r.key); return; }
+        selectRun(r.key);
+      };
+      box.appendChild(el);
+    }
+  }
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+async function toggleStar(key) {
+  D.starred = D.starred.includes(key) ? D.starred.filter(k => k !== key) : [...D.starred, key];
+  renderRuns();
+  await api('/api/state', { starred: D.starred });
+}
+
+// ---------------------------------------------------------------- selected run
+async function selectRun(key) {
+  if (!run(key)) return;
+  sel = key; store.set('sel', key);
+  renderRuns(); renderRun();
+  const r = run(key);
+  curve = null; drawChart();
+  $('best').textContent = 'loading curves…';
+  try {
+    if (!curveCache[key]) curveCache[key] = await api('/api/curves?key=' + encodeURIComponent(key));
+    if (sel !== key) return;
+    fillTags(curveCache[key]); drawChart();
+  } catch (e) { $('best').textContent = 'curves: ' + e.message; }
+}
+function renderRun() {
+  const r = sel && run(sel);
+  $('norun').hidden = !!r; $('runinfo').hidden = !r;
+  if (!r) return;
+  if (document.activeElement !== $('label')) $('label').textContent = label(r);
+  $('runname').textContent = r.name;
+  $('runmeta').textContent = [r.wandb_id, r.task, 'seed ' + r.seed, r.started.replace('T', ' ')].filter(Boolean).join(' · ');
+  const warn = [];
+  if (!r.task) warn.push('No W&B metadata: the task id is unknown, so videos cannot be rendered.');
+  else if (r.commit && D.head && r.commit !== D.head) warn.push(`Trained at ${r.commit.slice(0, 7)}; renders use the cluster checkout at ${D.head.slice(0, 7)}. If the task changed since, rendering can fail or differ.`);
+  $('commitwarn').textContent = warn.join(' ');
+  renderChips();
+}
+function renderChips() {
+  const r = sel && run(sel); if (!r) return;
+  const m = marks(r.key);
+  const inGrid = new Set(grid.filter(g => g.key === r.key).map(g => g.it));
+  $('chips').innerHTML = '';
+  for (const it of r.checkpoints) {
+    const s = status(r.key, it);
+    const c = document.createElement('span');
+    c.className = `chip ${s}` + (m[it] ? ' marked' : '') + (inGrid.has(it) ? ' ingrid' : '');
+    c.title = `model_${it}.pt — ${s}${m[it] ? ' — ★ ' + m[it] : ''}`;
+    c.innerHTML = `<span class="ic">${ICON[s]}</span>${it}${m[it] ? `<span class="mk">★${m[it] === '★' ? '' : esc(m[it])}</span>` : ''}`;
+    c.onclick = (e) => e.altKey ? toggleMark(r.key, it) : addToGrid([{ key: r.key, it }]);
+    $('chips').appendChild(c);
+  }
+  drawChart();
+}
+async function toggleMark(key, it) {
+  const m = { ...marks(key) };
+  if (m[it]) delete m[it]; else m[it] = '★';
+  D.marks[key] = m;
+  renderChips();
+  await api('/api/state', { marks: { [key]: m } });
+}
+$('label').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } });
+$('label').addEventListener('blur', async () => {
+  const v = $('label').textContent.trim();
+  if (!sel || v === (D.labels[sel] || '')) return;
+  if (v) D.labels[sel] = v; else delete D.labels[sel];
+  renderRuns(); renderGrid();
+  await api('/api/state', { labels: { [sel]: v } });
+});
+
+// ---------------------------------------------------------------- chart
+function fillTags(c) {
+  const tags = Object.keys(c).sort();
+  const want = store.get('tag', null);
+  const pick = (tags.includes(want) && want) || tags.find(t => /episode_success/i.test(t)) || tags.find(t => /success/i.test(t)) || tags.find(t => t === 'Train/mean_reward') || tags[0];
+  $('tag').innerHTML = tags.map(t => `<option ${t === pick ? 'selected' : ''}>${esc(t)}</option>`).join('');
+}
+$('tag').onchange = () => { store.set('tag', $('tag').value); drawChart(); };
+$('smooth').onchange = () => drawChart();
+
+function smoothed(pts, win) {
+  if (!win) return pts;
+  const out = []; let j0 = 0, sum = 0;
+  for (let i = 0, j = 0; i < pts.length; i++) {
+    while (j < pts.length && pts[j][0] <= pts[i][0] + win / 2) sum += pts[j++][1];
+    while (pts[j0][0] < pts[i][0] - win / 2) sum -= pts[j0++][1];
+    out.push([pts[i][0], sum / (j - j0)]);
+  }
+  return out;
+}
+function drawChart() {
+  const svg = $('svg'); const r = sel && run(sel);
+  const c = r && curveCache[r.key]; const tag = $('tag').value;
+  const W = svg.clientWidth || 600, H = 170, L = 44, R = 8, T = 8, B = 34;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  if (!c || !c[tag]) { svg.innerHTML = ''; curve = null; return; }
+  const pts = smoothed(c[tag], +$('smooth').value || 0);
+  const maxIt = Math.max(r.checkpoints.at(-1) || 0, pts.at(-1)?.[0] || 1);
+  let lo = Math.min(...pts.map(p => p[1])), hi = Math.max(...pts.map(p => p[1]));
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const x = (it) => L + (it / maxIt) * (W - L - R);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  const ticks = niceTicks(lo, hi, 4);
+  let g = '';
+  for (const t of ticks) g += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)"/><text x="${L - 5}" y="${y(t) + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${fmt(t)}</text>`;
+  for (const t of niceTicks(0, maxIt, 6)) g += `<text x="${x(t)}" y="${H - 2}" text-anchor="middle" font-size="10" fill="var(--muted)">${t}</text>`;
+  // checkpoint ticks, coloured by video status
+  const m = marks(r.key);
+  for (const it of r.checkpoints) {
+    const s = status(r.key, it);
+    g += `<line x1="${x(it)}" x2="${x(it)}" y1="${H - B + 4}" y2="${H - B + (m[it] ? 16 : 11)}" stroke="${STCOL[s]}" stroke-width="${m[it] ? 3 : 2}" stroke-linecap="round"/>`;
+  }
+  const d = pts.map((p, i) => (i ? 'L' : 'M') + x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1)).join('');
+  g += `<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>`;
+  g += `<line id="xh" y1="${T}" y2="${H - B}" stroke="var(--ink2)" stroke-dasharray="3 3" visibility="hidden"/><circle id="xd" r="4" fill="var(--accent)" stroke="var(--panel)" stroke-width="2" visibility="hidden"/>`;
+  svg.innerHTML = g;
+  // best checkpoint by the smoothed curve
+  let best = null;
+  for (const it of r.checkpoints) { const v = valueAt(pts, it); if (v != null && (!best || v > best[1])) best = [it, v]; }
+  const lastV = valueAt(pts, r.checkpoints.at(-1));
+  $('best').innerHTML = best ? `best ckpt <b>${best[0]}</b> (${fmt(best[1])})<br>latest ${r.checkpoints.at(-1)} (${fmt(lastV)}, ${Math.round(100 * lastV / best[1])}% of best)` : '';
+  curve = { pts, x, y, maxIt, L, R, W, best };
+}
+function valueAt(pts, it) {
+  if (!pts.length) return null;
+  let b = pts[0];
+  for (const p of pts) if (Math.abs(p[0] - it) < Math.abs(b[0] - it)) b = p;
+  return b[1];
+}
+function nearestCkpt(it) { const r = run(sel); return r.checkpoints.reduce((a, b) => Math.abs(b - it) < Math.abs(a - it) ? b : a); }
+function niceTicks(lo, hi, n) {
+  const span = hi - lo, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 5, 10].map(s => s * mag).find(s => s >= step0);
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toPrecision(10)); return out;
+}
+function fmt(v) { return v == null ? '–' : Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3); }
+function chartIt(e) {
+  if (!curve) return null;
+  const rect = $('svg').getBoundingClientRect();
+  const px = (e.clientX - rect.left) * (curve.W / rect.width);
+  return { it: Math.max(0, Math.min(curve.maxIt, (px - curve.L) / (curve.W - curve.L - curve.R) * curve.maxIt)), rect };
+}
+$('svg').addEventListener('mousemove', (e) => {
+  const h = chartIt(e); if (!h) return;
+  const ck = nearestCkpt(h.it), v = valueAt(curve.pts, ck);
+  const xh = $('xh'), xd = $('xd');
+  xh.setAttribute('x1', curve.x(ck)); xh.setAttribute('x2', curve.x(ck)); xh.setAttribute('visibility', 'visible');
+  xd.setAttribute('cx', curve.x(ck)); xd.setAttribute('cy', curve.y(v)); xd.setAttribute('visibility', 'visible');
+  const tip = $('tip'); tip.style.display = 'block';
+  tip.innerHTML = `model_${ck} · <b>${fmt(v)}</b> · ${status(sel, ck)}`;
+  const left = curve.x(ck) * h.rect.width / curve.W;
+  tip.style.left = Math.min(left + 10, h.rect.width - tip.offsetWidth) + 'px'; tip.style.top = '4px';
+});
+$('svg').addEventListener('mouseleave', () => { $('tip').style.display = 'none'; $('xh')?.setAttribute('visibility', 'hidden'); $('xd')?.setAttribute('visibility', 'hidden'); });
+$('svg').addEventListener('click', (e) => { const h = chartIt(e); if (h) addToGrid([{ key: sel, it: nearestCkpt(h.it) }]); });
+window.addEventListener('resize', () => drawChart());
+
+// ---------------------------------------------------------------- quick picks
+$('aMarked').onclick = () => {
+  const m = Object.keys(marks(sel)).map(Number);
+  if (!m.length) return toast('No marked checkpoints (alt+click a checkpoint to mark it).');
+  addToGrid(m.sort((a, b) => a - b).map(it => ({ key: sel, it })));
+};
+$('aSpread').onclick = () => {
+  const cks = run(sel).checkpoints, n = Math.min(6, cks.length);
+  const pick = [...new Set(Array.from({ length: n }, (_, i) => cks[Math.round(i * (cks.length - 1) / Math.max(1, n - 1))]))];
+  addToGrid(pick.map(it => ({ key: sel, it })));
+};
+$('aBest').onclick = () => {
+  const r = run(sel), its = [];
+  if (curve?.best) its.push(curve.best[0]);
+  its.push(r.checkpoints.at(-1));
+  addToGrid([...new Set(its)].map(it => ({ key: sel, it })));
+};
+
+// ---------------------------------------------------------------- grid
+async function addToGrid(items) {
+  const add = items.filter(n => !grid.some(g => g.key === n.key && g.it === n.it));
+  grid.push(...add); store.set('grid', grid);
+  renderGrid(); renderChips();
+  await ensureVideos(add);
+}
+async function ensureVideos(items) {
+  const byRun = {};
+  for (const { key, it } of items) (byRun[key] ||= []).push(it);
+  for (const [key, its] of Object.entries(byRun)) {
+    const r = run(key); if (!r) continue;
+    const fetch = its.filter(it => status(key, it) === 'cluster');
+    const render = its.filter(it => ['none', 'failed'].includes(status(key, it)));
+    if (fetch.length) {
+      try { const res = await api('/api/fetch', { key, iterations: fetch }); r.local_videos = res.local_videos; }
+      catch (e) { toast('Download failed: ' + e.message); }
+    }
+    if (render.length) {
+      try {
+        const res = await api('/api/render', { key, iterations: render, episodes: +$('episodes').value || 1 });
+        batching[key] = [...new Set([...(batching[key] || []), ...res.queued])];
+        if (res.queued.length) toast(`Queued render of ${res.queued.join(', ')} for ${short(r)} (one SLURM job per run)`);
+        pollJobs(true);
+      } catch (e) { toast('Render request failed: ' + e.message); }
+    }
+    renderGrid(); renderChips();
+  }
+}
+function removeTile(i) { grid.splice(i, 1); store.set('grid', grid); renderGrid(); renderChips(); }
+function renderGrid() {
+  const box = $('grid');
+  const keep = new Map([...box.querySelectorAll('.tile')].map(t => [t.dataset.id, t]));
+  box.innerHTML = '';
+  if (!grid.length) { box.innerHTML = '<div id="empty">Click checkpoints to compare their videos here.</div>'; return; }
+  grid.forEach((g, i) => {
+    const r = D && run(g.key), s = r ? status(g.key, g.it) : 'none';
+    const id = `${g.key}|${g.it}|${s}`;
+    let t = keep.get(id);
+    if (!t) {
+      t = document.createElement('div'); t.className = 'tile'; t.dataset.id = id;
+      const m = r ? marks(g.key)[g.it] : null;
+      t.innerHTML = `<div class="th"><span class="ic" style="color:${STCOL[s]}">${ICON[s]}</span>
+        <span class="t" title="${esc(r?.name)}"><b>${g.it}</b> · ${esc(r ? short(r) : g.key)} ${r?.seed ? '· s' + r.seed : ''} ${m ? '<span style="color:var(--warn)">★</span>' : ''}</span>
+        <button data-a="sel" title="Open this run">↗</button><button data-a="x" title="Remove">✕</button></div>`;
+      if (s === 'local') {
+        const v = document.createElement('video');
+        v.src = `/video/${encodeURIComponent(g.key).replace(/%2F/g, '/')}/${g.it}`;
+        v.muted = true; v.playsInline = true; v.controls = true; v.preload = 'auto';
+        v.loop = $('gLoop').checked; v.playbackRate = +$('gSpeed').value;
+        t.appendChild(v);
+      } else {
+        const job = jobs.filter(j => j.key === g.key && j.iterations.includes(g.it)).at(-1);
+        const msg = { rendering: job ? `Rendering ${job.local ? 'locally (cluster queue full)' : 'on the cluster'} — ${job.status}${job.reason && job.status === 'PENDING' ? ' (' + job.reason + ')' : ''}${job.id ? ', job ' + job.id : ''}` : 'Waiting to submit a render job…',
+                      cluster: 'Downloading from the cluster…', failed: 'Render failed.', none: r?.task ? 'No video yet.' : 'No video; the task id is unknown, so this run cannot be rendered.' }[s];
+        t.innerHTML += `<div class="ph"><div>${msg}</div>${s === 'failed' || s === 'none' ? (r?.task ? '<button data-a="render">Render</button>' : '') : ''}${job?.log ? `<pre>${esc(job.log)}</pre>` : ''}</div>`;
+      }
+    }
+    t.querySelector('[data-a=x]').onclick = () => removeTile(grid.indexOf(g));
+    t.querySelector('[data-a=sel]').onclick = () => selectRun(g.key);
+    const rb = t.querySelector('[data-a=render]'); if (rb) rb.onclick = () => ensureVideos([g]);
+    box.appendChild(t);
+  });
+  // keep playback state in sync for tiles that were rebuilt
+  if (playing) videos().forEach(v => v.paused && v.play().catch(() => {}));
+}
+const videos = () => [...document.querySelectorAll('#grid video')];
+let playing = false;
+function setPlaying(p) {
+  playing = p; $('gPlay').textContent = p ? '⏸ Pause all' : '▶ Play all';
+  videos().forEach(v => p ? v.play().catch(() => {}) : v.pause());
+}
+$('gPlay').onclick = () => setPlaying(!playing);
+$('gRestart').onclick = () => { videos().forEach(v => v.currentTime = 0); setPlaying(true); };
+$('gSpeed').onchange = () => videos().forEach(v => v.playbackRate = +$('gSpeed').value);
+$('gLoop').onchange = () => videos().forEach(v => v.loop = $('gLoop').checked);
+$('gSize').oninput = () => { $('grid').style.setProperty('--tile', $('gSize').value + 'px'); store.set('size', $('gSize').value); };
+$('gClear').onclick = () => { grid = []; store.set('grid', grid); renderGrid(); renderChips(); };
+document.addEventListener('keydown', (e) => {
+  if (e.target.closest('input, select, [contenteditable=true]')) return;
+  if (e.key === ' ') { e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === 'r') $('gRestart').click();
+  else if (e.key === ',' || e.key === '.') { setPlaying(false); videos().forEach(v => v.currentTime = Math.max(0, v.currentTime + (e.key === '.' ? 1 : -1) / 30)); }
+  else if (e.key === '[' || e.key === ']') {
+    const s = $('gSpeed'); s.selectedIndex = Math.max(0, Math.min(s.options.length - 1, s.selectedIndex + (e.key === ']' ? 1 : -1))); s.onchange();
+  }
+});
+
+// ---------------------------------------------------------------- jobs
+async function pollJobs(once) {
+  try {
+    const prev = JSON.stringify(jobs.map(j => [j.id, j.status]));
+    const res = await api('/api/jobs');
+    jobs = res.jobs; batching = res.batching;
+    const changed = prev !== JSON.stringify(jobs.map(j => [j.id, j.status]));
+    if (changed && jobs.some(j => j.finished)) await loadIndex(false);
+    renderJobs();
+    if (changed || once) { renderChips(); renderGrid(); }
+  } catch (e) { /* server restarting */ }
+  if (!once) {
+    const busy = jobs.some(j => ['SUBMITTING', 'PENDING', 'RUNNING'].includes(j.status)) || Object.keys(batching).length;
+    setTimeout(pollJobs, busy ? 5000 : 20000);
+  }
+}
+function renderJobs() {
+  const active = jobs.filter(j => ['SUBMITTING', 'PENDING', 'RUNNING'].includes(j.status)).length;
+  $('jobsum').textContent = `Render jobs — ${active} active, ${jobs.length} in the last 24 h`;
+  $('joblist').innerHTML = jobs.slice().reverse().map(j => `<div class="job">
+    <span class="mono">${j.id || '…'}</span><span class="st-${j.status}">${j.status}${j.reason && j.status === 'PENDING' ? ' · ' + esc(j.reason) : ''}</span>
+    <span>${esc(D && run(j.key) ? short(run(j.key)) : j.name)} · ${j.iterations.join(', ')}</span>
+    ${j.log ? `<pre>${esc(j.log)}</pre>` : ''}</div>`).join('');
+}
+
+// ---------------------------------------------------------------- boot
+async function loadIndex(refresh) {
+  const d = await api('/api/index' + (refresh ? '?refresh=1' : ''));
+  D = d; D.labels ||= {}; D.marks ||= {}; D.starred ||= [];
+  renderRuns(); renderRun(); renderGrid();
+}
+$('bulk').onclick = async () => {
+  const runs = listed.filter(r => r.task);
+  if (!runs.length) return toast('No renderable runs in the list.');
+  const tag = $('tag').value || store.get('tag', null);
+  if (!confirm(`Render best + latest for ${runs.length} runs?\nBest by ${tag || 'the default success scalar'}, smoothed over ${+$('smooth').value || 0} iterations. Existing videos are skipped.`)) return;
+  const b = $('bulk'); b.disabled = true; b.textContent = 'Planning…';
+  try {
+    const res = await api('/api/render_best_latest', { keys: runs.map(r => r.key), tag, smooth: +$('smooth').value || 0, episodes: +$('episodes').value || 1 });
+    let queued = 0, errors = [];
+    for (const [key, p] of Object.entries(res)) {
+      if (p.error) { errors.push(short(run(key)) + ': ' + p.error); continue; }
+      queued += p.queued.length;
+      if (p.queued.length) batching[key] = [...new Set([...(batching[key] || []), ...p.queued])];
+    }
+    toast(`Queued ${queued} videos across ${runs.length} runs.` + (errors.length ? ` Failed: ${errors.join('; ')}` : ''), 8000);
+    pollJobs(true); renderChips();
+  } catch (e) { toast('Failed: ' + e.message); }
+  b.disabled = false; b.textContent = 'Render best + latest of listed runs';
+};
+$('rescan').onclick = async () => {
+  $('rescan').disabled = true; $('rescan').textContent = '⟳ …';
+  try { await loadIndex(true); for (const k in curveCache) if (run(k)?.active) delete curveCache[k]; toast('Rescanned the cluster.'); }
+  catch (e) { toast('Rescan failed: ' + e.message); }
+  $('rescan').disabled = false; $('rescan').textContent = '⟳ Rescan';
+};
+['search', 'fStar', 'fActive', 'fLabel'].forEach(id => $(id).addEventListener('input', renderRuns));
+(async () => {
+  const f = store.get('filters', { q: '', fs: true, fa: false, fl: false });
+  $('search').value = f.q; $('fStar').checked = f.fs; $('fActive').checked = f.fa; $('fLabel').checked = f.fl;
+  $('gSize').value = store.get('size', 420); $('gSize').oninput();
+  await loadIndex(false);
+  if (!D.starred.length) { $('fStar').checked = false; renderRuns(); }
+  // #run=<key|wandb id>&show=900,4800 opens a run and puts those checkpoints in the grid.
+  const h = new URLSearchParams(location.hash.slice(1));
+  const hr = h.get('run') && D.runs.find(r => r.key === h.get('run') || r.wandb_id === h.get('run'));
+  if (hr) { sel = hr.key; if (h.get('show')) addToGrid(h.get('show').split(',').map(Number).filter(it => hr.checkpoints.includes(it)).map(it => ({ key: hr.key, it }))); }
+  if (sel && run(sel)) selectRun(sel); else sel = null;
+  pollJobs();
+  ensureVideos(grid.filter(g => run(g.key) && status(g.key, g.it) === 'cluster'));
+})();
+</script>
+</body>
+</html>

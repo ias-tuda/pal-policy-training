@@ -32,6 +32,10 @@ from pal_mjlab.tasks.manipulation.scene import INACTIVE_SIZE
 
 _SPHERE = int(mujoco.mjtGeom.mjGEOM_SPHERE)
 _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
+#: The mug's body (``scene.get_mug_spec``): a cylinder keeps its half-height second, after its
+#: radius. An object with one is neither a cube nor a ball (`shape_kind` ``other``).
+_CYLINDER = int(mujoco.mjtGeom.mjGEOM_CYLINDER)
+_HALF_Z_COLUMN = {_SPHERE: 0, _CYLINDER: 1, _BOX: 2}
 
 #: Attribute on the env caching each object's (geom id, geom type) pairs.
 _GEOMS = "_pal_shape_geoms"
@@ -81,10 +85,10 @@ def _object_geoms(env: ManagerBasedRlEnv, object_name: str) -> list[tuple[int, i
     obj: Entity = env.scene[object_name]
     types = env.sim.mj_model.geom_type
     geoms = [(int(g), int(types[int(g)])) for g in obj.indexing.geom_ids.tolist()]
-    bad = [(g, t) for g, t in geoms if t not in (_SPHERE, _BOX)]
+    bad = [(g, t) for g, t in geoms if t not in _HALF_Z_COLUMN]
     if bad:
       raise ValueError(
-        f"{object_name!r} has geoms that are neither a box nor a sphere: {bad}"
+        f"{object_name!r} has geoms that are not a box, a sphere or a cylinder: {bad}"
       )
     cache[object_name] = geoms
   return cache[object_name]
@@ -101,7 +105,7 @@ def object_half_height(
   size = env.sim.model.geom_size
   half = None
   for gid, gtype in _object_geoms(env, object_name):
-    col = 0 if gtype == _SPHERE else 2
+    col = _HALF_Z_COLUMN[gtype]
     h = size[:, gid, col] if env_ids is None else size[env_ids, gid, col]
     half = h if half is None else torch.maximum(half, h)
   assert half is not None, f"{object_name!r} has no geoms"
@@ -109,9 +113,12 @@ def object_half_height(
 
 
 def shape_kind(env: ManagerBasedRlEnv, object_name: str = "object") -> str:
-  """``cube`` (only boxes), ``ball`` (only spheres) or ``mixed`` (both): a property of the model,
-  not of a world."""
+  """``cube`` (only boxes), ``ball`` (only spheres), ``mixed`` (both) or ``other`` (anything with
+  a cylinder, the mug): a property of the model, not of a world. `ball_mask` is all False for
+  ``other``, so a `PerShape` resolves to its cube value."""
   types = {t for _, t in _object_geoms(env, object_name)}
+  if _CYLINDER in types:
+    return "other"
   if types == {_BOX}:
     return "cube"
   if types == {_SPHERE}:
