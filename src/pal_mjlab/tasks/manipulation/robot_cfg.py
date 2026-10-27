@@ -50,6 +50,12 @@ class GripperCfg:
   hand_body: str
   """Body whose subtree is the hand, for the end-effector/ground collision sensor."""
 
+  grasp_geom_regex: str
+  """The two opposing pad geoms the grasp sensor watches -- exactly one per jaw side. A grasp
+  is both of them touching the object. Narrower than ``pad_geom_regex`` on purpose: that one
+  also names geoms deeper in the finger (friction surfaces), which a small object held at
+  the pads never touches, and requiring *every* friction geom made the grasp unreachable."""
+
   def __post_init__(self) -> None:
     if len(self.pad_sites) != 2:
       raise ValueError(
@@ -63,6 +69,50 @@ class GripperCfg:
   @property
   def ground_sensor_name(self) -> str:
     return f"{self.name}_hand_ground_contact"
+
+  @property
+  def surface_sensor_name(self) -> str:
+    return f"{self.name}_hand_surface_contact"
+
+
+@dataclasses.dataclass(frozen=True)
+class KeepoutBoxCfg:
+  """A box, fixed in one of the robot's own frames, that named links must stay out of.
+
+  The trunk of a humanoid is the obvious instance: the arms can fold into the chest, and the
+  trunk colliders only stop them once they touch. This is the volume they must keep clear,
+  so the penalty starts *before* the contact. (S5.1 item 8, from Claudius's 82c4450.)
+  """
+
+  reference_body: str
+  """Body whose frame the box is fixed in -- the trunk link, so it follows the torso."""
+
+  body_name_regex: tuple[str, ...]
+  """Links that must stay out, matched against body names. A link whose origin is inside
+  the box at the start pose must not be listed: it would pay the full penalty from the
+  first step of every episode (on Kangaroo, the shoulder link)."""
+
+  center: tuple[float, float, float]
+  """Box centre in ``reference_body``'s frame, metres."""
+
+  half_extents: tuple[float, float, float]
+  """Box half-extents, metres, taken from the trunk's collision geom."""
+
+  margin: float = 0.05
+  """Distance from the box surface at which the penalty starts, metres. It stands in for
+  the watched links' own thickness -- the term scores link *origins* -- and must stay below
+  the tightest clearance the start pose holds, or the penalty is on before the policy acts."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ReachCfg:
+  """How far from the robot an object can be and still be worth reaching for."""
+
+  reference_body: str
+  """Body the distance is measured from, horizontally. The base link."""
+
+  max_distance: float
+  """Planar distance beyond which an object is out of reach, metres."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,28 +137,6 @@ class ManipulationRobotCfg:
   viewer_body: str
   """Body the viewer anchors on."""
 
-  joint_damping_range: Mapping[str, tuple[float, float]] | None = None
-  """Absolute ``dof_damping`` ranges keyed by joint-name regex, sampled per env at startup.
-  ``None`` disables the randomisation.
-
-  Absolute for the same reason as ``joint_friction_range``, and it is a distinct quantity
-  from the ``damping`` in ``_pal_impedance_params``: that one is the actuator's derivative
-  gain (randomised separately by ``dr.pd_gains``), whereas this is joint-level viscous
-  damping. The arms carry none of the latter at all, so a multiplicative range would be a
-  silent no-op on exactly the joints that matter.
-  """
-
-  joint_friction_range: Mapping[str, tuple[float, float]] | None = None
-  """Absolute ``dof_frictionloss`` ranges keyed by joint-name regex, sampled per env at
-  startup. ``None`` disables the randomisation.
-
-  Absolute rather than scaled because the arm actuators are built by
-  ``_calc_actuator_params``, which sets armature/stiffness/damping but *no* frictionloss:
-  their default is 0, so a multiplicative range would be a no-op and the arms would keep
-  the frictionless joints they have today. Ranges are per joint group because the stiction
-  that is realistic on a 50 N.m arm joint would seize the gripper four-bar.
-  """
-
   fixed_base: bool = False
   """Weld the robot's root body to the world, holding it at its initial pose. Set for
   humanoids doing tabletop work: balance is out of scope for a manipulation policy and a
@@ -116,6 +144,27 @@ class ManipulationRobotCfg:
 
   root_free_joint: str = "origin"
   """Name of the root free joint. Used to locate the root body when ``fixed_base`` is set."""
+
+  action_clip: dict[str, tuple[float, float]] | None = None
+  """Per-actuator clamp on the *processed* joint target, as ``JointPositionActionCfg.clip``
+  takes it. None leaves targets unclamped. mjlab builds position actuators with
+  ``ctrllimited=False``, so a target past a joint limit is not clamped by the simulator --
+  the actuator pushes the joint into its limit at up to its full effort."""
+
+  trunk_keepout: KeepoutBoxCfg | None = None
+  """Clearance volume around the trunk, penalised as ``trunk_clearance``; ``None`` for none."""
+
+  joint_velocity_limits: Mapping[str, float] | None = None
+  """Hardware joint speed ceilings in rad/s, keyed by actuator-name regex, or ``None``.
+
+  `make_tabletop_env_cfg` turns them into a per-control-step slew limit on the commanded
+  target (`mdp.RateLimitedJointPositionAction`). Taken from the robot's URDF, not tuned: a
+  target that moves faster than the servo can follow trains against an actuator that does
+  not exist. (S5.1 item 4, Claudius's 602cd9d.)"""
+
+  reach: ReachCfg | None = None
+  """Usable workspace radius; an object beyond it ends the episode as ``out_of_reach``.
+  ``None`` never calls an object unreachable."""
 
   def __post_init__(self) -> None:
     if not self.grippers:

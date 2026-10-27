@@ -26,16 +26,14 @@ whitelist that today knows only ``joint_pos``, ``joint_vel``, ``actions``, ``com
 the IMU terms. The object-state terms below have no entry there yet, so a policy trained
 with them cannot be driven on hardware until the C++ node is extended. Keep these term
 *names and dimensions* stable so that extension stays mechanical.
-
-Every term in the actor group must be something hardware can actually produce. The grasp
-flag is the counter-example and is deliberately critic-only (see below): it comes from a
-MuJoCo contact sensor with no hardware equivalent.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import math
+import re
 from collections.abc import Mapping
-from dataclasses import replace
 
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -71,35 +69,12 @@ COMMAND = "goal_pose"
 #: Sensor name for object-on-table support.
 SUPPORT_SENSOR = "object_table_contact"
 
-# -- Object tracker error model -------------------------------------------------------
-# Sized for a marker-based tracker (OptiTrack class), with headroom. The dominant error of
-# such a system is *not* per-frame jitter -- that is sub-millimetre -- but the constant
-# offset between the tracked rigid-body frame and the cube's geometric centre, which comes
-# out of calibration and then holds for the whole episode. That distinction matters: a
-# zero-mean noise resampled every step is something the policy can average away over a few
-# frames, leaving it effectively reading ground truth, whereas a per-episode bias is not
-# observable from a single trajectory and has to be handled.
-OBJECT_POS_BIAS = 0.008
-"""Per-episode constant position offset, metres."""
-OBJECT_POS_NOISE = 0.002
-"""Per-step position jitter, metres."""
-OBJECT_YAW_BIAS = 0.03
-"""Per-episode constant yaw offset, radians."""
-OBJECT_YAW_NOISE = 0.01
-"""Per-step yaw jitter, radians."""
-
-# Tracker latency, in control steps. The loop runs at 1/(sim.timestep * decimation) =
-# 50 Hz, so one step is 20 ms; 0-2 steps spans a marker tracker's few-ms capture latency
-# plus network and ROS transport. Sampled per env so the policy cannot tune to one value.
-OBJECT_DELAY_MIN_LAG = 0
-OBJECT_DELAY_MAX_LAG = 2
-
 
 def make_grasp_sensor(gripper: GripperCfg, object_name: str) -> ContactSensorCfg:
   """Pads-vs-object contact: the ground-truth grasp signal."""
   return ContactSensorCfg(
     name=gripper.contact_sensor_name,
-    primary=ContactMatch(mode="geom", pattern=gripper.pad_geom_regex, entity=ROBOT),
+    primary=ContactMatch(mode="geom", pattern=gripper.grasp_geom_regex, entity=ROBOT),
     secondary=ContactMatch(mode="body", pattern=object_name, entity=object_name),
     fields=("found", "force"),
     reduce="none",
@@ -140,6 +115,353 @@ def make_hand_ground_sensor(gripper: GripperCfg) -> ContactSensorCfg:
   )
 
 
+def make_hand_surface_sensor(
+  gripper: GripperCfg, surface_name: str = TABLE
+) -> ContactSensorCfg:
+  """Hand-vs-table contact, so a task can penalise leaning on the work surface.
+
+  Distinct from the ground sensor above, which watches the floor. Scraping or resting the
+  jaw on the table is a cheap way for a simulated policy to stabilise a grasp, and it is the
+  first thing that stops working on a real table.
+  """
+  return ContactSensorCfg(
+    name=gripper.surface_sensor_name,
+    primary=ContactMatch(mode="subtree", pattern=gripper.hand_body, entity=ROBOT),
+    secondary=ContactMatch(mode="body", pattern=surface_name, entity=surface_name),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=1,
+    history_length=4,
+  )
+
+
+#: Physics step and control decimation: 2 ms x 10 = 50 Hz control. Named because the arm slew
+#: limit is a speed times the control period; see the sim cfg below for why 2 ms.
+SIM_TIMESTEP = 0.002
+DECIMATION = 10
+CONTROL_DT = SIM_TIMESTEP * DECIMATION
+
+#: MuJoCo disable flags of every tabletop task. ``nativeccd`` off is what sends box-box pairs (the
+#: cubes, the table top and legs, the box's walls) to mujoco_warp's dedicated ``box_box`` collider,
+#: as CPU MuJoCo does; with it on (mujoco_warp's default, every run before plan S9.1) they go through
+#: GJK/EPA + multicontact, which under a pressing hand returns one contact where CPU MuJoCo returns
+#: four, and a cube held down on a cube sank 1.1-1.7 cm into it, the base 1.5-2.6 cm into the table
+#: (CPU MuJoCo on the same model, state and controls: 1.3 / 2.2 mm; 100 solver iterations, impratio 1
+#: or a pyramidal cone did not help). In mujoco_warp the flag changes only box-box pairs; the pads,
+#: arm and torso are meshes and capsules. Measured 2026-10-05 on the S9 stack renders (decision 0004).
+SIM_DISABLE_FLAGS = ("nativeccd",)
+
+#: Plan S7-8's stack-task speeds (`SLEW=stack`): the arm at a fraction of the URDF speed
+#: (`robots.kangaroo.KANGAROO_GRIPPERS`' `joint_velocity_limits`) per joint group, the jaw at
+#: 0.03 rad per control step (1.5 rad/s). Claudius's recipe (`origin/faster-moves` b236d62,
+#: ``Slow25`` = 0.25 x ``STANDING_SLEW_RATE_SCALE``): arm 1-3 at 1/16, arm 4-7 at 1/8 (0.122 /
+#: 0.147 / 0.294 rad/s), the jaw at 0.15 x ``JAW_SLEW_LIMIT`` 0.20. The groups cut across the
+#: URDF limits' (1-2 | 3-7), so the rates are built per joint (`stack_arm_rate_limit`).
+STACK_ARM_SPEED_FRACTION = {
+  r"arm_.*_[123]_joint": 1.0 / 16.0,
+  r"arm_.*_[4-7]_joint": 1.0 / 8.0,
+}
+STACK_JAW_STEP = 0.03
+
+
+def stack_arm_rate_limit(urdf_limits: Mapping[str, float]) -> dict[str, float]:
+  """Largest change of each arm joint's command per control step at the stack task's speeds,
+  rad, keyed ``arm_.*_<i>_joint``: the joint's URDF limit (``urdf_limits``, rad/s, by regex) times
+  its `STACK_ARM_SPEED_FRACTION` times `CONTROL_DT`. Joints 1-7, sampled as ``arm_left_<i>_joint``."""
+
+  def lookup(table: Mapping[str, float], name: str) -> float:
+    for pattern, value in table.items():
+      if re.fullmatch(pattern, name):
+        return value
+    raise ValueError(f"no entry for {name!r} in {tuple(table)}")
+
+  return {
+    f"arm_.*_{i}_joint": lookup(urdf_limits, f"arm_left_{i}_joint")
+    * lookup(STACK_ARM_SPEED_FRACTION, f"arm_left_{i}_joint")
+    * CONTROL_DT
+    for i in range(1, 8)
+  }
+
+
+#: The action modes (`ACTION`): the policy's action sets the commanded target (``abs``, every run
+#: up to S7-7) or moves it (``delta``, plan S7-8; `mdp.DeltaRateLimitedJointPositionAction`).
+ACTION_MODES = ("abs", "delta")
+
+#: What the policy observes, by name (plan S7-2). ``S71`` is every run up to S7-1: 36-D, with
+#: `grasped` in the actor. ``B`` is baseline B's actor (Claudius's `origin/faster-moves`
+#: dc498d9): 38-D, only what the robot can measure -- see `_deployable_observations`.
+OBSERVATION_SETS = ("S71", "B")
+
+#: Baseline B's joint-encoder model: a per-episode calibration offset on the joint positions,
+#: rad, and 0-1 control steps of joint-state latency. Claudius's `JOINT_POS_BIAS` and
+#: `JOINT_DELAY_*_LAG`.
+_B_JOINT_POS_BIAS = 0.01
+_B_JOINT_LAG = (0, 1)
+
+
+#: Plan S7-6: the real robot's two latencies, ported from Claudius's `origin/faster-moves`
+#: (1d484c4 tracker, 71e1147 jaw servo; measured on the robot 2026-09-29).
+#:
+#: The cube is tracked by FoundationPose, 100-150 ms end to end (capture, inference, network,
+#: ROS) = 5-8 control steps at `CONTROL_DT`, against the 0-2 steps (`_DR_OBS_OBJECT_LAG`, on
+#: the actor's cube terms under DR-obs and baseline B) every run up to S7-5 trained with. Drawn per env per episode, on
+#: the cube's pose (`mdp._ObjectTracker`), replacing the term-level 0-2 on the actor's cube
+#: terms rather than adding to it.
+VISION_TRACKER_LAG = (5, 8)  # control steps
+#: The jaw servo: a first-order lag with a saturating speed between the jaw command and the
+#: joint (`mdp.RateLimitedJointPositionAction._resolve_servo`). Recorded strokes: 0.13-0.17 s
+#: steady lag, 1.3-1.7 rad/s peak. The two are not separable from one logged stroke (a pure
+#: 0.14 s lag fits the lag samples too), so both are modelled and both ranges are wide --
+#: Claudius's reading, kept as is. Per env, per episode.
+JAW_SERVO_TAU = (0.11, 0.19)  # s
+JAW_SERVO_MAX_VEL = (1.25, 1.75)  # rad/s
+#: Plan S7-11's wide servo (JSW): the same model, with the slow end stretched to the eval's stress
+#: (a) -- time constant x 2, speed x 0.5 (0.22-0.38 s, 0.625-0.875 rad/s) -- under which every S7-11
+#: policy lost 12-40 points (2026-10-06): their close is timed to the servo they trained on.
+JAW_SERVO_TAU_WIDE = (0.11, 0.38)  # s
+JAW_SERVO_MAX_VEL_WIDE = (0.625, 1.75)  # rad/s
+
+
+@dataclasses.dataclass(frozen=True)
+class LatencyModelCfg:
+  """Plan S7-6's latency model: which of the robot's measured latencies training sees."""
+
+  tracker_lag: tuple[int, int] | None
+  """The cube tracker's lag, control steps, on the cube pose; None keeps the observation
+  set's own term-level lag (0-2 under DR-obs, every run up to S7-5)."""
+
+  jaw_servo: bool
+  """The jaw servo model (`JAW_SERVO_TAU`, `JAW_SERVO_MAX_VEL`) between command and joint."""
+
+  servo_tau: tuple[float, float] = JAW_SERVO_TAU
+  """Per-env range of the servo's time constant, s (with ``jaw_servo``)."""
+
+  servo_max_vel: tuple[float, float] = JAW_SERVO_MAX_VEL
+  """Per-env range of the servo's speed limit, rad/s (with ``jaw_servo``)."""
+
+
+#: Latency models by name (`LAG`). ``none`` is every run up to S7-5; ``FP`` the FoundationPose
+#: tracker alone, ``JS`` the jaw servo alone, ``FP+JS`` both (plan S7-6); ``FP+JSW`` both with the
+#: wide servo (plan S7-11).
+LATENCY_MODELS = {
+  "none": LatencyModelCfg(tracker_lag=None, jaw_servo=False),
+  "FP": LatencyModelCfg(tracker_lag=VISION_TRACKER_LAG, jaw_servo=False),
+  "JS": LatencyModelCfg(tracker_lag=None, jaw_servo=True),
+  "FP+JS": LatencyModelCfg(tracker_lag=VISION_TRACKER_LAG, jaw_servo=True),
+  # Plan S7-11: the jaw servo drawn down to twice as slow (`JAW_SERVO_TAU_WIDE`).
+  "FP+JSW": LatencyModelCfg(
+    tracker_lag=VISION_TRACKER_LAG,
+    jaw_servo=True,
+    servo_tau=JAW_SERVO_TAU_WIDE,
+    servo_max_vel=JAW_SERVO_MAX_VEL_WIDE,
+  ),
+}
+
+#: The actor's terms that read the tracked object, and so move onto the tracker's lag.
+_TRACKED_OBJECT_TERMS = ("object_pos", "object_yaw")
+
+
+def _apply_tracker_lag(cfg: ManagerBasedRlEnvCfg, lag: tuple[int, int]) -> None:
+  """Put the actor's cube terms on one shared tracker ``lag`` steps late, and the critic's on
+  the live pose.
+
+  After `apply_dr_level`, which may already have replaced the actor's cube terms (DR-obs). The
+  terms are *replaced*, not edited: in the ``S71`` set the actor and critic share term objects.
+  The term-level delay goes to zero on both, so the lag is the tracker's alone; the noise model
+  (per-episode bias, per-step jitter) is kept, and is applied to the lagged pose, as on the
+  robot.
+  """
+  for group_name, group in cfg.observations.items():
+    for name in _TRACKED_OBJECT_TERMS:
+      if name not in group.terms:
+        raise ValueError(
+          f"tracker lag asked for, but the {group_name!r} group has no {name!r} term"
+        )
+      term = group.terms[name]
+      group.terms[name] = dataclasses.replace(
+        term,
+        params={**term.params, "lag": lag if group_name == "actor" else None},
+        delay_min_lag=0,
+        delay_max_lag=0,
+      )
+
+
+def _apply_occlusion(
+  cfg: ManagerBasedRlEnvCfg,
+  occ: mdp.OccCfg,
+  latency: LatencyModelCfg,
+  tcp: SceneEntityCfg,
+  jaw_name: str,
+) -> None:
+  """Plan S7-7: the actor's cube terms report through one `mdp.CubeSensor` -- the cube's pose as
+  the tracker reports it (``lag`` steps late), visible or not, with the filler ``occ.fill`` while
+  it is not -- and, if ``occ.flag``, a visibility flag; the critic keeps the live cube and gets
+  the flag and the steps since the cube was last seen.
+
+  After `_apply_tracker_lag` and `apply_dr_level`. The tracker's lag is S7-6's ``FP`` lag if the
+  run has one, else the 0-2 steps every run up to S7-5 trained with (`_DR_OBS_OBJECT_LAG`, which
+  moves from mjlab's term-level delay onto the tracker). The noise is the actor's cube terms'
+  own, applied inside the sensor so that a filler is not noised (`mdp.OccCfg.noise`).
+  """
+  lag = latency.tracker_lag or _DR_OBS_OBJECT_LAG
+  actor = cfg.observations["actor"]
+  sensor_params = {
+    "object_name": OBJECT,
+    "lag": lag,
+    "occ": dataclasses.replace(occ, noise=_occ_noise(actor.terms)),
+    "tcp_cfg": tcp,
+    "jaw_name": jaw_name,
+  }
+  terms = {}
+  for name, term in actor.terms.items():
+    if name == "object_pos":
+      term = dataclasses.replace(
+        term,
+        func=mdp.object_position_occ,
+        params=sensor_params,
+        noise=None,
+        delay_min_lag=0,
+        delay_max_lag=0,
+      )
+    elif name == "object_yaw":
+      term = dataclasses.replace(
+        term,
+        func=mdp.object_yaw_occ,
+        params=sensor_params,
+        noise=None,
+        delay_min_lag=0,
+        delay_max_lag=0,
+      )
+    terms[name] = term
+    if name == "object_yaw" and occ.flag:
+      terms["object_seen"] = ObservationTermCfg(
+        func=mdp.object_seen, params=sensor_params
+      )
+  if "object_yaw" not in actor.terms:
+    raise ValueError("occlusion asked for, but the actor has no 'object_yaw' term")
+  actor.terms = terms
+  critic = cfg.observations["critic"]
+  critic.terms = {
+    **critic.terms,
+    "object_seen": ObservationTermCfg(func=mdp.object_seen, params=sensor_params),
+    "object_unseen": ObservationTermCfg(
+      func=mdp.object_unseen_steps, params=sensor_params
+    ),
+  }
+
+
+def _occ_noise(terms) -> tuple[float, float, float, float]:
+  """(pos bias, pos jitter, yaw bias, yaw jitter) of the actor's cube terms, before they move
+  into the sensor."""
+
+  def bound(term) -> tuple[float, float]:
+    noise = term.noise
+    if noise is None:
+      return 0.0, 0.0
+    return float(noise.bias_noise_cfg.n_max), float(noise.noise_cfg.n_max)
+
+  return (*bound(terms["object_pos"]), *bound(terms["object_yaw"]))
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolSpeedCapCfg:
+  """Plan S7-2's module V: a bound on the tool's speed in the action term. See
+  `mdp.ToolSpeedCappedJointPositionAction`."""
+
+  speed: float
+  """Tool speed bound, m/s."""
+
+  slow_speed: float
+  """Tool speed bound in the slow zone, m/s."""
+
+  slow_zone: float = 0.05
+  """The slow zone: a held object within this distance of its resting height on the table,
+  or horizontally of the goal, m."""
+
+  slow_near_surface: bool = True
+  """Whether the slow zone includes "within ``slow_zone`` of the resting height" (lifting off,
+  setting down anywhere). False keeps only "horizontally near the goal": plan S7-9's PV, a slow
+  approach to the target with no other bound."""
+
+
+def _deployable_observations(
+  action_joints: SceneEntityCfg,
+  arm_joints: SceneEntityCfg,
+  tcp: SceneEntityCfg,
+  grasp_sensor: str,
+) -> dict[str, ObservationGroupCfg]:
+  """Baseline B's observation groups (plan S7-2): an actor fed only what the robot measures.
+
+  Against ``S71``: the jaw's velocity is out (noise-dominated, and the jaw's position and the
+  last action already say what it is doing); the TCP's orientation is in; `grasped` -- a
+  MuJoCo contact sensor with no counterpart on the robot -- moves to the critic. The joint
+  readings get a per-episode encoder offset and 0-1 steps of latency, and the object-tracker
+  error model of `DR-obs` is on at every rung. The bias noise uses ``operation="abs"`` (see
+  `apply_dr_level`, DR-obs): with mjlab's default "add" it random-walks across episodes.
+
+  The critic is the actor's terms without noise *or* latency -- `enable_corruption=False`
+  switches noise off but not delay -- plus `grasped` as privileged information. It runs only in
+  simulation and is not exported.
+  """
+
+  def tracker(bias: float, noise: float) -> NoiseModelWithAdditiveBiasCfg:
+    return NoiseModelWithAdditiveBiasCfg(
+      noise_cfg=Unoise(n_min=-noise, n_max=noise),
+      bias_noise_cfg=Unoise(n_min=-bias, n_max=bias, operation="abs"),
+    )
+
+  joint_lag = {"delay_min_lag": _B_JOINT_LAG[0], "delay_max_lag": _B_JOINT_LAG[1]}
+  object_lag = {
+    "delay_min_lag": _DR_OBS_OBJECT_LAG[0],
+    "delay_max_lag": _DR_OBS_OBJECT_LAG[1],
+  }
+  actor_terms = {
+    "joint_pos": ObservationTermCfg(
+      func=mdp.joint_pos_rel,
+      params={"asset_cfg": action_joints},
+      noise=tracker(_B_JOINT_POS_BIAS, 0.002),
+      **joint_lag,
+    ),
+    "joint_vel": ObservationTermCfg(
+      func=mdp.joint_vel_rel,
+      params={"asset_cfg": arm_joints},
+      noise=Unoise(n_min=-0.2, n_max=0.2),
+      **joint_lag,
+    ),
+    "actions": ObservationTermCfg(func=mdp.last_action),
+    "tcp_pos": ObservationTermCfg(func=mdp.ee_position_b, params={"asset_cfg": tcp}),
+    "tcp_quat": ObservationTermCfg(
+      func=mdp.ee_orientation_b, params={"asset_cfg": tcp}
+    ),
+    "object_pos": ObservationTermCfg(
+      func=mdp.object_position_b,
+      params={"object_name": OBJECT},
+      noise=tracker(_DR_OBS_OBJECT_POS_BIAS, _DR_OBS_OBJECT_POS_NOISE),
+      **object_lag,
+    ),
+    "object_yaw": ObservationTermCfg(
+      func=mdp.object_yaw_b,
+      params={"object_name": OBJECT},
+      noise=tracker(_DR_OBS_OBJECT_YAW_BIAS, _DR_OBS_OBJECT_YAW_NOISE),
+      **object_lag,
+    ),
+    "target_pos": ObservationTermCfg(
+      func=mdp.goal_position_b, params={"command_name": COMMAND}
+    ),
+  }
+  critic_terms = {
+    name: dataclasses.replace(term, delay_min_lag=0, delay_max_lag=0)
+    for name, term in actor_terms.items()
+  }
+  critic_terms["grasped"] = ObservationTermCfg(
+    func=mdp.is_grasped, params={"sensor_name": grasp_sensor}
+  )
+  return {
+    "actor": ObservationGroupCfg(actor_terms, enable_corruption=True),
+    "critic": ObservationGroupCfg(critic_terms, enable_corruption=False),
+  }
+
+
 def make_tabletop_env_cfg(
   robot: ManipulationRobotCfg,
   gripper_name: str | None = None,
@@ -148,6 +470,26 @@ def make_tabletop_env_cfg(
   object_pose_range: Mapping[str, tuple[float, float]] | None = None,
   min_separation: float = 0.0,
   episode_length_s: float = 20.0,
+  hold_nominal: bool = True,
+  dr_level: str | None = None,
+  guard_divergence: bool = True,
+  trunk_clearance_penalty: float = 1.0,
+  action_slew_rate_scale: float = 1.0,
+  table_top_z: float = scene.TABLE_TOP_Z,
+  observation_set: str = "S71",
+  jaw_slew_rate: float | None = None,
+  tool_speed_cap: ToolSpeedCapCfg | None = None,
+  dr_spawn_widening: bool = True,
+  arm_range_clip: bool = False,
+  arm_effort_band: bool = False,
+  latency: LatencyModelCfg = LATENCY_MODELS["none"],
+  occlusion: mdp.OccCfg | None = None,
+  stack_speed: bool = False,
+  action_mode: str = "abs",
+  command_obs: bool = False,
+  goal_area: dict | None = None,
+  object_geoms: tuple[str, ...] | None = None,
+  object_friction: tuple[float, float] | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """A complete tabletop manipulation environment for ``robot``.
 
@@ -160,7 +502,71 @@ def make_tabletop_env_cfg(
     object_pose_range: XY/yaw spawn range on the table, relative to the table centre.
     min_separation: minimum XY gap enforced between spawned objects.
     episode_length_s: episode timeout.
+    hold_nominal: command the joints the policy does not drive to their defaults instead of
+      to zero. Off is the pre-S4 behaviour and is kept only so the two can be compared; it
+      collapses the legs within 0.2 s.
+    dr_level: domain-randomisation rung by name, or None to leave the base cfg's own
+      randomisation alone. See `DR_LEVELS`. Spelled `dr_level` rather than `dr` only because
+      this module imports mjlab's `dr` term namespace; the task factories expose it as `dr`.
+    guard_divergence: terminate any world whose physics goes non-finite, and sanitise
+      observations as a backstop.
+      On by default because contact-rich GPU sim diverges at a measured ~1 per 0.5M
+      world-steps here and `mujoco_warp` does not reset a diverged world by itself; off
+      reproduces the pre-guard behaviour, in which the first divergence kills the run.
+    trunk_clearance_penalty: weight of ``trunk_clearance`` (see `trunk_clearance_rewards`),
+      for a robot with a ``trunk_keepout``; 0 turns it off.
+    action_slew_rate_scale: a factor on the robot's `joint_velocity_limits` slew: 1.0 is the
+      URDF rate, 0.5 halves every limited joint's top speed (plan S7, speed bound A). Must be
+      in (0, 1] -- the limits are hardware ceilings, so a factor above one would train
+      against an actuator that does not exist -- and 1.0 on a robot without limits.
+    table_top_z: height of the table's top face, m. `scene.TABLE_TOP_Z` (0.76) for every run
+      up to S7-1; `scene.ROBOT_CELL_TABLE_TOP_Z` for plan S7-2's baseline B.
+    observation_set: what the actor and critic observe, by name; see `OBSERVATION_SETS`.
+    jaw_slew_rate: largest change of the commanded jaw target per control step, rad, or None
+      for none. Plan S7-2's baseline B: 0.04 = PAL's 2 rad/s. Not scaled by
+      ``action_slew_rate_scale``, which is the arm's.
+    tool_speed_cap: plan S7-2's module V, or None. See `ToolSpeedCapCfg`.
+    dr_spawn_widening: whether `DR-scene` widens ``object_pose_range`` (it does for the
+      +/-2 cm box every run up to S7-1 used). Off for a spawn box that is already the whole
+      region to train on (plan S7-2's W boxes).
+    arm_range_clip: plan S7-4's C -- the arm's (not the jaw's) targets clipped to the joint
+      range in the action term, after the slew and any tool cap.
+    arm_effort_band: plan S7-4's T in the action term -- the arm's targets kept within
+      q +/- tau_cmd / K, tau_cmd the effort limit the robot's model carries (lowered by the
+      robot cfg, `robots.kangaroo_grippers_left_arm(arm_effort_scale=...)`).
+    latency: plan S7-6's latency model -- the cube tracker's lag and the jaw servo. See
+      `LATENCY_MODELS`; ``none`` is every run up to S7-5.
+    occlusion: plan S7-7's occlusion model and filler, or None (every run up to S7-6). See
+      `mdp.OccCfg` and `_apply_occlusion`.
+    stack_speed: plan S7-8's stack-task speeds (`STACK_ARM_SPEED_FRACTION`, `STACK_JAW_STEP`)
+      in place of the URDF slew times ``action_slew_rate_scale`` (which must stay 1.0) and of
+      ``jaw_slew_rate``.
+    action_mode: ``abs`` (today's) or ``delta`` (`ACTION_MODES`). ``delta`` needs a per-step limit
+      on every joint -- the action's full scale -- and no tool speed cap.
+    goal_area: plan S7-8's area the goal is drawn from, for ``reset_objects_on_surface``'s
+      ``goal_area`` (the object is drawn where that area has a point far enough from it).
+    command_obs: plan S7-8's ``CMD_OBS``: the actor's and critic's ``actions`` term shows the
+      commanded target relative to the default pose (`mdp.commanded_target_rel`) instead of the
+      raw last action. Still 8-D.
+    object_geoms: the manipulated object's geom names, for the DR of its friction (`DR-object`);
+      None is the one geom ``{OBJECT}_geom`` a cube and a ball have. Plan S8's MIX has two.
+    object_friction: `DR-object`'s range for the object's sliding friction (abs, uniform); None is
+      `_DR_OBJECT_FRICTION`, every object before plan §12. The pin's sets its pair with the socket
+      block (the element-wise max, L10), so it keeps its own value (`pick_place_env_cfg`'s ``pin``).
   """
+  if observation_set not in OBSERVATION_SETS:
+    raise ValueError(
+      f"unknown observation set {observation_set!r}; have {OBSERVATION_SETS}"
+    )
+  if action_mode not in ACTION_MODES:
+    raise ValueError(f"unknown action mode {action_mode!r}; have {ACTION_MODES}")
+  if stack_speed and action_slew_rate_scale != 1.0:
+    raise ValueError(
+      "stack_speed replaces the URDF slew factor; action_slew_rate_scale must stay 1.0, "
+      f"got {action_slew_rate_scale}"
+    )
+  if action_mode == "delta" and tool_speed_cap is not None:
+    raise ValueError("a delta action is not built on the tool speed cap (plan S7-8)")
   gripper = robot.gripper(gripper_name)
   if objects is None:
     objects = {OBJECT: scene.get_cube_cfg(name=OBJECT)}
@@ -195,58 +601,133 @@ def make_tabletop_env_cfg(
     "object_pos": ObservationTermCfg(
       func=mdp.object_position_b,
       params={"object_name": OBJECT},
-      noise=NoiseModelWithAdditiveBiasCfg(
-        noise_cfg=Unoise(n_min=-OBJECT_POS_NOISE, n_max=OBJECT_POS_NOISE),
-        bias_noise_cfg=Unoise(n_min=-OBJECT_POS_BIAS, n_max=OBJECT_POS_BIAS),
-      ),
-      delay_min_lag=OBJECT_DELAY_MIN_LAG,
-      delay_max_lag=OBJECT_DELAY_MAX_LAG,
+      noise=Unoise(n_min=-0.005, n_max=0.005),
     ),
     "object_yaw": ObservationTermCfg(
       func=mdp.object_yaw_b,
       params={"object_name": OBJECT},
-      noise=NoiseModelWithAdditiveBiasCfg(
-        noise_cfg=Unoise(n_min=-OBJECT_YAW_NOISE, n_max=OBJECT_YAW_NOISE),
-        bias_noise_cfg=Unoise(n_min=-OBJECT_YAW_BIAS, n_max=OBJECT_YAW_BIAS),
-      ),
-      delay_min_lag=OBJECT_DELAY_MIN_LAG,
-      delay_max_lag=OBJECT_DELAY_MAX_LAG,
+      noise=Unoise(n_min=-0.02, n_max=0.02),
     ),
     "target_pos": ObservationTermCfg(
       func=mdp.goal_position_b, params={"command_name": COMMAND}
     ),
+    "grasped": ObservationTermCfg(
+      func=mdp.is_grasped, params={"sensor_name": grasp_sensor}
+    ),
   }
-
-  # ``grasped`` is read off a pads-vs-object contact sensor, which exists in MuJoCo and
-  # nowhere on the real gripper. Feeding it to the actor trains a policy around a perfect
-  # binary grasp flag it cannot have at deployment, so it stays critic-only: privileged
-  # information is exactly what an asymmetric actor-critic is for. The critic is not
-  # exported and runs only in sim, so it may use it freely.
-  critic_terms = dict(actor_terms)
-  # ``enable_corruption=False`` below suppresses the critic's noise, but not its delay --
-  # those are separate stages of the observation pipeline. The critic runs only in sim and
-  # is never exported, so strip the lag too and let it value states from the true object
-  # pose; a critic fed stale observations just adds variance to the advantage estimate.
-  for _name in ("object_pos", "object_yaw"):
-    critic_terms[_name] = replace(critic_terms[_name], delay_min_lag=0, delay_max_lag=0)
-  critic_terms["grasped"] = ObservationTermCfg(
-    func=mdp.is_grasped, params={"sensor_name": grasp_sensor}
-  )
-
   observations = {
     "actor": ObservationGroupCfg(dict(actor_terms), enable_corruption=True),
-    "critic": ObservationGroupCfg(critic_terms, enable_corruption=False),
+    "critic": ObservationGroupCfg(dict(actor_terms), enable_corruption=False),
   }
+  # The arm's joints: the action joints but the jaws.
+  jaw_joints = action_jaw_joints(robot, gripper)
+  arm_regex = arm_joint_regex(robot, gripper)
+  if observation_set == "B":
+    observations = _deployable_observations(
+      action_joints,
+      SceneEntityCfg(ROBOT, joint_names=arm_regex),
+      tcp,
+      grasp_sensor,
+    )
+
+  if command_obs:
+    # Plan S7-8's CMD_OBS: what the term commanded, not the raw last action -- same place, same
+    # width. Replaced, not edited: in the S71 set the actor and critic share term objects.
+    for group in observations.values():
+      group.terms = {
+        name: ObservationTermCfg(func=mdp.commanded_target_rel)
+        if name == "actions"
+        else term
+        for name, term in group.terms.items()
+      }
 
   # -- Actions --------------------------------------------------------------------
-  actions: dict[str, ActionTermCfg] = {
-    "joint_pos": JointPositionActionCfg(
-      entity_name=ROBOT,
-      actuator_names=robot.action_joint_regex,
-      scale=robot.action_scale,
-      use_default_offset=True,
+  # With `joint_velocity_limits` the commanded target may move at most limit * CONTROL_DT
+  # per control step (S5.1 item 4): still an absolute target, `default + scale * action`, so
+  # the deployment contract is unchanged, but a saturated action ramps instead of jumping.
+  # Joints without a limit -- the jaw, unless ``jaw_slew_rate`` gives it one -- behave exactly
+  # as `JointPositionActionCfg`.
+  joint_pos_kwargs = dict(
+    entity_name=ROBOT,
+    actuator_names=robot.action_joint_regex,
+    scale=robot.action_scale,
+    clip=robot.action_clip,
+    use_default_offset=True,
+  )
+  # `action_slew_rate_scale` scales that limit (plan S7, speed bound A). It is a property of
+  # the action term, so a deployment must apply the same per-step clamp to reproduce it.
+  if not 0.0 < action_slew_rate_scale <= 1.0:
+    raise ValueError(
+      f"action_slew_rate_scale={action_slew_rate_scale} is outside (0, 1]: the velocity "
+      "limits are hardware ceilings and can only be tightened"
     )
-  }
+  if robot.joint_velocity_limits is None and action_slew_rate_scale != 1.0:
+    raise ValueError(
+      f"action_slew_rate_scale={action_slew_rate_scale}, but the robot has no "
+      "joint_velocity_limits for it to scale"
+    )
+  if stack_speed:
+    if robot.joint_velocity_limits is None:
+      raise ValueError("stack_speed needs the robot's joint_velocity_limits")
+    rate_limit = stack_arm_rate_limit(robot.joint_velocity_limits)
+    for jaw in jaw_joints:
+      rate_limit[re.escape(jaw)] = STACK_JAW_STEP
+  else:
+    rate_limit = {
+      pattern: limit * CONTROL_DT * action_slew_rate_scale
+      for pattern, limit in (robot.joint_velocity_limits or {}).items()
+    }
+    if jaw_slew_rate is not None:
+      for jaw in jaw_joints:
+        rate_limit[re.escape(jaw)] = jaw_slew_rate
+  # Plan S7-4's bounds on the arm's final target (C, T); `mdp.RateLimitedJointPositionAction`.
+  bounds = {}
+  if arm_range_clip:
+    bounds["range_clip_joints"] = arm_regex
+  if arm_effort_band:
+    bounds["effort_band_joints"] = arm_regex
+  if latency.jaw_servo:
+    bounds["servo_joints"] = tuple(re.escape(jaw) for jaw in jaw_joints)
+    bounds["servo_tau"] = latency.servo_tau
+    bounds["servo_max_vel"] = latency.servo_max_vel
+  if bounds and not rate_limit:
+    raise ValueError(
+      "the arm bounds and the jaw servo live in the rate-limited action term; no slew limit"
+    )
+  if command_obs and not rate_limit:
+    raise ValueError(
+      "command_obs reads the commanded target of the rate-limited action term; no slew limit"
+    )
+  if action_mode == "delta" and not rate_limit:
+    raise ValueError("a delta action needs a per-step limit on every joint")
+  action_cfg = (
+    mdp.DeltaRateLimitedJointPositionActionCfg
+    if action_mode == "delta"
+    else mdp.RateLimitedJointPositionActionCfg
+  )
+  joint_pos_action: ActionTermCfg = (
+    action_cfg(**joint_pos_kwargs, rate_limit=rate_limit, **bounds)
+    if rate_limit
+    else JointPositionActionCfg(**joint_pos_kwargs)
+  )
+  if tool_speed_cap is not None:
+    joint_pos_action = mdp.ToolSpeedCappedJointPositionActionCfg(
+      **joint_pos_kwargs,
+      **bounds,
+      rate_limit=rate_limit,
+      capped_joints=arm_regex,
+      tool_site=gripper.tcp_site,
+      speed_limit=tool_speed_cap.speed,
+      slow_speed_limit=tool_speed_cap.slow_speed,
+      slow_zone=tool_speed_cap.slow_zone,
+      slow_near_surface=tool_speed_cap.slow_near_surface,
+      control_dt=CONTROL_DT,
+      object_name=OBJECT,
+      grasp_sensor_name=grasp_sensor,
+      surface_name=TABLE,
+      command_name=COMMAND,
+    )
+  actions: dict[str, ActionTermCfg] = {"joint_pos": joint_pos_action}
 
   # -- Commands -------------------------------------------------------------------
   if command_cfg is None:
@@ -275,14 +756,12 @@ def make_tabletop_env_cfg(
         "asset_cfg": SceneEntityCfg(ROBOT, joint_names=(".*",)),
       },
     ),
-    # Holding the *pose* is not enough: ``clear_state`` also zeroes every actuator target
-    # on reset, and the action manager only writes the joints the policy owns. Without
-    # this the leg position actuators would drive to 0 and retract the telescopic legs to
-    # their mechanical minimum a second into the episode, fixed base or not.
-    "hold_joints_at_default": EventTermCfg(
-      func=mdp.hold_joints_at_default,
-      mode="reset",
-      params={"asset_cfg": SceneEntityCfg(ROBOT)},
+    # Then tell the actuators to hold that pose. Without this the reset zeroes every joint
+    # target and only the action joints get one written back, so the legs, the telescopic
+    # drive and the pelvis are commanded to 0 for the whole episode -- see
+    # mdp.hold_nominal_targets.
+    "hold_nominal_targets": EventTermCfg(
+      func=mdp.hold_nominal_targets, mode="reset", params={}
     ),
     # Only then jitter the commanded joints. The legs are deliberately excluded: perturbing
     # them independently would violate the four-bar mimic.
@@ -303,6 +782,7 @@ def make_tabletop_env_cfg(
         "surface_cfg": SceneEntityCfg(TABLE),
         "pose_range": dict(object_pose_range),
         "min_separation": min_separation,
+        **({} if goal_area is None else {"goal_area": goal_area}),
       },
     ),
     "pad_friction_slide": EventTermCfg(
@@ -314,43 +794,6 @@ def make_tabletop_env_cfg(
         "distribution": "uniform",
         "axes": [0],
         "ranges": (0.6, 1.2),
-      },
-    ),
-    # Robot-to-table extrinsics. Without this every env shares one bit-identical workspace
-    # layout and the policy can memorise a single reach. ``startup`` rather than ``reset``
-    # because base placement is a property of a physical setup, not of an episode -- and
-    # across 4096 envs that is still 4096 distinct layouts. Doing it at startup also keeps
-    # it clear of ``reset_objects``, which reads the table pose out of physics data to
-    # place the cubes and so must run after the table has moved.
-    # This doubles as the tracker-to-robot calibration error when object pose arrives in
-    # the tracker's frame rather than the robot's.
-    "table_pose": EventTermCfg(
-      mode="startup",
-      func=dr.body_pos,
-      params={
-        "asset_cfg": SceneEntityCfg(TABLE, body_names=(TABLE,)),
-        "operation": "add",
-        "distribution": "uniform",
-        "ranges": {0: (-0.02, 0.02), 1: (-0.02, 0.02), 2: (-0.01, 0.01)},
-      },
-    ),
-    # Actuator variation.
-    # Every actuator group, not just the commanded ones: ``dr.pd_gains`` indexes
-    # ``entity.actuators`` (one entry per actuator *group*) with ids that
-    # ``SceneEntityCfg.actuator_names`` resolves against ``entity.actuator_names`` (one
-    # entry per MJCF actuator, i.e. per joint). Those two lists have different lengths, so
-    # naming a subset here raises IndexError inside mjlab. Scoping is not worth working
-    # around: the extra groups are the legs, which are welded by ``fixed_base`` and parked
-    # at their defaults by ``hold_joints_at_default``, so their tracking error is ~0 and a
-    # +/-15% gain draw changes the torque they apply by nothing measurable.
-    "pd_gains": EventTermCfg(
-      mode="startup",
-      func=dr.pd_gains,
-      params={
-        "asset_cfg": SceneEntityCfg(ROBOT),
-        "kp_range": (0.85, 1.15),
-        "kd_range": (0.85, 1.15),
-        "operation": "scale",
       },
     ),
     "pad_friction_spin": EventTermCfg(
@@ -365,32 +808,8 @@ def make_tabletop_env_cfg(
       },
     ),
   }
-  if robot.joint_damping_range is not None:
-    events["joint_damping"] = EventTermCfg(
-      mode="startup",
-      func=dr.joint_damping,
-      params={
-        "asset_cfg": action_joints,
-        "operation": "abs",
-        "distribution": "uniform",
-        "ranges": dict(robot.joint_damping_range),
-        "shared_random": False,
-      },
-    )
-
-  if robot.joint_friction_range is not None:
-    events["joint_friction"] = EventTermCfg(
-      mode="startup",
-      func=dr.dof_frictionloss,
-      params={
-        "asset_cfg": action_joints,
-        "operation": "abs",
-        "distribution": "uniform",
-        "ranges": dict(robot.joint_friction_range),
-        "shared_random": False,
-      },
-    )
-
+  if not hold_nominal:
+    del events["hold_nominal_targets"]
   if not robot.fixed_base:
     events["reset_base"] = EventTermCfg(
       func=mdp.reset_root_state_uniform,
@@ -433,6 +852,7 @@ def make_tabletop_env_cfg(
     "joint_pos_limits": RewardTermCfg(
       func=mdp.joint_pos_limits, weight=-10.0, params={"asset_cfg": action_joints}
     ),
+    **trunk_clearance_rewards(robot, trunk_clearance_penalty),
   }
 
   # -- Terminations ---------------------------------------------------------------
@@ -440,29 +860,71 @@ def make_tabletop_env_cfg(
     "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
     "object_dropped": TerminationTermCfg(
       func=mdp.entity_below_height,
-      params={"entity_name": OBJECT, "min_height": scene.TABLE_TOP_Z - 0.2},
+      params={"entity_name": OBJECT, "min_height": table_top_z - 0.2},
     ),
   }
+  if robot.reach is not None:
+    terminations["out_of_reach"] = TerminationTermCfg(
+      func=mdp.entity_out_of_reach,
+      params={
+        "entity_names": tuple(objects),
+        "max_distance": robot.reach.max_distance,
+        "reference_body": robot.reach.reference_body,
+        "robot_name": ROBOT,
+      },
+    )
+  if guard_divergence:
+    # A failure, not a truncation -- the plan's D9. Both are defensible: a failure pushes
+    # the policy away from the configurations that blow up, at the cost of a shaping term
+    # whose size is whatever V(s') happened to be; a truncation injects no value signal but
+    # bootstraps from a state that is either corrupted or, here, freshly reset -- the value
+    # of a new episode, not of this one's continuation. D9 chose failure because V(s')=0 is
+    # at least a consistent defined choice, and nothing measured since overturns it: the
+    # rate is 0.056-0.074% of episodes (jobs 157183/157184), so the choice moves ~0.06% of
+    # transitions either way.
+    terminations["non_finite_state"] = TerminationTermCfg(
+      func=mdp.non_finite_state, time_out=False
+    )
+    # The backstop, for a state that is finite in qpos/qvel but produces a non-finite
+    # observation anyway -- a velocity or sensor reading that overflows on the way out.
+    # Rewards need no equivalent: mjlab's RewardManager.compute already sanitises every
+    # term unconditionally (reward_manager.py:129).
+    for group in observations.values():
+      group.nan_policy = "sanitize"
+      # One check on the concatenated group rather than one per term. Per-term checking
+      # forces a host sync per term per step, and the term is not the interesting answer
+      # anyway -- `non_finite_state` already says the physics diverged.
+      group.nan_check_per_term = False
 
   sensors = [
     make_grasp_sensor(gripper, OBJECT),
     make_support_sensor(OBJECT),
     make_hand_ground_sensor(gripper),
+    make_hand_surface_sensor(gripper),
   ]
 
   entities: dict[str, EntityCfg] = {
     ROBOT: robot.build_entity_cfg(),
-    TABLE: scene.get_table_cfg(),
+    TABLE: scene.get_table_cfg(table_top_z),
   }
   entities.update(objects)
 
-  return ManagerBasedRlEnvCfg(
+  cfg = ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),
       entities=entities,
       sensors=tuple(sensors),
       num_envs=1,
-      env_spacing=2.5,
+      # Zero, not the locomotion default. mjlab simulates the envs as batched worlds with
+      # identical geometry -- every world's table is at the same place -- but a scene with a
+      # terrain still lays `env_origins` out on a grid of `env_spacing`, which is what a
+      # locomotion task needs to spread its robots over the terrain. Nothing here honours
+      # that grid: `reset_objects_on_surface` reads the table out of physics, so the cube
+      # lands on the table, while `LiftingCommand` adds `env_origins` to its target, so the
+      # goal walks off into space. At the default 2.5 the goal sits 1.6-1.9 m from the cube
+      # in every env but the first, and no policy can reach it. Measured; see
+      # `test_the_goal_is_reachable_from_the_object`.
+      env_spacing=0.0,
       extent=2.5,
     ),
     observations=observations,
@@ -489,17 +951,360 @@ def make_tabletop_env_cfg(
         # 2 ms, matching the locomotion tasks. The gripper four-bar is a stiff closed
         # linkage whose passive joints carry only 1e-4 armature; at 5 ms they diverge
         # (measured: |qvel| past 900 rad/s and NaN within ~40 control steps under random
-        # actions). Decimation is raised to keep the control rate at 50 Hz.
-        timestep=0.002,
+        # actions). Decimation is raised to keep the control rate at 50 Hz. That was measured
+        # before decision 0002 raised the tabletop overlay's passive armature to 5e-3; whether
+        # a longer step is now viable is untested.
+        timestep=SIM_TIMESTEP,
         iterations=10,
         ls_iterations=20,
         impratio=10,
         cone="elliptic",
+        disableflags=SIM_DISABLE_FLAGS,
       ),
     ),
-    decimation=10,
+    decimation=DECIMATION,
     episode_length_s=episode_length_s,
   )
+  if dr_level is not None:
+    apply_dr_level(
+      cfg,
+      dr_level,
+      action_joints,
+      spawn_widening=dr_spawn_widening,
+      object_geoms=object_geoms,
+      object_friction=object_friction,
+    )
+  if latency.tracker_lag is not None:
+    _apply_tracker_lag(cfg, latency.tracker_lag)
+  if occlusion is not None:
+    _apply_occlusion(cfg, occlusion, latency, tcp, gripper.finger_joint)
+  return cfg
+
+
+def action_jaw_joints(
+  robot: ManipulationRobotCfg, gripper: GripperCfg
+) -> tuple[str, ...]:
+  """The jaws the policy drives: every gripper's finger joint the action space names (plan S11's
+  JOINT drives both; a one-arm task, one), else ``gripper``'s alone."""
+  jaws = tuple(
+    g.finger_joint
+    for g in robot.grippers
+    if any(re.fullmatch(p, g.finger_joint) for p in robot.action_joint_regex)
+  )
+  return jaws or (gripper.finger_joint,)
+
+
+def arm_joint_regex(
+  robot: ManipulationRobotCfg, gripper: GripperCfg
+) -> tuple[str, ...]:
+  """The action joint patterns but the jaws' (`action_jaw_joints`): the driven arms' joints."""
+  jaws = action_jaw_joints(robot, gripper)
+  return tuple(
+    p for p in robot.action_joint_regex if not any(re.fullmatch(p, jaw) for jaw in jaws)
+  )
+
+
+def trunk_clearance_rewards(
+  robot: ManipulationRobotCfg, weight: float = 1.0
+) -> dict[str, RewardTermCfg]:
+  """``trunk_clearance``: a penalty for arm links approaching the trunk's keep-out box.
+
+  S5.1 item 8 (Claudius's 82c4450). The trunk colliders stop an arm at the chest; this
+  prices the approach, so the policy does not learn to lean an elbow on it. Weight 1.0 is
+  his: ~10 % of what the top of his stack reward pays per step. A separate function because
+  a task that replaces the reward dict wholesale (pick-and-place's variants) has to add it
+  back, and every variant must carry it the same way.
+  """
+  keepout = robot.trunk_keepout
+  if keepout is None or not weight:
+    return {}
+  return {
+    "trunk_clearance": RewardTermCfg(
+      func=mdp.keepout_box_penalty,
+      weight=-abs(weight),
+      params={
+        "center": keepout.center,
+        "half_extents": keepout.half_extents,
+        "margin": keepout.margin,
+        "reference_body": keepout.reference_body,
+        "asset_cfg": SceneEntityCfg(ROBOT, body_names=keepout.body_name_regex),
+      },
+    )
+  }
+
+
+#: The domain-randomisation ladder (S2 of the pick-and-place plan), lowest rung first. Each
+#: rung *adds* to the one below, so a task states its level and the config records it instead
+#: of a report claiming it. `None` -- the default -- leaves the base cfg exactly as it is,
+#: which is what lift and stack have always run; note that the base cfg is **not** DR0, since
+#: it randomises pad friction at startup and jitters the commanded joints at reset.
+#:
+#: What each rung adds:
+#:
+#: * ``DR0`` -- nothing in the model varies: removes the two things the base cfg randomises
+#:   (pad friction, reset jitter). The actor's base observation noise -- joint pos +/-0.002
+#:   rad, vel +/-0.2 rad/s, object pos +/-5 mm, yaw +/-0.02 rad -- stays on at every rung.
+#: * ``DR-object`` -- the object's physics: sliding friction and mass.
+#: * ``DR-contact`` -- the gripper side: the base cfg's pad friction, restored.
+#: * ``DR-robot`` -- actuation: PD gains, joint friction and joint damping on the driven
+#:   joints, and a +/-0.02 rad jitter on their reset pose.
+#: * ``DR-obs`` -- perception: an object-tracker error model (per-episode bias, per-step
+#:   jitter, 0-2 steps of lag) and an encoder bias.
+#: * ``DR-scene`` -- layout: the table's pose (x, y +/-2 cm, height +/-1 cm) and a wider
+#:   spawn box.
+#:
+#: v0 trains at DR0 and DR-object only; the rest are defined so that climbing is a change of
+#: one string. Two caveats are recorded rather than hidden:
+#:
+#: * **DR-scene moves the table, so a goal with a hardcoded position stops being right.** A
+#:   2 cm table offset eats 2 cm of a 2.5 cm success threshold. A task that uses this rung
+#:   needs a goal that reads the surface out of physics -- `mdp.SurfaceOffsetCommand` is that
+#:   goal, and `pick_place_env_cfg._command_cfg` is one way to switch to it. Both it and the
+#:   spawn (`reset_objects_on_surface`) read the table's world XY as well as its height, so
+#:   the target stays fixed *relative to the table* and moves +/-2 cm relative to the robot.
+#: * **Randomising the cube's size is deliberately not here**, even though `dr.geom_size`
+#:   works: the cube's resting height is a function of its size, so it breaks a hardcoded
+#:   goal z the same way the table does. It would be safe to add for a task already using
+#:   `mdp.SurfaceOffsetCommand`, which reads the object's half-height, and unsafe for one
+#:   that is not -- and a rung that is conditionally correct is worse than a missing one.
+DR_LEVELS = ("DR0", "DR-object", "DR-contact", "DR-robot", "DR-obs", "DR-scene")
+
+#: Rungs at and above this one move the table; see the caveat on `DR_LEVELS`.
+DR_LEVELS_THAT_MOVE_THE_TABLE = ("DR-scene",)
+
+#: DR-object: the cube's sliding friction, and its mass in kg -- 30 g to 100 g brackets a
+#: light plastic cube and a heavy wooden one, and the point of the rung is that the policy
+#: cannot assume the 50 g it was built with.
+#:
+#: The mass goes through `dr.pseudo_inertia`, not `dr.body_mass`, on mjlab's own instruction:
+#: `body_mass` changes the mass and leaves `body_inertia` alone, which models a point mass
+#: bolted to the COM rather than a denser cube, and it warns as much at runtime. A 100 g cube
+#: carrying the rotational inertia of a 50 g one is exactly the quantity a grasp has to
+#: resist, so the approximation is not one to make here. `alpha` is a log density scale --
+#: mass and inertia both scale by exp(2*alpha) -- so the kg range is converted rather than
+#: written out, and the conversion is what `test_ranges_land_where_the_config_says` checks.
+_DR_OBJECT_FRICTION = (0.5, 1.2)
+_DR_OBJECT_MASS_KG = (0.03, 0.10)
+_CUBE_NOMINAL_MASS_KG = 0.05  # scene.get_cube_spec's default
+_DR_OBJECT_ALPHA = tuple(
+  math.log(mass / _CUBE_NOMINAL_MASS_KG) / 2 for mass in _DR_OBJECT_MASS_KG
+)
+
+#: DR-robot: +/-20% on the PD gains of the driven joints, and absolute joint-level friction
+#: and viscous damping per joint group, keyed by joint regex.
+#:
+#: The friction and damping ranges are Claudius's (`origin/fix-stack-exploration-collapse`,
+#: 860554a, `joint_friction_range` / `joint_damping_range` in his `robots/kangaroo.py`),
+#: folded in by S5.1 of the pick-and-place plan. The arms carry no `frictionloss` and no
+#: joint `damping` in the model at all -- their damping lives in the actuator kd -- so both
+#: are absolute and are new behaviour rather than a perturbation: 1.0 N.m of stiction is 2 %
+#: of the arm's 50 N.m effort limit, 0.05 N.m.s/rad is ~5 % of an arm kd of 1.0. The jaw
+#: ships with `damping="0.03"` (`kangaroo_grippers.xml`), which its range brackets, and gets
+#: three orders of magnitude less stiction than an arm, since anything larger stalls it.
+_DR_ROBOT_GAIN_SCALE = (0.8, 1.2)
+#: DR-robot's reset jitter on the driven joints, rad: Claudius's value, aligned by plan S7
+#: (decided 2026-09-24). The base cfg has the same +/-0.02; DR0 switches it off and this rung
+#: puts it back.
+_DR_ROBOT_RESET_JITTER = 0.02
+_DR_ROBOT_JOINT_FRICTION = {
+  r"arm_.*_[1-7]_joint": (0.0, 1.0),
+  r"gripper_.*_finger_joint": (0.0, 0.02),
+}
+_DR_ROBOT_JOINT_DAMPING = {
+  r"arm_.*_[1-7]_joint": (0.0, 0.05),
+  r"gripper_.*_finger_joint": (0.02, 0.04),
+}
+
+#: DR-obs: what the policy is allowed to be wrong about. The object pose gets a tracker
+#: error model rather than wider zero-mean noise: a per-episode bias, a small per-step
+#: jitter, and 0-2 control steps (0-40 ms) of lag sampled per env. The numbers are
+#: Claudius's (860554a, `OBJECT_*` in his `tabletop_env_cfg.py`), sized for a marker-based
+#: tracker with headroom, and folded in by S5.1. The point of the bias is that it cannot be
+#: averaged away over a few frames, which zero-mean noise resampled every step can -- the
+#: base cfg's +/-5 mm, and the +/-15 mm this rung used before, both left the policy
+#: effectively reading ground truth. Plus an encoder bias, also a per-episode constant.
+_DR_OBS_OBJECT_POS_BIAS = 0.008  # m
+_DR_OBS_OBJECT_POS_NOISE = 0.002  # m
+_DR_OBS_OBJECT_YAW_BIAS = 0.03  # rad
+_DR_OBS_OBJECT_YAW_NOISE = 0.01  # rad
+_DR_OBS_OBJECT_LAG = (0, 2)  # control steps
+_DR_OBS_ENCODER_BIAS = 0.005
+
+#: DR-scene: the table's pose, and how much wider the spawn box gets. The pose is Claudius's
+#: (x, y +/-2 cm, z +/-1 cm), aligned by plan S7 (decided 2026-09-24); the height was +/-2 cm
+#: before. The spawn widening is additive rather than a factor, because the tasks' nominal
+#: spawn ranges differ by an order of magnitude (2 cm for pick-and-place, 15 cm for lift) and
+#: a factor would push the larger ones off the table.
+_DR_SCENE_TABLE_XY = 0.02
+_DR_SCENE_TABLE_HEIGHT = 0.01
+_DR_SCENE_EXTRA_SPAWN = 0.03
+
+
+def _on_joints(
+  ranges: Mapping[str, tuple[float, float]], joint_regex: tuple[str, ...]
+) -> dict[str, tuple[float, float]]:
+  """Restrict joint-regex keyed DR ranges to the joints matched by ``joint_regex``.
+
+  mjlab matches a string-keyed ``ranges`` against *every* joint of the entity and ignores
+  the event's ``asset_cfg.joint_names`` (`_randomize_with_string_ranges` in
+  `mjlab/envs/mdp/dr/_core.py`), so ``arm_.*`` would also randomise an arm the task has
+  parked outside its action space. Each key becomes "matches the group *and* one of the
+  action regexes": the lookahead asserts the group pattern over the whole name, then the
+  alternation must match it too. A group with no action joint still raises in mjlab, which
+  is the loud failure wanted.
+  """
+  either = "|".join(f"(?:{r})" for r in joint_regex)
+  return {rf"(?=(?:{group})$)(?:{either})": rng for group, rng in ranges.items()}
+
+
+def _dr_index(level: str) -> int:
+  if level not in DR_LEVELS:
+    raise ValueError(f"unknown DR level {level!r}; have {DR_LEVELS}")
+  return DR_LEVELS.index(level)
+
+
+def apply_dr_level(
+  cfg: ManagerBasedRlEnvCfg,
+  level: str,
+  action_joints: SceneEntityCfg,
+  object_name: str = OBJECT,
+  spawn_widening: bool = True,
+  object_geoms: tuple[str, ...] | None = None,
+  object_friction: tuple[float, float] | None = None,
+) -> ManagerBasedRlEnvCfg:
+  """Set the environment's domain randomisation to a named rung, in place.
+
+  Cumulative: every rung includes the ones below it. See `DR_LEVELS`. ``spawn_widening=False``
+  keeps `DR-scene`'s table pose but not its wider spawn box (plan S7-2's W boxes are already
+  the region to train on).
+  """
+  rung = _dr_index(level)
+
+  # DR0 and up: the base cfg's own randomisation is off unless a rung puts it back.
+  if rung < _dr_index("DR-contact"):
+    for term in ("pad_friction_slide", "pad_friction_spin"):
+      cfg.events.pop(term, None)
+  cfg.events["reset_robot_joints"].params["position_range"] = (0.0, 0.0)
+
+  if rung >= _dr_index("DR-object"):
+    object_geom = SceneEntityCfg(
+      object_name, geom_names=object_geoms or (f"{object_name}_geom",)
+    )
+    cfg.events["object_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_friction,
+      params={
+        "asset_cfg": object_geom,
+        "operation": "abs",
+        "distribution": "uniform",
+        "axes": [0],  # sliding only; torsional friction is the pads' business.
+        "ranges": _DR_OBJECT_FRICTION if object_friction is None else object_friction,
+      },
+    )
+    cfg.events["object_mass"] = EventTermCfg(
+      mode="startup",
+      func=dr.pseudo_inertia,
+      params={
+        "asset_cfg": SceneEntityCfg(object_name, body_names=(object_name,)),
+        "alpha_range": _DR_OBJECT_ALPHA,
+        "distribution": "uniform",
+      },
+    )
+
+  if rung >= _dr_index("DR-robot"):
+    cfg.events["reset_robot_joints"].params["position_range"] = (
+      -_DR_ROBOT_RESET_JITTER,
+      _DR_ROBOT_RESET_JITTER,
+    )
+    cfg.events["actuator_gains"] = EventTermCfg(
+      mode="startup",
+      func=dr.pd_gains,
+      params={
+        "asset_cfg": action_joints,
+        "kp_range": _DR_ROBOT_GAIN_SCALE,
+        "kd_range": _DR_ROBOT_GAIN_SCALE,
+        "operation": "scale",
+      },
+    )
+    for name, func, ranges in (
+      ("joint_friction", dr.joint_friction, _DR_ROBOT_JOINT_FRICTION),
+      ("joint_damping", dr.joint_damping, _DR_ROBOT_JOINT_DAMPING),
+    ):
+      cfg.events[name] = EventTermCfg(
+        mode="startup",
+        func=func,
+        params={
+          "asset_cfg": action_joints,
+          "operation": "abs",
+          "distribution": "uniform",
+          "ranges": _on_joints(ranges, tuple(action_joints.joint_names)),
+        },
+      )
+    # Action delay is *not* here, and cannot be: mjlab's delay buffer is configured on the
+    # actuator (`delay_min_lag`/`delay_max_lag` and friends, `mjlab/actuator/actuator.py:67-85`),
+    # so it is a property of the robot cfg rather than something an event can switch on. Per-env
+    # lags can then be randomised through `Actuator.set_lags`. Adding it means a robot variant,
+    # which is why this rung stops short of it.
+
+  if rung >= _dr_index("DR-obs"):
+    # The actor and critic groups share their term objects (`make_tabletop_env_cfg` copies the
+    # dict, not the terms), so the actor's terms are *replaced*, not edited. That matters for
+    # the lag: `enable_corruption=False` switches off a group's noise but not its delay, so an
+    # edited shared term would feed the critic stale object poses too. The critic runs only in
+    # sim and keeps the true pose.
+    terms = cfg.observations["actor"].terms
+    for name, bias, noise in (
+      ("object_pos", _DR_OBS_OBJECT_POS_BIAS, _DR_OBS_OBJECT_POS_NOISE),
+      ("object_yaw", _DR_OBS_OBJECT_YAW_BIAS, _DR_OBS_OBJECT_YAW_NOISE),
+    ):
+      terms[name] = dataclasses.replace(
+        terms[name],
+        noise=NoiseModelWithAdditiveBiasCfg(
+          noise_cfg=Unoise(n_min=-noise, n_max=noise),
+          # "abs", not the default "add": mjlab 1.6.0's `NoiseModelWithAdditiveBias.reset`
+          # computes `bias = bias_noise_cfg.apply(bias)`, so with "add" every reset adds a
+          # fresh draw to the old bias and it random-walks across episodes (measured: 15 mm
+          # against an 8 mm bound after the first reset alone). "abs" replaces it.
+          bias_noise_cfg=Unoise(n_min=-bias, n_max=bias, operation="abs"),
+        ),
+        delay_min_lag=_DR_OBS_OBJECT_LAG[0],
+        delay_max_lag=_DR_OBS_OBJECT_LAG[1],
+      )
+    cfg.events["encoder_bias"] = EventTermCfg(
+      mode="reset",
+      func=dr.encoder_bias,
+      params={
+        "asset_cfg": action_joints,
+        "bias_range": (-_DR_OBS_ENCODER_BIAS, _DR_OBS_ENCODER_BIAS),
+      },
+    )
+
+  if rung >= _dr_index("DR-scene"):
+    cfg.events["table_pose"] = EventTermCfg(
+      mode="startup",
+      func=dr.body_pos,
+      params={
+        "asset_cfg": SceneEntityCfg(TABLE, body_names=(TABLE,)),
+        "operation": "add",
+        "distribution": "uniform",
+        "axes": [0, 1, 2],
+        "ranges": {
+          0: (-_DR_SCENE_TABLE_XY, _DR_SCENE_TABLE_XY),
+          1: (-_DR_SCENE_TABLE_XY, _DR_SCENE_TABLE_XY),
+          2: (-_DR_SCENE_TABLE_HEIGHT, _DR_SCENE_TABLE_HEIGHT),
+        },
+      },
+    )
+    # The spawn box widens about its own centre. `reset_objects_on_surface` reads the table's
+    # position and height out of physics, so the cube still lands on the surface, at the same
+    # offset from the table's centre, wherever the table is.
+    if spawn_widening:
+      pose_range = cfg.events["reset_objects"].params["pose_range"]
+      for axis in ("x", "y"):
+        lo, hi = pose_range[axis]
+        pose_range[axis] = (lo - _DR_SCENE_EXTRA_SPAWN, hi + _DR_SCENE_EXTRA_SPAWN)
+
+  return cfg
 
 
 def apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
