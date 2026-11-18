@@ -32,9 +32,10 @@ Design:
 **P1.2, checkpoint `model_6000.pt`**: LowSpeed task, fine-tuned from P1 `model_5000`.
 
 - wandb: `claudik/kangaroo-locomanip`, run `l2pfbq7x` (P1.2). The P1 parent is `vfvrla1a`.
-- local copy: `logs/rsl_rl/kangaroo_locomanip/2026-11-17_19-59-37_P1.2-finetune-lowspeed-s1/model_6000.pt`
-  on the workstation where it was trained. Checkpoints are not in git; ask for the file or
-  take it from wandb.
+- **in this branch: [`checkpoints/p1.2_model_6000.pt`](checkpoints/p1.2_model_6000.pt)**
+  (Git LFS: run `git lfs install && git lfs pull` after cloning; sha256 `582821c6e2dbeed5…`), with the run's `env.yaml` / `agent.yaml`. This is the only
+  checkpoint in git, kept on purpose for the handover; do not add more, since `logs/` is
+  gitignored for a reason.
 
 | test (64 envs, 20 s) | result |
 |---|---|
@@ -53,7 +54,7 @@ floor, `v_min = 0.2 m/s` and `w_min = 0.3 rad/s`, until inside the tolerance, as
 make sync   # uv, GPU torch: --extra cu128
 
 T=Mjlab-LocoManip-Velocity-Flat-Pal-Kangaroo-Grippers-LowSpeed
-CK=logs/rsl_rl/kangaroo_locomanip/<run>/model_6000.pt
+CK=locomanip_docs/checkpoints/p1.2_model_6000.pt
 
 # evaluate (stand + walk_to), ~5 min on one GPU
 uv run python scripts/locomanip_eval.py --task $T --checkpoint $CK --v-min 0.2 --w-min 0.3 --out eval.json
