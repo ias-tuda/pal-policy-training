@@ -5,8 +5,9 @@ Walking is one SKEMA skill, `walk_to(x, y, yaw)`; manipulation skills run while 
 stands. The split follows HOMIE: a lower-body RL policy keeps balance and walks, while the
 arms are driven by something else (now a random script, later the WC-c pick-place policy).
 
-Status (2026-11-18): **stage P1 (walk/stand policy) is good enough to build on.** P2–P4 have
-not started. The details, all measurements, and the failed runs are in
+Status (2026-11-18): **stage P1 (walk/stand policy) is good enough to build on.** P2b: a
+walk_to + grasp demo runs end to end (37.5 % grasp success, vs 87.5 % for the grasp policy
+solo). P3–P4 have not started. The details, all measurements, and the failed runs are in
 [`report.md`](report.md). The stage plan is in [`plan.md`](plan.md).
 
 ## What is here
@@ -18,6 +19,7 @@ not started. The details, all measurements, and the failed runs are in
 | `src/pal_mjlab/tasks/locomanip/mdp/arm_actions.py` | `ScriptedArmJointPositionAction`: arms and grippers follow random minimum-jerk targets. It is an action term with 0 policy dims. |
 | `scripts/locomanip_eval.py` | gate tests: `stand` (20 s, zero command, arms moving) and `walk_to` (random target ≤ 2 m, P-controller) on 64 envs |
 | `scripts/locomanip_video.py` | demo video: 3 walk_to targets, then standing with arms moving |
+| `scripts/locomanip_p2/` | P2: arm-motion replay while standing (P2a); grasp policy on the P1.2 robot and the walk_to + grasp demo with lower/upper policy slots (P2b; needs the grasp code of `e61bd8e9`) |
 | `scripts/pal_onnx_video.py` | reference: runs PAL's shipped walking ONNX policies (from `pal_policy_deployer`) |
 
 Design:

@@ -50,6 +50,9 @@ Run WC-c with P1 on the legs in a combined play env (table + cube, free base). M
 success rate against fixed-base WC-c. If it is < ~90 % of the fixed-base rate, fine-tune P1
 with WC-c driving the arms (P1 frozen → then joint fine-tune).
 
+Status 2026-11-18: P2a (scripted arm replay, no falls) and P2b (vyq9vrpy grasp + walk_to
+demo, 37.5 %) are done; see report §P2. Next: raise the grasp success near the table.
+
 ## P3 — Further skills (place, handover) on P1
 
 The same as P2 for the existing fork tasks (pick_place target variants, MugKugel handoff).

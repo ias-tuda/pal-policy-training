@@ -154,6 +154,108 @@ Speed probe, commanded → actual:
 
 Status: planned — no results yet; plan §P2
 
+### P2a — scripted pick-place arm motion replayed while standing (2026-11-18)
+No WC-c checkpoint is on this workstation; its runs are on the IAS cluster. The stand-in
+is the repo's scripted IK pick-place (`scripts/scripted_pick_place.py rollout --gains G20`):
+the same plant, real reach / grasp / lift / carry / place motions, 10/10 placed. Its
+joint targets were recorded through `rollout(hook=...)`: 10 episodes, 399 steps each, left
+arm + left jaw only (moving ranges 0.47–1.54 rad); cube 50 g.
+
+Replay on P1.2 `model_6000`: 64 envs, zero twist command, 30 s. Each env loops one recorded
+episode, with min-jerk ramps from and back to the home pose and a random start phase. The
+startup DR adds a 0–1 kg hand payload.
+
+| speed | upright | drift at end, mean / max | peak drift max |
+|---|---|---|---|
+| ×1 (as recorded) | 64/64 | 4.2 / 12.5 cm | 12.8 cm |
+| ×2 | 64/64 | 4.8 / 14.7 cm | 14.7 cm |
+
+No falls, even at double speed. The drift runs a little above the random-arm stand test
+(8.7 cm max over 20 s), but this test is 30 s. Conclusion: P1.2 can carry pick-place arm
+motions without retraining. For P2b, the base moves up to ~13 cm during a pick, so the arm
+controller has to work in the base frame, closed loop, not from a fixed world pose.
+Files: `scripts/locomanip_p2/record_pp.py`, `replay_stand.py`; the recorded targets
+(`pp_g20_targets.npz`) stay in `artifacts/P2a/` (not committed).
+
+### P2b — a learned grasp policy on the P1.2-balanced robot, then walk_to + grasp (2026-11-18)
+There is still no WC-c checkpoint here, so the arm policy is the standing left-arm grasp policy
+**vyq9vrpy** `model_4998.pt` (sha256 `658cb435…`). Its task is
+`Mjlab-Grasp-LeftArm-Standing-Gravcomp-ArmV36-Slow50-NoTable-Smooth-Wide-Patient-LeanObs-Pal-Kangaroo-Grippers`.
+It was trained at commit `e61bd8e9`, which is not on this branch. The scripts run on that code:
+`PYTHONPATH=<worktree of e61bd8e9>/src`.
+
+The grasp robot stands on 30× stiffened leg PD and runs at step_dt 0.02. It has 8 actions
+(7 for the left arm, 1 for the jaw) and a 38-dim observation. It uses v36 arm gains with body gravcomp.
+
+**Combined env** (`scripts/locomanip_p2/stand_grasp.py`): this is the grasp task's play config with these changes.
+- The legs are back on the walking gains. The pelvis is on G20, and the right arm too (P1.2's
+  gains): the grasp policy does not drive the right arm.
+- The env adds an action term `legs` (P1.2's 14 targets), a `twist` command and a `loco`
+  observation group (P1.2's 114 dims). P1.2's jaw observation is shifted to its own default.
+- `settled_stance` is removed.
+- Body gravcomp stays on the left arm and gripper only. The free joint's gravcomp share is
+  clamped to 0 (see "what broke").
+
+Both actors run from their checkpoints, with the MLP and the normaliser. They match the rsl_rl
+runner's policy to about 1e-6.
+
+| setup (32 envs) | grasp success | early terminations | base drift mean/max |
+|---|---|---|---|
+| solo, its own task (rsl_rl runner, 10 s) | **87.5 %** | 4 | max 1.1 cm |
+| P1.2 legs, first combined version | 6 % | 4 | 13 / 53 cm |
+| + right arm G20, free-joint gravcomp removed | 9 % | 5 | 12 / 36 cm |
+| + table +3 / +4.5 cm | 22 / 34 % | 6 / 11 | 11 / 44, 13 / 46 cm |
+| **+ table +6 / +7.5 cm** | **44 %** | 12 / 17 | 11 / 39, 10 / 31 cm |
+| + table +9 cm | 34 % | 21 | 6 / 36 cm |
+
+P1.2 stands the base about 4.5 cm higher than the grasp robot does, with pitch +1.5° and roll
+−4.5°. The grasp policy works in the base frame, so the cube looks lower than any cube it saw
+in training (the table-height DR is only ±1.5 cm). Raising the table makes up for this.
+Removing the gain/damping/friction DR does not help: 0/32 on the plant before the table raise.
+
+**Demo with two policy slots** (`scripts/locomanip_p2/locomanip_demo.py`), as the user asked.
+- Lower body: P1.2 is always on. Skills write only its twist: `walk_to` writes the
+  P-controller with a speed floor (0.2 m/s, 0.3 rad/s), every other phase writes zero.
+- Upper body (left arm and jaw): a swappable slot, `home` (hold the default) or `grasp` (vyq9vrpy).
+- Sequence per env: `walk_to(0, 0, 0)` from (−1.2, 0.4 m, 20°), then 1 s settle, then the grasp
+  for up to 12 s. The table is at +6 cm. `out_of_reach` is removed. A termination ends the env (no retry).
+
+| 32 envs, seed 0 | result |
+|---|---|
+| walk_to within 5 cm / 5° | 22/32, median 3.3 s, median error 2.9 cm / 1.4° |
+| grasp success (counted over all 32) | **12/32 (37.5 %)**, median 2.8 s after the grasp starts |
+| failures | table contact in the grasp 11, table contact in walk_to 1, arm–arm self-collision 1 |
+
+Videos: seed 0 (arrives in 3.4 s, lifts the cube 6.0 s later) and seed 2 (arrives, misses the
+grasp). Both are rendered single-env and are not committed. Copies of all session videos are in
+`~/Documents/Office/Images and Videos/HybridT-Paper/SKEMA-GeneralMotions/kangaroo-locomanip_2026-11-18/`.
+
+**What broke**
+- **Gravcomp lifts the floating base.** mujoco_warp (`passive.py:581`) applies body gravcomp
+  to every DOF of the chain whose joint has no `actgravcomp`, and that includes the free
+  joint. The result is an external lift of the base. With full gravcomp the stand drift was
+  21.7 / 48.4 cm in 10 s; without it, 2.5 / 3.6 cm. Fix: gravcomp on the left arm only, plus
+  `actgravcomp=True` and `actfrcrange≈0` on the free joint (in the spec, before compile).
+- **The right arm sagged onto the table.** On v36 gains without gravcomp it fell 7 cm in
+  0.2 s. Fix: G20 for the right arm.
+- **`settled_stance` with an extra action term stores a collapsed stance** (leg length
+  0.117 m). The legs term outputs 0 while the stance settles. So "grasp plant + legs term"
+  is not a valid control. Valid controls are the solo task, and the env without the legs term (15/16).
+- **The first table sweep ran with the sagging right arm**, and it is discarded.
+- **The demo's twist stayed at 0.** `build_cfg` set `rel_standing_envs = 1`, so the command
+  term zeroed the twist every step. Fix: set it to 0 in the demo.
+
+**Conclusion and next step.** The loco-manipulation loop works end to end: P1.2 always on, and
+the upper slot switched by the skill. The grasp, however, reaches only about 40–44 % against
+87.5 % solo. The main failure is table contact while the base sways about 10 cm and rolls
+4–5°. The next stage fine-tunes the grasp policy on the P1.2-balanced robot (plan §P2, next step).
+
+Provenance: branch `skema-locomanip`. The grasp code is `e61bd8e9` (branch
+`faster-moves-backup`). P1.2 is `locomanip_docs/checkpoints/p1.2_model_6000.pt`. Host: the local
+workstation (1 GPU). The commands are in the scripts' docstrings, for example
+`stand_grasp.py <grasp ckpt> <p12 ckpt> 32 --seconds 15 --table-dz 0.06` and
+`locomanip_demo.py <grasp ckpt> <p12 ckpt> 32`.
+
 ## P3 — Further skills (place, handover) on P1
 
 Status: planned — no results yet; plan §P3
